@@ -80,8 +80,43 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
+/// The package names a pub search query could name: every run of name characters in every key and
+/// value of the query string, decoded as a form (`+` is a space, keys too) and lowercased, as pub
+/// package names are. Whichever parameter the upstream reads its term from, and however the term is
+/// qualified (`package:`, `dependency:`) or spelled, an internal name in it is seen.
+fn search_names(raw_query: &str) -> Vec<String> {
+    let decoded = match reqwest::Url::parse(&format!("http://query/?{raw_query}")) {
+        Ok(url) => url
+            .query_pairs()
+            .map(|(key, value)| format!("{key} {value}"))
+            .collect::<Vec<_>>()
+            .join(" "),
+        // Not parseable as a form: read it percent-decoded as a whole rather than not at all.
+        Err(_) => percent_encoding::percent_decode_str(&raw_query.replace('+', " "))
+            .decode_utf8_lossy()
+            .into_owned(),
+    };
+    decoded
+        .to_lowercase()
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
 async fn search_packages(State(state): State<AppState>, RawQuery(raw_query): RawQuery) -> Response {
     let raw_query = raw_query.unwrap_or_default();
+    // #68 namespace isolation: a search naming an internal namespace is never sent upstream (it
+    // would disclose the name), nor answered from a stored upstream answer; the result is empty.
+    if search_names(&raw_query).iter().any(|name| {
+        crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::PubDart,
+            name,
+        )
+    }) {
+        return pub_json_response(br#"{"packages":[]}"#.to_vec());
+    }
     let key = format!(
         "pub/search/{}.json",
         hex::encode(sha2::Sha256::digest(raw_query.as_bytes()))
@@ -627,6 +662,17 @@ async fn download_archive(
     .await
     {
         Ok(data) => {
+            // The allowlist's pinned integrity holds on the first download too, before anything is cached:
+            // the cache-hit branch checks the same rule.
+            if let Some(response) = crate::curation::verify_integrity(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::PubDart,
+                &package,
+                Some(version),
+                &data,
+            ) {
+                return response;
+            }
             let hash = hex::encode(sha2::Sha256::digest(&data));
             cache_bytes(&state, key.clone(), data.clone()).await;
             cache_bytes(&state, format!("{}.sha256", key), hash.into_bytes()).await;
@@ -989,6 +1035,32 @@ fn is_valid_pub_version(version: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    #[test]
+    fn search_names_reads_every_name_in_the_term() {
+        let names = |query: &str| super::search_names(query);
+        let reads = |query: &str| names(query).contains(&"corp_lib".to_string());
+        for query in [
+            "q=corp_lib",
+            "page=2&q=CORP_Lib",
+            "q=package:corp_lib",
+            "q=dependency%3Acorp_lib",
+            "q=tools+corp_lib",
+            "q=%63orp_lib",
+            "q=public&q=corp_lib",
+            "%71=corp_lib",
+            "page=corp_lib",
+            "a=1&b=2&c=3&q=corp_lib",
+            "q=-corp_lib",
+            "q=corp_lib-",
+        ] {
+            assert!(reads(query), "{query}: {:?}", names(query));
+        }
+        assert!(!reads("q=corp_library"));
+        assert!(!reads("q=corp-lib2"));
+        assert_eq!(names("q="), ["q"]);
+    }
+
     use super::*;
     use crate::test_helpers::{
         body_bytes, create_test_context_with_config, send, send_with_headers, TestContext,

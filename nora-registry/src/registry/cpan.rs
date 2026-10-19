@@ -29,8 +29,6 @@ use axum::{
 };
 use std::time::Duration;
 
-const UPSTREAM_DEFAULT: &str = "https://www.cpan.org";
-
 /// Prefix under which CPAN distributions are stored, and an empty suffix: the CPAN index
 /// (`repo_index::build_cpan_index`) reads archives by their file name with
 /// [`parse_dist_archive_filename`], not by a suffix — distributions come as .tar.gz,
@@ -85,7 +83,13 @@ async fn fetch_index(state: &AppState, filename: &str) -> Response {
         }
     }
 
-    let proxy_url = upstream_url(state);
+    // No upstream when the operator switched it off: what is stored is all there is.
+    let Some(proxy_url) = upstream_url(state) else {
+        return match cached_data {
+            Some(data) => with_index_response(data.to_vec()),
+            None => StatusCode::NOT_FOUND.into_response(),
+        };
+    };
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), filename);
 
     match proxy_fetch(
@@ -264,8 +268,10 @@ async fn distribution_proxy(
         return response;
     }
 
-    // Fetch from upstream
-    let proxy_url = upstream_url(&state);
+    // Fetch from upstream — none when the operator switched it off.
+    let Some(proxy_url) = upstream_url(&state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
     let url = format!(
         "{}/authors/id/{}",
         proxy_url.trim_end_matches('/'),
@@ -283,6 +289,17 @@ async fn distribution_proxy(
     .await
     {
         Ok(bytes) => {
+            // The allowlist's pinned integrity holds on the first download too, before anything is cached:
+            // the cache-hit branch checks the same rule.
+            if let Some(response) = crate::curation::verify_integrity(
+                &state.curation().curation_engine,
+                crate::curation::RegistryType::Cpan,
+                dist_name,
+                dist_version.as_deref(),
+                &bytes,
+            ) {
+                return response;
+            }
             state.metrics.record_download("cpan");
             state.metrics.record_cache_miss("cpan");
             state.activity.push(ActivityEntry::new(
@@ -311,6 +328,16 @@ async fn distribution_proxy(
         Err(ProxyError::NotFound) => {
             // Upstream returned 404 — serve cached copy if we have one
             if let Some(ref data) = cached_data {
+                // A fallback serves stored bytes the verified read above did not: the pin holds.
+                if let Some(response) = crate::curation::verify_integrity(
+                    &state.curation().curation_engine,
+                    crate::curation::RegistryType::Cpan,
+                    dist_name,
+                    dist_version.as_deref(),
+                    data,
+                ) {
+                    return response;
+                }
                 state.metrics.record_download("cpan");
                 state.metrics.record_cache_hit("cpan");
                 state.activity.push(ActivityEntry::new(
@@ -327,6 +354,15 @@ async fn distribution_proxy(
         Err(e) => {
             if let Some(ref data) = cached_data {
                 if state.config.cpan.serve_stale {
+                    if let Some(response) = crate::curation::verify_integrity(
+                        &state.curation().curation_engine,
+                        crate::curation::RegistryType::Cpan,
+                        dist_name,
+                        dist_version.as_deref(),
+                        data,
+                    ) {
+                        return response;
+                    }
                     tracing::warn!(
                         registry = "cpan",
                         dist_path,
@@ -362,13 +398,10 @@ async fn distribution_proxy(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-fn upstream_url(state: &AppState) -> String {
-    state
-        .config
-        .cpan
-        .proxy
-        .clone()
-        .unwrap_or_else(|| UPSTREAM_DEFAULT.to_string())
+/// The configured upstream, or None when the operator switched it off with an empty
+/// NORA_CPAN_PROXY: then nothing is asked of any upstream.
+fn upstream_url(state: &AppState) -> Option<String> {
+    crate::config::configured_upstream(&state.config.cpan.proxy).map(str::to_string)
 }
 
 fn with_binary(data: Vec<u8>, content_type: &'static str) -> Response {
@@ -1406,5 +1439,152 @@ mod cpan_every_archive_extension {
         let path = "/cpan/authors/id/A/AU/AUTHOR/Foo-Bar-1.23.tar.Z";
         let resp = send(&ctx.app, Method::GET, path, "").await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+}
+
+/// The fallbacks that serve a stored distribution when the verified read did not (the upstream
+/// answered 404, or failed with serve_stale on) hold the allowlist's pinned integrity too.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cpan_fallback_holds_the_pin {
+    use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
+    use crate::test_helpers::{body_bytes, create_test_context_with_storage_and_config, send};
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const KEY: &str = "cpan/authors/id/C/CO/CORP/Corp-Lib-1.0.tar.gz";
+    const URI: &str = "/cpan/authors/id/C/CO/CORP/Corp-Lib-1.0.tar.gz";
+    const STORED: &[u8] = b"TAMPERED";
+
+    /// The first read of the distribution succeeds, every later one fails: the verified read
+    /// fails after the plain one (a race with a rewrite, or a transient error).
+    struct SecondReadFails {
+        inner: ObjectStorage,
+        reads: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for SecondReadFails {
+        async fn get(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            if k == KEY && self.reads.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Err(crate::storage::StorageError::Network("read failed".into()));
+            }
+            self.inner.get(k).await
+        }
+        async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(k, d, sha256).await
+        }
+        async fn pin(&self, k: &str) -> Option<String> {
+            self.inner.pin(k).await
+        }
+        async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+            self.inner.delete(k).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn list_with_meta(&self, p: &str) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+            self.inner.list_with_meta(p).await
+        }
+        async fn stat(&self, k: &str) -> Option<FileMeta> {
+            self.inner.stat(k).await
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "second-read-fails-test-store"
+        }
+        async fn put_from_path(
+            &self,
+            k: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(k, src, sha256).await
+        }
+        async fn copy(&self, s: &str, d: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
+            self.inner.copy(s, d, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(k).await
+        }
+    }
+
+    /// `upstream_404`: the upstream says "not found"; otherwise it is unreachable (stale path).
+    async fn fallback(pin_of: &[u8], upstream_404: bool) -> (StatusCode, bool, Vec<u8>) {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let upstream = if upstream_404 {
+            server.uri()
+        } else {
+            "http://127.0.0.1:9".to_string()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        let pinned = format!("sha256:{}", hex::encode(sha2::Sha256::digest(pin_of)));
+        std::fs::write(
+            &allowlist,
+            serde_json::json!({"version": 1, "entries": [
+                {"registry": "cpan", "name": "Corp-Lib", "version": "1.0", "integrity": pinned}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let storage = Storage::from_backend(std::sync::Arc::new(SecondReadFails {
+            inner: ObjectStorage::in_memory(),
+            reads: AtomicUsize::new(0),
+        }));
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.cpan.enabled = true;
+            cfg.cpan.proxy = Some(upstream);
+            cfg.cpan.serve_stale = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        ctx.state.storage.put(KEY, STORED).await.unwrap();
+        let resp = send(&ctx.app, Method::GET, URI, "").await;
+        let status = resp.status();
+        let stale = resp.headers().contains_key("x-nora-stale");
+        (status, stale, body_bytes(resp).await.to_vec())
+    }
+
+    #[tokio::test]
+    async fn the_stale_fallback_holds_the_pin() {
+        let (status, _, body) = fallback(b"GOOD", false).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_ne!(body, STORED);
+        // Control: the path is the stale fallback, and a matching pin is served there.
+        let (status, stale, body) = fallback(STORED, false).await;
+        assert_eq!((status, stale), (StatusCode::OK, true));
+        assert_eq!(body, STORED);
+    }
+
+    #[tokio::test]
+    async fn the_not_found_fallback_holds_the_pin() {
+        let (status, _, body) = fallback(b"GOOD", true).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_ne!(body, STORED);
+        let (status, _, body) = fallback(STORED, true).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, STORED);
     }
 }

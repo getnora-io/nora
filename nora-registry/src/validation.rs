@@ -374,6 +374,18 @@ pub fn validate_docker_reference(reference: &str) -> Result<(), ValidationError>
         }
     }
 
+    // A tag's manifest is stored as `<tag>.json` beside its sidecars `<tag>.meta.json` and
+    // `<tag>.stats.json`. A tag named `<other>.meta` or `<other>.stats` would therefore read,
+    // overwrite or delete another tag's sidecar, so no such tag is accepted.
+    if [".meta", ".stats"]
+        .iter()
+        .any(|stem| ends_with_ci(reference, stem))
+    {
+        return Err(ValidationError::InvalidReference(
+            "a tag may not end in .meta or .stats: NORA stores its metadata files under those names".to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -760,6 +772,16 @@ mod tests {
     }
 
     // Reference tests
+    #[test]
+    fn a_tag_named_like_a_sidecar_is_refused() {
+        for bad in ["v1.meta", "V1.STATS", "x.stats", "1.0.0.Meta"] {
+            assert!(validate_docker_reference(bad).is_err(), "{bad}");
+        }
+        for good in ["a.meta.b", "meta", "stats", "1.0.0", "v1.metadata"] {
+            assert!(validate_docker_reference(good).is_ok(), "{good}");
+        }
+    }
+
     #[test]
     fn test_reference_valid_tag() {
         assert!(validate_docker_reference("latest").is_ok());

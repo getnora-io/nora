@@ -208,6 +208,8 @@ pub struct AuthConfig {
     #[serde(default = "default_token_cache_ttl")]
     pub token_cache_ttl: u64,
     /// Trusted proxy IPs/CIDRs — only these sources have XFF/X-Real-IP honored.
+    /// X-Forwarded-For is read from the right: the client is the rightmost address that is
+    /// not in this list, so every proxy hop in front of NORA belongs here.
     /// Default: 127.0.0.1,::1 (loopback only).
     /// ENV: NORA_AUTH_TRUSTED_PROXIES=127.0.0.1,::1,10.0.0.0/8
     #[serde(default)]

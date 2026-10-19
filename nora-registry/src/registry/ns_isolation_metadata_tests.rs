@@ -180,6 +180,78 @@ async fn conan_internal_search_not_forwarded() {
     );
 }
 
+// ── pub_dart: search ────────────────────────────────────────────────────────
+
+/// A search term naming an internal namespace never reaches the upstream; a public term does.
+#[tokio::test]
+async fn pubdart_internal_search_not_forwarded() {
+    use sha2::Digest;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"packages":[{"package":"x"}]}"#),
+        )
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let ctx = create_test_context_with_config(move |c| {
+        c.pub_dart.enabled = true;
+        c.pub_dart.proxy = Some(uri);
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+    });
+    // A stored answer to an internal term (an older release cached it) is not served either.
+    ctx.state
+        .storage
+        .put(
+            &format!(
+                "pub/search/{}.json",
+                hex::encode(sha2::Sha256::digest(b"q=internalcached"))
+            ),
+            br#"{"packages":[{"package":"x"}]}"#,
+        )
+        .await
+        .unwrap();
+    for query in [
+        "q=internalpkg",
+        "q=internal%70kg&page=2",
+        "page=1&q=internalpkg",
+        "q=INTERNALpkg",
+        "q=package:internalpkg",
+        "q=dependency%3Ainternalpkg",
+        "q=tools+internalpkg",
+        "q=internalcached",
+        "q=publicpkg&q=internalpkg",
+        "%71=internalpkg",
+        "page=1&sort=top&q=internalpkg",
+        "q=-internalpkg",
+        "q=internalpkg-x",
+    ] {
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/pub/api/packages?{query}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{query}");
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(!body.contains("\"x\""), "{query}: upstream result served");
+    }
+    assert!(
+        upstream.received_requests().await.unwrap().is_empty(),
+        "an internal term reached the upstream"
+    );
+    let resp = send(&ctx.app, Method::GET, "/pub/api/packages?q=publicpkg", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        upstream.received_requests().await.unwrap().len(),
+        1,
+        "a public term is asked upstream"
+    );
+}
+
 // ── pub_dart: version metadata ──────────────────────────────────────────────
 
 #[tokio::test]

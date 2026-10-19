@@ -312,6 +312,20 @@ async fn handle(
                 return StatusCode::PAYLOAD_TOO_LARGE.into_response();
             }
 
+            // The allowlist's pinned integrity holds on the first download too, before anything
+            // is cached: the cache-hit branch checks the same rule.
+            if let Some((ref module_name, ref version)) = go_curation {
+                if let Some(response) = crate::curation::verify_integrity(
+                    &state.curation().curation_engine,
+                    crate::curation::RegistryType::Go,
+                    module_name,
+                    version.as_deref(),
+                    &bytes,
+                ) {
+                    return response;
+                }
+            }
+
             state.metrics.record_download("go");
             state.metrics.record_cache_miss("go");
             state.activity.push(ActivityEntry::new(
@@ -1329,6 +1343,50 @@ mod go_version_curation {
             let path = format!("/go/example.com/evil/@v/{version}.zip");
             let resp = send(&ctx.app, Method::GET, &path, "").await;
             assert_ne!(resp.status(), StatusCode::FORBIDDEN, "{version}");
+        }
+    }
+
+    /// An allowlist entry that pins the archive's SHA-256 refuses other bytes on the first
+    /// download from the upstream, not only once they are cached.
+    #[tokio::test]
+    async fn a_pinned_integrity_refuses_other_bytes_on_the_first_download() {
+        use sha2::Digest;
+        let upstream = upstream().await; // serves b"ZIP"
+        let dir = tempfile::tempdir().unwrap();
+        let pinned = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"GOOD")));
+        let allowlist = write(
+            &dir,
+            "allowlist.json",
+            &format!(
+                r#"{{"version": 1, "entries": [{{"registry": "go", "name": "example.com/good", "version": "v1.0.0", "integrity": "{pinned}"}}]}}"#
+            ),
+        );
+        // The module archive in any case of its extension: NORA reads `.ZIP` as the archive
+        // everywhere else (selection, size limit, quarantine, content type).
+        for path in [
+            "/go/example.com/good/@v/v1.0.0.zip",
+            "/go/example.com/good/@v/v1.0.0.ZIP",
+        ] {
+            let uri = upstream.uri();
+            let allowlist = allowlist.clone();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.go.proxy = Some(uri);
+                cfg.curation.mode = crate::config::CurationMode::Enforce;
+                cfg.curation.allowlist_path = Some(allowlist);
+            });
+            let first = send(&ctx.app, Method::GET, path, "").await;
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            let second = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(
+                second.status(),
+                StatusCode::FORBIDDEN,
+                "{path}: cached copy"
+            );
+            assert_eq!(
+                first.status(),
+                StatusCode::FORBIDDEN,
+                "{path}: first download"
+            );
         }
     }
 

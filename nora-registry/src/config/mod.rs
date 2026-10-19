@@ -206,6 +206,29 @@ fn surface_unknown_keys(
 // --- Shared defaults (used by submodules via `super::default_*`) ---
 
 /// Returns `true` — used as serde default for boolean fields that should default to enabled.
+/// An upstream setting as written: empty (or only whitespace) switches the upstream off. One rule
+/// for the environment variable and the config file, so `NORA_<FMT>_PROXY=""` and `proxy = ""`
+/// mean the same.
+pub(crate) fn upstream_setting(value: String) -> Option<String> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+/// The upstream a handler may ask: None when the setting is absent or blank, whatever wrote it
+/// (environment, config file, or code). Every handler reads its upstream through this, so a blank
+/// value can never reach a request.
+pub(crate) fn configured_upstream(setting: &Option<String>) -> Option<&str> {
+    setting.as_deref().filter(|value| !value.trim().is_empty())
+}
+
+/// `proxy = ""` in the config file reads as no upstream, like the empty environment variable.
+pub(crate) fn deserialize_upstream<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value: Option<String> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(value.and_then(upstream_setting))
+}
+
 pub(crate) fn default_true() -> bool {
     true
 }
@@ -1655,6 +1678,86 @@ mod tests {
         let mut hosted = Config::default();
         hosted.apply_enabled_registries(&std::collections::HashSet::from([RegistryType::Raw]));
         assert_eq!(hosted.curation_mode_notice(), None, "only raw mounted");
+    }
+
+    /// The empty setting switches the upstream off in both places it can be written, for all six
+    /// formats: the environment variable and the config file.
+    #[test]
+    fn an_empty_setting_reads_as_no_upstream_in_env_and_file() {
+        let _lock = env_lock();
+        for var in [
+            "NORA_GEMS_PROXY",
+            "NORA_NUGET_PROXY",
+            "NORA_CONAN_PROXY",
+            "NORA_TF_PROXY",
+            "NORA_ANSIBLE_PROXY",
+            "NORA_CPAN_PROXY",
+        ] {
+            std::env::set_var(var, "");
+        }
+        let mut cfg = Config::default();
+        cfg.apply_env_overrides().unwrap();
+        let mut spaced = Config::default();
+        for var in [
+            "NORA_GEMS_PROXY",
+            "NORA_NUGET_PROXY",
+            "NORA_CONAN_PROXY",
+            "NORA_TF_PROXY",
+            "NORA_ANSIBLE_PROXY",
+            "NORA_CPAN_PROXY",
+        ] {
+            std::env::set_var(var, "  ");
+        }
+        spaced.apply_env_overrides().unwrap();
+        for proxy in [
+            &spaced.gems.proxy,
+            &spaced.nuget.proxy,
+            &spaced.conan.proxy,
+            &spaced.terraform.proxy,
+            &spaced.ansible.proxy,
+            &spaced.cpan.proxy,
+        ] {
+            assert_eq!(proxy, &None, "a value of spaces in the environment");
+        }
+        for var in [
+            "NORA_GEMS_PROXY",
+            "NORA_NUGET_PROXY",
+            "NORA_CONAN_PROXY",
+            "NORA_TF_PROXY",
+            "NORA_ANSIBLE_PROXY",
+            "NORA_CPAN_PROXY",
+        ] {
+            std::env::remove_var(var);
+        }
+        let env = [
+            ("gems", cfg.gems.proxy.clone()),
+            ("nuget", cfg.nuget.proxy.clone()),
+            ("conan", cfg.conan.proxy.clone()),
+            ("terraform", cfg.terraform.proxy.clone()),
+            ("ansible", cfg.ansible.proxy.clone()),
+            ("cpan", cfg.cpan.proxy.clone()),
+        ];
+        for (format, proxy) in env {
+            assert_eq!(proxy, None, "{format}: empty environment variable");
+        }
+
+        let file: Config = toml::from_str(
+            "[gems]\nproxy = \"\"\n[nuget]\nproxy = \" \"\n[conan]\nproxy = \"\"\n[terraform]\nproxy = \"\"\n[ansible]\nproxy = \"\"\n[cpan]\nproxy = \"\"\n",
+        )
+        .unwrap();
+        for (format, proxy) in [
+            ("gems", file.gems.proxy),
+            ("nuget", file.nuget.proxy),
+            ("conan", file.conan.proxy),
+            ("terraform", file.terraform.proxy),
+            ("ansible", file.ansible.proxy),
+            ("cpan", file.cpan.proxy),
+        ] {
+            assert_eq!(proxy, None, "{format}: empty value in the config file");
+        }
+        // Control: a missing key keeps the public default.
+        let file: Config = toml::from_str("[gems]\nenabled = true\n").unwrap();
+        assert!(file.gems.proxy.is_some());
     }
 
     #[test]

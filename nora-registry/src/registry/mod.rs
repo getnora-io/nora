@@ -28,6 +28,8 @@ pub(crate) mod terraform;
 mod ns_isolation_metadata_tests;
 
 pub use ansible::routes as ansible_routes;
+pub(crate) use cargo_registry::canonical_crate_name;
+pub use cargo_registry::rebuild_crate_name_records as rebuild_cargo_name_records;
 pub use cargo_registry::routes as cargo_routes;
 pub use conan::routes as conan_routes;
 pub use cpan::routes as cpan_routes;
@@ -1574,6 +1576,1279 @@ mod tests {
                 None => assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}"),
             }
         }
+    }
+}
+
+/// An allowlist entry that pins an artifact's SHA-256 refuses other bytes on the first download
+/// from the upstream, in every format that checks it on a cache hit: the pin is the operator's
+/// statement of what the artifact is, and the first client (often CI) is the one it protects.
+#[cfg(test)]
+mod first_download_integrity {
+    #![allow(clippy::unwrap_used)]
+
+    use crate::config::{Config, CurationMode, MavenProxyEntry};
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use wiremock::matchers::{any, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SERVED: &[u8] = b"TAMPERED";
+
+    /// An upstream that answers every request with bytes other than the pinned ones.
+    async fn upstream() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(SERVED.to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// Requests `uri` twice under an allowlist that pins `name@version` to the SHA-256 of
+    /// b"GOOD"; both answers are 403 and neither carries the upstream's bytes.
+    async fn refused(
+        server: &MockServer,
+        registry: &str,
+        name: &str,
+        version: &str,
+        uri: &str,
+        configure: fn(&mut Config, String),
+    ) {
+        let entries = serde_json::json!([
+            {"registry": registry, "name": name, "version": version, "integrity": pinned()}
+        ]);
+        refused_entries(server, registry, entries, uri, configure).await;
+    }
+
+    fn pinned() -> String {
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"GOOD")))
+    }
+
+    /// A context in enforce mode with an allowlist of `entries`, its upstream at `url`.
+    fn enforced(
+        entries: serde_json::Value,
+        url: String,
+        configure: fn(&mut Config, String),
+    ) -> crate::test_helpers::TestContext {
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(
+            &allowlist,
+            serde_json::json!({"version": 1, "entries": entries}).to_string(),
+        )
+        .unwrap();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        // The allowlist is read when the context is built; the directory may go after that.
+        let ctx = create_test_context_with_config(move |cfg| {
+            configure(cfg, url);
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        drop(dir);
+        ctx
+    }
+
+    async fn refused_entries(
+        server: &MockServer,
+        registry: &str,
+        entries: serde_json::Value,
+        uri: &str,
+        configure: fn(&mut Config, String),
+    ) {
+        let ctx = enforced(entries, server.uri(), configure);
+        for attempt in ["first download", "second download"] {
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            let status = resp.status();
+            let body = body_bytes(resp).await;
+            assert!(
+                !body.windows(SERVED.len()).any(|w| w == SERVED),
+                "{registry} {attempt}: the upstream's bytes were served"
+            );
+            assert_eq!(status, StatusCode::FORBIDDEN, "{registry} {attempt}");
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn maven() {
+        let s = upstream().await;
+        let uri = "/maven2/com/corp/lib/1.0.0/lib-1.0.0.jar";
+        refused(&s, "maven", "com.corp:lib", "1.0.0", uri, |c, u| {
+            c.maven.proxies = vec![MavenProxyEntry::Simple(u)];
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cargo() {
+        let s = upstream().await;
+        let uri = "/cargo/api/v1/crates/corp-lib/1.0.0/download";
+        refused(&s, "cargo", "corp-lib", "1.0.0", uri, |c, u| {
+            c.cargo.proxy = Some(u);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn npm() {
+        let s = upstream().await;
+        let uri = "/npm/corp-lib/-/corp-lib-1.0.0.tgz";
+        refused(&s, "npm", "corp-lib", "1.0.0", uri, |c, u| {
+            c.npm.proxy = Some(u);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pypi() {
+        let s = MockServer::start().await;
+        let file = format!("{}/files/corp_lib-1.0.0.tar.gz", s.uri());
+        Mock::given(method("GET"))
+            .and(path("/corp-lib/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body><a href="{file}">corp_lib-1.0.0.tar.gz</a></body></html>"#
+            )))
+            .mount(&s)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/corp_lib-1.0.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(SERVED.to_vec()))
+            .mount(&s)
+            .await;
+        let uri = "/simple/corp-lib/corp_lib-1.0.0.tar.gz";
+        refused(&s, "pypi", "corp-lib", "1.0.0", uri, |c, u| {
+            c.pypi.proxies = serde_json::from_value(serde_json::json!([u])).unwrap();
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn gems() {
+        let s = upstream().await;
+        refused(
+            &s,
+            "gems",
+            "corp",
+            "1.0.0",
+            "/gems/gems/corp-1.0.0.gem",
+            |c, u| {
+                c.gems.enabled = true;
+                c.gems.proxy = Some(u);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nuget() {
+        let s = upstream().await;
+        let uri = "/nuget/v3/flatcontainer/corp.lib/1.0.0/corp.lib.1.0.0.nupkg";
+        refused(&s, "nuget", "corp.lib", "1.0.0", uri, |c, u| {
+            c.nuget.enabled = true;
+            c.nuget.proxy = Some(u);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn pub_dart() {
+        let s = upstream().await;
+        let uri = "/pub/packages/corp/versions/1.0.0.tar.gz";
+        refused(&s, "pub", "corp", "1.0.0", uri, |c, u| {
+            c.pub_dart.enabled = true;
+            c.pub_dart.proxy = Some(u);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ansible() {
+        let s = upstream().await;
+        let uri = "/ansible/download/corp-lib-1.0.0.tar.gz";
+        refused(&s, "ansible", "corp.lib", "1.0.0", uri, |c, u| {
+            c.ansible.enabled = true;
+            c.ansible.proxy = Some(u);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cpan() {
+        let s = upstream().await;
+        let uri = "/cpan/authors/id/C/CO/CORP/Corp-Lib-1.0.tar.gz";
+        refused(&s, "cpan", "Corp-Lib", "1.0", uri, |c, u| {
+            c.cpan.enabled = true;
+            c.cpan.proxy = Some(u);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn docker_manifest() {
+        let s = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "content-type",
+                        "application/vnd.docker.distribution.manifest.v2+json",
+                    )
+                    .set_body_bytes(SERVED.to_vec()),
+            )
+            .mount(&s)
+            .await;
+        refused(
+            &s,
+            "docker",
+            "corp/app",
+            "1.0",
+            "/v2/corp/app/manifests/1.0",
+            |c, u| {
+                c.docker.upstreams = vec![crate::config::DockerUpstream {
+                    url: u,
+                    auth: None,
+                    namespace: None,
+                    prefix: None,
+                }];
+            },
+        )
+        .await;
+    }
+
+    /// A gem file name read two ways: the pin of the second reading holds.
+    #[tokio::test]
+    async fn gems_every_reading_of_the_file_name() {
+        let s = upstream().await;
+        let entries = serde_json::json!([
+            {"registry": "gems", "name": "evil", "version": "1"},
+            {"registry": "gems", "name": "evil-1", "version": "2.0", "integrity": pinned()}
+        ]);
+        refused_entries(
+            &s,
+            "gems",
+            entries,
+            "/gems/gems/evil-1-2.0-java.gem",
+            |c, u| {
+                c.gems.enabled = true;
+                c.gems.proxy = Some(u);
+            },
+        )
+        .await;
+    }
+
+    /// The package file in any case of its extension.
+    #[tokio::test]
+    async fn nuget_upper_case_extension() {
+        let s = upstream().await;
+        let uri = "/nuget/v3/flatcontainer/corp.lib/1.0.0/corp.lib.1.0.0.NUPKG";
+        refused(&s, "nuget", "corp.lib", "1.0.0", uri, |c, u| {
+            c.nuget.enabled = true;
+            c.nuget.proxy = Some(u);
+        })
+        .await;
+    }
+
+    /// Every file of a pinned Maven version, the pom as well as the jar.
+    #[tokio::test]
+    async fn maven_pom() {
+        let s = upstream().await;
+        let uri = "/maven2/com/corp/lib/1.0.0/lib-1.0.0.pom";
+        refused(&s, "maven", "com.corp:lib", "1.0.0", uri, |c, u| {
+            c.maven.proxies = vec![MavenProxyEntry::Simple(u)];
+        })
+        .await;
+    }
+
+    /// A conan package file, as well as the recipe files.
+    #[tokio::test]
+    async fn conan_package_file() {
+        let s = upstream().await;
+        let uri = "/conan/v2/conans/corp/1.0/_/_/revisions/r1/packages/p1/revisions/pr1/files/conan_package.tgz";
+        refused(&s, "conan", "corp", "1.0", uri, |c, u| {
+            c.conan.enabled = true;
+            c.conan.proxy = Some(u);
+        })
+        .await;
+    }
+
+    /// An official image asked of the upstream under its `library/` name: the pin is on the name
+    /// the client asked for.
+    #[tokio::test]
+    async fn docker_official_image() {
+        let s = MockServer::start().await;
+        Mock::given(path("/v2/library/app/manifests/1.0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "content-type",
+                        "application/vnd.docker.distribution.manifest.v2+json",
+                    )
+                    .set_body_bytes(SERVED.to_vec()),
+            )
+            .mount(&s)
+            .await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&s)
+            .await;
+        refused(
+            &s,
+            "docker",
+            "app",
+            "1.0",
+            "/v2/app/manifests/1.0",
+            |c, u| {
+                c.docker.upstreams = vec![crate::config::DockerUpstream {
+                    url: u,
+                    auth: None,
+                    namespace: None,
+                    prefix: None,
+                }];
+            },
+        )
+        .await;
+    }
+
+    /// A copy stored before the pin (an older release cached it on its first download): a range of
+    /// it is refused like the whole file, while a range of an unpinned file is still served.
+    async fn range_refused(
+        registry: &str,
+        name: &str,
+        version: &str,
+        uri: &str,
+        key: &str,
+        configure: fn(&mut Config, String),
+    ) {
+        for pin in [true, false] {
+            let mut entry =
+                serde_json::json!({"registry": registry, "name": name, "version": version});
+            if pin {
+                entry["integrity"] = serde_json::Value::String(pinned());
+            }
+            let ctx = enforced(
+                serde_json::json!([entry]),
+                "http://127.0.0.1:9".to_string(),
+                configure,
+            );
+            ctx.state.storage.put(key, SERVED).await.unwrap();
+            let resp = crate::test_helpers::send_with_headers(
+                &ctx.app,
+                Method::GET,
+                uri,
+                vec![("range", "bytes=0-")],
+                "",
+            )
+            .await;
+            let status = resp.status();
+            let body = body_bytes(resp).await;
+            if pin {
+                assert_eq!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{registry} range of a pinned file"
+                );
+                assert!(
+                    !body.windows(SERVED.len()).any(|w| w == SERVED),
+                    "{registry}: a range served the stored bytes"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::PARTIAL_CONTENT,
+                    "{registry} range of an unpinned file"
+                );
+            }
+        }
+    }
+
+    /// In audit mode a pin refuses nothing, so a range of a pinned file is still a range: the range
+    /// serve stands down only where a byte check could refuse.
+    #[tokio::test]
+    async fn range_of_a_pinned_file_in_audit_mode_is_still_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(
+            &allowlist,
+            serde_json::json!({"version": 1, "entries": [
+                {"registry": "gems", "name": "corp", "version": "1.0.0", "integrity": pinned()}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let allowlist = allowlist.to_string_lossy().into_owned();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = Some("http://127.0.0.1:9".to_string());
+            cfg.curation.mode = CurationMode::Audit;
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        ctx.state
+            .storage
+            .put("gems/gems/corp-1.0.0.gem", SERVED)
+            .await
+            .unwrap();
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/gems/gems/corp-1.0.0.gem",
+            vec![("range", "bytes=0-")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+    }
+
+    /// A gem file name read two ways, a stored copy and a range: the pin of the second reading
+    /// holds the range too.
+    #[tokio::test]
+    async fn range_of_a_gem_with_two_readings() {
+        let entries = serde_json::json!([
+            {"registry": "gems", "name": "evil", "version": "1"},
+            {"registry": "gems", "name": "evil-1", "version": "2.0", "integrity": pinned()}
+        ]);
+        let ctx = enforced(entries, "http://127.0.0.1:9".to_string(), |c, u| {
+            c.gems.enabled = true;
+            c.gems.proxy = Some(u);
+        });
+        ctx.state
+            .storage
+            .put("gems/gems/evil-1-2.0-java.gem", SERVED)
+            .await
+            .unwrap();
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/gems/gems/evil-1-2.0-java.gem",
+            vec![("range", "bytes=0-")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A blocklist ahead of the allowlist in the chain (it skips this artifact): the pin still
+    /// holds the range, as it holds a full download.
+    #[tokio::test]
+    async fn range_with_a_blocklist_ahead_of_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            serde_json::json!({"version": 1, "rules": [
+                {"registry": "pypi", "name": "other-lib", "version": "*", "reason": "test"}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let allowlist = dir.path().join("allowlist.json");
+        std::fs::write(
+            &allowlist,
+            serde_json::json!({"version": 1, "entries": [
+                {"registry": "pypi", "name": "corp-lib", "version": "1.0.0", "integrity": pinned()}
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let (blocklist, allowlist) = (
+            blocklist.to_string_lossy().into_owned(),
+            allowlist.to_string_lossy().into_owned(),
+        );
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxies =
+                serde_json::from_value(serde_json::json!(["http://127.0.0.1:9"])).unwrap();
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(blocklist);
+            cfg.curation.allowlist_path = Some(allowlist);
+        });
+        ctx.state
+            .storage
+            .put("pypi/corp-lib/corp_lib-1.0.0.tar.gz", SERVED)
+            .await
+            .unwrap();
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/corp-lib/corp_lib-1.0.0.tar.gz",
+            vec![("range", "bytes=0-")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A stale copy of a pinned SNAPSHOT, served because every upstream failed: the pin holds it.
+    #[tokio::test]
+    async fn maven_stale_snapshot_holds_the_pin() {
+        let entries = serde_json::json!([
+            {"registry": "maven", "name": "com.corp:lib", "version": "1.0-SNAPSHOT", "integrity": pinned()}
+        ]);
+        let ctx = enforced(entries, "http://127.0.0.1:9".to_string(), |c, u| {
+            c.maven.proxies = vec![MavenProxyEntry::Simple(u)];
+            c.maven.metadata_ttl = 0;
+        });
+        ctx.state
+            .storage
+            .put(
+                "maven/com/corp/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar",
+                SERVED,
+            )
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/corp/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar",
+            "",
+        )
+        .await;
+        let status = resp.status();
+        let body = body_bytes(resp).await;
+        assert!(
+            !body.windows(SERVED.len()).any(|w| w == SERVED),
+            "stale bytes served"
+        );
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn range_gems() {
+        range_refused(
+            "gems",
+            "corp",
+            "1.0.0",
+            "/gems/gems/corp-1.0.0.gem",
+            "gems/gems/corp-1.0.0.gem",
+            |c, u| {
+                c.gems.enabled = true;
+                c.gems.proxy = Some(u);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn range_maven() {
+        range_refused(
+            "maven",
+            "com.corp:lib",
+            "1.0.0",
+            "/maven2/com/corp/lib/1.0.0/lib-1.0.0.jar",
+            "maven/com/corp/lib/1.0.0/lib-1.0.0.jar",
+            |c, u| c.maven.proxies = vec![MavenProxyEntry::Simple(u)],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn range_pypi() {
+        range_refused(
+            "pypi",
+            "corp-lib",
+            "1.0.0",
+            "/simple/corp-lib/corp_lib-1.0.0.tar.gz",
+            "pypi/corp-lib/corp_lib-1.0.0.tar.gz",
+            |c, u| c.pypi.proxies = serde_json::from_value(serde_json::json!([u])).unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn range_npm() {
+        range_refused(
+            "npm",
+            "corp-lib",
+            "1.0.0",
+            "/npm/corp-lib/-/corp-lib-1.0.0.tgz",
+            "npm/corp-lib/tarballs/corp-lib-1.0.0.tgz",
+            |c, u| c.npm.proxy = Some(u),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn conan() {
+        let s = upstream().await;
+        let uri = "/conan/v2/conans/corp/1.0/_/_/revisions/r1/files/conan_sources.tgz";
+        refused(&s, "conan", "corp", "1.0", uri, |c, u| {
+            c.conan.enabled = true;
+            c.conan.proxy = Some(u);
+        })
+        .await;
+    }
+}
+
+/// An empty `NORA_<FORMAT>_PROXY` switches the format's upstream off: the config then reads the
+/// format as having no upstream, and a request for something not stored is answered 404 without
+/// asking anyone. Each case names an artifact the public default upstream does serve, so a
+/// fallback to that default answers 200 (or 502 offline) instead of 404.
+#[cfg(test)]
+mod proxy_off_means_off {
+    #![allow(clippy::unwrap_used)]
+
+    use crate::config::Config;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+
+    async fn not_found(uri: &str, configure: fn(&mut Config)) {
+        let ctx = create_test_context_with_config(configure);
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+    }
+
+    #[tokio::test]
+    async fn gems() {
+        not_found("/gems/gems/rake-13.0.6.gem", |c| {
+            c.gems.enabled = true;
+            c.gems.proxy = None;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nuget() {
+        let uri = "/nuget/v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg";
+        not_found(uri, |c| {
+            c.nuget.enabled = true;
+            c.nuget.proxy = None;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn conan() {
+        not_found("/conan/v2/conans/zlib/1.3.1/_/_/latest", |c| {
+            c.conan.enabled = true;
+            c.conan.proxy = None;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn terraform() {
+        not_found("/terraform/v1/providers/hashicorp/null/versions", |c| {
+            c.terraform.enabled = true;
+            c.terraform.proxy = None;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ansible() {
+        let uri =
+            "/ansible/api/v3/plugin/ansible/content/published/collections/index/community/general/";
+        not_found(uri, |c| {
+            c.ansible.enabled = true;
+            c.ansible.proxy = None;
+        })
+        .await;
+    }
+
+    /// What is stored keeps being served, whatever its age: with the upstream off it is all
+    /// there is, and nothing reaches an upstream to refresh it.
+    async fn stored(uri: &str, key: &str, body: &[u8], configure: fn(&mut Config)) {
+        let ctx = create_test_context_with_config(configure);
+        ctx.state.storage.put(key, body).await.unwrap();
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let served = crate::test_helpers::body_bytes(resp).await;
+        assert_eq!(served.as_ref(), body, "{uri}");
+    }
+
+    #[tokio::test]
+    async fn gems_stored_index() {
+        stored("/gems/specs.4.8.gz", "gems/specs.4.8.gz", b"SPECS", |c| {
+            c.gems.enabled = true;
+            c.gems.proxy = None;
+            c.gems.metadata_ttl = 0;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cpan_stored_index() {
+        let key = "cpan/modules/02packages.details.txt.gz";
+        stored(
+            "/cpan/modules/02packages.details.txt.gz",
+            key,
+            b"PKGS",
+            |c| {
+                c.cpan.enabled = true;
+                c.cpan.proxy = None;
+                c.cpan.metadata_ttl = 0;
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn terraform_stored_versions() {
+        let key = "terraform/providers/corp/thing/versions.json";
+        let body = br#"{"versions":[{"version":"1.0.0"}]}"#;
+        stored(
+            "/terraform/v1/providers/corp/thing/versions",
+            key,
+            body,
+            |c| {
+                c.terraform.enabled = true;
+                c.terraform.proxy = None;
+                c.terraform.metadata_ttl = 0;
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nuget_stored_version_list() {
+        let key = "nuget/flatcontainer/corp.lib/index.json";
+        let body = br#"{"versions":["1.0.0"]}"#;
+        stored(
+            "/nuget/v3/flatcontainer/corp.lib/index.json",
+            key,
+            body,
+            |c| {
+                c.nuget.enabled = true;
+                c.nuget.proxy = None;
+                c.nuget.metadata_ttl = 0;
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cpan() {
+        not_found("/cpan/authors/id/H/HA/HAARG/Moo-2.005005.tar.gz", |c| {
+            c.cpan.enabled = true;
+            c.cpan.proxy = None;
+        })
+        .await;
+    }
+
+    // ---- Every route, measured: nothing leaves NORA ----
+
+    const TF_PROVIDER_META: &[u8] = br#"{"_nora_upstream_url":"https://releases.example/p.zip","_nora_upstream_shasums_url":"https://releases.example/SHA256SUMS","_nora_upstream_shasums_sig_url":"https://releases.example/SHA256SUMS.sig"}"#;
+
+    /// How the upstream setting is written: absent, blank (whatever wrote it: a file, the
+    /// environment or code — handlers must read it as off too), or the public default.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Mode {
+        Off,
+        Blank,
+        On,
+    }
+
+    fn set_upstream(proxy: &mut Option<String>, mode: Mode) {
+        match mode {
+            Mode::Off => *proxy = None,
+            Mode::Blank => *proxy = Some("  ".to_string()),
+            Mode::On => {}
+        }
+    }
+
+    /// Where an address goes when the upstream is on: nowhere (answered locally), to the upstream
+    /// over an empty store, or to an address an earlier configuration stored (needs the seeds).
+    #[derive(Clone, Copy)]
+    enum Reach {
+        Local,
+        Cold,
+        Seeded,
+    }
+
+    /// Every route of a format with its upstream switched off, over an empty store and over one
+    /// holding stale copies and the upstream addresses an earlier configuration stored: no request
+    /// leaves NORA, whatever host a handler meant to ask (the client goes through a recording proxy
+    /// without idle connections, so each request is seen), and the answer is the stored copy (200)
+    /// or 404. The control, per address: with the public default upstream on and nothing stored,
+    /// every address not marked local reaches the upstream.
+    async fn no_egress(
+        format: &str,
+        uris: &[(&str, Reach)],
+        seeds: &[(&str, &[u8])],
+        configure: fn(&mut Config, Mode),
+    ) {
+        use crate::test_helpers::{create_test_context_with_egress_proxy, EgressRecorder};
+        for mode in [Mode::Off, Mode::Blank, Mode::On] {
+            let upstream_on = mode == Mode::On;
+            let recorder = EgressRecorder::start().await;
+            let ctx =
+                create_test_context_with_egress_proxy(&recorder.url, move |c| configure(c, mode));
+            for seeded in [false, true] {
+                if seeded {
+                    for (key, body) in seeds {
+                        ctx.state.storage.put(key, body).await.unwrap();
+                    }
+                }
+                for (uri, reach) in uris {
+                    let before = recorder.seen().await.len();
+                    let status = send(&ctx.app, Method::GET, uri, "").await.status();
+                    // Revalidations and cache fills that run off the request path.
+                    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                    let seen = recorder.seen().await;
+                    let asked = &seen[before..];
+                    if upstream_on {
+                        let expected = match reach {
+                            Reach::Cold => !seeded,
+                            Reach::Seeded => seeded,
+                            Reach::Local => false,
+                        };
+                        if expected {
+                            assert!(
+                                !asked.is_empty(),
+                                "{format} control: {uri} never reached the default upstream (seeded: {seeded})"
+                            );
+                        }
+                    } else {
+                        assert!(
+                            asked.is_empty(),
+                            "{format} {uri} asked with the upstream {mode:?}: {asked:?}"
+                        );
+                        // 200: a stored copy; 204: Terraform's module answer pointing at NORA's own
+                        // source route; 404: nothing stored.
+                        assert!(
+                            [StatusCode::OK, StatusCode::NO_CONTENT, StatusCode::NOT_FOUND]
+                                .contains(&status),
+                            "{format} {uri} with the upstream {mode:?} answered {status} (seeded: {seeded})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gems_every_route() {
+        no_egress(
+            "gems",
+            &[
+                ("/gems/specs.4.8.gz", Reach::Cold),
+                ("/gems/latest_specs.4.8.gz", Reach::Cold),
+                ("/gems/prerelease_specs.4.8.gz", Reach::Cold),
+                ("/gems/info/rake", Reach::Cold),
+                ("/gems/gems/rake-13.0.6.gem", Reach::Cold),
+                (
+                    "/gems/quick/Marshal.4.8/rake-13.0.6.gemspec.rz",
+                    Reach::Cold,
+                ),
+            ],
+            &[
+                ("gems/specs.4.8.gz", b"SPECS"),
+                ("gems/latest_specs.4.8.gz", b"SPECS"),
+                ("gems/info/rake", b"---\n13.0.6 |checksum:00"),
+            ],
+            |c, mode| {
+                c.gems.enabled = true;
+                c.gems.metadata_ttl = 0;
+                set_upstream(&mut c.gems.proxy, mode);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nuget_every_route() {
+        let mut uris = Vec::new();
+        for prefix in ["nuget", "chocolatey", "pwsh"] {
+            for (path, reach) in [
+                ("v3/index.json", Reach::Local),
+                ("v3/query?q=newtonsoft", Reach::Cold),
+                ("v3/autocomplete?q=newt", Reach::Cold),
+                ("v3/registration/newtonsoft.json/index.json", Reach::Cold),
+                (
+                    "v3/registration/awssdk.core/page/3.7.0/3.7.400.json",
+                    Reach::Cold,
+                ),
+                ("v3/flatcontainer/newtonsoft.json/index.json", Reach::Cold),
+                (
+                    "v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
+                    Reach::Cold,
+                ),
+                (
+                    "v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.nuspec",
+                    Reach::Cold,
+                ),
+                ("v3/other/resource.json", Reach::Local),
+            ] {
+                uris.push((format!("/{prefix}/{path}"), reach));
+            }
+        }
+        let uris: Vec<(&str, Reach)> = uris.iter().map(|(u, r)| (u.as_str(), *r)).collect();
+        no_egress(
+            "nuget",
+            &uris,
+            &[(
+                "nuget/flatcontainer/newtonsoft.json/index.json",
+                br#"{"versions":["13.0.1"]}"#,
+            )],
+            |c, mode| {
+                c.nuget.enabled = true;
+                c.nuget.metadata_ttl = 0;
+                set_upstream(&mut c.nuget.proxy, mode);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn conan_every_route() {
+        let r = "/conan/v2/conans/zlib/1.3.1/_/_";
+        let uris = [
+            ("/conan/v1/ping".to_string(), Reach::Local),
+            ("/conan/v2/ping".to_string(), Reach::Local),
+            ("/conan/v2/conans/search?q=zlib".to_string(), Reach::Cold),
+            (format!("{r}/latest"), Reach::Cold),
+            (format!("{r}/revisions"), Reach::Cold),
+            (format!("{r}/revisions/r1/files"), Reach::Cold),
+            (format!("{r}/revisions/r1/files/conanfile.py"), Reach::Cold),
+            (format!("{r}/revisions/r1/packages/p1/latest"), Reach::Cold),
+            (
+                format!("{r}/revisions/r1/packages/p1/revisions"),
+                Reach::Cold,
+            ),
+            (
+                format!("{r}/revisions/r1/packages/p1/revisions/pr1/files"),
+                Reach::Cold,
+            ),
+            (
+                format!("{r}/revisions/r1/packages/p1/revisions/pr1/files/conan_package.tgz"),
+                Reach::Cold,
+            ),
+        ];
+        let uris: Vec<(&str, Reach)> = uris.iter().map(|(u, r)| (u.as_str(), *r)).collect();
+        no_egress("conan", &uris, &[], |c, mode| {
+            c.conan.enabled = true;
+            c.conan.metadata_ttl = 0;
+            set_upstream(&mut c.conan.proxy, mode);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn terraform_every_route() {
+        let d = "/terraform/v1/providers/download/hashicorp/null/3.2.2";
+        let uris = [
+            (
+                "/terraform/.well-known/terraform.json".to_string(),
+                Reach::Local,
+            ),
+            (
+                "/terraform/v1/providers/hashicorp/null/versions".to_string(),
+                Reach::Cold,
+            ),
+            (
+                "/terraform/v1/providers/hashicorp/null/3.2.2/download/linux/amd64".to_string(),
+                Reach::Cold,
+            ),
+            (
+                format!("{d}/terraform-provider-null_3.2.2_linux_amd64.zip"),
+                Reach::Cold,
+            ),
+            (
+                format!("{d}/terraform-provider-null_3.2.2_SHA256SUMS"),
+                Reach::Cold,
+            ),
+            (
+                format!("{d}/terraform-provider-null_3.2.2_SHA256SUMS.sig"),
+                Reach::Cold,
+            ),
+            (
+                "/terraform/v1/modules/corp/net/aws/versions".to_string(),
+                Reach::Cold,
+            ),
+            (
+                "/terraform/v1/modules/corp/net/aws/1.0.0/download".to_string(),
+                Reach::Cold,
+            ),
+            (
+                "/terraform/v1/modules/download/corp/net/aws/1.0.0/source".to_string(),
+                Reach::Seeded,
+            ),
+            (
+                "/terraform/registry.terraform.io/hashicorp/null/index.json".to_string(),
+                Reach::Cold,
+            ),
+            (
+                "/terraform/registry.terraform.io/hashicorp/null/3.2.2.json".to_string(),
+                Reach::Cold,
+            ),
+            // A version whose platforms are listed but whose archives are not stored: the mirror
+            // asks for each archive (`mirror_fetch_archive`).
+            (
+                "/terraform/registry.terraform.io/hashicorp/random/1.0.0.json".to_string(),
+                Reach::Cold,
+            ),
+        ];
+        let uris: Vec<(&str, Reach)> = uris.iter().map(|(u, r)| (u.as_str(), *r)).collect();
+        no_egress(
+            "terraform",
+            &uris,
+            &[
+                (
+                    "terraform/modules/corp/net/aws/1.0.0/_source_url",
+                    b"https://source.example/net.tar.gz",
+                ),
+                (
+                    "terraform/providers/hashicorp/null/3.2.2/linux_amd64.json",
+                    TF_PROVIDER_META,
+                ),
+                (
+                    "terraform/providers/hashicorp/null/versions.json",
+                    br#"{"versions":[{"version":"3.2.2","platforms":[{"os":"linux","arch":"amd64"}]}]}"#,
+                ),
+                (
+                    "terraform/providers/hashicorp/random/versions.json",
+                    br#"{"versions":[{"version":"1.0.0","platforms":[{"os":"linux","arch":"amd64"}]}]}"#,
+                ),
+            ],
+            |c, mode| {
+                c.terraform.enabled = true;
+                c.terraform.metadata_ttl = 0;
+                set_upstream(&mut c.terraform.proxy, mode);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn ansible_every_route() {
+        let v3 = "/ansible/v3/collections/community/general";
+        let idx = "/ansible/api/v3/plugin/ansible/content/published/collections/index";
+        let uris = [
+            ("/ansible/".to_string(), Reach::Local),
+            ("/ansible/api/".to_string(), Reach::Local),
+            ("/ansible/v3/collections/".to_string(), Reach::Cold),
+            (format!("{v3}/"), Reach::Cold),
+            (format!("{v3}/versions/"), Reach::Cold),
+            (format!("{v3}/versions/8.0.0/"), Reach::Cold),
+            (format!("{idx}/"), Reach::Cold),
+            (format!("{idx}/community/general/"), Reach::Cold),
+            (format!("{idx}/community/general/versions/"), Reach::Cold),
+            (format!("{idx}/community/general/versions/8.0.0/"), Reach::Cold),
+            ("/ansible/download/community-general-8.0.0.tar.gz".to_string(), Reach::Cold),
+            (
+                "/ansible/api/v3/plugin/ansible/content/published/collections/artifacts/community-general-8.0.0.tar.gz"
+                    .to_string(),
+                Reach::Cold,
+            ),
+        ];
+        let uris: Vec<(&str, Reach)> = uris.iter().map(|(u, r)| (u.as_str(), *r)).collect();
+        no_egress("ansible", &uris, &[], |c, mode| {
+            c.ansible.enabled = true;
+            c.ansible.metadata_ttl = 0;
+            set_upstream(&mut c.ansible.proxy, mode);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn cpan_every_route() {
+        no_egress(
+            "cpan",
+            &[
+                ("/cpan/modules/02packages.details.txt.gz", Reach::Cold),
+                ("/cpan/modules/03modlist.data.gz", Reach::Cold),
+                ("/cpan/authors/01mailrc.txt.gz", Reach::Cold),
+                (
+                    "/cpan/authors/id/H/HA/HAARG/Moo-2.005005.tar.gz",
+                    Reach::Cold,
+                ),
+            ],
+            &[("cpan/modules/02packages.details.txt.gz", b"PKGS")],
+            |c, mode| {
+                c.cpan.enabled = true;
+                c.cpan.metadata_ttl = 0;
+                set_upstream(&mut c.cpan.proxy, mode);
+            },
+        )
+        .await;
+    }
+
+    /// Only `upstream_url` reads a format's upstream setting in its handler: every decision about
+    /// asking an upstream goes through the one rule that reads a blank setting as switched off.
+    #[test]
+    fn only_upstream_url_reads_the_upstream_setting() {
+        for (format, field, source) in [
+            ("gems", "gems", include_str!("gems.rs")),
+            ("nuget", "nuget", include_str!("nuget.rs")),
+            ("conan", "conan", include_str!("conan.rs")),
+            ("terraform", "terraform", include_str!("terraform.rs")),
+            ("ansible", "ansible", include_str!("ansible.rs")),
+            ("cpan", "cpan", include_str!("cpan.rs")),
+        ] {
+            let code = source.split("#[cfg(test)]").next().unwrap();
+            let read = format!("state.config.{field}.proxy");
+            // The field itself, not `proxy_timeout` or `proxy_auth`.
+            let at: Vec<usize> = code
+                .match_indices(&read)
+                .map(|(i, _)| i)
+                .filter(|i| {
+                    !code[i + read.len()..]
+                        .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                })
+                .collect();
+            assert_eq!(at.len(), 1, "{format}: {read} read {} times", at.len());
+            let before = &code[..at[0]];
+            let function = before.rfind("\nfn ").unwrap_or(0);
+            assert!(
+                before[function..].starts_with("\nfn upstream_url(state: &AppState)"),
+                "{format}: {read} read outside upstream_url"
+            );
+        }
+    }
+}
+
+/// An upstream's credential goes only to that upstream: a PyPI index may name its files on
+/// another host, and that host must not receive the index's Basic credential.
+#[cfg(test)]
+mod pypi_credential_host {
+    #![allow(clippy::unwrap_used)]
+
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::Method;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn a_file_on_another_host_is_fetched_without_the_index_credential() {
+        let files = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/files/corp_lib-1.0.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SDIST".to_vec()))
+            .mount(&files)
+            .await;
+        let index = MockServer::start().await;
+        let href = format!("{}/files/corp_lib-1.0.0.tar.gz", files.uri());
+        Mock::given(method("GET"))
+            .and(path("/corp-lib/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body><a href="{href}">corp_lib-1.0.0.tar.gz</a></body></html>"#
+            )))
+            .mount(&index)
+            .await;
+        let url = index.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxies = serde_json::from_value(serde_json::json!([
+                {"url": url, "auth": "corp:s3cret"}
+            ]))
+            .unwrap();
+        });
+        let _ = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/corp-lib/corp_lib-1.0.0.tar.gz",
+            "",
+        )
+        .await;
+        let leaked: Vec<_> = files
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.headers.get("authorization").is_some())
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "the index credential reached another host"
+        );
+    }
+
+    /// Several upstreams: the credential of the upstream whose index named the file goes only to
+    /// that upstream's origin — never to another configured upstream's host.
+    #[tokio::test]
+    async fn a_credential_never_reaches_another_configured_upstream() {
+        let first = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/files/corp_lib-1.0.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SDIST".to_vec()))
+            .mount(&first)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&first)
+            .await;
+        let second = MockServer::start().await;
+        let href = format!("{}/files/corp_lib-1.0.0.tar.gz", first.uri());
+        Mock::given(method("GET"))
+            .and(path("/corp-lib/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body><a href="{href}">corp_lib-1.0.0.tar.gz</a></body></html>"#
+            )))
+            .mount(&second)
+            .await;
+        let (a, b) = (first.uri(), second.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxies = serde_json::from_value(serde_json::json!([
+                {"url": a},
+                {"url": b, "auth": "corp:s3cret"}
+            ]))
+            .unwrap();
+        });
+        let _ = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/corp-lib/corp_lib-1.0.0.tar.gz",
+            "",
+        )
+        .await;
+        let requests = first.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.url.path() == "/files/corp_lib-1.0.0.tar.gz"),
+            "control: the file was asked of the first upstream's host"
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|r| r.headers.get("authorization").is_none()),
+            "the second upstream's credential reached the first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_on_the_index_host_is_fetched_with_the_credential() {
+        let index = MockServer::start().await;
+        let href = format!("{}/files/corp_lib-1.0.0.tar.gz", index.uri());
+        Mock::given(method("GET"))
+            .and(path("/corp-lib/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body><a href="{href}">corp_lib-1.0.0.tar.gz</a></body></html>"#
+            )))
+            .mount(&index)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/files/corp_lib-1.0.0.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SDIST".to_vec()))
+            .mount(&index)
+            .await;
+        let url = index.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.proxies = serde_json::from_value(serde_json::json!([
+                {"url": url, "auth": "corp:s3cret"}
+            ]))
+            .unwrap();
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/corp-lib/corp_lib-1.0.0.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        let file_requests: Vec<_> = index
+            .received_requests()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.url.path().starts_with("/files/"))
+            .collect();
+        assert!(!file_requests.is_empty());
+        assert!(
+            file_requests
+                .iter()
+                .all(|r| r.headers.get("authorization").is_some()),
+            "the index host must receive its credential for its own files"
+        );
     }
 }
 

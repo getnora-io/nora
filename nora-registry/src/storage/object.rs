@@ -313,9 +313,21 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        let encoded = encode_object_key(key);
-        let path = Path::from(encoded);
-        self.store.delete(&path).await.map_err(map_err)?;
+        // An object store answers a delete of an absent object with success. The local backend
+        // answers NotFound, and callers rely on it: to fall back to a second copy, or to answer
+        // 404. So the object is looked up first, under the legacy `_at_` encoding too, as `get`
+        // and `stat` do, and an absent one is NotFound here as well.
+        let path = Path::from(encode_object_key(key));
+        let target = match self.store.head(&path).await {
+            Ok(_) => path,
+            Err(object_store::Error::NotFound { .. }) if key.contains('@') => {
+                let legacy = Path::from(encode_object_key_legacy(key));
+                self.store.head(&legacy).await.map_err(map_err)?;
+                legacy
+            }
+            Err(e) => return Err(map_err(e)),
+        };
+        self.store.delete(&target).await.map_err(map_err)?;
         Ok(())
     }
 
@@ -554,6 +566,61 @@ impl StorageBackend for ObjectStorage {
 mod tests {
     use super::*;
     use sha2::Digest;
+
+    /// A delete answers as the local backend does: an absent object is NotFound, a present one
+    /// goes, and one written under the pre-#534 `_at_` encoding goes too. An object store
+    /// answers a delete of an absent object with success, which callers took for "deleted".
+    #[tokio::test]
+    async fn a_delete_answers_not_found_for_an_absent_object_as_local_does() {
+        let object = ObjectStorage::in_memory();
+        let dir = tempfile::tempdir().unwrap();
+        let local = crate::storage::LocalStorage::new(dir.path().to_str().unwrap());
+        let backends: [&dyn StorageBackend; 2] = [&object, &local];
+        for backend in backends {
+            let name = backend.backend_name();
+            assert!(
+                matches!(
+                    backend.delete("raw/absent.bin").await,
+                    Err(StorageError::NotFound)
+                ),
+                "{name}: an absent object"
+            );
+            let data = b"bytes";
+            let sha = hex::encode(sha2::Sha256::digest(data));
+            backend.put("raw/present.bin", data, &sha).await.unwrap();
+            backend.delete("raw/present.bin").await.unwrap();
+            assert!(
+                backend.stat("raw/present.bin").await.is_none(),
+                "{name}: deleted"
+            );
+            assert!(
+                matches!(
+                    backend.delete("raw/present.bin").await,
+                    Err(StorageError::NotFound)
+                ),
+                "{name}: a second delete"
+            );
+        }
+        // An object under the legacy encoding, as a pre-#534 store holds it.
+        let key = "npm/@scope/pkg/metadata.json";
+        object
+            .store()
+            .put(
+                &Path::from(encode_object_key_legacy(key)),
+                object_store::PutPayload::from_static(b"{}"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            object.stat(key).await.is_some(),
+            "readable under the legacy encoding"
+        );
+        object.delete(key).await.unwrap();
+        assert!(
+            object.stat(key).await.is_none(),
+            "deleted under the legacy encoding"
+        );
+    }
 
     #[test]
     fn test_backend_name() {

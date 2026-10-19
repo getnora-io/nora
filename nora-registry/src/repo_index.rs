@@ -405,6 +405,12 @@ async fn build_cargo_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     Some(to_sorted_vec(crates))
 }
 
+/// `pypi/<package>/dates.json`: the release dates NORA keeps for a package, not a file of it.
+fn is_pypi_dates_record(rest: &str) -> bool {
+    rest.split_once('/')
+        .is_some_and(|(_, file)| file == "dates.json")
+}
+
 async fn build_pypi_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
     let keys = list_keys(storage, "pypi/").await?;
     let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
@@ -416,9 +422,10 @@ async fn build_pypi_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                 let name = parts[0].to_string();
                 let entry = packages.entry(name).or_insert((0, 0, 0));
                 // Count only real distribution files — a checksum sidecar
-                // (`<file>.sha256`) is not a separate artifact (#588). Its bytes
-                // still count toward size so the total matches on-disk du.
-                if !crate::gc::is_checksum_sidecar(key) {
+                // (`<file>.sha256`) and the release-date record (`dates.json`) are not
+                // artifacts (#588). Their bytes still count toward size so the total
+                // matches on-disk du.
+                if !crate::gc::is_checksum_sidecar(key) && !is_pypi_dates_record(rest) {
                     entry.0 += 1;
                 }
 
@@ -430,6 +437,8 @@ async fn build_pypi_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
         }
     }
 
+    // A package NORA holds only the release dates of has no artifact to list.
+    packages.retain(|_, entry| entry.0 > 0);
     Some(to_sorted_vec(packages))
 }
 
@@ -995,6 +1004,28 @@ mod tests {
         assert_eq!(repos[0].versions, 1, "checksum sidecar must not be counted");
         // ...but its bytes still count toward size, so size == on-disk du.
         assert_eq!(repos[0].size, 100 + 8);
+    }
+
+    #[tokio::test]
+    async fn pypi_index_counts_no_release_dates_record() {
+        let (_d, s) = temp_storage();
+        s.put("pypi/six/six-1.16.0-py3-none-any.whl", &[0u8; 100])
+            .await
+            .unwrap();
+        s.put("pypi/six/dates.json", br#"{"a":null}"#)
+            .await
+            .unwrap();
+        // A package NORA holds only the release dates of (a refused download).
+        s.put("pypi/other/dates.json", b"{}").await.unwrap();
+        // A file named like the record but deeper is still a file.
+        s.put("pypi/deep/sub/dates.json", &[0u8; 5]).await.unwrap();
+
+        let repos = build_pypi_index(&s).await.expect("index built");
+        let names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["deep", "six"], "{names:?}");
+        let six = repos.iter().find(|r| r.name == "six").unwrap();
+        assert_eq!(six.versions, 1, "dates.json is not an artifact");
+        assert_eq!(six.size, 100 + 10, "its bytes still count toward size");
     }
 
     #[tokio::test]

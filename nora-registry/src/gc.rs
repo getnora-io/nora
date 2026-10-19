@@ -508,7 +508,7 @@ async fn detect_docker_orphans(storage: &Storage) -> DockerDetectionResult {
         collect_manifest_refs(json, &mut blobs, &mut children);
         // A referenced blob may be stored under this repository's key or, for a
         // namespaced repository, under the un-namespaced legacy key that the serve
-        // path falls back to (storage_get_with_fallback). Protect both so GC keeps
+        // path falls back to (storage_get_reader_with_fallback). Protect both so GC keeps
         // a blob the server would still serve. strip_docker_namespace only drops a
         // leading registry host (a first segment containing '.'), so genuinely
         // distinct repositories do not collide and #984 cross-repo isolation holds.
@@ -762,24 +762,51 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
         tracing::error!("GC: storage.list(cargo/) failed: {}", e);
         Vec::new()
     });
-    let mut crate_files: HashSet<String> = HashSet::new(); // "name/version"
-    let mut index_entries: HashSet<String> = HashSet::new(); // "name"
+    let mut crate_files: HashSet<String> = HashSet::new(); // names with a .crate
     let mut crate_keys: Vec<String> = Vec::new();
-    let mut index_keys: Vec<String> = Vec::new();
+    // Names any index key speaks for: the index, NORA's upstream copy, the assembled index, an
+    // entry. A .crate is kept while one of them names its crate.
+    let mut indexed: HashSet<String> = HashSet::new();
+    // cargo/index/<prefix>/<name>, with its crate's name
+    let mut index_keys: Vec<(String, String)> = Vec::new();
     let mut index_entry_keys: Vec<String> = Vec::new(); // per-version cargo/index-entries/ (#39)
 
+    // cargo/index-upstream/<prefix>/<name> (NORA's copy of an upstream's index) and
+    // cargo/index-assembled/<prefix>/<name> (the index NORA assembled from entries): collected
+    // with the crate, like its index.
+    let mut per_crate_keys: Vec<(String, String)> = Vec::new();
+    // cargo/_names/<canon>: the spelling a crate was published under, kept while any stored name has
+    // that canon. `_names` cannot be a crate (a crate name starts with a letter or digit), so no
+    // crate's files share the prefix.
+    let mut name_records: Vec<(String, String)> = Vec::new();
+
     for key in &keys {
-        if key.starts_with("cargo/index-entries/") {
-            // cargo/index-entries/XX/XX/name/version.json — the scan-regenerate source of truth
+        if let Some(canon) = key
+            .strip_prefix("cargo/_names/")
+            .filter(|canon| is_crate_name(canon))
+        {
+            name_records.push((key.clone(), canon.to_string()));
+            continue;
+        }
+        let per_crate = key
+            .strip_prefix("cargo/index-upstream/")
+            .or_else(|| key.strip_prefix("cargo/index-assembled/"));
+        if let Some(rest) = per_crate {
+            if let Some(name) = rest.rsplit('/').next().filter(|n| is_crate_name(n)) {
+                per_crate_keys.push((key.clone(), name.to_string()));
+                indexed.insert(name.to_string());
+            }
+        } else if let Some(rest) = key.strip_prefix("cargo/index-entries/") {
+            // cargo/index-entries/<prefix>/<name>/<version>.json — the scan-regenerate source of truth
             index_entry_keys.push(key.clone());
-        } else if key.starts_with("cargo/index/") {
-            // cargo/index/XX/XX/name
-            if let Some(name) = key
-                .strip_prefix("cargo/index/")
-                .and_then(|s| s.split('/').nth(2))
-            {
-                index_entries.insert(name.to_string());
-                index_keys.push(key.clone());
+            if let Some(name) = rest.rsplit('/').nth(1).filter(|n| is_crate_name(n)) {
+                indexed.insert(name.to_string());
+            }
+        } else if let Some(rest) = key.strip_prefix("cargo/index/") {
+            // cargo/index/<prefix>/<name>; the prefix is one segment for one- and two-letter names
+            if let Some(name) = rest.rsplit('/').next().filter(|n| is_crate_name(n)) {
+                index_keys.push((key.clone(), name.to_string()));
+                indexed.insert(name.to_string());
             }
         } else if ends_with_ci(key, ".crate") {
             // cargo/name/version/name-version.crate
@@ -795,48 +822,82 @@ async fn detect_cargo_orphans(storage: &Storage) -> DetectionResult {
         }
     }
 
-    let total = crate_keys.len() + index_keys.len();
+    let total = crate_keys.len() + index_keys.len() + per_crate_keys.len() + name_records.len();
     let mut orphans = Vec::new();
 
+    // An upstream copy or an assembled index of a crate with no .crate stored, like its index.
+    for (key, name) in &per_crate_keys {
+        if !crate_files.contains(name) {
+            info!("Cargo orphan index: {} (no .crate files)", key);
+            orphans.push(key.clone());
+        }
+    }
+
     // Index entries without any .crate files
-    for key in &index_keys {
-        if let Some(name) = key
-            .strip_prefix("cargo/index/")
-            .and_then(|s| s.split('/').nth(2))
-        {
-            if !crate_files.contains(name) {
-                info!("Cargo orphan index: {} (no .crate files)", key);
-                orphans.push(key.clone());
-                // Also remove the per-version entry keys for this fully-deleted crate (#39
-                // layout), else a later publish's regenerate would resurrect index lines that
-                // point at missing .crate files.
-                let entries_prefix = format!(
-                    "{}/",
-                    key.replacen("cargo/index/", "cargo/index-entries/", 1)
-                );
-                for ek in &index_entry_keys {
-                    if ek.starts_with(&entries_prefix) {
-                        orphans.push(ek.clone());
-                    }
+    for (key, name) in &index_keys {
+        if !crate_files.contains(name) {
+            info!("Cargo orphan index: {} (no .crate files)", key);
+            orphans.push(key.clone());
+            // Also remove the per-version entry keys for this fully-deleted crate (#39
+            // layout), else a later publish's regenerate would resurrect index lines that
+            // point at missing .crate files.
+            let entries_prefix = format!(
+                "{}/",
+                key.replacen("cargo/index/", "cargo/index-entries/", 1)
+            );
+            for ek in &index_entry_keys {
+                if ek.starts_with(&entries_prefix) {
+                    orphans.push(ek.clone());
                 }
             }
         }
     }
 
-    // .crate files without index entry
+    // .crate files no index key names
     for key in &crate_keys {
         let parts: Vec<&str> = key
             .strip_prefix("cargo/")
             .unwrap_or(key)
             .split('/')
             .collect();
-        if parts.len() >= 2 && !index_entries.contains(parts[0]) {
+        if parts.len() >= 2 && !indexed.contains(parts[0]) {
             info!("Cargo orphan crate: {} (no index entry)", key);
             orphans.push(key.clone());
         }
     }
 
+    // A name record no stored name has the canon of: its crate is gone (here, or in this pass).
+    let removed: HashSet<&String> = orphans.iter().collect();
+    let live: HashSet<String> = crate_keys
+        .iter()
+        .filter(|key| !removed.contains(key))
+        .filter_map(|key| key.strip_prefix("cargo/")?.split('/').next())
+        .map(crate::registry::canonical_crate_name)
+        .chain(
+            index_keys
+                .iter()
+                .chain(per_crate_keys.iter())
+                .filter(|(key, _)| !removed.contains(key))
+                .map(|(_, name)| crate::registry::canonical_crate_name(name)),
+        )
+        .collect();
+    for (key, canon) in &name_records {
+        if !live.contains(canon) {
+            info!("Cargo orphan name record: {} (no crate of that name)", key);
+            orphans.push(key.clone());
+        }
+    }
+
     DetectionResult { total, orphans }
+}
+
+/// A crate name as the registry accepts it: letters, digits, `-` and `_`. A key whose last segment
+/// is not one (a file NORA keeps beside the index) speaks for no crate.
+fn is_crate_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
 // ============================================================================
@@ -2597,6 +2658,169 @@ mod tests {
         assert!(result.orphan_keys[0].ends_with(".mod"));
     }
 
+    /// Rows G1/G2: a crate's name record (`cargo/_names/<canon>`) is kept while a stored crate has that
+    /// canon in any spelling, and collected with the last one; a record no crate has the canon of is
+    /// an orphan.
+    #[tokio::test]
+    async fn a_name_record_lives_and_goes_with_its_crate() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            // my-crate: published and alive; its record is kept.
+            "cargo/index/my/-c/my-crate",
+            "cargo/index-entries/my/-c/my-crate/1.0.0.json",
+            "cargo/my-crate/1.0.0/my-crate-1.0.0.crate",
+            "cargo/_names/my-crate",
+            // gone-crate: its index has no .crate left, so it goes, and its record with it.
+            "cargo/index/go/ne/gone_crate",
+            "cargo/index-entries/go/ne/gone_crate/1.0.0.json",
+            "cargo/_names/gone-crate",
+            // a record no crate has the canon of.
+            "cargo/_names/never-published",
+            // a crate named `names` (it exists on crates.io): its files are a crate's, not records.
+            "cargo/index/na/me/names",
+            "cargo/index-entries/na/me/names/0.14.0.json",
+            "cargo/names/0.14.0/names-0.14.0.crate",
+            "cargo/names/metadata.json",
+            "cargo/_names/names",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let result = detect_cargo_orphans(&storage).await;
+        assert!(!result
+            .orphans
+            .contains(&"cargo/_names/my-crate".to_string()));
+        assert!(result
+            .orphans
+            .contains(&"cargo/_names/gone-crate".to_string()));
+        assert!(result
+            .orphans
+            .contains(&"cargo/_names/never-published".to_string()));
+        assert!(!result
+            .orphans
+            .contains(&"cargo/my-crate/1.0.0/my-crate-1.0.0.crate".to_string()));
+        for key in [
+            "cargo/index/na/me/names",
+            "cargo/index-entries/na/me/names/0.14.0.json",
+            "cargo/names/0.14.0/names-0.14.0.crate",
+            "cargo/names/metadata.json",
+            "cargo/_names/names",
+        ] {
+            assert!(
+                !result.orphans.contains(&key.to_string()),
+                "{key} collected"
+            );
+        }
+    }
+
+    /// An orphan index takes its own entries with it, never those of a crate whose name it starts.
+    #[tokio::test]
+    async fn an_orphan_index_takes_only_its_own_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "cargo/index/se/rd/serde",
+            "cargo/index-entries/se/rd/serde/1.0.0.json",
+            "cargo/index/se/rd/serde-derive",
+            "cargo/index-entries/se/rd/serde-derive/1.0.0.json",
+            "cargo/serde-derive/1.0.0/serde-derive-1.0.0.crate",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let result = detect_cargo_orphans(&storage).await;
+        assert!(result
+            .orphans
+            .contains(&"cargo/index/se/rd/serde".to_string()));
+        assert!(result
+            .orphans
+            .contains(&"cargo/index-entries/se/rd/serde/1.0.0.json".to_string()));
+        for key in [
+            "cargo/index/se/rd/serde-derive",
+            "cargo/index-entries/se/rd/serde-derive/1.0.0.json",
+            "cargo/serde-derive/1.0.0/serde-derive-1.0.0.crate",
+        ] {
+            assert!(!result.orphans.contains(&key.to_string()), "{key}");
+        }
+    }
+
+    /// A crate file is kept while any index key names its crate — the index, NORA's upstream copy,
+    /// the assembled index or a per-version entry — whatever the name's length; a crate file with
+    /// none is an orphan.
+    #[tokio::test]
+    async fn a_crate_file_with_any_index_key_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "cargo/index-upstream/it/oa/itoa",
+            "cargo/itoa/1.0.11/itoa-1.0.11.crate",
+            "cargo/index-assembled/pu/b1/pub1",
+            "cargo/pub1/0.1.0/pub1-0.1.0.crate",
+            "cargo/index-entries/pu/b2/pub2/0.1.0.json",
+            "cargo/pub2/0.1.0/pub2-0.1.0.crate",
+            "cargo/index/1/a",
+            "cargo/a/0.1.0/a-0.1.0.crate",
+            "cargo/index/2/ab",
+            "cargo/ab/0.1.0/ab-0.1.0.crate",
+            "cargo/lone/1.0.0/lone-1.0.0.crate",
+            "cargo/index/config.json",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let result = detect_cargo_orphans(&storage).await;
+        for key in [
+            "cargo/itoa/1.0.11/itoa-1.0.11.crate",
+            "cargo/pub1/0.1.0/pub1-0.1.0.crate",
+            "cargo/pub2/0.1.0/pub2-0.1.0.crate",
+            "cargo/a/0.1.0/a-0.1.0.crate",
+            "cargo/ab/0.1.0/ab-0.1.0.crate",
+            "cargo/index-upstream/it/oa/itoa",
+            "cargo/index/1/a",
+            "cargo/index/config.json",
+        ] {
+            assert!(
+                !result.orphans.contains(&key.to_string()),
+                "{key} taken for an orphan"
+            );
+        }
+        assert!(result
+            .orphans
+            .contains(&"cargo/lone/1.0.0/lone-1.0.0.crate".to_string()));
+    }
+
+    /// NORA's upstream copy of a crate's index and the index it assembled are collected like the
+    /// index itself: an orphan when no `.crate` of that crate is stored, kept when one is (one- and
+    /// two-letter names included).
+    #[tokio::test]
+    async fn cargo_upstream_copy_is_an_orphan_without_crate_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "cargo/index-upstream/se/rd/serde",
+            "cargo/index-upstream/to/ki/tokio",
+            "cargo/index-upstream/1/a",
+            "cargo/index-upstream/1/b",
+            "cargo/index-assembled/se/rd/serde",
+            "cargo/index-assembled/to/ki/tokio",
+            "cargo/index-assembled/2/cd",
+            "cargo/tokio/1.0.0/tokio-1.0.0.crate",
+            "cargo/a/0.1.0/a-0.1.0.crate",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let result = detect_cargo_orphans(&storage).await;
+        for (key, orphan) in [
+            ("cargo/index-upstream/se/rd/serde", true),
+            ("cargo/index-upstream/to/ki/tokio", false),
+            ("cargo/index-upstream/1/a", false),
+            ("cargo/index-upstream/1/b", true),
+            ("cargo/index-assembled/se/rd/serde", true),
+            ("cargo/index-assembled/to/ki/tokio", false),
+            ("cargo/index-assembled/2/cd", true),
+        ] {
+            assert_eq!(result.orphans.contains(&key.to_string()), orphan, "{key}");
+        }
+    }
+
     #[tokio::test]
     async fn test_gc_cargo_matching_index_no_orphans() {
         let dir = tempfile::tempdir().unwrap();
@@ -3470,7 +3694,7 @@ mod docker_gc_reachability {
 
     // A namespaced manifest can reference a blob stranded at the legacy
     // (un-namespaced) key — a partial key migration, or a flat blob still served
-    // through the ns→legacy read fallback (storage_get_with_fallback). The server
+    // through the ns→legacy read fallback (storage_get_reader_with_fallback). The server
     // serves it; GC must keep it, mirroring the fallback the serve path honors.
     #[tokio::test]
     async fn a_namespaced_manifest_keeps_its_legacy_keyed_blobs() {

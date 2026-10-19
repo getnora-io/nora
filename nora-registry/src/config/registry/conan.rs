@@ -9,7 +9,10 @@ use std::env;
 pub struct ConanConfig {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default = "default_conan_proxy")]
+    #[serde(
+        default = "default_conan_proxy",
+        deserialize_with = "super::super::deserialize_upstream"
+    )]
     pub proxy: Option<String>,
     #[serde(default, skip_serializing)]
     pub proxy_auth: Option<ProtectedString>,
@@ -56,7 +59,7 @@ impl ConanConfig {
             self.enabled = val.to_lowercase() == "true" || val == "1";
         }
         if let Ok(val) = env::var("NORA_CONAN_PROXY") {
-            self.proxy = if val.is_empty() { None } else { Some(val) };
+            self.proxy = super::super::upstream_setting(val);
         }
         if let Ok(val) = env::var("NORA_CONAN_PROXY_AUTH") {
             self.proxy_auth = if val.is_empty() {
