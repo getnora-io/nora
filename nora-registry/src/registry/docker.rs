@@ -1980,9 +1980,14 @@ async fn upload_blob(
         }
     }
 
-    // Move temp file into storage — no RAM copy of the blob
+    // Move temp file into storage — no RAM copy of the blob. The digest was just checked
+    // against the bytes (`sha256:` and their hex), so it pins them (#1154).
     let key = format!("docker/{}/blobs/{}", name, digest);
-    match state.storage.put_from_path(&key, &temp_path, None).await {
+    match state
+        .storage
+        .put_from_path(&key, &temp_path, digest.strip_prefix("sha256:"))
+        .await
+    {
         Ok(()) => {
             guard.disarm(); // temp moved into storage — nothing left to clean up
             state.metrics.record_upload("docker");
@@ -7834,6 +7839,61 @@ mod integration_tests {
         let put_url = format!("/v2/alpine/blobs/uploads/{}?digest={}", uuid, digest);
         let put_resp = send(&ctx.app, Method::PUT, &put_url, Body::from(&blob_data[..])).await;
         assert_eq!(put_resp.status(), StatusCode::CREATED);
+    }
+
+    /// #1154: an uploaded blob is pinned to the digest it was checked against, whichever form
+    /// the upload took (monolithic PUT, chunked PATCH then PUT, single POST).
+    #[tokio::test]
+    async fn an_uploaded_blob_is_pinned_to_its_digest() {
+        let ctx = create_test_context();
+        let session = |ctx: &crate::test_helpers::TestContext| {
+            let app = ctx.app.clone();
+            async move {
+                let resp = send(
+                    &app,
+                    Method::POST,
+                    "/v2/alpine/blobs/uploads/",
+                    Body::empty(),
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::ACCEPTED);
+                let location = resp.headers().get("location").unwrap().to_str().unwrap();
+                location.rsplit('/').next().unwrap().to_string()
+            }
+        };
+        let digest_of = |data: &[u8]| hex::encode(sha2::Sha256::digest(data));
+
+        let monolithic = b"pinned monolithic blob";
+        let uuid = session(&ctx).await;
+        let url = format!(
+            "/v2/alpine/blobs/uploads/{uuid}?digest=sha256:{}",
+            digest_of(monolithic)
+        );
+        let resp = send(&ctx.app, Method::PUT, &url, Body::from(&monolithic[..])).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let chunked = b"pinned chunked blob";
+        let uuid = session(&ctx).await;
+        let url = format!("/v2/alpine/blobs/uploads/{uuid}");
+        let resp = send(&ctx.app, Method::PATCH, &url, Body::from(&chunked[..])).await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let url = format!("{url}?digest=sha256:{}", digest_of(chunked));
+        let resp = send(&ctx.app, Method::PUT, &url, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        let single = b"pinned single-post blob";
+        let url = format!(
+            "/v2/alpine/blobs/uploads/?digest=sha256:{}",
+            digest_of(single)
+        );
+        let resp = send(&ctx.app, Method::POST, &url, Body::from(&single[..])).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        for data in [&monolithic[..], &chunked[..], &single[..]] {
+            let hex = digest_of(data);
+            let key = format!("docker/alpine/blobs/sha256:{hex}");
+            assert_eq!(ctx.state.storage.pin(&key).await, Some(hex), "{key}");
+        }
     }
 
     #[tokio::test]
