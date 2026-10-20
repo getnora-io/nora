@@ -460,6 +460,25 @@ impl LocalStorage {
             })
     }
 
+    /// Drop the pin of `key`, for a write that stored bytes without a digest: the pin of the
+    /// bytes it replaced must not outlive them (#1154). The object store gets this from the
+    /// write itself, which replaces the object's attributes. A key without a pin writes nothing.
+    /// Fails closed, as [`record_pin`](Self::record_pin) does: a stale pin left behind would
+    /// fail every later read of the new bytes.
+    async fn forget_pin(&self, key: &str) -> Result<()> {
+        let pins = Arc::clone(&self.pins);
+        let key_owned = key.to_string();
+        tokio::task::spawn_blocking(move || pins.remove(&key_owned))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+            .map_err(|e| {
+                tracing::error!(error = %e, key = %key, "hash-pin tombstone failed");
+                StorageError::Io(std::io::Error::other(format!(
+                    "hash-pin tombstone failed: {e}"
+                )))
+            })
+    }
+
     /// Create a new temp file for a write of `dest`, in this instance's staging
     /// directory (see [`Staging`]).
     #[cfg(test)]
@@ -882,7 +901,7 @@ impl StorageBackend for LocalStorage {
         }
         match sha256 {
             Some(hash) => self.record_pin(key, hash).await,
-            None => Ok(()),
+            None => self.forget_pin(key).await,
         }
     }
 
@@ -950,7 +969,7 @@ impl StorageBackend for LocalStorage {
             .or_else(|| self.pins.get(src))
         {
             Some(hash) => self.record_pin(dst, &hash).await,
-            None => Ok(()),
+            None => self.forget_pin(dst).await,
         }
     }
 
@@ -2292,6 +2311,42 @@ mod tests {
                 "{prefix:?}"
             );
         }
+    }
+
+    /// #1154: a write without a digest whose tombstone cannot reach the disk reports it, as a
+    /// pin that cannot is reported: the stale pin left behind would fail every read of the new
+    /// bytes.
+    #[tokio::test]
+    async fn a_write_whose_tombstone_cannot_be_written_fails() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let storage = LocalStorage::new(store.to_str().unwrap());
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let sha = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
+        for key in ["raw/k", "raw/t"] {
+            storage
+                .put_from_path(key, &file("v1", b"v1"), Some(&sha(b"v1")))
+                .await
+                .unwrap();
+        }
+        storage
+            .put_from_path("raw/u", &file("u", b"u"), None)
+            .await
+            .unwrap();
+        // The pin file can no longer be appended to.
+        let pins = store.join(PIN_FILE);
+        std::fs::remove_file(&pins).unwrap();
+        std::fs::create_dir(&pins).unwrap();
+        assert!(storage
+            .put_from_path("raw/k", &file("v2", b"v2"), None)
+            .await
+            .is_err());
+        assert!(storage.copy("raw/u", "raw/t", None).await.is_err());
     }
 
     /// Only the staging directory itself, at the root and spelled exactly, is left out; a key
