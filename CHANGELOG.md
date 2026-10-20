@@ -1,6 +1,16 @@
 # Changelog
 ## [Unreleased]
 
+## [1.4.1] - 2026-10-20
+
+### Fixed
+- **A write without a digest leaves no pin of the bytes it replaced (#1154)** — on local storage, a file stored without a digest (and a copy of an unpinned source) kept the pin of the bytes it replaced, so a later read of the new bytes failed its integrity check; the object store already dropped the pin. Both backends now agree, a tombstone that cannot be written fails the write, and a Docker blob upload pins the blob to the digest it was checked against.
+- **A ranged answer serves the version its headers describe (#1153)** — a raw download took its ETag from one read and the bytes of a range from another, so an overwrite in between answered `206` with the old ETag over the new bytes and a client resuming with `If-Range` spliced two versions. A range is now served only from an object of the size the caller described and, for raw, the version its ETag names; otherwise the whole object is served from the first read. On local storage a read takes the body and its pin of one version.
+- **The version check and the staging-directory test run on macOS (#1155, #1156)** — `scripts/pre-commit-check.sh` needed GNU grep, and a test assumed a case-sensitive file system.
+
+### Security
+- **Registry answers are inert in a browser, and UI links are encoded (GHSA-mv9j-vg66-3mr2)** — registries answered stored and proxied files with the type the format gives them and without a sandbox policy (only raw sent one), so a document a browser renders — a Maven `.pom` or `.xml` with a stylesheet, RPM metadata, a NuGet `.nuspec`, an upstream's `text/html` relayed for a Docker manifest or an npm audit — could run script on NORA's origin; UI directory and version pages put stored paths into link attributes and an inline `onclick` without encoding them, and some date columns, including an image's creation date and upstream release dates, were not escaped. Every answer of the registry routes now carries `Content-Security-Policy: sandbox` (package clients do not read it; the UI's own pages keep their policy), and UI links are built from URL-encoded path segments with escaped attributes.
+
 ## [1.4.0] - 2026-10-19
 
 ### Added
