@@ -66,6 +66,10 @@ jobs:
         run: ./scripts/test-reland-filechanges.sh
       - name: Diff-coverage helper self-test
         run: bash scripts/test-diff-coverage.sh
+      # The version check guards every commit and tag; it runs here with GNU grep and with a
+      # grep that refuses -P, as macOS's does (#1155).
+      - name: Version check self-test
+        run: bash scripts/test-pre-commit-check.sh
       # The self-test runs first on purpose: lock-audit is a heuristic over source text,
       # and a broken one prints nothing — indistinguishable from a clean tree. It also
       # runs the audit under every awk on the image, so a gawk-only construct creeping

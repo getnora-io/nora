@@ -2305,14 +2305,20 @@ mod tests {
             crate::validation::validate_storage_key(key).unwrap();
             put_key(&storage, key).await;
         }
-        // Not writable through the API, but on disk the full walk lists it (case-sensitive fs).
-        std::fs::create_dir_all(dir.path().join(".NORA-STAGING/x")).unwrap();
-        std::fs::write(dir.path().join(".NORA-STAGING/x/f"), b"x").unwrap();
-        for (prefix, key) in [
+        let mut rows = vec![
             ("raw/g/.nora-staging/", "raw/g/.nora-staging/f"),
             (".nora-stagingx/a/", ".nora-stagingx/a/f"),
-            (".NORA-STAGING/x/", ".NORA-STAGING/x/f"),
-        ] {
+        ];
+        // Not writable through the API, but on disk the full walk lists it. On a file system
+        // that ignores case (APFS, NTFS) `.NORA-STAGING` is the staging directory itself, so
+        // the spelling the row tells apart exists only where the file system keeps it (#1156).
+        std::fs::write(dir.path().join("case-probe"), b"").unwrap();
+        if !dir.path().join("CASE-PROBE").exists() {
+            std::fs::create_dir_all(dir.path().join(".NORA-STAGING/x")).unwrap();
+            std::fs::write(dir.path().join(".NORA-STAGING/x/f"), b"x").unwrap();
+            rows.push((".NORA-STAGING/x/", ".NORA-STAGING/x/f"));
+        }
+        for (prefix, key) in rows {
             let mut full = Vec::new();
             LocalStorage::list_files_sync(
                 &dir.path().to_path_buf(),
