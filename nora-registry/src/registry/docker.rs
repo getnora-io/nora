@@ -249,92 +249,21 @@ async fn storage_get_reader_with_fallback(
     .map(|(size, _pin, reader)| (size, reader))
 }
 
-/// An `AsyncRead` wrapper that hashes the bytes it streams and, on a SHA-256
-/// mismatch at EOF, fails the stream instead of letting a tampered blob complete
-/// cleanly. `get_reader` (#580) streams large docker blobs without buffering, so
-/// the buffered-`get()` fail-closed verify (#582) does not run on this path; this
-/// restores NORA-side tamper *detection* for the streaming path (the docker
-/// client's own content-digest check is the complementary layer). It cannot
-/// un-send bytes already streamed, but it errors the response and logs on tamper
-/// rather than serving a clean 200. Recomputing the digest on the streaming path
-/// is the same deliberate cost #582 accepts for buffered reads.
-struct VerifyingReader<R> {
-    inner: R,
-    hasher: sha2::Sha256,
-    expected_hex: String,
-    finished: bool,
-}
-
-impl<R> VerifyingReader<R> {
-    fn new(inner: R, digest: &str) -> Self {
-        let expected_hex = digest
-            .strip_prefix("sha256:")
-            .unwrap_or(digest)
-            .to_ascii_lowercase();
-        Self {
-            inner,
-            hasher: sha2::Sha256::default(),
-            expected_hex,
-            finished: false,
-        }
-    }
-}
-
-// #849: `VerifyingReader` verifies the blob digest at EOF, so it may be served through the
-// `reader_stream_body` sole-sink. A raw reader carries neither impl, so it cannot be handed
-// to it — a compile-time serve-integrity witness on the streaming path.
-impl<R: tokio::io::AsyncRead + Send + Unpin + 'static>
-    nora_registry::verified::stream_sealed::Sealed for VerifyingReader<R>
-{
-}
-impl<R: tokio::io::AsyncRead + Send + Unpin + 'static> nora_registry::verified::VerifiedByteReader
-    for VerifyingReader<R>
-{
-}
-
-impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for VerifyingReader<R> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        use sha2::Digest as _;
-        use std::task::Poll;
-        // VerifyingReader<R: Unpin> is itself Unpin, so this projection is safe
-        // (no `unsafe`, honouring `#![forbid(unsafe_code)]`).
-        let this = self.get_mut();
-        if this.finished {
-            return Poll::Ready(Ok(()));
-        }
-        let before = buf.filled().len();
-        match std::pin::Pin::new(&mut this.inner).poll_read(cx, buf) {
-            Poll::Ready(Ok(())) => {
-                let filled = buf.filled();
-                if filled.len() > before {
-                    this.hasher.update(&filled[before..]);
-                    Poll::Ready(Ok(()))
-                } else {
-                    // EOF — verify the accumulated digest before a clean end.
-                    this.finished = true;
-                    let got = hex::encode(this.hasher.clone().finalize());
-                    if got == this.expected_hex {
-                        Poll::Ready(Ok(()))
-                    } else {
-                        tracing::error!(
-                            expected = %this.expected_hex,
-                            got = %got,
-                            "blob integrity verification failed while streaming — aborting response"
-                        );
-                        Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "blob integrity verification failed",
-                        )))
-                    }
-                }
-            }
-            other => other,
-        }
-    }
+/// A blob served from storage or from a fill in flight, checked against its digest as it
+/// streams. The stream holds its last frame back until the digest is verified, so a blob
+/// whose bytes do not match never arrives complete: hyper stops reading a body once the
+/// declared `Content-Length` is out, and a check that waited for one more read after the last
+/// byte never ran (R19). The docker client's own digest check is the complementary layer.
+fn blob_verifying_stream(
+    reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    digest: &str,
+    log_key: String,
+) -> nora_registry::verified::VerifyingStream {
+    let expected = digest
+        .strip_prefix("sha256:")
+        .unwrap_or(digest)
+        .to_ascii_lowercase();
+    nora_registry::verified::verify_while_streaming(reader, Some(expected), log_key)
 }
 
 /// Check if a key exists in namespaced or legacy location.
@@ -1265,7 +1194,7 @@ async fn serve_local_blob(
         crate::registry_type::RegistryType::Docker,
         "LOCAL",
     ));
-    let stream = VerifyingReader::new(reader, digest);
+    let stream = blob_verifying_stream(reader, digest, format!("docker/{name}/blobs/{digest}"));
     Some(
         Response::builder()
             .status(StatusCode::OK)
@@ -1274,7 +1203,7 @@ async fn serve_local_blob(
             .header(header::ACCEPT_RANGES, "bytes")
             .header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")
             .header("docker-content-digest", digest)
-            .body(nora_registry::verified::reader_stream_body(stream))
+            .body(nora_registry::verified::stream_body(stream))
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
     )
 }
@@ -3389,14 +3318,18 @@ async fn spool_response(
             let reader = tokio_util::io::StreamReader::new(Box::pin(spool_follower(
                 follower, status, 0, stall,
             )));
-            let stream = VerifyingReader::new(reader, digest);
+            let stream = blob_verifying_stream(
+                Box::pin(reader),
+                digest,
+                format!("docker blob {digest} (fill)"),
+            );
             let mut builder = builder.status(StatusCode::OK);
             if let Some(len) = len {
                 builder = builder
                     .header(header::CONTENT_LENGTH, len)
                     .header(header::ACCEPT_RANGES, "bytes");
             }
-            builder.body(nora_registry::verified::reader_stream_body(stream))
+            builder.body(nora_registry::verified::stream_body(stream))
         }
     };
     response.unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
@@ -3675,7 +3608,7 @@ fn spawn_blob_spool(
                 "Docker blob SHA-256 mismatch from upstream — not cached"
             );
             // TempFileGuard drops and cleans up; the follower's own handle still reads
-            // to the end, and VerifyingReader fails the response there.
+            // to the end, and the verifying stream fails the response before its last frame.
             drop(lease);
             progress.send_modify(|s| s.done = Some(Err("SHA-256 mismatch".to_string())));
             return;
@@ -4705,31 +4638,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verifying_reader_passes_match_and_aborts_mismatch() {
+    async fn a_blob_stream_passes_its_digest_and_withholds_the_end_of_another() {
+        use futures::StreamExt as _;
         use sha2::Digest as _;
-        use tokio::io::AsyncReadExt;
-
-        let data = b"hello-blob-content-1234567890";
-        let good = format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)));
-
-        // Matching digest: the stream reads fully with no error.
-        let mut ok = VerifyingReader::new(&data[..], &good);
-        let mut buf = Vec::new();
-        assert!(ok.read_to_end(&mut buf).await.is_ok());
-        assert_eq!(buf, data);
-
-        // Wrong digest: the error surfaces at EOF, aborting the stream rather
-        // than letting a tampered blob complete cleanly.
-        let bad = format!(
-            "sha256:{}",
-            hex::encode(sha2::Sha256::digest(b"different-bytes"))
-        );
-        let mut tampered = VerifyingReader::new(&data[..], &bad);
-        let mut buf2 = Vec::new();
-        assert!(
-            tampered.read_to_end(&mut buf2).await.is_err(),
-            "a digest mismatch must error the stream, not complete cleanly"
-        );
+        let data = vec![9u8; 600_000];
+        let good = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
+        let bad = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"other")));
+        for (digest, intact) in [(&good, true), (&bad, false)] {
+            let reader: std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>> =
+                Box::pin(std::io::Cursor::new(data.clone()));
+            let mut stream = blob_verifying_stream(reader, digest, "docker/alpine/blobs/x".into());
+            let (mut got, mut failed) = (0usize, false);
+            while let Some(frame) = stream.next().await {
+                match frame {
+                    Ok(bytes) => got += bytes.len(),
+                    Err(_) => failed = true,
+                }
+            }
+            if intact {
+                assert!(
+                    !failed && got == data.len(),
+                    "intact: {got} of {}",
+                    data.len()
+                );
+            } else {
+                assert!(
+                    failed && got < data.len(),
+                    "mismatch: {got} of {} sent",
+                    data.len()
+                );
+            }
+        }
     }
 
     #[test]
@@ -7811,6 +7750,56 @@ mod integration_tests {
             !tags.contains(&serde_json::json!("v1")),
             "v1 must be gone from tags/list after digest delete (#658)"
         );
+    }
+
+    /// A blob changed on disk never reaches the client complete: the stream checks the digest
+    /// before its last bytes go out. Served over a real socket, as a client sees it: hyper
+    /// stops reading the body once the declared length is out, so a check that waits for one
+    /// more read after the last byte never runs (R19).
+    #[tokio::test]
+    async fn a_tampered_blob_never_arrives_complete() {
+        for size in [855usize, 300_000] {
+            let ctx = create_test_context();
+            let blob: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+            let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&blob)));
+            let url = format!("/v2/alpine/blobs/uploads/?digest={digest}");
+            let resp = send(&ctx.app, Method::POST, &url, Body::from(blob.clone())).await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let app = ctx.app.clone();
+            tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap();
+            });
+            let client = reqwest::Client::new();
+            let get = || {
+                client
+                    .get(format!("http://{addr}/v2/alpine/blobs/{digest}"))
+                    .send()
+            };
+
+            let on_disk = std::path::Path::new(&ctx.state.config.storage.path)
+                .join(format!("docker/alpine/blobs/{digest}"));
+            let mut tampered = std::fs::read(&on_disk).unwrap();
+            tampered[size / 2] ^= 0xFF;
+            std::fs::write(&on_disk, &tampered).unwrap();
+            match get().await {
+                Err(_) => {}
+                Ok(resp) => match resp.bytes().await {
+                    Err(_) => {}
+                    Ok(bytes) => assert!(
+                        bytes.len() < size,
+                        "{size}: a tampered blob arrived complete ({} of {size} bytes)",
+                        bytes.len()
+                    ),
+                },
+            }
+
+            // An intact blob still arrives whole.
+            std::fs::write(&on_disk, &blob).unwrap();
+            let bytes = get().await.unwrap().bytes().await.unwrap();
+            assert_eq!(&bytes[..], &blob[..], "{size}");
+        }
     }
 
     #[tokio::test]
