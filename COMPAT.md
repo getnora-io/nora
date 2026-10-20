@@ -4,6 +4,34 @@ This document describes which parts of each registry protocol are implemented in
 
 **Legend:** Full = complete implementation, Partial = basic support with limitations, Stub = placeholder, — = not implemented
 
+## Support matrix
+
+Which formats NORA proxies and hosts, the upstream each proxies by default, and what to know about each. The sections below describe the protocol coverage per format.
+
+| Format | Pull (proxy/cache) | Push/Publish | Default Upstream | Notes |
+|--------|:---:|:---:|---|---|
+| Docker Registry v2 | ✅ | ✅ | `registry-1.docker.io` | hosted + proxy; cache on when `docker.upstreams` non-empty (Docker Hub by default) |
+| Maven | ✅ | ✅ | `repo1.maven.org/maven2` | hosted + proxy |
+| npm | ✅ | ✅ | `registry.npmjs.org` | hosted + proxy |
+| Cargo | ✅ | ✅ | `crates.io` (sparse index) | hosted + proxy (sparse index) |
+| PyPI | ✅ | ✅ | `pypi.org/simple/` | hosted + proxy |
+| Go Modules | ✅ | — | `proxy.golang.org` | proxy only (modules immutable, push not in protocol) |
+| Raw files | ❌ | ✅ | — (no upstream) | hosted only; conditional `PUT`/`GET` (ETag, `If-Match`, `If-None-Match`) on every backend; upload verification via `Repr-Digest` (RFC 9530) |
+| RubyGems | ✅ | ❌ | `rubygems.org` | proxy only — `gem push` not implemented |
+| Terraform | ✅ | — | `registry.terraform.io` | proxy only; client configuration notes in COMPAT.md |
+| Ansible Galaxy | ✅ | ❌ | `galaxy.ansible.com` | proxy only — `ansible-galaxy collection publish` not implemented |
+| NuGet | ✅ | ❌ | `api.nuget.org` | proxy only — `dotnet nuget push` not implemented |
+| Pub (Dart/Flutter) | ✅ | ❌ | `pub.dev` | proxy only — `dart pub publish` not implemented |
+| CPAN | ✅ | — | `www.cpan.org` | proxy only |
+| Conan (C/C++) | ✅ | ❌ | `center2.conan.io` | proxy only (Conan 2 clients) |
+| RPM (yum/dnf) | ⚠️ | ✅ | — (none by default) | hosted; pull-through via `[rpm.proxies]` / `NORA_RPM_PROXIES` (off by default); auto-generates `repodata/` |
+| Debian/APT | ⚠️ | ✅ | — (none by default) | hosted; pull-through via `[deb.proxies]` / `NORA_DEB_PROXIES` (off by default); flat & structured layouts; auto-generates `Packages`/`Release`/`InRelease` |
+| Hugging Face Hub | ✅ | — | `huggingface.co` | opt-in (`NORA_HF_ENABLED=true`, not in `all`); public models; files cached by digest, checked on the way in; never Xet; datasets not served — see COMPAT.md |
+
+> **Helm charts** work via the Docker/OCI endpoint — `helm push`/`pull` with `--plain-http` or behind TLS reverse proxy.
+
+> **Pull/Push legend:** ✅ supported · ⚠️ pull-through available but off by default (no default upstream) · ❌ not implemented · — not applicable (protocol has no push). Per-format details and cache strategy in [COMPAT.md](COMPAT.md).
+
 ## Docker (OCI Distribution Spec 1.1)
 
 | Endpoint | Method | Status | Notes |
