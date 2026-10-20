@@ -182,16 +182,18 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)>;
 
     /// Stream the inclusive byte range `[start, end]` of an object, returning the object's
-    /// total size and a reader over exactly those bytes. The default reads from the start and
-    /// discards the prefix; backends override with an efficient seek / ranged GET.
+    /// total size, its pin and a reader over exactly those bytes — size, pin and bytes of one
+    /// version, as [`get_reader`](Self::get_reader) returns them, so a caller can tell whether
+    /// the range came from the version it described (#1153). The default reads from the start
+    /// and discards the prefix; backends override with an efficient seek / ranged GET.
     async fn get_range(
         &self,
         key: &str,
         start: u64,
         end: u64,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         use tokio::io::AsyncReadExt;
-        let (size, _, mut reader) = self.get_reader(key).await?;
+        let (size, pin, mut reader) = self.get_reader(key).await?;
         let mut to_skip = start;
         let mut buf = [0u8; 64 * 1024];
         while to_skip > 0 {
@@ -203,7 +205,7 @@ pub trait StorageBackend: Send + Sync {
             to_skip -= n as u64;
         }
         let len = end.saturating_sub(start) + 1;
-        Ok((size, Box::pin(reader.take(len))))
+        Ok((size, pin, Box::pin(reader.take(len))))
     }
 }
 
@@ -689,7 +691,7 @@ impl Storage {
         key: &str,
         start: u64,
         end: u64,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         validate_storage_key(key)?;
         match self.inner.get_range(key, start, end).await {
             Ok(r) => {
