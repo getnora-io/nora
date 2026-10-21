@@ -29,11 +29,13 @@ pub struct AuthenticatedUser(pub String);
 pub struct AuthenticatedRole(pub crate::tokens::Role);
 
 /// The lifetime ceiling (seconds) the caller's own credential imposes on any
-/// token it mints. Inserted ONLY for OIDC identities — the provider's
-/// `max_token_lifetime_secs`, which already bounds the JWT itself. Absent for
-/// Basic and opaque (`nra_`) callers, which carry no such ceiling. A UI mint
-/// reads it to cap the new token so a short-lived federated identity cannot
-/// bootstrap a long-lived static one (#1094).
+/// token it mints. Inserted ONLY for OIDC identities: the shorter of the
+/// provider's `max_token_lifetime_secs` and what is left of the JWT until its
+/// `exp`, so a minted token never outlives the JWT that minted it (0 once the
+/// JWT has expired, inside the validator's leeway). Absent for Basic and opaque
+/// (`nra_`) callers, which carry no such ceiling. A UI mint reads it to cap the
+/// new token so a short-lived federated identity cannot bootstrap a long-lived
+/// static one (#1094).
 #[derive(Clone, Copy, Debug)]
 pub struct MintLifetimeCeiling(pub u64);
 
@@ -567,9 +569,15 @@ pub async fn auth_middleware(
                         // the identity — i.e. the provider that actually validated
                         // this JWT — never re-looked-up by name, since provider
                         // names are not unique (#1094 N2).
-                        request
-                            .extensions_mut()
-                            .insert(MintLifetimeCeiling(identity.max_token_lifetime_secs));
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        request.extensions_mut().insert(MintLifetimeCeiling(
+                            identity
+                                .max_token_lifetime_secs
+                                .min(identity.expires_at.saturating_sub(now)),
+                        ));
                         request
                             .extensions_mut()
                             .insert(AuthenticatedUser(identity.subject.clone()));
@@ -3225,7 +3233,8 @@ Jd74nq6dNCjpWG4drIsyhqX+
     /// the provider's `max_token_lifetime_secs` (900s here). An unrestricted
     /// write identity (main-ref rule, provider `["*"]`) may mint — it is not
     /// scope-refused — but the 3650-day request is capped to the ceiling itself,
-    /// not rounded up to a day (R2-01).
+    /// not rounded up to a day (R2-01), and never outlives the JWT that minted
+    /// it: here the JWT expires in 600s, under the ceiling.
     #[tokio::test]
     async fn test_oidc_minted_token_lifetime_capped_at_provider_ceiling() {
         let mock_server = MockServer::start().await;
@@ -3271,10 +3280,117 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let entries = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
         assert_eq!(entries.len(), 1, "exactly one token minted");
         let lifetime = entries[0].expires_at - entries[0].created_at;
-        assert_eq!(
-            lifetime, 900,
-            "an OIDC-minted token outlived the provider ceiling: {lifetime}s (want 900s)"
+        assert!(
+            (590..=600).contains(&lifetime),
+            "an OIDC-minted token outlived the JWT that minted it: {lifetime}s (JWT 600s, ceiling 900s)"
         );
+    }
+
+    /// A JWT the validator still accepts inside its leeway, though its `exp`
+    /// has passed, mints nothing: the token would outlive the credential that
+    /// minted it from its first second. Fail closed: 403, no token.
+    #[tokio::test]
+    async fn test_oidc_identity_already_expired_cannot_mint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // Lifetime 600s (under the 900s ceiling), expired 30s ago, inside the
+        // 60s leeway: authentication still accepts it.
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now - 630,
+            now - 30,
+        );
+        let bearer = format!("Bearer {jwt}");
+        let read = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/none.txt",
+            vec![("authorization", &bearer)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            read.status(),
+            StatusCode::NOT_FOUND,
+            "the JWT authenticates"
+        );
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &bearer),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write&ttl_days=1".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .is_empty(),
+            "an expired JWT minted a token"
+        );
+    }
+
+    /// A JWT without `exp` is refused at authentication (the validator
+    /// requires it), so it never reaches the mint.
+    #[tokio::test]
+    async fn test_oidc_jwt_without_exp_cannot_mint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".to_string());
+        let claims = json!({
+            "iss": mock_server.uri(),
+            "sub": "repo:myorg/app:ref:refs/heads/main",
+            "aud": "nora",
+            "iat": now_secs(),
+        });
+        let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let jwt = encode(&header, &claims, &key).unwrap();
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &format!("Bearer {jwt}")),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write&ttl_days=1".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .list_all_tokens()
+            .is_empty());
     }
 
     #[tokio::test]

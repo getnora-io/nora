@@ -55,6 +55,9 @@ pub struct OidcIdentity {
     /// re-looking-up the provider by name — provider names are not unique, so a
     /// disabled same-name provider would mislead a by-name lookup (#1094 N2).
     pub max_token_lifetime_secs: u64,
+    /// The JWT's `exp` (Unix seconds). The validator requires it; a token
+    /// minted by this identity must not outlive it.
+    pub expires_at: u64,
 }
 
 /// Standard JWT claims we extract.
@@ -309,6 +312,9 @@ impl OidcValidator {
             rule_namespace_scope: rule_scope,
             namespace_scope_enforcement: provider.namespace_scope_enforcement,
             max_token_lifetime_secs: provider.max_token_lifetime_secs,
+            // Required by the validation above; 0 if absent, which leaves a
+            // mint no lifetime at all (fail closed).
+            expires_at: claims.exp.unwrap_or(0),
         })
     }
 

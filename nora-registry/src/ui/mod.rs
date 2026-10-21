@@ -976,6 +976,9 @@ enum UiMintRefusal {
     /// The caller's identity is namespace-scoped; the UI mints only unrestricted
     /// opaque tokens, so handing one out would widen the caller's authority.
     ScopedCannotMintUnrestricted,
+    /// The caller's credential has expired (an OIDC JWT still inside the
+    /// validator's leeway): a token from it would outlive it at once.
+    CredentialExpired,
 }
 
 impl UiMintRefusal {
@@ -986,6 +989,9 @@ impl UiMintRefusal {
             }
             UiMintRefusal::ScopedCannotMintUnrestricted => {
                 "A namespace-scoped identity cannot mint an unrestricted token"
+            }
+            UiMintRefusal::CredentialExpired => {
+                "The credential has expired; a token minted from it would outlive it"
             }
         }
     }
@@ -1095,6 +1101,16 @@ async fn tokens_create(
             .clamp(1, crate::tokens::MAX_TOKEN_TTL_DAYS),
         caller_mint_ceiling.map(|Extension(c)| c.0),
     );
+    // Nothing left of the caller's credential: fail closed, mint nothing.
+    if ttl_secs == 0 {
+        return (
+            StatusCode::FORBIDDEN,
+            Html(format!(
+                r##"<div class="bg-red-900/30 border border-red-700 rounded-lg p-4 text-red-400">{}</div>"##,
+                UiMintRefusal::CredentialExpired.message()
+            )),
+        );
+    }
 
     let description = if form.description.trim().is_empty() {
         None
