@@ -36,6 +36,17 @@ struct CachedToken {
 
 const TOKEN_PREFIX: &str = "nra_";
 
+/// The longest lifetime a token is minted with, whatever a route asks for:
+/// ten years. Applied by the store, so every route that mints is held to it.
+pub const MAX_TOKEN_TTL_DAYS: u64 = 3650;
+
+const SECS_PER_DAY: u64 = 24 * 60 * 60;
+
+/// The lifetime in days a mint asking for `ttl_days` is granted.
+pub fn granted_ttl_days(ttl_days: u64) -> u64 {
+    ttl_days.min(MAX_TOKEN_TTL_DAYS)
+}
+
 /// Access role for API tokens
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -151,7 +162,8 @@ impl TokenStore {
         }
     }
 
-    /// Generate a new API token for a user
+    /// Generate a new API token for a user, living `ttl_days` days — at most
+    /// [`MAX_TOKEN_TTL_DAYS`].
     pub fn create_token(
         &self,
         user: &str,
@@ -159,6 +171,25 @@ impl TokenStore {
         description: Option<String>,
         role: Role,
     ) -> Result<String, TokenError> {
+        // A lifetime too long to count in seconds is longer than the cap.
+        let max_secs = MAX_TOKEN_TTL_DAYS * SECS_PER_DAY;
+        let ttl_secs = ttl_days
+            .checked_mul(SECS_PER_DAY)
+            .map_or(max_secs, |secs| secs.min(max_secs));
+        self.create_token_for_secs(user, ttl_secs, description, role)
+    }
+
+    /// Generate a new API token living `ttl_secs` seconds — at most
+    /// [`MAX_TOKEN_TTL_DAYS`] days. For a caller whose own credential lives
+    /// less than a day: the token it mints must not outlive it.
+    pub fn create_token_for_secs(
+        &self,
+        user: &str,
+        ttl_secs: u64,
+        description: Option<String>,
+        role: Role,
+    ) -> Result<String, TokenError> {
+        let ttl_secs = ttl_secs.min(MAX_TOKEN_TTL_DAYS * SECS_PER_DAY);
         // Generate random token
         let raw_token = format!(
             "{}{}",
@@ -174,7 +205,7 @@ impl TokenStore {
             .unwrap_or_default()
             .as_secs();
 
-        let expires_at = now + (ttl_days * 24 * 60 * 60);
+        let expires_at = now.saturating_add(ttl_secs);
 
         let info = TokenInfo {
             token_hash,
@@ -1135,6 +1166,37 @@ mod tests {
                 .is_err(),
             "a revoked legacy token verifies from disk after the migration"
         );
+    }
+
+    /// Every mint gets at most MAX_TOKEN_TTL_DAYS days, however long it asks
+    /// for: a lifetime that overflows when counted in seconds included, which
+    /// used to wrap around to a token of a few hours (C10).
+    #[test]
+    fn create_token_caps_the_lifetime_centrally() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+        let ten_years = 3650 * 86_400;
+        for (asked, want) in [
+            (30, 30 * 86_400),
+            (3650, ten_years),
+            (3651, ten_years),
+            (1_000_000_000, ten_years),
+            (213_503_982_334_602, ten_years),
+            (u64::MAX, ten_years),
+        ] {
+            let token = store.create_token("u", asked, None, Role::Read).unwrap();
+            let prefix = &sha256_hex(&token)[..16];
+            let entry = store
+                .list_all_tokens()
+                .into_iter()
+                .find(|t| t.file_id == prefix)
+                .unwrap();
+            assert_eq!(
+                entry.expires_at - entry.created_at,
+                want,
+                "ttl_days={asked}"
+            );
+        }
     }
 
     #[test]

@@ -1021,15 +1021,17 @@ fn decide_ui_token_mint(
     Ok(requested_role)
 }
 
-/// Cap a requested token lifetime (days) by an optional ceiling in seconds —
-/// an OIDC caller's provider `max_token_lifetime_secs` (#1094). Day-granular,
-/// matching the store's whole-day TTL: a sub-day ceiling floors to 1 day (the
-/// store's minimum), still far below the 3650-day clamp. `None` (Basic/opaque
-/// callers, which carry no ceiling) leaves the lifetime unchanged.
-fn cap_ttl_days(requested_days: u64, ceiling_secs: Option<u64>) -> u64 {
+/// The lifetime in seconds of a token asked for `requested_days` days, capped
+/// by an optional ceiling in seconds — an OIDC caller's provider
+/// `max_token_lifetime_secs` (#1094). A ceiling shorter than a day is kept to
+/// the second: the token never outlives what the caller's own credential may
+/// (R2-01). `None` (Basic/opaque callers, which carry no ceiling) leaves the
+/// lifetime unchanged.
+fn cap_ttl_secs(requested_days: u64, ceiling_secs: Option<u64>) -> u64 {
+    let requested = requested_days.saturating_mul(86_400);
     match ceiling_secs {
-        Some(secs) => requested_days.min((secs / 86_400).max(1)),
-        None => requested_days,
+        Some(ceiling) => requested.min(ceiling),
+        None => requested,
     }
 }
 
@@ -1087,8 +1089,10 @@ async fn tokens_create(
         }
     };
 
-    let ttl_days = cap_ttl_days(
-        form.ttl_days.unwrap_or(90).clamp(1, 3650),
+    let ttl_secs = cap_ttl_secs(
+        form.ttl_days
+            .unwrap_or(90)
+            .clamp(1, crate::tokens::MAX_TOKEN_TTL_DAYS),
         caller_mint_ceiling.map(|Extension(c)| c.0),
     );
 
@@ -1098,8 +1102,17 @@ async fn tokens_create(
         Some(form.description.trim().to_string())
     };
 
-    match store.create_token(&user, ttl_days, description, granted_role) {
+    let role_label = granted_role.to_string();
+    match store.create_token_for_secs(&user, ttl_secs, description, granted_role) {
         Ok(raw_token) => {
+            // Who minted what, never the token itself.
+            state.audit.log(crate::audit::AuditEntry::new(
+                "token_mint",
+                &user,
+                &user,
+                "ui",
+                &format!("role={role_label} ttl_secs={ttl_secs}"),
+            ));
             let html = render_token_created_fragment(&raw_token, lang);
             (StatusCode::OK, Html(html))
         }
@@ -1328,18 +1341,21 @@ mod base_path_tests {
     /// #1094: an OIDC caller's provider lifetime ceiling caps the minted token;
     /// a caller with no ceiling (Basic/opaque) is unchanged.
     #[test]
-    fn cap_ttl_days_respects_the_ceiling() {
+    fn cap_ttl_secs_respects_the_ceiling() {
+        const DAY: u64 = 86_400;
         // No ceiling: the requested (already clamped) lifetime is unchanged.
-        assert_eq!(cap_ttl_days(3650, None), 3650);
-        assert_eq!(cap_ttl_days(1, None), 1);
+        assert_eq!(cap_ttl_secs(3650, None), 3650 * DAY);
+        assert_eq!(cap_ttl_secs(1, None), DAY);
         // A whole-day ceiling caps a longer request…
-        assert_eq!(cap_ttl_days(3650, Some(7 * 86_400)), 7);
+        assert_eq!(cap_ttl_secs(3650, Some(7 * DAY)), 7 * DAY);
         // …but leaves a shorter request alone.
-        assert_eq!(cap_ttl_days(3, Some(7 * 86_400)), 3);
+        assert_eq!(cap_ttl_secs(3, Some(7 * DAY)), 3 * DAY);
         // Exactly one day.
-        assert_eq!(cap_ttl_days(3650, Some(86_400)), 1);
-        // A sub-day ceiling floors to the store's 1-day minimum (still << 3650).
-        assert_eq!(cap_ttl_days(3650, Some(900)), 1);
-        assert_eq!(cap_ttl_days(3650, Some(0)), 1);
+        assert_eq!(cap_ttl_secs(3650, Some(DAY)), DAY);
+        // A sub-day ceiling is kept to the second (R2-01), not rounded up to a day.
+        assert_eq!(cap_ttl_secs(3650, Some(900)), 900);
+        assert_eq!(cap_ttl_secs(3650, Some(0)), 0);
+        // A lifetime too long to count in seconds still caps.
+        assert_eq!(cap_ttl_secs(u64::MAX, Some(900)), 900);
     }
 }

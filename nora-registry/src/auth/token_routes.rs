@@ -14,7 +14,8 @@ use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use utoipa::ToSchema;
 
-use crate::tokens::Role;
+use crate::audit::AuditEntry;
+use crate::tokens::{granted_ttl_days, Role};
 use crate::AppState;
 
 use super::resolve_client_ip;
@@ -134,12 +135,24 @@ async fn create_token(
             .into_response();
     }
 
-    match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
-        Ok(token) => Json(CreateTokenResponse {
-            token,
-            expires_in_days: req.ttl_days,
-        })
-        .into_response(),
+    let ttl_days = granted_ttl_days(req.ttl_days);
+    let role_label = role.to_string();
+    match token_store.create_token(&req.username, ttl_days, req.description, role) {
+        Ok(token) => {
+            // Who minted what, never the token itself.
+            state.audit.log(AuditEntry::new(
+                "token_mint",
+                &req.username,
+                &req.username,
+                "api",
+                &format!("role={role_label} ttl_days={ttl_days}"),
+            ));
+            Json(CreateTokenResponse {
+                token,
+                expires_in_days: ttl_days,
+            })
+            .into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -322,5 +335,162 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("nora_abc123"));
         assert!(json.contains("30"));
+    }
+}
+
+/// Every route that mints a token caps its lifetime the same way and leaves an
+/// audit entry naming who minted what (C10, R2-04).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod mint_tests {
+    use crate::test_helpers::*;
+    use crate::tokens::Role;
+    use axum::http::{Method, StatusCode};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    const TEN_YEARS: u64 = 3650 * 86_400;
+
+    fn audited(users: &[(&str, &str)]) -> TestContext {
+        create_test_context_with_auth_and_config(users, |cfg| {
+            cfg.audit.mode = crate::audit::AuditMode::File;
+        })
+    }
+
+    /// The audit entries written so far (drains the log).
+    async fn audit_entries(ctx: &TestContext) -> Vec<serde_json::Value> {
+        let path = ctx.state.audit.path().clone();
+        ctx.state.audit.shutdown().await;
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// The lifetime of the one token `owner` has.
+    fn lifetime_of(ctx: &TestContext, owner: &str) -> u64 {
+        let tokens = ctx.state.tokens.as_ref().unwrap().list_tokens(owner);
+        assert_eq!(tokens.len(), 1, "{owner} has one token");
+        tokens[0].expires_at - tokens[0].created_at
+    }
+
+    async fn post_json(
+        ctx: &TestContext,
+        uri: &str,
+        auth: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut headers = vec![("content-type", "application/json")];
+        if let Some(auth) = auth {
+            headers.push(("authorization", auth));
+        }
+        let resp = send_with_headers(&ctx.app, Method::POST, uri, headers, body.to_string()).await;
+        let status = resp.status();
+        let body = body_bytes(resp).await;
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    #[tokio::test]
+    async fn api_tokens_caps_the_lifetime_and_audits_the_mint() {
+        let ctx = audited(&[("alice", "alicepw"), ("bob", "bobpw")]);
+        for (user, ttl) in [("alice", "1000000000"), ("bob", "213503982334602")] {
+            let (status, json) = post_json(
+                &ctx,
+                "/api/tokens",
+                None,
+                &format!(r#"{{"username":"{user}","password":"{user}pw","ttl_days":{ttl},"role":"write"}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(
+                json["expires_in_days"], 3650,
+                "the answer names the lifetime granted"
+            );
+            assert_eq!(lifetime_of(&ctx, user), TEN_YEARS, "ttl_days={ttl}");
+        }
+        let token = ctx.state.tokens.as_ref().unwrap();
+        let entries = audit_entries(&ctx).await;
+        let mints: Vec<_> = entries
+            .iter()
+            .filter(|e| e["action"] == "token_mint")
+            .collect();
+        assert_eq!(mints.len(), 2, "one audit entry per mint: {entries:?}");
+        assert_eq!(mints[0]["actor"], "alice");
+        assert_eq!(mints[0]["artifact"], "alice");
+        let detail = mints[0]["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("role=write") && detail.contains("ttl_days=3650"),
+            "{detail}"
+        );
+        for t in token.list_all_tokens() {
+            assert!(
+                !entries.iter().any(|e| e.to_string().contains(&t.file_id)),
+                "a token id in the audit log"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_mint_caps_the_lifetime_it_reports_and_audits() {
+        let ctx = audited(&[]);
+        let admin = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("root", 30, None, Role::Admin)
+            .unwrap();
+        let (status, json) = post_json(
+            &ctx,
+            "/api/v1/admin/tokens",
+            Some(&format!("Bearer {admin}")),
+            r#"{"username":"svc","role":"read","ttl_days":1000000000}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["expires_in_days"], 3650,
+            "the answer names the lifetime granted"
+        );
+        assert_eq!(lifetime_of(&ctx, "svc"), TEN_YEARS);
+        let entries = audit_entries(&ctx).await;
+        let mint = entries
+            .iter()
+            .find(|e| e["action"] == "admin_token_mint")
+            .unwrap();
+        assert_eq!(mint["detail"], "role=read ttl_days=3650", "{mint}");
+    }
+
+    #[tokio::test]
+    async fn ui_mint_is_audited() {
+        let ctx = audited(&[("alice", "alicepw")]);
+        let basic = format!("Basic {}", STANDARD.encode("alice:alicepw"));
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &basic),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=ci&role=write&ttl_days=30".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(lifetime_of(&ctx, "alice"), 30 * 86_400);
+        let entries = audit_entries(&ctx).await;
+        let mint = entries
+            .iter()
+            .find(|e| e["action"] == "token_mint")
+            .unwrap_or_else(|| panic!("no token_mint entry: {entries:?}"));
+        assert_eq!(mint["actor"], "alice");
+        assert_eq!(mint["artifact"], "alice");
+        let detail = mint["detail"].as_str().unwrap();
+        assert!(detail.contains("role=write"), "{detail}");
+        assert!(
+            detail.contains(&format!("ttl_secs={}", 30 * 86_400)),
+            "{detail}"
+        );
     }
 }

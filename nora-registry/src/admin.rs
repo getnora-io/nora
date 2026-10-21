@@ -241,10 +241,11 @@ async fn admin_create_token(
     };
 
     let role_label = role.to_string();
-    match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
+    let ttl_days = crate::tokens::granted_ttl_days(req.ttl_days);
+    match token_store.create_token(&req.username, ttl_days, req.description, role) {
         Ok(token) => {
             // Audit the mint with actor + target + role + ttl (never the token itself).
-            let detail = format!("role={} ttl_days={}", role_label, req.ttl_days);
+            let detail = format!("role={} ttl_days={}", role_label, ttl_days);
             state.audit.log(AuditEntry::new(
                 "admin_token_mint",
                 &caller.0,
@@ -254,7 +255,7 @@ async fn admin_create_token(
             ));
             Json(AdminCreateTokenResponse {
                 token,
-                expires_in_days: req.ttl_days,
+                expires_in_days: ttl_days,
             })
             .into_response()
         }

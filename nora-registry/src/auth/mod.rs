@@ -3127,7 +3127,8 @@ Jd74nq6dNCjpWG4drIsyhqX+
     /// #1094: a token minted by an OIDC identity through the UI must not outlive
     /// the provider's `max_token_lifetime_secs` (900s here). An unrestricted
     /// write identity (main-ref rule, provider `["*"]`) may mint — it is not
-    /// scope-refused — but the 3650-day request is capped to the 1-day floor.
+    /// scope-refused — but the 3650-day request is capped to the ceiling itself,
+    /// not rounded up to a day (R2-01).
     #[tokio::test]
     async fn test_oidc_minted_token_lifetime_capped_at_provider_ceiling() {
         let mock_server = MockServer::start().await;
@@ -3174,8 +3175,8 @@ Jd74nq6dNCjpWG4drIsyhqX+
         assert_eq!(entries.len(), 1, "exactly one token minted");
         let lifetime = entries[0].expires_at - entries[0].created_at;
         assert_eq!(
-            lifetime, 86_400,
-            "an OIDC-minted token outlived the provider ceiling: {lifetime}s (want 1 day)"
+            lifetime, 900,
+            "an OIDC-minted token outlived the provider ceiling: {lifetime}s (want 900s)"
         );
     }
 
