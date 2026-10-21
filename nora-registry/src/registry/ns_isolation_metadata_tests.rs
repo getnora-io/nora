@@ -1407,3 +1407,142 @@ async fn a_cpan_distribution_internal_by_its_author_path_stays_local() {
     .await;
     assert_eq!(other.status(), StatusCode::OK);
 }
+
+/// Terraform: every path an internal provider or module is served from — the registry protocol,
+/// its file downloads and the provider network mirror — answers 503 when the store cannot read
+/// the local copy.
+#[tokio::test]
+async fn an_internal_terraform_provider_or_module_on_a_store_that_cannot_be_read_is_503() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    let zip = "terraform-provider-infra_1.0.0_linux_amd64.zip";
+    let stored: Vec<(String, Vec<u8>)> = vec![
+        (
+            "terraform/providers/internalns/infra/versions.json".into(),
+            br#"{"versions":[{"version":"1.0.0","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"}]}]}"#.to_vec(),
+        ),
+        (
+            "terraform/providers/internalns/infra/1.0.0/linux_amd64.json".into(),
+            format!(r#"{{"os":"linux","arch":"amd64","filename":"{zip}","download_url":"http://nora/terraform/v1/providers/download/internalns/infra/1.0.0/{zip}","shasum":"00ff"}}"#).into_bytes(),
+        ),
+        (format!("terraform/download/internalns/infra/1.0.0/{zip}"), b"zip".to_vec()),
+        (
+            "terraform/modules/internalns/vpc/aws/versions.json".into(),
+            br#"{"modules":[{"versions":[{"version":"1.0.0"}]}]}"#.to_vec(),
+        ),
+        (
+            "terraform/modules/internalns/vpc/aws/1.0.0/_source_url".into(),
+            b"https://modules.example/vpc-1.0.0.tar.gz".to_vec(),
+        ),
+        (
+            "terraform/modules/internalns/vpc/aws/1.0.0/source.tar.gz".into(),
+            b"tgz".to_vec(),
+        ),
+    ];
+    let paths = [
+        (
+            "/terraform/v1/providers/internalns/infra/versions".to_string(),
+            StatusCode::OK,
+        ),
+        (
+            "/terraform/v1/providers/internalns/infra/1.0.0/download/linux/amd64".to_string(),
+            StatusCode::OK,
+        ),
+        (
+            format!("/terraform/v1/providers/download/internalns/infra/1.0.0/{zip}"),
+            StatusCode::OK,
+        ),
+        (
+            "/terraform/v1/modules/internalns/vpc/aws/versions".to_string(),
+            StatusCode::OK,
+        ),
+        (
+            "/terraform/v1/modules/internalns/vpc/aws/1.0.0/download".to_string(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "/terraform/v1/modules/download/internalns/vpc/aws/1.0.0/source".to_string(),
+            StatusCode::OK,
+        ),
+        (
+            "/terraform/registry.terraform.io/internalns/infra/index.json".to_string(),
+            StatusCode::OK,
+        ),
+        (
+            "/terraform/registry.terraform.io/internalns/infra/1.0.0.json".to_string(),
+            StatusCode::OK,
+        ),
+    ];
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.terraform.enabled = true;
+        c.terraform.proxy = Some(BLACKHOLE.to_string());
+    });
+    for (key, body) in &stored {
+        ctx.state.storage.put(key, body).await.unwrap();
+    }
+    let mut up = Vec::new();
+    for (path, expected) in &paths {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != *expected {
+            up.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        up.is_empty(),
+        "internal terraform objects not served from their local copy with the store up: {up:#?}"
+    );
+    outage.begin();
+    let mut wrong = Vec::new();
+    for (path, _) in &paths {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            wrong.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "internal terraform objects answered other than 503 with the store down: {wrong:#?}"
+    );
+}
+
+/// The network mirror lists every platform of an internal provider's version from its cached
+/// metadata: a platform whose metadata the store cannot read makes the answer 503, never a list
+/// that silently leaves the platform out.
+#[tokio::test]
+async fn an_internal_mirror_platform_whose_metadata_cannot_be_read_is_503_not_left_out() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.terraform.enabled = true;
+        c.terraform.proxy = Some(BLACKHOLE.to_string());
+    });
+    ctx.state
+        .storage
+        .put(
+            "terraform/providers/internalns/infra/versions.json",
+            br#"{"versions":[{"version":"1.0.0","platforms":[{"os":"linux","arch":"amd64"},{"os":"darwin","arch":"arm64"}]}]}"#,
+        )
+        .await
+        .unwrap();
+    for platform in ["linux_amd64", "darwin_arm64"] {
+        ctx.state
+            .storage
+            .put(
+                &format!("terraform/providers/internalns/infra/1.0.0/{platform}.json"),
+                format!(r#"{{"download_url":"http://nora/{platform}.zip","shasum":"00ff"}}"#)
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+    let path = "/terraform/registry.terraform.io/internalns/infra/1.0.0.json";
+    let both = send(&ctx.app, Method::GET, path, "").await;
+    assert_eq!(both.status(), StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_slice(&body_bytes(both).await).unwrap();
+    assert_eq!(listed["archives"].as_object().unwrap().len(), 2);
+    outage.fail_reads_of("/darwin_arm64.json");
+    let resp = send(&ctx.app, Method::GET, path, "").await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
