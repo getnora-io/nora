@@ -111,7 +111,9 @@ async fn handle_npm_post(
     // `200 {}`, which npm and yarn render as "0 vulnerabilities" (Pavel 10.10). 4xx,
     // not 5xx: pnpm retries a 5xx for about 70 s before failing anyway, and every
     // client prints the error text on a 4xx (kit npm-audit-matrix).
-    let forward_body: Vec<u8> = if !filter_active {
+    // A bulk body is always read: the names of packages published here are stripped from it
+    // whether or not a namespace filter is configured.
+    let forward_body: Vec<u8> = if !filter_active && !is_bulk {
         body.to_vec()
     } else if is_quick || is_full {
         return audit_refused(
@@ -150,14 +152,15 @@ async fn handle_npm_post(
                 )
             }
         };
-        match strip_internal_bulk(&plain, engine, &owned_scopes) {
-            Some(stripped) => stripped,
-            None => {
-                return audit_refused(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "audit body is not the expected JSON object of package versions",
-                )
-            }
+        let Some(stripped) = strip_internal_bulk(&plain, engine, &owned_scopes) else {
+            return audit_refused(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "audit body is not the expected JSON object of package versions",
+            );
+        };
+        match strip_published_bulk(&state, stripped).await {
+            Ok(stripped) => stripped,
+            Err(response) => return response,
         }
     };
 
@@ -299,6 +302,73 @@ fn strip_internal_bulk(
         // that still contains the internal names. Keep the invariant fail-closed.
         serde_json::to_vec(&map).ok()
     }
+}
+
+/// The most packages a bulk audit may name: each is a listing of the store to tell whether it is
+/// published here. Lockfiles of large monorepos name a few thousand.
+const NPM_AUDIT_MAX_PACKAGES: usize = 10_000;
+
+/// Strip the packages published here from a bulk-advisories body that [`strip_internal_bulk`]
+/// returned: a published name is NORA's, and an upstream that learns it can register it. The
+/// body is forwarded unchanged when it names none. A name whose published state cannot be read
+/// refuses the audit (503): forwarding it could hand the name over, and dropping it would hide
+/// its advisories.
+async fn strip_published_bulk(state: &AppState, body: Vec<u8>) -> Result<Vec<u8>, Response> {
+    use futures::StreamExt;
+    let Ok(mut map) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body)
+    else {
+        return Err(audit_refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "audit body is not the expected JSON object of package versions",
+        ));
+    };
+    if map.len() > NPM_AUDIT_MAX_PACKAGES {
+        return Err(audit_refused(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "audit body names more packages than NORA checks (10000)",
+        ));
+    }
+    let states: Vec<(String, Published)> = futures::stream::iter(map.keys().cloned())
+        .map(|name| async move {
+            // A name that is no valid key cannot be published here.
+            let prefix = format!("npm/{name}/versions/");
+            let published = match crate::validation::validate_storage_key(
+                crate::validation::listing_key(&prefix),
+            ) {
+                Ok(()) => published_state(&state.storage, &name).await,
+                Err(_) => Published::No,
+            };
+            (name, published)
+        })
+        .buffer_unordered(32)
+        .collect()
+        .await;
+    let mut stripped = false;
+    for (name, published) in states {
+        match published {
+            Published::Yes(_) => {
+                map.remove(&name);
+                stripped = true;
+            }
+            Published::No => {}
+            Published::Unknown => {
+                return Err(crate::registry::storage_unavailable(
+                    "npm",
+                    &format!("npm/{name}/versions/"),
+                ))
+            }
+        }
+    }
+    if !stripped {
+        return Ok(body);
+    }
+    serde_json::to_vec(&map).map_err(|e| {
+        tracing::error!(error = %e, "npm audit: re-serializing the stripped body failed");
+        audit_refused(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audit body could not be re-serialized",
+        )
+    })
 }
 
 /// GitHub Packages' tarball path, `download/<@scope/name>/<version>/<sha1>`: the package
@@ -696,6 +766,14 @@ async fn handle_request(
         &package_name,
     ) {
         return response;
+    }
+
+    // A tarball of a published package that NORA does not store is no version of it: the upstream
+    // is not asked, so what it has under the name is neither served nor stored beside the published
+    // versions (as for cargo, #1158). The packument lists the published versions only, so only a
+    // direct or locked URL gets here.
+    if let Published::Yes(_) = published_state(&state.storage, &package_name).await {
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     // --- Proxy fetch path ---
@@ -8666,5 +8744,201 @@ mod publish_attachments {
             stored(&ctx, "@s/pkg").await["npm/@s/pkg/tarballs/pkg-1.0.1.tgz"],
             b"next"
         );
+    }
+}
+
+/// A package published here is NORA's: its name is never an upstream's to answer for (R2-20). A
+/// tarball of it that NORA does not store is no version of it — the upstream is not asked, so a
+/// squatter's bytes are neither served nor stored beside the published ones — and a bulk audit
+/// does not hand its name to the upstream.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod published_names_stay_local {
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, create_test_context_with_storage_and_config,
+        outage_storage, send, send_with_headers, TestContext,
+    };
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use base64::Engine;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const BULK: &str = "/npm/-/npm/v1/security/advisories/bulk";
+
+    async fn recording_upstream() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    async fn publish(ctx: &TestContext, name: &str, version: &str) {
+        let short = name.rsplit('/').next().unwrap();
+        let payload = serde_json::json!({
+            "name": name,
+            "versions": { version: { "name": name, "version": version, "dist": {} } },
+            "_attachments": { format!("{short}-{version}.tgz"): {
+                "data": base64::engine::general_purpose::STANDARD.encode(b"published"),
+            } },
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/npm/{name}"),
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    async fn asked(upstream: &MockServer) -> Vec<String> {
+        upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_tarball_a_published_package_does_not_store_is_not_fetched() {
+        let upstream = recording_upstream().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxy = Some(uri));
+        publish(&ctx, "corp-lib", "1.0.0").await;
+        publish(&ctx, "@corp/lib", "1.0.0").await;
+
+        for path in [
+            "/npm/corp-lib/-/corp-lib-9.9.9.tgz",
+            "/npm/@corp/lib/-/lib-9.9.9.tgz",
+            "/npm/download/@corp/lib/9.9.9/0123abcd",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+        let tarballs = ctx
+            .state
+            .storage
+            .list("npm/corp-lib/tarballs/")
+            .await
+            .unwrap();
+        assert!(
+            tarballs.iter().all(|key| !key.contains("9.9.9")),
+            "{tarballs:?}"
+        );
+
+        // Controls: the published version is served from its own bytes, and a package that is
+        // not published is still fetched from the upstream.
+        let own = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/corp-lib/-/corp-lib-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(own.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(own).await[..], b"published");
+        let other = send(&ctx.app, Method::GET, "/npm/other/-/other-1.0.0.tgz", "").await;
+        assert_eq!(other.status(), StatusCode::OK);
+        assert!(asked(&upstream)
+            .await
+            .contains(&"/other/-/other-1.0.0.tgz".to_string()));
+    }
+
+    /// The JSON object the upstream received as the bulk audit body.
+    async fn forwarded(upstream: &MockServer) -> serde_json::Value {
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "one audit forwarded");
+        serde_json::from_slice(&requests[0].body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_bulk_audit_does_not_name_a_published_package_to_the_upstream() {
+        let body = serde_json::json!({
+            "corp-lib": ["1.0.0"],
+            "@corp/lib": ["1.0.0"],
+            "plain-pkg": ["1.0.0"],
+        });
+        let gzipped = {
+            use std::io::Write;
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            gz.write_all(body.to_string().as_bytes()).unwrap();
+            gz.finish().unwrap()
+        };
+        // Without a namespace filter, and with one that does not cover the published names.
+        for filter in [vec![], vec!["@internal/*".to_string()]] {
+            for gzip in [false, true] {
+                let upstream = recording_upstream().await;
+                let uri = upstream.uri();
+                let namespaces = filter.clone();
+                let ctx = create_test_context_with_config(move |cfg| {
+                    cfg.npm.proxy = Some(uri);
+                    cfg.curation.internal_namespaces = namespaces;
+                });
+                publish(&ctx, "corp-lib", "1.0.0").await;
+                publish(&ctx, "@corp/lib", "1.0.0").await;
+                let resp = if gzip {
+                    send_with_headers(
+                        &ctx.app,
+                        Method::POST,
+                        BULK,
+                        vec![("content-encoding", "gzip")],
+                        gzipped.clone(),
+                    )
+                    .await
+                } else {
+                    send(&ctx.app, Method::POST, BULK, body.to_string()).await
+                };
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::OK,
+                    "filter {filter:?} gzip {gzip}"
+                );
+                assert_eq!(
+                    forwarded(&upstream).await,
+                    serde_json::json!({ "plain-pkg": ["1.0.0"] }),
+                    "filter {filter:?} gzip {gzip}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bulk_audit_naming_no_published_package_is_forwarded_as_sent() {
+        let upstream = recording_upstream().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxy = Some(uri));
+        publish(&ctx, "corp-lib", "1.0.0").await;
+        let sent = r#"{"plain-pkg":["1.0.0"],"lodash":["4.17.0"]}"#;
+        let resp = send(&ctx.app, Method::POST, BULK, sent).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(&requests[0].body[..], sent.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_bulk_audit_is_refused_while_the_store_cannot_tell_what_is_published() {
+        let upstream = recording_upstream().await;
+        let uri = upstream.uri();
+        let (storage, outage) = outage_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.npm.proxy = Some(uri)
+        });
+        publish(&ctx, "corp-lib", "1.0.0").await;
+        outage.begin();
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            BULK,
+            r#"{"corp-lib":["1.0.0"],"plain-pkg":["1.0.0"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
     }
 }
