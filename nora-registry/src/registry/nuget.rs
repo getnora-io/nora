@@ -936,7 +936,10 @@ async fn flatcontainer_download(
     // The quarantine takes a release date only when upstream dates are trusted (#750). Without
     // trust the date above is a cached registration's age — when NORA last wrote a listing, not
     // when it first fetched these bytes — so the quarantine keeps its own clock.
-    let first_seen = publish_date.filter(|_| state.config.server.trust_upstream_dates);
+    let first_seen = crate::digest_quarantine::first_seen_seed(
+        state.config.server.trust_upstream_dates,
+        publish_date,
+    );
     let content_type = if ends_with_ci(filename, ".nuspec") {
         "application/xml"
     } else {

@@ -338,6 +338,14 @@ pub fn proxy_gate(
     )
 }
 
+/// The first-seen a proxy handler gives [`proxy_gate_dated`]: its release date, only when upstream
+/// dates are trusted (#750). Without trust a handler's date is NORA's cache-age of a metadata file —
+/// when NORA last wrote a listing, not when it first fetched these bytes — and taken as first-seen
+/// it would let a file fetched now pass as mature, so the quarantine keeps its own clock.
+pub fn first_seen_seed(trust_upstream_dates: bool, release_date: Option<i64>) -> Option<i64> {
+    release_date.filter(|_| trust_upstream_dates)
+}
+
 /// Like [`proxy_gate`], but seeds the first-seen clock from a trusted upstream
 /// release date (#750). When `trusted_first_seen` is `Some` — only when
 /// `server.trust_upstream_dates` is set and the registry caches a date — an

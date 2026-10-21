@@ -470,7 +470,10 @@ async fn download_file(
             &q_mode,
             q_secs,
             "cache",
-            publish_date,
+            crate::digest_quarantine::first_seen_seed(
+                state.config.server.trust_upstream_dates,
+                publish_date,
+            ),
         ) {
             return resp;
         }
@@ -618,7 +621,10 @@ async fn download_file(
                     &q_mode,
                     q_secs,
                     &file_url,
-                    publish_date,
+                    crate::digest_quarantine::first_seen_seed(
+                        state.config.server.trust_upstream_dates,
+                        publish_date,
+                    ),
                 ) {
                     return resp;
                 }
@@ -4430,11 +4436,11 @@ mod release_age_without_the_json_index {
         );
     }
 
-    /// The cached listing dates only the files it names. A release that came after it was
-    /// never seen by NORA at that time: dating it by the listing's age would let the
-    /// quarantine record it as first seen a month ago.
+    /// Without trusted dates the quarantine counts from NORA's first fetch of a file, whether
+    /// or not a cached listing names it: the listing's age says when NORA wrote it, not when it
+    /// first fetched these bytes.
     #[tokio::test]
-    async fn a_release_after_the_cached_listing_is_not_dated_by_it() {
+    async fn without_trusted_dates_a_cached_listing_does_not_date_the_quarantine() {
         let up = upstream(
             &[
                 ("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z")),
@@ -4448,15 +4454,53 @@ mod release_age_without_the_json_index {
             cfg.curation.quarantine_ttl = Some("7d".to_string());
         });
         cached_listing(&ctx, r#"{"foo-1.0.tar.gz":"2019-01-01T00:00:00Z"}"#, 30).await;
+        for file in ["foo-2.0.tar.gz", "foo-1.0.tar.gz"] {
+            assert_eq!(
+                index_then_download(&ctx, PIP_HTML, file).await,
+                StatusCode::FORBIDDEN,
+                "{file}: first fetched now, held for 7d whatever the listing's age"
+            );
+        }
+    }
+
+    /// A file cached before the quarantine recorded it is counted from now on the cache path.
+    #[tokio::test]
+    async fn a_file_cached_before_the_quarantine_saw_it_counts_from_now() {
+        let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
+        let ctx = context(&up, false, |cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".to_string());
+        });
+        cached_listing(&ctx, r#"{"foo-1.0.tar.gz":"2019-01-01T00:00:00Z"}"#, 30).await;
+        ctx.state
+            .storage
+            .put("pypi/foo/foo-1.0.tar.gz", b"BYTES foo-1.0.tar.gz")
+            .await
+            .unwrap();
         assert_eq!(
-            index_then_download(&ctx, PIP_HTML, "foo-2.0.tar.gz").await,
-            StatusCode::FORBIDDEN,
-            "a file first seen now is held for 7d"
+            send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "")
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
         );
+        assert!(!crate::test_helpers::upstream_paths(&up)
+            .await
+            .iter()
+            .any(|p| p.starts_with("/files/")));
+    }
+
+    /// With trusted dates the upload time seeds the quarantine (#750): a file uploaded years
+    /// ago is not held as new to this mirror.
+    #[tokio::test]
+    async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
+        let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
+        let ctx = context(&up, true, |cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".to_string());
+        });
         assert_eq!(
             index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
-            StatusCode::OK,
-            "a file NORA saw listed 30 days ago has matured"
+            StatusCode::OK
         );
     }
 

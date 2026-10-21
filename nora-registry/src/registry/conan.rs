@@ -453,7 +453,10 @@ async fn recipe_file_download(
             &q_mode,
             q_secs,
             "cache",
-            publish_date,
+            crate::digest_quarantine::first_seen_seed(
+                state.config.server.trust_upstream_dates,
+                publish_date,
+            ),
         ) {
             return resp;
         }
@@ -568,7 +571,10 @@ async fn recipe_file_download(
                 &q_mode,
                 q_secs,
                 &url,
-                publish_date,
+                crate::digest_quarantine::first_seen_seed(
+                    state.config.server.trust_upstream_dates,
+                    publish_date,
+                ),
             ) {
                 return resp;
             }
@@ -901,7 +907,10 @@ async fn package_file_download(
             &q_mode,
             q_secs,
             "cache",
-            publish_date,
+            crate::digest_quarantine::first_seen_seed(
+                state.config.server.trust_upstream_dates,
+                publish_date,
+            ),
         ) {
             return resp;
         }
@@ -1018,7 +1027,10 @@ async fn package_file_download(
                 &q_mode,
                 q_secs,
                 &url,
-                publish_date,
+                crate::digest_quarantine::first_seen_seed(
+                    state.config.server.trust_upstream_dates,
+                    publish_date,
+                ),
             ) {
                 return resp;
             }
@@ -2079,5 +2091,124 @@ mod per_conan_client {
         }
         let sent = upstream_paths(&up).await;
         assert!(sent.iter().all(|path| !is_file(path)), "{sent:?}");
+    }
+}
+
+/// Without trusted upstream dates the quarantine counts from NORA's own first fetch of an
+/// artifact's bytes: metadata cached a month ago says when NORA last wrote it, not when it first
+/// fetched this file, and its age would let a file first fetched now pass as mature. With trusted
+/// dates the release date seeds it (#750), so an old release is not held as new to this mirror.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod quarantine_first_seen {
+    use crate::test_helpers::{
+        create_test_context_with_config, put_written_days_ago, quarantine_7d, send, TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn serve(up: &MockServer, at: &str, body: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(up)
+            .await;
+    }
+
+    async fn status(ctx: &TestContext, uri: &str) -> StatusCode {
+        send(&ctx.app, Method::GET, uri, "").await.status()
+    }
+
+    const REV: &str = "0123456789abcdef0123456789abcdef";
+    const LATEST: &[u8] =
+        br#"{"revision":"0123456789abcdef0123456789abcdef","time":"2019-01-01T00:00:00.000+0000"}"#;
+
+    fn recipe_file() -> String {
+        format!("/conan/v2/conans/oldlib/1.0/_/_/revisions/{REV}/files/conan_export.tgz")
+    }
+
+    fn package_file() -> String {
+        format!(
+            "/conan/v2/conans/oldlib/1.0/_/_/revisions/{REV}/packages/{REV}/revisions/{REV}/files/conan_package.tgz"
+        )
+    }
+
+    async fn context(trust: bool) -> (MockServer, TestContext) {
+        let up = MockServer::start().await;
+        serve(
+            &up,
+            &format!("/v2/conans/oldlib/1.0/_/_/revisions/{REV}/files/conan_export.tgz"),
+            b"RECIPE".to_vec(),
+        )
+        .await;
+        serve(
+            &up,
+            &format!("/v2/conans/oldlib/1.0/_/_/revisions/{REV}/packages/{REV}/revisions/{REV}/files/conan_package.tgz"),
+            b"PACKAGE".to_vec(),
+        )
+        .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.conan.enabled = true;
+            cfg.conan.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = trust;
+            quarantine_7d(cfg);
+        });
+        put_written_days_ago(&ctx, "conan/oldlib/1.0/_/_/latest.json", LATEST, 30).await;
+        (up, ctx)
+    }
+
+    #[tokio::test]
+    async fn without_trusted_dates_a_cached_latest_does_not_date_the_quarantine() {
+        let (_up, ctx) = context(false).await;
+        assert_eq!(
+            status(&ctx, &recipe_file()).await,
+            StatusCode::FORBIDDEN,
+            "recipe"
+        );
+        assert_eq!(
+            status(&ctx, &package_file()).await,
+            StatusCode::FORBIDDEN,
+            "package"
+        );
+    }
+
+    /// Files cached before the quarantine recorded them are counted from now on the cache path.
+    #[tokio::test]
+    async fn a_file_cached_before_the_quarantine_saw_it_counts_from_now() {
+        let (up, ctx) = context(false).await;
+        let base = format!("conan/oldlib/1.0/_/_/revisions/{REV}");
+        put_written_days_ago(
+            &ctx,
+            &format!("{base}/files/conan_export.tgz"),
+            b"RECIPE",
+            30,
+        )
+        .await;
+        let package = format!("{base}/packages/{REV}/revisions/{REV}/files/conan_package.tgz");
+        put_written_days_ago(&ctx, &package, b"PACKAGE", 30).await;
+        assert_eq!(
+            status(&ctx, &recipe_file()).await,
+            StatusCode::FORBIDDEN,
+            "recipe"
+        );
+        assert_eq!(
+            status(&ctx, &package_file()).await,
+            StatusCode::FORBIDDEN,
+            "package"
+        );
+        assert!(crate::test_helpers::upstream_paths(&up).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
+        let (_up, ctx) = context(true).await;
+        assert_eq!(status(&ctx, &recipe_file()).await, StatusCode::OK, "recipe");
+        assert_eq!(
+            status(&ctx, &package_file()).await,
+            StatusCode::OK,
+            "package"
+        );
     }
 }

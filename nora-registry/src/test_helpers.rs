@@ -735,6 +735,26 @@ pub async fn artifact_counts(ctx: &TestContext, registry: &str) -> ArtifactCount
     }
 }
 
+/// Store `body` at `key` as NORA would have written it `days` ago: a cache an earlier request
+/// filled, as a reader of its modification time sees it. Local storage only.
+pub async fn put_written_days_ago(ctx: &TestContext, key: &str, body: &[u8], days: u64) {
+    ctx.state.storage.put(key, body).await.unwrap();
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400);
+    std::fs::File::options()
+        .write(true)
+        .open(std::path::Path::new(&ctx.state.config.storage.path).join(key))
+        .unwrap()
+        .set_modified(then)
+        .unwrap();
+}
+
+/// Quarantine every proxied artifact for 7 days, curation on.
+pub fn quarantine_7d(cfg: &mut Config) {
+    cfg.curation.mode = crate::config::CurationMode::Enforce;
+    cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+    cfg.curation.quarantine_ttl = Some("7d".to_string());
+}
+
 /// The path of every request an upstream mock has received, in order.
 pub async fn upstream_paths(upstream: &wiremock::MockServer) -> Vec<String> {
     upstream
