@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -105,6 +106,14 @@ pub struct TokenStore {
     cache_ttl: Duration,
     /// Pending last_used updates: file_id_prefix -> timestamp (flushed periodically)
     pending_last_used: Arc<RwLock<HashMap<String, u64>>>,
+    /// Held to rewrite an existing token file or to remove one, so a rewrite
+    /// (the last_used flush, the legacy-hash migration) that read the file
+    /// before a revoke cannot put it back after the revoke removed it.
+    file_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Bumped by every revoke, under the cache lock. A verify reads it before
+    /// it reads the token file and caches its result only if no revoke came in
+    /// between, so a verify racing a revoke cannot cache the revoked token.
+    revocations: Arc<AtomicU64>,
 }
 
 impl TokenStore {
@@ -137,6 +146,8 @@ impl TokenStore {
             cache: Arc::new(RwLock::new(HashMap::new())),
             cache_ttl,
             pending_last_used: Arc::new(RwLock::new(HashMap::new())),
+            file_lock: Arc::new(tokio::sync::Mutex::new(())),
+            revocations: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -216,7 +227,9 @@ impl TokenStore {
             }
         }
 
-        // Slow path: read from disk and verify Argon2
+        // Slow path: read from disk and verify Argon2. A revoke after this
+        // point keeps the result out of the cache (see `revocations`).
+        let revocations = self.revocations.load(Ordering::SeqCst);
         let file_path = self.storage_path.join(format!("{}.json", &cache_key[..16]));
 
         let content = match fs::read_to_string(&file_path) {
@@ -237,11 +250,17 @@ impl TokenStore {
             // Legacy SHA256 hash (no salt) — verify and migrate
             let legacy_hash = sha256_hex(token);
             if info.token_hash == legacy_hash {
-                // Migrate to Argon2id
+                // Migrate to Argon2id. Best effort: skipped while another
+                // rewrite or a revoke holds the file, and when a revoke
+                // removed the file since it was read; a later verify retries.
                 if let Ok(new_hash) = hash_token_argon2(token) {
                     info.token_hash = new_hash;
                     if let Ok(json) = serde_json::to_string_pretty(&info) {
-                        let _ = write_token_file(&file_path, &json);
+                        if let Ok(_file) = self.file_lock.try_lock() {
+                            if file_path.exists() {
+                                let _ = write_token_file(&file_path, &json);
+                            }
+                        }
                     }
                 }
                 true
@@ -264,16 +283,22 @@ impl TokenStore {
             return Err(TokenError::Expired);
         }
 
-        // Populate cache (key must match lookup at line 180: full 64-char SHA-256 hex)
-        self.cache.write().insert(
-            cache_key.clone(),
-            CachedToken {
-                user: info.user.clone(),
-                role: info.role.clone(),
-                expires_at: info.expires_at,
-                cached_at: Instant::now(),
-            },
-        );
+        // Populate cache (key must match the fast-path lookup: full 64-char
+        // SHA-256 hex), unless a revoke came in since the file was read.
+        {
+            let mut cache = self.cache.write();
+            if self.revocations.load(Ordering::SeqCst) == revocations {
+                cache.insert(
+                    cache_key.clone(),
+                    CachedToken {
+                        user: info.user.clone(),
+                        role: info.role.clone(),
+                        expires_at: info.expires_at,
+                        cached_at: Instant::now(),
+                    },
+                );
+            }
+        }
 
         // Schedule deferred last_used update
         self.pending_last_used
@@ -343,6 +368,9 @@ impl TokenStore {
 
         for (file_prefix, timestamp) in &pending {
             let file_path = self.storage_path.join(format!("{}.json", file_prefix));
+            // From the read to the rename: a revoke waits, so it removes the
+            // rewritten file instead of being undone by it.
+            let _file = self.file_lock.lock().await;
             let content = match tokio::fs::read_to_string(&file_path).await {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -374,9 +402,9 @@ impl TokenStore {
     /// Cache keys are full 64-char SHA-256 hex; revoke only knows the 16-char prefix,
     /// so we must scan for matching entries.
     fn invalidate_cache(&self, hash_prefix: &str) {
-        self.cache
-            .write()
-            .retain(|k, _| !k.starts_with(hash_prefix));
+        let mut cache = self.cache.write();
+        cache.retain(|k, _| !k.starts_with(hash_prefix));
+        self.revocations.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Revoke a token by its hash prefix.
@@ -384,12 +412,16 @@ impl TokenStore {
     /// `hash_prefix` must be exactly 16 lowercase hexadecimal characters (the
     /// first 16 chars of SHA-256(token)). Anything else is rejected to prevent
     /// path-traversal attacks via crafted prefixes like `../../etc/passwd`.
-    pub fn revoke_token(&self, hash_prefix: &str) -> Result<(), TokenError> {
+    ///
+    /// Waits for a running rewrite of the file (the last_used flush), so the
+    /// revoke is never undone by it; once this returns the token is refused.
+    pub async fn revoke_token(&self, hash_prefix: &str) -> Result<(), TokenError> {
         // SECURITY: validate format before building filesystem path
         if !is_valid_hash_prefix(hash_prefix) {
             return Err(TokenError::NotFound);
         }
         let file_path = self.storage_path.join(format!("{}.json", hash_prefix));
+        let _file = self.file_lock.lock().await;
 
         // TOCTOU fix: try remove directly
         match fs::remove_file(&file_path) {
@@ -402,9 +434,11 @@ impl TokenStore {
         }
     }
 
-    /// Revoke all tokens for a user
-    pub fn revoke_all_for_user(&self, user: &str) -> usize {
+    /// Revoke all tokens for a user. Waits for a running rewrite of a token
+    /// file, like [`TokenStore::revoke_token`].
+    pub async fn revoke_all_for_user(&self, user: &str) -> usize {
         let mut count = 0;
+        let _files = self.file_lock.lock().await;
 
         if let Ok(entries) = fs::read_dir(&self.storage_path) {
             for entry in entries.flatten() {
@@ -420,7 +454,9 @@ impl TokenStore {
 
         // Evict cached entries for this user so revoked tokens fail immediately
         if count > 0 {
-            self.cache.write().retain(|_, v| v.user != user);
+            let mut cache = self.cache.write();
+            cache.retain(|_, v| v.user != user);
+            self.revocations.fetch_add(1, Ordering::SeqCst);
         }
 
         count
@@ -537,7 +573,7 @@ mod tests {
         // A revokes it (removes the on-disk token + clears A's cache). B's cache is
         // untouched — there is no cross-pod invalidation.
         let hash_prefix = sha256_hex(&token)[..16].to_string();
-        replica_a.revoke_token(&hash_prefix).unwrap();
+        futures::executor::block_on(replica_a.revoke_token(&hash_prefix)).unwrap();
 
         // WITHIN cache_ttl, B still serves the revoked token from cache — the
         // documented window.
@@ -742,7 +778,7 @@ mod tests {
         let file_id = &entries[0].file_id;
 
         // Revoke using file_id from list
-        store.revoke_token(file_id).unwrap();
+        futures::executor::block_on(store.revoke_token(file_id)).unwrap();
 
         // Token should be gone
         assert!(store.verify_token(&token).is_err());
@@ -762,7 +798,7 @@ mod tests {
 
         assert!(store.verify_token(&token).is_ok());
 
-        store.revoke_token(hash_prefix).unwrap();
+        futures::executor::block_on(store.revoke_token(hash_prefix)).unwrap();
 
         let result = store.verify_token(&token);
         assert!(matches!(result, Err(TokenError::NotFound)));
@@ -773,7 +809,7 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
 
-        let result = store.revoke_token("nonexistent12345");
+        let result = futures::executor::block_on(store.revoke_token("nonexistent12345"));
         assert!(matches!(result, Err(TokenError::NotFound)));
     }
 
@@ -786,7 +822,7 @@ mod tests {
         store.create_token("user1", 30, None, Role::Write).unwrap();
         store.create_token("user2", 30, None, Role::Read).unwrap();
 
-        let revoked = store.revoke_all_for_user("user1");
+        let revoked = futures::executor::block_on(store.revoke_all_for_user("user1"));
         assert_eq!(revoked, 2);
 
         assert_eq!(store.list_tokens("user1").len(), 0);
@@ -866,7 +902,7 @@ mod tests {
         assert!(store.verify_token(&token).is_ok());
 
         // Revoke
-        store.revoke_token(hash_prefix).unwrap();
+        futures::executor::block_on(store.revoke_token(hash_prefix)).unwrap();
 
         // Cache should be invalidated
         let result = store.verify_token(&token);
@@ -889,7 +925,7 @@ mod tests {
         assert_eq!(store.cache.read().len(), 3);
 
         // Revoke all tokens for alice
-        let revoked = store.revoke_all_for_user("alice");
+        let revoked = futures::executor::block_on(store.revoke_all_for_user("alice"));
         assert_eq!(revoked, 2);
 
         // Alice's cache entries should be gone, bob's should remain
@@ -992,6 +1028,115 @@ mod tests {
         assert!(cold.verify_token(&token).is_ok());
     }
 
+    /// A token revoked while `flush_last_used` is rewriting its file stays
+    /// revoked: the flush must not put the file back. The flush is started
+    /// first and has read the file when the revoke runs (X01).
+    #[tokio::test]
+    async fn revoke_during_flush_stays_revoked() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+        let token = store.create_token("alice", 30, None, Role::Write).unwrap();
+        // Schedules a pending last_used update for the flush to write.
+        store.verify_token(&token).unwrap();
+        let prefix = sha256_hex(&token)[..16].to_string();
+        let file = temp_dir.path().join(format!("{prefix}.json"));
+
+        let mut flush = Box::pin(store.flush_last_used());
+        // One poll starts the flush: it reads the token file off the runtime
+        // and yields; the sleep lets that read finish.
+        assert!(futures::poll!(flush.as_mut()).is_pending());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The revoke is polled first, so it runs before the flush resumes.
+        let revoke = async { store.revoke_token(&prefix).await };
+        let (revoked, ()) = tokio::join!(revoke, flush);
+
+        revoked.unwrap();
+        assert!(!file.exists(), "the flush put a revoked token file back");
+        assert!(
+            matches!(store.verify_token(&token), Err(TokenError::NotFound)),
+            "a revoked token verifies again after the flush"
+        );
+        assert!(
+            TokenStore::new(temp_dir.path())
+                .verify_token(&token)
+                .is_err(),
+            "a revoked token verifies from disk after the flush"
+        );
+    }
+
+    /// A verify that read the token file before a revoke and finishes after it
+    /// must not leave the token in the verify cache: the next verify on the
+    /// same store refuses it. The Argon2 check of a cold verify takes long
+    /// enough for the revoke to land inside it.
+    #[test]
+    fn verify_racing_revoke_leaves_nothing_cached() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+        let token = store.create_token("alice", 30, None, Role::Write).unwrap();
+        let prefix = sha256_hex(&token)[..16].to_string();
+
+        let verifier = {
+            let store = store.clone();
+            let token = token.clone();
+            std::thread::spawn(move || store.verify_token(&token))
+        };
+        std::thread::sleep(Duration::from_millis(20));
+        futures::executor::block_on(store.revoke_token(&prefix)).unwrap();
+        // Whatever the racing verify answered, it was before the revoke.
+        let _ = verifier.join().unwrap();
+
+        assert!(
+            matches!(store.verify_token(&token), Err(TokenError::NotFound)),
+            "a verify racing the revoke cached the revoked token"
+        );
+    }
+
+    /// The legacy-hash migration rewrites the token file on a verify; a revoke
+    /// landing between its read and its write must stay in force: the
+    /// migration must not put the file back.
+    #[test]
+    fn legacy_migration_racing_revoke_does_not_resurrect() {
+        let temp_dir = TempDir::new().unwrap();
+        let raw_token = "nra_0123456789abcdef0123456789abcdef";
+        let prefix = sha256_hex(raw_token)[..16].to_string();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let info = TokenInfo {
+            token_hash: sha256_hex(raw_token),
+            user: "legacyuser".to_string(),
+            created_at: now,
+            expires_at: now + 86400,
+            last_used: None,
+            description: None,
+            role: Role::Write,
+        };
+        let file = temp_dir.path().join(format!("{prefix}.json"));
+        fs::write(&file, serde_json::to_string_pretty(&info).unwrap()).unwrap();
+
+        let store = TokenStore::new(temp_dir.path());
+        let verifier = {
+            let store = store.clone();
+            std::thread::spawn(move || store.verify_token(raw_token))
+        };
+        // The migration hashes with Argon2 between its read and its write.
+        std::thread::sleep(Duration::from_millis(20));
+        futures::executor::block_on(store.revoke_token(&prefix)).unwrap();
+        let _ = verifier.join().unwrap();
+
+        assert!(
+            !file.exists(),
+            "the migration put a revoked token file back"
+        );
+        assert!(
+            TokenStore::new(temp_dir.path())
+                .verify_token(raw_token)
+                .is_err(),
+            "a revoked legacy token verifies from disk after the migration"
+        );
+    }
+
     #[test]
     fn test_revoke_rejects_path_traversal() {
         let temp_dir = TempDir::new().unwrap();
@@ -1002,11 +1147,11 @@ mod tests {
         let _ = std::fs::write(&decoy, "should not be deleted");
 
         // Attempt path traversal
-        let result = store.revoke_token("../decoy");
+        let result = futures::executor::block_on(store.revoke_token("../decoy"));
         assert!(matches!(result, Err(TokenError::NotFound)));
-        let result = store.revoke_token("../../etc/passwd");
+        let result = futures::executor::block_on(store.revoke_token("../../etc/passwd"));
         assert!(matches!(result, Err(TokenError::NotFound)));
-        let result = store.revoke_token("");
+        let result = futures::executor::block_on(store.revoke_token(""));
         assert!(matches!(result, Err(TokenError::NotFound)));
     }
 }

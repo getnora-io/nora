@@ -264,7 +264,7 @@ async fn revoke_token(
         return (StatusCode::NOT_FOUND, "Token not found").into_response();
     }
 
-    match token_store.revoke_token(&req.hash_prefix) {
+    match token_store.revoke_token(&req.hash_prefix).await {
         Ok(()) => (StatusCode::OK, "Token revoked").into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }

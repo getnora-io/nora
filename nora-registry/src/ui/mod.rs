@@ -1179,7 +1179,7 @@ async fn tokens_revoke(
         return (StatusCode::NOT_FOUND, Html("Token not found".to_string()));
     }
 
-    match store.revoke_token(&file_id) {
+    match store.revoke_token(&file_id).await {
         Ok(()) => {
             // Return refreshed token list (same owner-scope as the list view)
             let tokens = if is_admin {
