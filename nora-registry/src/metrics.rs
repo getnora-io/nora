@@ -43,6 +43,16 @@ pub static TASK_PANICS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create TASK_PANICS_TOTAL metric at startup")
 });
 
+/// Maintenance ticks cut at their deadline, mostly because the store did not answer. The
+/// loop goes on; `/ready` says whether the store is reachable.
+pub static MAINTENANCE_TIMEOUTS_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
+        "nora_maintenance_timeouts_total",
+        "Maintenance ticks cut at their deadline"
+    )
+    .expect("failed to create MAINTENANCE_TIMEOUTS_TOTAL metric at startup")
+});
+
 /// Curation engine decisions, by effective outcome. Makes allow/deny visible in
 /// telemetry — previously curation only kept internal counters, so an operator
 /// could not see from Prometheus how often curation allowed vs blocked.

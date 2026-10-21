@@ -690,8 +690,8 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
 // ── Storage outage ──────────────────────────────────────────────────────────
 
-/// The switch of an [`outage_storage`]: up, down, failing object reads only, or failing the
-/// reads of some keys.
+/// The switch of an [`outage_storage`]: up, down, silent, failing object reads only, or
+/// failing the reads of some keys.
 #[derive(Clone)]
 pub struct StorageOutage(
     Arc<std::sync::atomic::AtomicU8>,
@@ -702,6 +702,7 @@ const STORE_UP: u8 = 0;
 const STORE_DOWN: u8 = 1;
 const STORE_READS_FAIL: u8 = 2;
 const STORE_READS_OF_FAIL: u8 = 3;
+const STORE_SILENT: u8 = 4;
 
 impl StorageOutage {
     /// Take the store down: every read, listing and write fails from now on.
@@ -721,8 +722,27 @@ impl StorageOutage {
         self.0.store(STORE_READS_OF_FAIL, Ordering::SeqCst);
     }
 
+    /// Make the store silent: every operation waits, as on a store that accepted the
+    /// connection and never answers, until [`Self::end`].
+    pub fn silence(&self) {
+        self.0.store(STORE_SILENT, Ordering::SeqCst);
+    }
+
+    /// Bring the store back: operations waiting on a silent store go on, and every later one
+    /// is answered.
+    pub fn end(&self) {
+        self.0.store(STORE_UP, Ordering::SeqCst);
+    }
+
     fn mode(&self) -> u8 {
         self.0.load(Ordering::SeqCst)
+    }
+
+    /// Wait while the store is silent.
+    async fn wait_answer(&self) {
+        while self.mode() == STORE_SILENT {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 }
 
@@ -780,31 +800,37 @@ impl OutageBackend {
 #[async_trait::async_trait]
 impl crate::storage::StorageBackend for OutageBackend {
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+        self.outage.wait_answer().await;
         self.check()?;
         self.inner.put(key, data, sha256).await
     }
 
     async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        self.outage.wait_answer().await;
         self.check_read(key)?;
         self.inner.get(key).await
     }
 
     async fn pin(&self, key: &str) -> Option<String> {
+        self.outage.wait_answer().await;
         self.check().ok()?;
         self.inner.pin(key).await
     }
 
     async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+        self.outage.wait_answer().await;
         self.check()?;
         self.inner.delete(key).await
     }
 
     async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+        self.outage.wait_answer().await;
         self.check()?;
         self.inner.list(prefix).await
     }
 
     async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
+        self.outage.wait_answer().await;
         self.check().ok()?;
         self.inner.stat(key).await
     }
@@ -813,6 +839,7 @@ impl crate::storage::StorageBackend for OutageBackend {
         &self,
         prefix: &str,
     ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
+        self.outage.wait_answer().await;
         self.check()?;
         self.inner.list_with_meta(prefix).await
     }
@@ -825,6 +852,14 @@ impl crate::storage::StorageBackend for OutageBackend {
         self.inner.total_size().await
     }
 
+    /// A store that is down refreshes nothing: its cached reachability goes stale.
+    async fn refresh_total_size(&self) {
+        self.outage.wait_answer().await;
+        if self.check().is_ok() {
+            self.inner.refresh_total_size().await;
+        }
+    }
+
     fn backend_name(&self) -> &'static str {
         "outage-test-store"
     }
@@ -835,11 +870,13 @@ impl crate::storage::StorageBackend for OutageBackend {
         src: &std::path::Path,
         sha256: Option<&str>,
     ) -> crate::storage::Result<()> {
+        self.outage.wait_answer().await;
         self.check()?;
         self.inner.put_from_path(key, src, sha256).await
     }
 
     async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
+        self.outage.wait_answer().await;
         self.check()?;
         self.inner.copy(src, dst, sha256).await
     }
@@ -852,6 +889,7 @@ impl crate::storage::StorageBackend for OutageBackend {
         Option<String>,
         std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
     )> {
+        self.outage.wait_answer().await;
         self.check_read(key)?;
         self.inner.get_reader(key).await
     }
@@ -866,6 +904,7 @@ impl crate::storage::StorageBackend for OutageBackend {
         Option<String>,
         std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
     )> {
+        self.outage.wait_answer().await;
         self.check_read(key)?;
         self.inner.get_range(key, start, end).await
     }

@@ -3196,21 +3196,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         "System endpoints"
     );
 
-    // Background task: flush token last_used + periodic maintenance every 30 seconds
-    // Under the supervisor: a panicking tick restarts the loop, and the heartbeat (beaten
-    // after each completed tick) fails /health when ticks stop completing.
-    let maintenance_state = state.clone();
-    state.tasks.spawn("maintenance", move || {
-        let state = maintenance_state.clone();
-        run_maintenance(
-            MAINTENANCE_PERIOD,
-            Arc::clone(&state.maintenance),
-            move |tick_count| {
-                let state = state.clone();
-                async move { maintenance_tick(&state, tick_count).await }
-            },
-        )
-    });
+    spawn_maintenance(&state, MAINTENANCE_PERIOD);
 
     // SIGHUP handler: hot-reload curation policy
     #[cfg(unix)]
@@ -3302,9 +3288,41 @@ pub(crate) fn supervision(
     (Arc::new(tasks), heartbeat)
 }
 
-/// Run `tick` every `period`, numbering the ticks from 1 and recording on `heartbeat` each
-/// one that completes. The first tick fires at once. A panicking tick ends the loop, which
-/// its supervisor restarts; ticks that keep panicking or one that hangs stop the beats,
+/// Background task: flush token last_used + periodic maintenance every `period`.
+/// Under the supervisor: a panicking tick restarts the loop, and the heartbeat fails
+/// /health when the loop stops starting ticks or every tick panics.
+fn spawn_maintenance(state: &AppState, period: std::time::Duration) {
+    let maintenance_state = state.clone();
+    state.tasks.spawn("maintenance", move || {
+        let state = maintenance_state.clone();
+        run_maintenance(period, Arc::clone(&state.maintenance), move |tick_count| {
+            let state = state.clone();
+            async move { maintenance_tick(&state, tick_count).await }
+        })
+    });
+}
+
+/// How long a maintenance tick may run before it is cut, for a loop ticking every `period`
+/// whose heartbeat may be silent for `max_silence`: a third of what the window leaves after
+/// one period. Between two beats then fit the wait for the next tick, a tick that panics
+/// just inside its deadline and the restarted loop's first tick cut at it, with one more
+/// deadline to spare for the restart backoff (1 s after a single panic) and scheduling. So a
+/// store that never answers, or one panic, keeps `/health` 200. With the default 300 s window
+/// that is 90 s; with the smallest, 90 s, it is 20 s. A storage listing that needs longer
+/// (a very large bucket) needs a larger `maintenance_stall_secs`.
+fn tick_deadline(
+    period: std::time::Duration,
+    max_silence: std::time::Duration,
+) -> std::time::Duration {
+    max_silence.saturating_sub(period) / 3
+}
+
+/// Run `tick` every `period`, numbering the ticks from 1, and record on `heartbeat` each one
+/// that completes or is cut at its deadline ([`tick_deadline`]). The first tick fires at once;
+/// a tick that runs past its slot delays the next to the following one. A cut tick is logged
+/// and counted, and the next starts on schedule: waiting on a store is not a dead loop, and
+/// `/ready` reports the store. A panicking tick ends the loop, which its supervisor restarts.
+/// The beats stop when ticks keep panicking or one holds its thread so that it cannot be cut,
 /// since the work they stand for (token flush, readiness refresh) is no longer done.
 async fn run_maintenance<F, Fut>(
     period: std::time::Duration,
@@ -3314,12 +3332,29 @@ async fn run_maintenance<F, Fut>(
     F: FnMut(u64) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
+    let deadline = tick_deadline(period, heartbeat.max_silence());
     let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick_count: u64 = 0;
     loop {
         interval.tick().await;
         tick_count += 1;
-        tick(tick_count).await;
+        // CANCEL-SAFETY: a tick cut here is dropped at whatever await it was in. Every part
+        // of it can stop at any await: storage refreshes and index rebuilds keep what they
+        // read in locals and publish it only at the end, the token flush runs in a task of
+        // its own (`flush_last_used_detached`), session and lock expiry do not await, and
+        // the temp-file sweep is a detached blocking task.
+        if tokio::time::timeout(deadline, tick(tick_count))
+            .await
+            .is_err()
+        {
+            metrics::MAINTENANCE_TIMEOUTS_TOTAL.inc();
+            warn!(
+                tick = tick_count,
+                deadline_ms = deadline.as_millis() as u64,
+                "maintenance tick cut at its deadline: storage too slow or not answering"
+            );
+        }
         heartbeat.beat();
     }
 }
@@ -3388,7 +3423,7 @@ mod maintenance_loop_tests {
     //! The maintenance loop under its supervisor: a panicking tick restarts the
     //! loop, ticks that never complete and a hung tick fail `/health`. Real time at a 20 ms
     //! cadence: the margins are whole ticks.
-    use super::run_maintenance;
+    use super::{run_maintenance, tick_deadline};
     use crate::supervise::{Heartbeat, Supervisor, Timing};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
@@ -3468,7 +3503,8 @@ mod maintenance_loop_tests {
     /// so no crash loop shows — still never complete: the heartbeat fails liveness.
     #[tokio::test]
     async fn ticks_that_fail_late_every_time_fail_liveness() {
-        let heartbeat = Arc::new(Heartbeat::new(PERIOD * 10));
+        // A window whose tick deadline (120 ms) is well past the panic.
+        let heartbeat = Arc::new(Heartbeat::new(PERIOD * 19));
         let timing = Timing {
             backoff_min: Duration::from_millis(5),
             backoff_max: Duration::from_millis(5),
@@ -3491,24 +3527,85 @@ mod maintenance_loop_tests {
         task.abort();
     }
 
+    /// The tick deadline leaves room in every allowed stall window for the wait for the next
+    /// tick, a tick that panics just inside the deadline, and the restarted loop's first tick
+    /// cut at it, plus the restart backoff.
+    #[test]
+    fn the_tick_deadline_fits_a_panic_and_a_cut_tick_in_the_window() {
+        let period = super::MAINTENANCE_PERIOD;
+        let backoff = Timing::default().backoff_min;
+        // 90: the smallest window the configuration accepts; 300: the default.
+        for secs in [90, 300, 3600] {
+            let window = Duration::from_secs(secs);
+            let deadline = tick_deadline(period, window);
+            assert!(
+                deadline >= Duration::from_secs(20),
+                "{secs} s: {deadline:?}"
+            );
+            assert!(
+                period + deadline * 2 + backoff < window,
+                "{secs} s: a panic and a cut tick overrun the window"
+            );
+        }
+        assert_eq!(
+            tick_deadline(period, Duration::from_secs(300)),
+            Duration::from_secs(90)
+        );
+    }
+
+    /// A tick that waits on something that never answers (a silent store) is cut at its
+    /// deadline: the loop goes on ticking on schedule, so liveness holds.
     #[tokio::test]
-    async fn a_hung_tick_fails_liveness() {
+    async fn a_tick_waiting_on_a_silent_store_is_cut_and_liveness_holds() {
+        let (tasks, heartbeat) = supervised(PERIOD * 10);
+        let hb = Arc::clone(&heartbeat);
+        let last = Arc::new(AtomicU64::new(0));
+        let l = Arc::clone(&last);
+        let task = tasks.spawn("maintenance", move || {
+            let l = Arc::clone(&l);
+            run_maintenance(PERIOD, Arc::clone(&hb), move |n| {
+                l.store(n, Ordering::SeqCst);
+                async move {
+                    if n == 2 {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            })
+        });
+        tokio::time::sleep(PERIOD * 30).await;
+        assert_eq!(
+            tasks.failing(),
+            None,
+            "a tick waiting on the store is not a dead loop"
+        );
+        assert!(
+            last.load(Ordering::SeqCst) >= 10,
+            "ticks after the cut one run on schedule"
+        );
+        task.abort();
+    }
+
+    /// A tick that holds its thread cannot be cut: the loop starts no new tick, and that
+    /// fails liveness.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tick_that_blocks_its_thread_fails_liveness() {
         let (tasks, heartbeat) = supervised(PERIOD * 10);
         let hb = Arc::clone(&heartbeat);
         let task = tasks.spawn("maintenance", move || {
             run_maintenance(PERIOD, Arc::clone(&hb), |n| async move {
                 if n == 2 {
-                    std::future::pending::<()>().await;
+                    std::thread::sleep(PERIOD * 40);
                 }
             })
         });
-        tokio::time::sleep(PERIOD * 2).await;
+        // The test thread waits on its own clock: a blocked worker can hold up tokio's timers.
+        std::thread::sleep(PERIOD * 2);
         assert_eq!(tasks.failing(), None, "within the silence it may keep");
-        tokio::time::sleep(PERIOD * 20).await;
+        std::thread::sleep(PERIOD * 20);
         assert_eq!(
             tasks.failing(),
             Some("maintenance"),
-            "a hung tick stops the beats"
+            "a loop that starts no tick stops the beats"
         );
         task.abort();
     }
@@ -3518,8 +3615,49 @@ mod maintenance_loop_tests {
 #[allow(clippy::unwrap_used)]
 mod maintenance_storage_tests {
     //! The server's own maintenance loop and tick when a tick is cut at its deadline.
-    use crate::test_helpers::create_test_context_with_auth;
+    use crate::test_helpers::{
+        create_test_context_with_auth, create_test_context_with_storage_and_config, outage_storage,
+        send,
+    };
+    use axum::http::{Method, StatusCode};
     use std::time::Duration;
+
+    /// A store that accepted the connection and went silent: `/health` stays 200 for
+    /// twice the stall window, `/ready` is 503; once the store answers again `/ready`
+    /// turns 200 under the same loop, which never failed.
+    #[tokio::test]
+    async fn a_silent_store_fails_readiness_not_liveness() {
+        let (storage, outage) = outage_storage();
+        outage.silence();
+        let ctx = create_test_context_with_storage_and_config(storage, |c| {
+            c.server.maintenance_stall_secs = 1
+        });
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
+
+        for _ in 0..25 {
+            let health = send(&ctx.app, Method::GET, "/health", "").await;
+            assert_eq!(
+                health.status(),
+                StatusCode::OK,
+                "liveness while the store is silent"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        outage.end();
+        let mut ready = StatusCode::SERVICE_UNAVAILABLE;
+        for _ in 0..30 {
+            ready = send(&ctx.app, Method::GET, "/ready", "").await.status();
+            if ready == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(ready, StatusCode::OK, "the store answers again");
+        assert_eq!(ctx.state.tasks.failing(), None);
+    }
 
     /// A tick cut while it flushes token `last_used` (its deadline can fall at any await)
     /// does not cut the flush: the timestamps it took still land on disk.

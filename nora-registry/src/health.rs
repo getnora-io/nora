@@ -83,7 +83,8 @@ async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<Health
     // route, storage-backed or not (#869). Readiness (`/ready`) is the storage gate.
     // A background task that stopped making progress or keeps panicking (see
     // supervise.rs) is the process's own fault, which a restart clears: that one fails
-    // liveness.
+    // liveness. A maintenance tick waiting on the store is cut at its deadline and is
+    // progress (main.rs `run_maintenance`), so a silent store stays a readiness matter.
     if let Some(task) = failing_task {
         tracing::warn!(task, "background task failing, failing liveness");
         return (StatusCode::SERVICE_UNAVAILABLE, Json(health));

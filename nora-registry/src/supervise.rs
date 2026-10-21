@@ -16,9 +16,10 @@
 //!   report what it does not do.
 //!
 //! A task may also have a [`Heartbeat`]: proof of progress, not only of life. The
-//! maintenance loop beats after each completed tick, so one that hangs, or whose ticks keep
-//! failing, fails `/health` too. `/health` asks [`Supervisor::failing`] and nothing
-//! else.
+//! maintenance loop beats after each tick that completes or is cut at its deadline, so a
+//! loop that starts no new tick, or whose ticks keep panicking, fails `/health` too; a tick
+//! waiting on a store that does not answer does not (that is `/ready`'s business).
+//! `/health` asks [`Supervisor::failing`] and nothing else.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -94,6 +95,11 @@ impl Heartbeat {
         now.saturating_sub(Duration::from_millis(
             self.last_beat_ms.load(Ordering::Relaxed),
         ))
+    }
+
+    /// How long the task may be silent.
+    pub fn max_silence(&self) -> Duration {
+        self.max_silence
     }
 
     /// Whether the task has been silent for longer than it may be.
