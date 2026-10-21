@@ -10,7 +10,11 @@
 #   maintenance   GET /__fi/panic-maint-once -> one maintenance tick panics: the loop is restarted
 #                                               and /health stays 200 past the allowed silence
 #   persistent    GET /__fi/panic-maint      -> every tick panics: /health turns 503, naming the task
-#   stall         GET /__fi/hang-maint       -> the maintenance loop hangs, /health turns 503
+#   storage wait  GET /__fi/hang-maint       -> every tick waits forever, as on a store that does
+#                                               not answer: each is cut at its deadline, logged and
+#                                               counted, and /health stays 200 past the allowed silence
+#   stall         GET /__fi/block-maint      -> a tick holds its thread, so the loop starts no new
+#                                               tick: /health turns 503, naming the task
 #   pull_stats, cleanup, sighup
 #                 GET /__fi/panic-task/<t>   -> the task panics once: logged, counted in
 #                                               nora_task_panics_total, restarted; /health 200
@@ -61,6 +65,12 @@ start() { # name [VAR=value...]
   echo "server did not start"; cat "$dir/nora.log"; exit 2
 }
 stop() { kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; pid=; }
+# A process with a thread that never returns cannot finish its shutdown: TERM, then KILL.
+stop_hard() {
+  kill "$pid" 2>/dev/null || true
+  for _ in $(seq 1 100); do alive || break; sleep 0.1; done
+  kill -9 "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; pid=
+}
 
 # Panics of task $1 in the log of scenario $2, and its counter on /metrics.
 panicked() { grep -c "background task panicked.*\"task\":\"$1\"\|\"task\":\"$1\".*background task panicked" "$work/$2/nora.log" || true; }
@@ -106,16 +116,30 @@ verdict persistent "$(holds test "$h" = 503 -a "$n" -ge 1 -a "$t" = maintenance)
   "/health $h failing_task=$t, $n ticks panicked, process alive"
 stop
 
-start stall
+start storage_wait
 code /__fi/hang-maint >/dev/null
+h=200
+for _ in $(seq 1 $((TICK + SILENCE + 5))); do
+  alive || { h=dead; break; }
+  h=$(code /health); [ "$h" = 200 ] || break; sleep 1
+done
+cut=$(grep -c 'maintenance tick cut at its deadline' "$work/storage_wait/nora.log" || true)
+m=$(curl -s -m 5 "$url/metrics" | awk '$1 == "nora_maintenance_timeouts_total" {print $2}')
+verdict storage_wait "$(holds test "$h" = 200 -a "$cut" -ge 2 -a "${m:-0}" -ge 2)" \
+  "/health $h for $((TICK + SILENCE + 5)) s of waiting ticks, $cut cut and logged, counted ${m:-0}"
+stop
+
+start stall
+code /__fi/block-maint >/dev/null
 h=200
 for _ in $(seq 1 $((TICK + SILENCE + 15))); do
   alive || { h=dead; break; }
   h=$(code /health); [ "$h" = 503 ] && break; sleep 1
 done
-r=$(code /ready)
-verdict stall "$(holds test "$h" = 503)" "/health $h, /ready $r once the loop hung"
-stop
+t=$(failing_task); r=$(code /ready)
+verdict stall "$(holds test "$h" = 503 -a "$t" = maintenance)" \
+  "/health $h failing_task=$t, /ready $r once the loop stopped ticking"
+stop_hard
 
 for task in pull_stats cleanup sighup; do
   start "$task" NORA_GC_ENABLED=true

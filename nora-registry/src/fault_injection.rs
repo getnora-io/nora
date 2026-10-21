@@ -6,7 +6,7 @@
 //! Tests always build with unwind, so only a release binary shows what a panic does to
 //! the process that ships. This module exists only in a build with the
 //! `fault-injection` feature, which no shipped build enables; it adds routes that make a
-//! handler, a background task or the maintenance loop panic or hang.
+//! handler, a background task or the maintenance loop panic, hang or block.
 
 use axum::{routing::get, Router};
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -14,12 +14,14 @@ use std::time::Duration;
 
 use crate::AppState;
 
-/// What the next maintenance ticks do: run normally, panic once, panic every time, or hang.
+/// What the next maintenance ticks do: run normally, panic once, panic every time, wait
+/// forever (as on a store that does not answer), or hold their thread.
 static MAINTENANCE_FAULT: AtomicU8 = AtomicU8::new(NONE);
 const NONE: u8 = 0;
 const PANIC: u8 = 1;
 const HANG: u8 = 2;
 const PANIC_ONCE: u8 = 3;
+const BLOCK: u8 = 4;
 
 /// The fault-injection routes, all under `/__fi/`.
 pub fn routes() -> Router<AppState> {
@@ -29,6 +31,7 @@ pub fn routes() -> Router<AppState> {
         .route("/__fi/panic-maint", get(|| arm(PANIC)))
         .route("/__fi/panic-maint-once", get(|| arm(PANIC_ONCE)))
         .route("/__fi/hang-maint", get(|| arm(HANG)))
+        .route("/__fi/block-maint", get(|| arm(BLOCK)))
         .route("/__fi/panic-task/{task}", get(arm_task))
 }
 
@@ -139,7 +142,9 @@ async fn arm(fault: u8) -> &'static str {
     "armed"
 }
 
-/// Called at the start of every maintenance tick: panics or never returns once armed.
+/// Called at the start of every maintenance tick: panics, waits forever or holds its thread
+/// once armed. A wait is cut at the tick's deadline; a held thread cannot be, so the loop
+/// starts no new tick (the runtime goes on serving on its other threads).
 pub async fn maintenance_fault() {
     match MAINTENANCE_FAULT.load(Ordering::SeqCst) {
         PANIC => panic!("fault injection: maintenance tick panic"),
@@ -148,6 +153,9 @@ pub async fn maintenance_fault() {
             panic!("fault injection: maintenance tick panic");
         }
         HANG => std::future::pending::<()>().await,
+        BLOCK => tokio::task::block_in_place(|| loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }),
         _ => {}
     }
 }
