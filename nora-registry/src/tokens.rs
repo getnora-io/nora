@@ -40,11 +40,25 @@ const TOKEN_PREFIX: &str = "nra_";
 /// ten years. Applied by the store, so every route that mints is held to it.
 pub const MAX_TOKEN_TTL_DAYS: u64 = 3650;
 
-const SECS_PER_DAY: u64 = 24 * 60 * 60;
+pub const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
-/// The lifetime in days a mint asking for `ttl_days` is granted.
-pub fn granted_ttl_days(ttl_days: u64) -> u64 {
-    ttl_days.min(MAX_TOKEN_TTL_DAYS)
+/// A lifetime of `ttl_days` days in seconds, at most [`MAX_TOKEN_TTL_DAYS`]
+/// days: a lifetime too long to count in seconds is longer than the cap.
+pub fn ttl_secs_for_days(ttl_days: u64) -> u64 {
+    let max_secs = MAX_TOKEN_TTL_DAYS * SECS_PER_DAY;
+    ttl_days
+        .checked_mul(SECS_PER_DAY)
+        .map_or(max_secs, |secs| secs.min(max_secs))
+}
+
+/// A token just minted, with what it was granted: what a route answers and
+/// audits, the lifetime possibly less than it asked for.
+#[derive(Debug)]
+pub struct MintedToken {
+    pub token: String,
+    pub owner: String,
+    pub role: Role,
+    pub ttl_secs: u64,
 }
 
 /// Access role for API tokens
@@ -171,24 +185,22 @@ impl TokenStore {
         description: Option<String>,
         role: Role,
     ) -> Result<String, TokenError> {
-        // A lifetime too long to count in seconds is longer than the cap.
-        let max_secs = MAX_TOKEN_TTL_DAYS * SECS_PER_DAY;
-        let ttl_secs = ttl_days
-            .checked_mul(SECS_PER_DAY)
-            .map_or(max_secs, |secs| secs.min(max_secs));
-        self.create_token_for_secs(user, ttl_secs, description, role)
+        self.mint_token(user, ttl_secs_for_days(ttl_days), description, role)
+            .map(|minted| minted.token)
     }
 
     /// Generate a new API token living `ttl_secs` seconds — at most
-    /// [`MAX_TOKEN_TTL_DAYS`] days. For a caller whose own credential lives
-    /// less than a day: the token it mints must not outlive it.
-    pub fn create_token_for_secs(
+    /// [`MAX_TOKEN_TTL_DAYS`] days — and report the lifetime granted. Seconds,
+    /// for a caller whose own credential lives less than a day: the token it
+    /// mints must not outlive it.
+    pub fn mint_token(
         &self,
         user: &str,
         ttl_secs: u64,
         description: Option<String>,
         role: Role,
-    ) -> Result<String, TokenError> {
+    ) -> Result<MintedToken, TokenError> {
+        let granted_role = role.clone();
         let ttl_secs = ttl_secs.min(MAX_TOKEN_TTL_DAYS * SECS_PER_DAY);
         // Generate random token
         let raw_token = format!(
@@ -223,7 +235,12 @@ impl TokenStore {
             serde_json::to_string_pretty(&info).map_err(|e| TokenError::Storage(e.to_string()))?;
         write_token_file(&file_path, &json).map_err(|e| TokenError::Storage(e.to_string()))?;
 
-        Ok(raw_token)
+        Ok(MintedToken {
+            token: raw_token,
+            owner: user.to_string(),
+            role: granted_role,
+            ttl_secs,
+        })
     }
 
     /// Verify a token and return user info if valid.
@@ -1196,6 +1213,25 @@ mod tests {
                 want,
                 "ttl_days={asked}"
             );
+        }
+    }
+
+    /// The store reports the lifetime it granted, not the one asked for: a
+    /// route answers and audits what the token really lives.
+    #[test]
+    fn mint_token_reports_the_lifetime_granted() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+        for (asked, granted) in [(900, 900), (u64::MAX, 3650 * 86_400)] {
+            let minted = store.mint_token("u", asked, None, Role::Write).unwrap();
+            assert_eq!(minted.ttl_secs, granted, "asked {asked}");
+            assert_eq!((minted.owner.as_str(), minted.role), ("u", Role::Write));
+            let entry = store
+                .list_all_tokens()
+                .into_iter()
+                .find(|t| t.file_id == sha256_hex(&minted.token)[..16])
+                .unwrap();
+            assert_eq!(entry.expires_at - entry.created_at, granted);
         }
     }
 

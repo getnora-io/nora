@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use utoipa::ToSchema;
 
 use crate::audit::AuditEntry;
-use crate::tokens::{granted_ttl_days, Role};
+use crate::tokens::{ttl_secs_for_days, Role, SECS_PER_DAY};
 use crate::AppState;
 
 use super::resolve_client_ip;
@@ -137,21 +137,23 @@ async fn create_token(
             .into_response();
     }
 
-    let ttl_days = granted_ttl_days(req.ttl_days);
-    let role_label = role.to_string();
-    match token_store.create_token(&req.username, ttl_days, req.description, role) {
-        Ok(token) => {
-            // Who minted what, never the token itself.
-            state.audit.log(AuditEntry::new(
-                "token_mint",
-                &req.username,
+    match token_store.mint_token(
+        &req.username,
+        ttl_secs_for_days(req.ttl_days),
+        req.description,
+        role,
+    ) {
+        Ok(minted) => {
+            state.audit.log(AuditEntry::token_mint(
                 &req.username,
                 "api",
-                &format!("role={role_label} ttl_days={ttl_days}"),
+                &minted.owner,
+                &minted.role,
+                minted.ttl_secs,
             ));
             Json(CreateTokenResponse {
-                token,
-                expires_in_days: ttl_days,
+                token: minted.token,
+                expires_in_days: minted.ttl_secs / SECS_PER_DAY,
             })
             .into_response()
         }
@@ -421,13 +423,12 @@ mod mint_tests {
             .filter(|e| e["action"] == "token_mint")
             .collect();
         assert_eq!(mints.len(), 2, "one audit entry per mint: {entries:?}");
-        assert_eq!(mints[0]["actor"], "alice");
-        assert_eq!(mints[0]["artifact"], "alice");
-        let detail = mints[0]["detail"].as_str().unwrap();
-        assert!(
-            detail.contains("role=write") && detail.contains("ttl_days=3650"),
-            "{detail}"
-        );
+        for (mint, user) in mints.iter().zip(["alice", "bob"]) {
+            assert_eq!(mint["actor"], user);
+            assert_eq!(mint["artifact"], user);
+            assert_eq!(mint["registry"], "api");
+            assert_eq!(mint["detail"], format!("role=write ttl_secs={TEN_YEARS}"));
+        }
         for t in token.list_all_tokens() {
             assert!(
                 !entries.iter().any(|e| e.to_string().contains(&t.file_id)),
@@ -462,9 +463,12 @@ mod mint_tests {
         let entries = audit_entries(&ctx).await;
         let mint = entries
             .iter()
-            .find(|e| e["action"] == "admin_token_mint")
-            .unwrap();
-        assert_eq!(mint["detail"], "role=read ttl_days=3650", "{mint}");
+            .find(|e| e["action"] == "token_mint")
+            .unwrap_or_else(|| panic!("no token_mint entry: {entries:?}"));
+        assert_eq!(mint["actor"], "root");
+        assert_eq!(mint["artifact"], "svc");
+        assert_eq!(mint["registry"], "admin");
+        assert_eq!(mint["detail"], format!("role=read ttl_secs={TEN_YEARS}"));
     }
 
     #[tokio::test]
@@ -492,11 +496,10 @@ mod mint_tests {
             .unwrap_or_else(|| panic!("no token_mint entry: {entries:?}"));
         assert_eq!(mint["actor"], "alice");
         assert_eq!(mint["artifact"], "alice");
-        let detail = mint["detail"].as_str().unwrap();
-        assert!(detail.contains("role=write"), "{detail}");
-        assert!(
-            detail.contains(&format!("ttl_secs={}", 30 * 86_400)),
-            "{detail}"
+        assert_eq!(mint["registry"], "ui");
+        assert_eq!(
+            mint["detail"],
+            format!("role=write ttl_secs={}", 30 * 86_400)
         );
     }
 }

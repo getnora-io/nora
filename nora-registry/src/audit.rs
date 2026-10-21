@@ -77,6 +77,26 @@ pub struct AuditEntry {
 }
 
 impl AuditEntry {
+    /// The entry of a token mint, the same on every route that mints: `actor`
+    /// minted for `owner` (artifact) through `route` (registry: `api`, `ui`,
+    /// `admin`) a token of `role` living `ttl_secs`, as granted. Never the
+    /// token itself.
+    pub fn token_mint(
+        actor: &str,
+        route: &str,
+        owner: &str,
+        role: &dyn std::fmt::Display,
+        ttl_secs: u64,
+    ) -> Self {
+        Self::new(
+            "token_mint",
+            actor,
+            owner,
+            route,
+            &format!("role={role} ttl_secs={ttl_secs}"),
+        )
+    }
+
     pub fn new(action: &str, actor: &str, artifact: &str, registry: &str, detail: &str) -> Self {
         Self {
             ts: Utc::now(),

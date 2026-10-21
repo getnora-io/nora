@@ -1118,18 +1118,16 @@ async fn tokens_create(
         Some(form.description.trim().to_string())
     };
 
-    let role_label = granted_role.to_string();
-    match store.create_token_for_secs(&user, ttl_secs, description, granted_role) {
-        Ok(raw_token) => {
-            // Who minted what, never the token itself.
-            state.audit.log(crate::audit::AuditEntry::new(
-                "token_mint",
-                &user,
+    match store.mint_token(&user, ttl_secs, description, granted_role) {
+        Ok(minted) => {
+            state.audit.log(crate::audit::AuditEntry::token_mint(
                 &user,
                 "ui",
-                &format!("role={role_label} ttl_secs={ttl_secs}"),
+                &minted.owner,
+                &minted.role,
+                minted.ttl_secs,
             ));
-            let html = render_token_created_fragment(&raw_token, lang);
+            let html = render_token_created_fragment(&minted.token, lang);
             (StatusCode::OK, Html(html))
         }
         Err(e) => {
