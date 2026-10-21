@@ -899,13 +899,13 @@ async fn flatcontainer_download(
     let id_lower = id.to_lowercase();
 
     // #733 serve-local: an internal-namespace package is operator-owned — skip curation and serve
-    // any local copy below; block the upstream branch separately. (.nupkg only; .nuspec is uncurated.)
-    let internal = ends_with_ci(filename, ".nupkg")
-        && crate::curation::is_internal_namespace(
-            &state.curation().curation_engine,
-            crate::curation::RegistryType::Nuget,
-            &id_lower,
-        );
+    // any local copy below; block the upstream branch separately. Its .nuspec is held the same:
+    // asking an upstream for it would hand over the internal name.
+    let internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Nuget,
+        &id_lower,
+    );
 
     let storage_key = format!("nuget/flatcontainer/{}", path.to_lowercase());
 
@@ -1055,7 +1055,7 @@ async fn flatcontainer_download(
         return response;
     }
 
-    // #733: an internal-namespace .nupkg with no local copy is never proxied upstream.
+    // #733: an internal-namespace .nupkg or .nuspec with no local copy is never proxied upstream.
     if internal {
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,

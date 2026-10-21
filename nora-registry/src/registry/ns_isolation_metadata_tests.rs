@@ -512,6 +512,41 @@ async fn nuget_internal_registration_index_served_local() {
 }
 
 #[tokio::test]
+async fn nuget_internal_nuspec_served_local_and_miss_blocked() {
+    let ctx = create_test_context_with_config(|c| {
+        c.nuget.enabled = true;
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.nuget.proxy = Some(BLACKHOLE.to_string());
+    });
+    ctx.state
+        .storage
+        .put(
+            "nuget/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
+            b"<package/>",
+        )
+        .await
+        .unwrap();
+    let served = send(
+        &ctx.app,
+        Method::GET,
+        "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
+        "",
+    )
+    .await;
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(served).await[..], b"<package/>");
+    // No local copy: refused as the package itself is, never asked of the upstream.
+    let missing = send(
+        &ctx.app,
+        Method::GET,
+        "/nuget/v3/flatcontainer/internalpkg/2.0.0/internalpkg.nuspec",
+        "",
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn pubdart_internal_listing_served_local() {
     let ctx = create_test_context_with_config(|c| {
         c.pub_dart.enabled = true;
@@ -810,7 +845,7 @@ async fn pypi_internal_refusal_increments_isolation_refused_metric() {
 // request; each internal path has a public twin that must reach it, so no path passes for
 // being dead.
 
-const INTERNAL_PATHS: [&str; 34] = [
+const INTERNAL_PATHS: [&str; 35] = [
     "/npm/internalpkg",
     "/npm/internalpkg/-/internalpkg-1.0.0.tgz",
     "/simple/internalpkg/",
@@ -823,6 +858,7 @@ const INTERNAL_PATHS: [&str; 34] = [
     "/gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
     "/nuget/v3/flatcontainer/internalpkg/index.json",
     "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+    "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
     "/go/internal.corp/lib/@v/list",
     "/go/internal.corp/lib/@v/v1.0.0.info",
     "/go/internal.corp/lib/@v/v1.0.0.zip",
