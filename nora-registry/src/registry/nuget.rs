@@ -916,6 +916,7 @@ async fn flatcontainer_download(
         // #754: the upstream is asked for a date only on a cache miss — a stored package's
         // digest is already recorded, and a cache hit pays no upstream round-trip.
         let ask_upstream = state.config.server.trust_upstream_dates
+            && nuget_date_read(&state)
             && state.storage.stat(&storage_key).await.is_none();
         publish_date = nuget_publish_date(&state, &id_lower, ver, ask_upstream).await;
 
@@ -1385,6 +1386,21 @@ async fn nuget_publish_date(
         }
         Registered::Absent => None,
     }
+}
+
+/// Whether anything reads a NuGet download's date: a release-age rule (curation on and
+/// `min_release_age` set globally or for NuGet) or the quarantine.
+fn nuget_date_read(state: &AppState) -> bool {
+    let curation = &state.config.curation;
+    let release_age = state.curation().curation_engine.is_active()
+        && (curation.min_release_age.is_some() || curation.nuget.min_release_age.is_some());
+    let quarantine = curation
+        .nuget
+        .quarantine
+        .as_ref()
+        .or(curation.quarantine.as_ref())
+        .is_some_and(|mode| !matches!(mode, crate::digest_quarantine::QuarantineMode::Off));
+    release_age || quarantine
 }
 
 /// `version`'s date on the upstream registration page `lower`..`upper`: `None` when the page
@@ -3715,6 +3731,44 @@ mod nuget_release_dates {
             .await
             .unwrap();
         assert_eq!(download(&ctx, "3.0.0").await, StatusCode::OK);
+        assert_eq!(registration_requests(&up).await, 0);
+    }
+
+    /// With trusted dates the quarantine takes the release date too (#750): a version published
+    /// years ago is not held as new to this mirror, also when only the upstream dates it.
+    #[tokio::test]
+    async fn with_trusted_dates_an_old_version_matures_in_the_quarantine() {
+        let up = upstream().await;
+        serve_registration(
+            &up,
+            REGISTRATION,
+            registration(vec![inline_page(
+                "1.0.0",
+                "2.0.0",
+                vec![
+                    leaf("1.0.0", "2019-01-01T00:00:00Z"),
+                    leaf("2.0.0", &minutes_ago(10)),
+                ],
+            )]),
+        )
+        .await;
+        let ctx = context(&up, true, quarantine_7d);
+        assert_eq!(download(&ctx, "1.0.0").await, StatusCode::OK);
+        assert_eq!(download(&ctx, "2.0.0").await, StatusCode::FORBIDDEN);
+    }
+
+    /// Nothing reads a date without a release-age rule or the quarantine: the upstream is not
+    /// asked for one.
+    #[tokio::test]
+    async fn no_date_is_asked_for_when_nothing_reads_it() {
+        let up = upstream().await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = true;
+        });
+        assert_eq!(download(&ctx, "4.0.0").await, StatusCode::OK);
         assert_eq!(registration_requests(&up).await, 0);
     }
 
