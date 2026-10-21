@@ -3856,6 +3856,18 @@ Jd74nq6dNCjpWG4drIsyhqX+
         assert!(oidc_status_for_aud("nora", any).await.is_success());
     }
 
+    /// Beside an audience, `any_audience = true` changes nothing: the audience
+    /// is still checked.
+    #[tokio::test]
+    async fn test_oidc_audience_wins_over_any_audience() {
+        let both = |p: &mut OidcProvider| p.any_audience = true;
+        assert_eq!(
+            oidc_status_for_aud("another-service", both).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(oidc_status_for_aud("nora", both).await.is_success());
+    }
+
     /// A provider with neither an audience nor `any_audience` admits no token,
     /// even if it reaches the validator without passing config validation.
     #[tokio::test]
