@@ -907,18 +907,17 @@ async fn flatcontainer_download(
             &id_lower,
         );
 
+    let storage_key = format!("nuget/flatcontainer/{}", path.to_lowercase());
+
     // Hoisted to function scope for the digest-quarantine serve gate (#750).
     let mut publish_date: Option<i64> = None;
     // Curation check for .nupkg downloads
     if ends_with_ci(filename, ".nupkg") && !internal {
-        // Extract publish date from cached registration index
-        publish_date = extract_nuget_publish_date(
-            &state.storage,
-            &id_lower,
-            ver,
-            state.config.server.trust_upstream_dates,
-        )
-        .await;
+        // #754: the upstream is asked for a date only on a cache miss — a stored package's
+        // digest is already recorded, and a cache hit pays no upstream round-trip.
+        let ask_upstream = state.config.server.trust_upstream_dates
+            && state.storage.stat(&storage_key).await.is_none();
+        publish_date = nuget_publish_date(&state, &id_lower, ver, ask_upstream).await;
 
         if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
@@ -933,7 +932,6 @@ async fn flatcontainer_download(
         }
     }
 
-    let storage_key = format!("nuget/flatcontainer/{}", path.to_lowercase());
     let content_type = if ends_with_ci(filename, ".nuspec") {
         "application/xml"
     } else {
@@ -1248,46 +1246,230 @@ fn serve_stale_or_not_found(
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
-/// Extract publish date from cached NuGet registration index.
-///
-/// NuGet registration index JSON has nested items:
+/// NuGet's `published` for an unlisted version, 1900-01-01T00:00:00Z: the date is not known.
+const UNLISTED_PUBLISHED: i64 = -2_208_988_800;
+
+/// What a registration document — the index or one of its pages — says of a version.
+#[derive(Debug, PartialEq)]
+enum Registered {
+    /// Listed; its `published` as Unix time, `None` when absent, unparsable or unlisted.
+    Listed(Option<i64>),
+    /// In the range of a page the index names without inlining it.
+    OnPage { lower: String, upper: String },
+    /// Not in the document.
+    Absent,
+}
+
+/// Find `version` in a registration index or page:
 /// ```json
-/// { "items": [{ "items": [{ "catalogEntry": { "version": "1.0.0", "published": "2024-01-15T10:30:00Z" } }] }] }
+/// { "items": [{ "lower": "1.0.0", "upper": "2.0.0", "items": [{ "catalogEntry": { "version": "1.0.0", "published": "2024-01-15T10:30:00Z" } }] }] }
 /// ```
-async fn extract_nuget_publish_date(
-    storage: &crate::storage::Storage,
-    id: &str,
-    version: &str,
-    trust_upstream: bool,
-) -> Option<i64> {
-    let meta_key = format!("nuget/registration/{}/index.json", id.to_lowercase());
-    // #513: untrusted upstream dates → NORA cache mtime, never upstream published.
-    if !trust_upstream {
-        return crate::curation::extract_mtime_as_publish_date(storage, &meta_key).await;
+/// An index past 128 versions names its pages by bounds only (#535); a page lists its leaves
+/// directly under `items`.
+fn registered(doc: &[u8], version: &str) -> Registered {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(doc) else {
+        return Registered::Absent;
+    };
+    let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
+        return Registered::Absent;
+    };
+    let leaves = |items: &[serde_json::Value]| {
+        items.iter().find_map(|item| {
+            let entry = item.get("catalogEntry")?;
+            let listed = entry.get("version")?.as_str()?;
+            nuget_version_order(listed, version)
+                .map_or_else(|| listed.eq_ignore_ascii_case(version), |o| o.is_eq())
+                .then(|| {
+                    entry
+                        .get("published")
+                        .and_then(|d| d.as_str())
+                        .and_then(crate::curation::parse_iso8601_to_unix)
+                        .filter(|&published| published > UNLISTED_PUBLISHED)
+                })
+        })
+    };
+    if items.iter().any(|item| item.get("catalogEntry").is_some()) {
+        return leaves(items).map_or(Registered::Absent, Registered::Listed);
     }
-    let data = storage.get(&meta_key).await.ok()?;
-    let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
-    let pages = json.get("items")?.as_array()?;
-    for page in pages {
-        // Pages may be non-inline (only @id pointer, no items array) per NuGet V3 spec.
-        // Skip instead of aborting the entire function (#535).
-        let Some(items) = page.get("items").and_then(|i| i.as_array()) else {
+    for page in items {
+        if let Some(inline) = page.get("items").and_then(|i| i.as_array()) {
+            if let Some(published) = leaves(inline) {
+                return Registered::Listed(published);
+            }
+            continue;
+        }
+        let bound = |name: &str| page.get(name).and_then(|b| b.as_str());
+        let (Some(lower), Some(upper)) = (bound("lower"), bound("upper")) else {
             continue;
         };
-        for item in items {
-            let Some(entry) = item.get("catalogEntry") else {
-                continue;
+        let above = nuget_version_order(version, lower).is_some_and(|o| o.is_ge());
+        let below = nuget_version_order(version, upper).is_some_and(|o| o.is_le());
+        if above && below {
+            return Registered::OnPage {
+                lower: lower.to_lowercase(),
+                upper: upper.to_lowercase(),
             };
-            let Some(ver) = entry.get("version").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if ver.eq_ignore_ascii_case(version) {
-                let date_str = entry.get("published").and_then(|d| d.as_str())?;
-                return crate::curation::parse_iso8601_to_unix(date_str);
+        }
+    }
+    Registered::Absent
+}
+
+/// When `version` of `id` was published, for release age and the quarantine clock.
+///
+/// Without trusted upstream dates (#513) a version is as old as the cached registration that
+/// lists it — NORA held it listed since that document was written — and undated when no cached
+/// one lists it: a version published after the index was cached was not seen by NORA then, and
+/// the index's age would let the quarantine record it as first seen long ago.
+///
+/// With trusted dates a version is as old as its `published`. One the cached registration does
+/// not date is looked up upstream when `ask_upstream`: a `dotnet restore` reads only the flat
+/// container, so nothing else brings its registration in. The unlisted marker dates nothing.
+async fn nuget_publish_date(
+    state: &AppState,
+    id: &str,
+    version: &str,
+    ask_upstream: bool,
+) -> Option<i64> {
+    let trust = state.config.server.trust_upstream_dates;
+    let storage = &state.storage;
+    let dated = |key: String, published: Option<i64>| async move {
+        match trust {
+            true => published,
+            false => storage.stat(&key).await.map(|m| m.modified as i64),
+        }
+    };
+    let index_key = format!("nuget/registration/{}/index.json", id);
+    let mut page = None;
+    if let Ok(doc) = storage.get(&index_key).await {
+        match registered(&doc, version) {
+            Registered::Listed(published) => return dated(index_key, published).await,
+            Registered::OnPage { lower, upper } => page = Some((lower, upper)),
+            Registered::Absent => {}
+        }
+    }
+    if let Some((lower, upper)) = &page {
+        let page_key = format!("nuget/registration/{}/page/{}/{}.json", id, lower, upper);
+        if let Ok(doc) = storage.get(&page_key).await {
+            if let Registered::Listed(published) = registered(&doc, version) {
+                return dated(page_key, published).await;
             }
         }
     }
-    None
+    if !trust || !ask_upstream || !is_valid_package_id(id) {
+        return None;
+    }
+    let upstream = upstream_url(state)?;
+    let base = format!(
+        "{}/v3/registration5-gz-semver2/{}",
+        upstream.trim_end_matches('/'),
+        id
+    );
+    // The page the cached index named first; when that one does not list the version, the
+    // upstream index — its pages may have moved since — and the page it names.
+    if let Some((lower, upper)) = &page {
+        if let Some(published) = upstream_page_date(state, &base, lower, upper, version).await {
+            return published;
+        }
+    }
+    let doc = nuget_registration_fetch(state, &format!("{base}/index.json")).await?;
+    match registered(&doc, version) {
+        Registered::Listed(published) => published,
+        Registered::OnPage { lower, upper } => {
+            upstream_page_date(state, &base, &lower, &upper, version)
+                .await
+                .flatten()
+        }
+        Registered::Absent => None,
+    }
+}
+
+/// `version`'s date on the upstream registration page `lower`..`upper`: `None` when the page
+/// does not list it or could not be read, `Some(None)` when it lists it undated.
+async fn upstream_page_date(
+    state: &AppState,
+    base: &str,
+    lower: &str,
+    upper: &str,
+    version: &str,
+) -> Option<Option<i64>> {
+    if !is_valid_version(lower) || !is_valid_version(upper) {
+        return None;
+    }
+    let doc = nuget_registration_fetch(state, &format!("{base}/page/{lower}/{upper}.json")).await?;
+    match registered(&doc, version) {
+        Registered::Listed(published) => Some(published),
+        _ => None,
+    }
+}
+
+/// One upstream registration document, read for a date only: it is not cached, so the
+/// registration endpoints' TTL and validators stay theirs.
+async fn nuget_registration_fetch(state: &AppState, url: &str) -> Option<Vec<u8>> {
+    proxy_fetch(
+        &state.http_client,
+        url,
+        Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
+        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
+        &state.circuit_breaker,
+        RegistryType::Nuget,
+    )
+    .await
+    .map_err(|e| tracing::debug!(url = %url, error = ?e, "nuget: registration for a date not read"))
+    .ok()
+}
+
+/// How NuGet orders two versions (`VersionComparer.Default`): by their numbers, then a
+/// pre-release before its release, pre-release labels one by one — numbers by value and before
+/// words, words without case — and a shorter run of equal labels first. Build metadata does not
+/// count. `None` when either is not a NuGet version.
+fn nuget_version_order(a: &str, b: &str) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering;
+    fn parts(version: &str) -> Option<(Vec<u64>, Option<String>)> {
+        let key = crate::curation::nuget_version_key(version)?;
+        let (release, pre) = match key.split_once('-') {
+            Some((release, pre)) => (release.to_string(), Some(pre.to_string())),
+            None => (key, None),
+        };
+        let mut numbers = release
+            .split('.')
+            .map(|n| n.parse().ok())
+            .collect::<Option<Vec<u64>>>()?;
+        numbers.resize(4, 0);
+        Some((numbers, pre))
+    }
+    fn label(a: &str, b: &str) -> Ordering {
+        let number = |s: &str| s.bytes().all(|c| c.is_ascii_digit());
+        match (number(a), number(b)) {
+            (true, true) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => a.cmp(b),
+        }
+    }
+    let ((a_numbers, a_pre), (b_numbers, b_pre)) = (parts(a)?, parts(b)?);
+    Some(
+        a_numbers
+            .cmp(&b_numbers)
+            .then_with(|| match (a_pre, b_pre) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+                (Some(a), Some(b)) => {
+                    let (mut a, mut b) = (a.split('.'), b.split('.'));
+                    loop {
+                        match (a.next(), b.next()) {
+                            (None, None) => break Ordering::Equal,
+                            (None, Some(_)) => break Ordering::Less,
+                            (Some(_), None) => break Ordering::Greater,
+                            (Some(x), Some(y)) => match label(x, y) {
+                                Ordering::Equal => continue,
+                                other => break other,
+                            },
+                        }
+                    }
+                }
+            }),
+    )
 }
 
 /// The configured upstream (`scheme://authority`), or None when the operator switched it off with
@@ -2144,10 +2326,19 @@ mod integration_tests {
         );
     }
 
+    /// Trusted upstream dates and no upstream: a date is what the cache holds.
+    fn trusted_without_upstream() -> crate::test_helpers::TestContext {
+        create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+            cfg.server.trust_upstream_dates = true;
+        })
+    }
+
     #[tokio::test]
     async fn test_extract_nuget_publish_date_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let ctx = trusted_without_upstream();
+        let storage = &ctx.state.storage;
         let meta = serde_json::json!({
             "items": [{
                 "items": [{
@@ -2166,15 +2357,14 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let result =
-            super::extract_nuget_publish_date(&storage, "newtonsoft.json", "6.0.0", true).await;
+        let result = super::nuget_publish_date(&ctx.state, "newtonsoft.json", "6.0.0", true).await;
         assert!(result.is_some());
     }
 
     #[tokio::test]
     async fn test_extract_nuget_publish_date_version_not_found() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let ctx = trusted_without_upstream();
+        let storage = &ctx.state.storage;
         let meta = serde_json::json!({
             "items": [{"items": [{"catalogEntry": {"version": "1.0.0", "published": "2023-01-01T00:00:00Z"}}]}]
         });
@@ -2186,17 +2376,15 @@ mod integration_tests {
             .await
             .unwrap();
 
-        let result = super::extract_nuget_publish_date(&storage, "test", "9.9.9", true).await;
+        let result = super::nuget_publish_date(&ctx.state, "test", "9.9.9", true).await;
         assert!(result.is_none());
     }
 
     #[tokio::test]
     async fn test_extract_nuget_publish_date_no_metadata() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let ctx = trusted_without_upstream();
 
-        let result =
-            super::extract_nuget_publish_date(&storage, "nonexistent", "1.0.0", true).await;
+        let result = super::nuget_publish_date(&ctx.state, "nonexistent", "1.0.0", true).await;
         assert!(result.is_none());
     }
 
@@ -2204,8 +2392,8 @@ mod integration_tests {
     /// date extraction for subsequent pages.
     #[tokio::test]
     async fn test_extract_nuget_publish_date_sparse_pages() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = crate::storage::Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let ctx = trusted_without_upstream();
+        let storage = &ctx.state.storage;
         // Page 0: non-inline (only @id, no items array).
         // Page 1: inline with the target version.
         let meta = serde_json::json!({
@@ -2230,7 +2418,7 @@ mod integration_tests {
             .unwrap();
 
         // Before #535 fix: this returned None because page 0 had no "items".
-        let result = super::extract_nuget_publish_date(&storage, "sparse-pkg", "2.0.0", true).await;
+        let result = super::nuget_publish_date(&ctx.state, "sparse-pkg", "2.0.0", true).await;
         assert!(result.is_some(), "date must be found despite sparse page 0");
     }
 
@@ -3188,5 +3376,313 @@ mod nuget_version_curation {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+/// How a NuGet download is dated for release age and the quarantine clock. The flat-container
+/// download a `dotnet restore` makes never reads the registration, so the date comes from what
+/// NORA holds of it, and from the upstream registration when that does not date the version.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod nuget_release_dates {
+    use crate::digest_quarantine::QuarantineMode;
+    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const ID: &str = "repro.pkg";
+    const REGISTRATION: &str = "/v3/registration5-gz-semver2/repro.pkg/index.json";
+    const UNLISTED: &str = "1900-01-01T00:00:00+00:00";
+
+    fn minutes_ago(minutes: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339()
+    }
+
+    fn leaf(version: &str, published: &str) -> serde_json::Value {
+        serde_json::json!({"catalogEntry": {"version": version, "published": published}})
+    }
+
+    fn inline_page(lower: &str, upper: &str, leaves: Vec<serde_json::Value>) -> serde_json::Value {
+        serde_json::json!({"lower": lower, "upper": upper, "count": leaves.len(), "items": leaves})
+    }
+
+    fn remote_page(lower: &str, upper: &str) -> serde_json::Value {
+        serde_json::json!({
+            "@id": format!("https://upstream.invalid/v3/registration5-gz-semver2/{ID}/page/{lower}/{upper}.json"),
+            "lower": lower, "upper": upper, "count": 64
+        })
+    }
+
+    fn registration(pages: Vec<serde_json::Value>) -> String {
+        serde_json::json!({"count": pages.len(), "items": pages}).to_string()
+    }
+
+    /// An upstream whose every package is its own bytes: two versions never share a digest.
+    async fn upstream() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v3-flatcontainer/[^/]+/[^/]+/[^/]+\.nupkg$"))
+            .respond_with(|req: &wiremock::Request| {
+                ResponseTemplate::new(200).set_body_bytes(format!("NUPKG {}", req.url.path()))
+            })
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    async fn serve_registration(upstream: &MockServer, at: &str, body: String) {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(upstream)
+            .await;
+    }
+
+    fn context(
+        upstream: &MockServer,
+        trust: bool,
+        customize: fn(&mut crate::config::Config),
+    ) -> TestContext {
+        let uri = upstream.uri();
+        create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = trust;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            customize(cfg);
+        })
+    }
+
+    fn quarantine_7d(cfg: &mut crate::config::Config) {
+        cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+        cfg.curation.quarantine_ttl = Some("7d".to_string());
+    }
+
+    fn min_age_1h(cfg: &mut crate::config::Config) {
+        cfg.curation.min_release_age = Some("1h".to_string());
+        cfg.curation.quarantine = Some(QuarantineMode::Observe);
+    }
+
+    fn min_age_1h_quarantine_7d(cfg: &mut crate::config::Config) {
+        cfg.curation.min_release_age = Some("1h".to_string());
+        quarantine_7d(cfg);
+    }
+
+    /// The registration index as an earlier request cached it `days` ago.
+    async fn cached_registration(ctx: &TestContext, body: &str, days: u64) {
+        let key = format!("nuget/registration/{ID}/index.json");
+        ctx.state.storage.put(&key, body.as_bytes()).await.unwrap();
+        let then = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400);
+        std::fs::File::options()
+            .write(true)
+            .open(std::path::Path::new(&ctx.state.config.storage.path).join(&key))
+            .unwrap()
+            .set_modified(then)
+            .unwrap();
+    }
+
+    async fn download(ctx: &TestContext, version: &str) -> StatusCode {
+        let uri = format!("/nuget/v3/flatcontainer/{ID}/{version}/{ID}.{version}.nupkg");
+        send(&ctx.app, Method::GET, &uri, "").await.status()
+    }
+
+    async fn registration_requests(upstream: &MockServer) -> usize {
+        upstream
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path().starts_with("/v3/registration5-gz-semver2/"))
+            .count()
+    }
+
+    /// Without trusted dates the cached registration dates only the versions it lists: a
+    /// version published after it was cached was never seen by NORA then, and dating it by
+    /// the index's age would let the quarantine record it as first seen a month ago.
+    #[tokio::test]
+    async fn a_version_the_cached_registration_does_not_list_is_not_dated_by_it() {
+        let up = upstream().await;
+        let ctx = context(&up, false, quarantine_7d);
+        let listed = registration(vec![inline_page(
+            "1.2.3",
+            "1.2.3",
+            vec![leaf("1.2.3", "2019-01-01T00:00:00Z")],
+        )]);
+        cached_registration(&ctx, &listed, 30).await;
+        assert_eq!(
+            download(&ctx, "1.2.4").await,
+            StatusCode::FORBIDDEN,
+            "a version NORA first fetches now is held for 7d"
+        );
+        assert_eq!(
+            download(&ctx, "1.2.3").await,
+            StatusCode::OK,
+            "a version NORA saw listed 30 days ago has matured"
+        );
+    }
+
+    /// With trusted dates a version the cache has no date for is dated by the upstream
+    /// registration: `dotnet restore` reads only the flat container, so a package published
+    /// minutes ago would otherwise pass `min_release_age` undated.
+    #[tokio::test]
+    async fn an_undated_version_is_dated_by_the_upstream_registration() {
+        let up = upstream().await;
+        serve_registration(
+            &up,
+            REGISTRATION,
+            registration(vec![inline_page(
+                "1.0.0",
+                "2.0.0",
+                vec![
+                    leaf("1.0.0", "2019-01-01T00:00:00Z"),
+                    leaf("2.0.0", &minutes_ago(10)),
+                ],
+            )]),
+        )
+        .await;
+        let ctx = context(&up, true, min_age_1h);
+        assert_eq!(
+            download(&ctx, "2.0.0").await,
+            StatusCode::FORBIDDEN,
+            "published 10 minutes ago, younger than 1h"
+        );
+        assert_eq!(download(&ctx, "1.0.0").await, StatusCode::OK);
+    }
+
+    /// A cached registration that predates the version does not date it either: the
+    /// upstream one, which lists it, does.
+    #[tokio::test]
+    async fn a_version_newer_than_the_cached_registration_is_dated_by_the_upstream() {
+        let up = upstream().await;
+        serve_registration(
+            &up,
+            REGISTRATION,
+            registration(vec![inline_page(
+                "1.0.0",
+                "2.0.0",
+                vec![
+                    leaf("1.0.0", "2019-01-01T00:00:00Z"),
+                    leaf("2.0.0", &minutes_ago(10)),
+                ],
+            )]),
+        )
+        .await;
+        let ctx = context(&up, true, min_age_1h);
+        let stale = registration(vec![inline_page(
+            "1.0.0",
+            "1.0.0",
+            vec![leaf("1.0.0", "2019-01-01T00:00:00Z")],
+        )]);
+        cached_registration(&ctx, &stale, 1).await;
+        assert_eq!(download(&ctx, "2.0.0").await, StatusCode::FORBIDDEN);
+        assert_eq!(download(&ctx, "1.0.0").await, StatusCode::OK);
+    }
+
+    /// Past 128 versions the registration index carries only page bounds: the version's date
+    /// is on the page whose range holds it.
+    #[tokio::test]
+    async fn a_version_on_a_page_the_index_does_not_inline_is_dated_by_that_page() {
+        let up = upstream().await;
+        serve_registration(
+            &up,
+            REGISTRATION,
+            registration(vec![
+                remote_page("1.0.0", "1.0.128"),
+                remote_page("1.0.129", "1.0.140"),
+            ]),
+        )
+        .await;
+        serve_registration(
+            &up,
+            "/v3/registration5-gz-semver2/repro.pkg/page/1.0.129/1.0.140.json",
+            serde_json::json!({
+                "lower": "1.0.129", "upper": "1.0.140", "count": 2,
+                "items": [leaf("1.0.129", &minutes_ago(10)), leaf("1.0.130", "2019-01-01T00:00:00Z")]
+            })
+            .to_string(),
+        )
+        .await;
+        let ctx = context(&up, true, min_age_1h);
+        assert_eq!(download(&ctx, "1.0.129").await, StatusCode::FORBIDDEN);
+        assert_eq!(download(&ctx, "1.0.130").await, StatusCode::OK);
+        let pages: Vec<String> = up
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| p.contains("/page/"))
+            .collect();
+        assert!(
+            pages
+                .iter()
+                .all(|p| p.ends_with("/page/1.0.129/1.0.140.json")),
+            "only the page whose range holds the version is asked for: {pages:?}"
+        );
+    }
+
+    /// NuGet publishes an unlisted version as `1900-01-01`: that marks the date unknown, it
+    /// does not make the version 126 years old.
+    #[tokio::test]
+    async fn the_unlisted_marker_does_not_date_a_version() {
+        let up = upstream().await;
+        let ctx = context(&up, true, min_age_1h_quarantine_7d);
+        let listed = registration(vec![inline_page(
+            "0.9.0",
+            "1.0.0",
+            vec![
+                leaf("0.9.0", "2019-01-01T00:00:00Z"),
+                leaf("1.0.0", UNLISTED),
+            ],
+        )]);
+        cached_registration(&ctx, &listed, 0).await;
+        assert_eq!(
+            download(&ctx, "1.0.0").await,
+            StatusCode::FORBIDDEN,
+            "an undated version is held on NORA's own clock"
+        );
+        assert_eq!(download(&ctx, "0.9.0").await, StatusCode::OK);
+    }
+
+    /// A package NORA already stores asks the upstream for no date: its digest is recorded, and
+    /// a cache hit does not pay an upstream round-trip.
+    #[tokio::test]
+    async fn a_stored_package_asks_the_upstream_for_no_date() {
+        let up = upstream().await;
+        let ctx = context(&up, true, min_age_1h);
+        ctx.state
+            .storage
+            .put(
+                &format!("nuget/flatcontainer/{ID}/3.0.0/{ID}.3.0.0.nupkg"),
+                b"stored",
+            )
+            .await
+            .unwrap();
+        assert_eq!(download(&ctx, "3.0.0").await, StatusCode::OK);
+        assert_eq!(registration_requests(&up).await, 0);
+    }
+
+    #[test]
+    fn nuget_versions_order_as_nuget_orders_them() {
+        use super::nuget_version_order;
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        for (a, b, want) in [
+            ("1.0.0", "1.0.0", Equal),
+            ("1.0", "1.0.0.0", Equal),
+            ("1.0.0+build", "1.0.0", Equal),
+            ("1.0.0-Beta", "1.0.0-beta", Equal),
+            ("1.0.9", "1.0.10", Less),
+            ("1.0.0.1", "1.0.0", Greater),
+            ("1.0.0-alpha", "1.0.0", Less),
+            ("1.0.0-alpha", "1.0.0-alpha.1", Less),
+            ("1.0.0-alpha.2", "1.0.0-alpha.10", Less),
+            ("1.0.0-2", "1.0.0-alpha", Less),
+            ("1.0.0-beta", "1.0.0-alpha", Greater),
+            ("2.0.0", "10.0.0", Less),
+        ] {
+            assert_eq!(nuget_version_order(a, b), Some(want), "{a} vs {b}");
+        }
+        assert_eq!(nuget_version_order("not.a.version.x", "1.0.0"), None);
     }
 }
