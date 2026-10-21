@@ -62,65 +62,118 @@ pub fn audit_actor(user: &Option<axum::Extension<AuthenticatedUser>>) -> &str {
     }
 }
 
-/// Tracks wrong passwords per client address for brute-force protection.
+/// Tracks wrong passwords for brute-force protection, per account and per
+/// address.
 ///
-/// After `max_failures` consecutive failures, the address is locked out of
-/// password authentication with exponential backoff: 2^(failures -
-/// max_failures) seconds, capped at 15 minutes. Bearer credentials (API
-/// tokens, OIDC JWTs) cannot be guessed and are neither counted nor refused.
+/// An account is a username at a client address. After `max_failures`
+/// consecutive failures it is locked out of password authentication with
+/// exponential backoff: 2^(failures - max_failures) seconds, capped at
+/// `max_lockout_secs`. Guesses at one account do not lock out another behind
+/// the same address, and only a login as that username clears its count.
+///
+/// An address is also held, whatever the username, once it has sent
+/// [`ADDRESS_FAILURES_PER_ACCOUNT`] times `max_failures` wrong passwords, with
+/// the same backoff, so guessing across usernames gains nothing. A login does
+/// not clear the address count, which ends after `2 * max_lockout_secs`
+/// without a failure ([`AuthFailureTracker::cleanup`]).
+///
+/// Bearer credentials (API tokens, OIDC JWTs) cannot be guessed and are
+/// neither counted nor refused.
 pub struct AuthFailureTracker {
-    /// IP -> (consecutive failures, last failure time)
-    entries: parking_lot::Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    entries: parking_lot::Mutex<FailureCounts>,
     /// Number of failures before lockout kicks in (default: 5)
     max_failures: u32,
     /// Maximum lockout duration in seconds (default: 900 = 15 minutes)
     max_lockout_secs: u64,
 }
 
+/// How many accounts' worth of failures an address may send before it is held
+/// whatever the username. An account adds at most `max_failures` failures
+/// before its own lockout stops counting it, so the address ceiling is reached
+/// only by failing many accounts, which is guessing across usernames rather
+/// than a mistyped password; ten accounts (50 failures at the default 5) keep
+/// an office of mistyping users clear of it.
+pub const ADDRESS_FAILURES_PER_ACCOUNT: u32 = 10;
+
+/// Failure counts: (consecutive failures, last failure).
+#[derive(Default)]
+struct FailureCounts {
+    /// By address and SHA-256 of the username: a fixed-size key whatever the
+    /// username a client sends.
+    accounts: HashMap<(IpAddr, [u8; 32]), (u32, Instant)>,
+    /// By address, for every username.
+    addresses: HashMap<IpAddr, (u32, Instant)>,
+}
+
+fn account_key(ip: IpAddr, username: &str) -> (IpAddr, [u8; 32]) {
+    use sha2::{Digest, Sha256};
+    (ip, Sha256::digest(username.as_bytes()).into())
+}
+
 impl AuthFailureTracker {
     pub fn new(max_failures: u32, max_lockout_secs: u64) -> Self {
         Self {
-            entries: parking_lot::Mutex::new(HashMap::new()),
+            entries: parking_lot::Mutex::new(FailureCounts::default()),
             max_failures,
             max_lockout_secs,
         }
     }
 
-    /// Check if IP is currently locked out. Returns remaining lockout seconds if blocked.
-    pub fn check_blocked(&self, ip: &IpAddr) -> Option<u64> {
-        let entries = self.entries.lock();
-        let (failures, last_failure) = entries.get(ip)?;
-        if *failures < self.max_failures {
+    /// Seconds left of a lockout at `threshold` failures, if one is running.
+    fn lockout_left(&self, count: Option<&(u32, Instant)>, threshold: u32) -> Option<u64> {
+        let (failures, last_failure) = count?;
+        if *failures < threshold {
             return None;
         }
-        let exponent = (*failures - self.max_failures).min(20);
+        let exponent = (*failures - threshold).min(20);
         let lockout_secs = (1u64 << exponent).min(self.max_lockout_secs);
         let elapsed = last_failure.elapsed().as_secs();
-        if elapsed < lockout_secs {
-            Some(lockout_secs - elapsed)
-        } else {
-            None
-        }
+        (elapsed < lockout_secs).then(|| lockout_secs - elapsed)
     }
 
-    /// Record a failed auth attempt for an IP.
-    pub fn record_failure(&self, ip: IpAddr) {
+    /// Seconds left until `username` at `ip` may try a password again, if it
+    /// is locked out: the account itself, or the address for every username.
+    pub fn check_blocked(&self, ip: &IpAddr, username: &str) -> Option<u64> {
+        let entries = self.entries.lock();
+        let account = self.lockout_left(
+            entries.accounts.get(&account_key(*ip, username)),
+            self.max_failures,
+        );
+        let address = self.lockout_left(
+            entries.addresses.get(ip),
+            self.max_failures
+                .saturating_mul(ADDRESS_FAILURES_PER_ACCOUNT),
+        );
+        account.max(address)
+    }
+
+    /// Record a wrong password for `username` at `ip`.
+    pub fn record_failure(&self, ip: IpAddr, username: &str) {
+        let now = Instant::now();
         let mut entries = self.entries.lock();
-        let entry = entries.entry(ip).or_insert_with(|| (0, Instant::now()));
-        entry.0 += 1;
-        entry.1 = Instant::now();
+        let account = entries
+            .accounts
+            .entry(account_key(ip, username))
+            .or_insert((0, now));
+        *account = (account.0.saturating_add(1), now);
+        let address = entries.addresses.entry(ip).or_insert((0, now));
+        *address = (address.0.saturating_add(1), now);
     }
 
-    /// Clear failure count on successful auth.
-    pub fn record_success(&self, ip: &IpAddr) {
+    /// A login as `username` from `ip`: clears that account's failures, not
+    /// the address's.
+    pub fn record_success(&self, ip: &IpAddr, username: &str) {
         let mut entries = self.entries.lock();
-        entries.remove(ip);
+        entries.accounts.remove(&account_key(*ip, username));
     }
 
-    /// Remove entries older than max_lockout_secs (call periodically).
+    /// Remove entries older than 2 x max_lockout_secs (call periodically).
     pub fn cleanup(&self) {
+        let keep =
+            |(_, last): &(u32, Instant)| last.elapsed().as_secs() < self.max_lockout_secs * 2;
         let mut entries = self.entries.lock();
-        entries.retain(|_, (_, last)| last.elapsed().as_secs() < self.max_lockout_secs * 2);
+        entries.accounts.retain(|_, count| keep(count));
+        entries.addresses.retain(|_, count| keep(count));
     }
 }
 
@@ -551,45 +604,52 @@ pub async fn auth_middleware(
         return unauthorized_response("Basic or Bearer authentication required", realm);
     }
 
-    // A client address locked out for wrong passwords gets no password
-    // checked. Bearer credentials above are not held by it.
-    if let Some(ip) = client_ip {
-        if let Some(retry_after) = state.auth_failures.check_blocked(&ip) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [
-                    (header::RETRY_AFTER, retry_after.to_string()),
-                    (header::CONTENT_TYPE, "application/json".to_string()),
-                ],
-                format!(
-                    r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                    retry_after
-                ),
-            )
-                .into_response();
-        }
-    }
+    // The account the password lockout counts by: the username at the client
+    // address. A header that does not decode to `user:password` is refused
+    // below without being counted.
+    let encoded = &auth_header[6..];
+    let account = client_ip.zip(basic_credentials(encoded).ok().map(|(user, _)| user));
+    let locked_out = account
+        .as_ref()
+        .and_then(|(ip, user)| state.auth_failures.check_blocked(ip, user));
 
     // Verify credentials: htpasswd first, then the token store (#736, #1094);
     // `decide_basic_auth` has the rules, this applies its decision.
-    let decision = decide_basic_auth(
-        &auth_header[6..],
-        state
-            .auth
-            .as_deref()
-            .map(|auth| move |user: &str, password: &str| auth.authenticate(user, password)),
-        state
-            .tokens
-            .as_ref()
-            .map(|store| move |password: &str| store.verify_token(password)),
-        request.method(),
-        is_admin,
-    );
+    let htpasswd = state
+        .auth
+        .as_deref()
+        .map(|auth| move |user: &str, password: &str| auth.authenticate(user, password));
+    let tokens = state
+        .tokens
+        .as_ref()
+        .map(|store| move |password: &str| store.verify_token(password));
+    let decision = match locked_out {
+        None => decide_basic_auth(encoded, htpasswd, tokens, request.method(), is_admin),
+        // A locked-out account gets no password checked. An API token sent as
+        // the password cannot be guessed, so it is still verified, as over
+        // Bearer: Docker has no other way to present one.
+        Some(retry_after) => match decide_basic_auth(
+            encoded,
+            None::<fn(&str, &str) -> bool>,
+            tokens,
+            request.method(),
+            is_admin,
+        ) {
+            decision @ (BasicDecision::Authenticated { .. }
+            | BasicDecision::Forbidden(_)
+            | BasicDecision::ServiceUnavailable(_)) => decision,
+            _ => return too_many_failed_attempts(retry_after),
+        },
+    };
     match decision {
         BasicDecision::Authenticated { user, role } => {
-            // Auth successful — clear failure counter
-            if let Some(ip) = client_ip {
-                state.auth_failures.record_success(&ip);
+            // A login as the username clears its failures. An API token of
+            // another owner sent under that username does not: it says nothing
+            // about the username's password.
+            if let Some((ip, username)) = &account {
+                if *username == user {
+                    state.auth_failures.record_success(ip, username);
+                }
             }
             // Basic-auth identities and opaque (nra_) tokens are not
             // namespace-scoped (#583 is OIDC-only).
@@ -600,20 +660,16 @@ pub async fn auth_middleware(
             request.extensions_mut().insert(AuthenticatedRole(role));
             next.run(request).await
         }
-        BasicDecision::Forbidden(reason) => {
-            // Valid credentials, not authorized: the credential still counts as good.
-            if let Some(ip) = client_ip {
-                state.auth_failures.record_success(&ip);
-            }
-            (StatusCode::FORBIDDEN, reason).into_response()
-        }
+        // Valid credentials, not authorized: not a wrong password, so not
+        // counted.
+        BasicDecision::Forbidden(reason) => (StatusCode::FORBIDDEN, reason).into_response(),
         BasicDecision::Unauthorized {
             message,
             record_failure,
         } => {
             if record_failure {
-                if let Some(ip) = client_ip {
-                    state.auth_failures.record_failure(ip);
+                if let Some((ip, username)) = &account {
+                    state.auth_failures.record_failure(*ip, username);
                 }
             }
             unauthorized_response(message, realm)
@@ -693,19 +749,16 @@ where
     if htpasswd.is_none() && tokens.is_none() {
         return BasicDecision::NotConfigured;
     }
-    let malformed = |message| BasicDecision::Unauthorized {
-        message,
-        record_failure: false,
+    let (username, password) = match basic_credentials(encoded) {
+        Ok(credentials) => credentials,
+        Err(message) => {
+            return BasicDecision::Unauthorized {
+                message,
+                record_failure: false,
+            }
+        }
     };
-    let Ok(decoded) = STANDARD.decode(encoded) else {
-        return malformed("Invalid credentials encoding");
-    };
-    let Ok(credentials) = String::from_utf8(decoded) else {
-        return malformed("Invalid credentials encoding");
-    };
-    let Some((username, password)) = credentials.split_once(':') else {
-        return malformed("Invalid credentials format");
-    };
+    let (username, password) = (username.as_str(), password.as_str());
 
     if htpasswd.is_some_and(|check| check(username, password)) {
         // Basic-auth carries no role, so it can never satisfy an admin path:
@@ -737,6 +790,37 @@ where
             record_failure: true,
         },
     }
+}
+
+/// The username and password of a Basic credential (`encoded`, the header
+/// value after `Basic `), or why it is malformed.
+fn basic_credentials(encoded: &str) -> Result<(String, String), &'static str> {
+    let Ok(decoded) = STANDARD.decode(encoded) else {
+        return Err("Invalid credentials encoding");
+    };
+    let Ok(credentials) = String::from_utf8(decoded) else {
+        return Err("Invalid credentials encoding");
+    };
+    let Some((username, password)) = credentials.split_once(':') else {
+        return Err("Invalid credentials format");
+    };
+    Ok((username.to_string(), password.to_string()))
+}
+
+/// The answer to a password from a locked-out account.
+fn too_many_failed_attempts(retry_after: u64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (header::RETRY_AFTER, retry_after.to_string()),
+            (header::CONTENT_TYPE, "application/json".to_string()),
+        ],
+        format!(
+            r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
+            retry_after
+        ),
+    )
+        .into_response()
 }
 
 /// The methods a read-only identity may not use: exactly PUT, POST, DELETE and
@@ -1037,9 +1121,9 @@ mod tests {
         let tracker = AuthFailureTracker::new(5, 900);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..4 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "alice");
         }
-        assert!(tracker.check_blocked(&ip).is_none());
+        assert!(tracker.check_blocked(&ip, "alice").is_none());
     }
 
     #[test]
@@ -1047,9 +1131,9 @@ mod tests {
         let tracker = AuthFailureTracker::new(5, 900);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..5 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "alice");
         }
-        assert!(tracker.check_blocked(&ip).is_some());
+        assert!(tracker.check_blocked(&ip, "alice").is_some());
     }
 
     #[test]
@@ -1057,11 +1141,11 @@ mod tests {
         let tracker = AuthFailureTracker::new(5, 900);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..10 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "alice");
         }
-        assert!(tracker.check_blocked(&ip).is_some());
-        tracker.record_success(&ip);
-        assert!(tracker.check_blocked(&ip).is_none());
+        assert!(tracker.check_blocked(&ip, "alice").is_some());
+        tracker.record_success(&ip, "alice");
+        assert!(tracker.check_blocked(&ip, "alice").is_none());
     }
 
     #[test]
@@ -1070,10 +1154,10 @@ mod tests {
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
         for _ in 0..3 {
-            tracker.record_failure(ip1);
+            tracker.record_failure(ip1, "alice");
         }
-        assert!(tracker.check_blocked(&ip1).is_some());
-        assert!(tracker.check_blocked(&ip2).is_none());
+        assert!(tracker.check_blocked(&ip1, "alice").is_some());
+        assert!(tracker.check_blocked(&ip2, "alice").is_none());
     }
 
     #[test]
@@ -1081,12 +1165,12 @@ mod tests {
         let tracker = AuthFailureTracker::new(3, 1); // 1 sec max lockout
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..5 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "alice");
         }
         // Cleanup should remove entries older than 2x max_lockout_secs
         std::thread::sleep(std::time::Duration::from_secs(3));
         tracker.cleanup();
-        assert!(tracker.check_blocked(&ip).is_none());
+        assert!(tracker.check_blocked(&ip, "alice").is_none());
     }
 
     #[test]
@@ -1095,9 +1179,9 @@ mod tests {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         // 5 failures = threshold, lockout = 2^0 = 1 sec
         for _ in 0..5 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "alice");
         }
-        let retry1 = tracker.check_blocked(&ip).unwrap();
+        let retry1 = tracker.check_blocked(&ip, "alice").unwrap();
         assert!(
             retry1 <= 1,
             "first lockout should be ~1 sec, got {}",
@@ -1105,8 +1189,8 @@ mod tests {
         );
 
         // 6 failures = 2^1 = 2 sec
-        tracker.record_failure(ip);
-        let retry2 = tracker.check_blocked(&ip).unwrap();
+        tracker.record_failure(ip, "alice");
+        let retry2 = tracker.check_blocked(&ip, "alice").unwrap();
         assert!(
             retry2 <= 2,
             "second lockout should be ~2 sec, got {}",
@@ -1114,8 +1198,8 @@ mod tests {
         );
 
         // 7 failures = 2^2 = 4 sec
-        tracker.record_failure(ip);
-        let retry3 = tracker.check_blocked(&ip).unwrap();
+        tracker.record_failure(ip, "alice");
+        let retry3 = tracker.check_blocked(&ip, "alice").unwrap();
         assert!(
             retry3 <= 4,
             "third lockout should be ~4 sec, got {}",
@@ -1955,14 +2039,17 @@ mod integration_tests {
     /// The test client's address (`send_with_headers` connects from it).
     const CLIENT_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
-    /// Record failures for the test client up to one short of lockout: the
-    /// test tracker locks out at its 5th, so whether the next request counts
-    /// as a failure decides whether the client ends up blocked.
+    /// The Basic username these tests send with an API token as the password.
+    const BASIC_USER: &str = "docker";
+
+    /// Record failures for the test client's `BASIC_USER` up to one short of
+    /// lockout: the test tracker locks out at its 5th, so whether the next
+    /// request counts as a failure decides whether the account ends up blocked.
     fn one_failure_from_lockout(tracker: &super::AuthFailureTracker) {
         for _ in 0..4 {
-            tracker.record_failure(CLIENT_IP);
+            tracker.record_failure(CLIENT_IP, BASIC_USER);
         }
-        assert!(tracker.check_blocked(&CLIENT_IP).is_none());
+        assert!(tracker.check_blocked(&CLIENT_IP, BASIC_USER).is_none());
     }
 
     /// #1094: without htpasswd, an API token sent as the Basic password is
@@ -2155,9 +2242,9 @@ mod integration_tests {
 
     /// #1094: the role gate holds on the htpasswd-less Basic path — a read
     /// token reads but cannot write (403), as over Bearer and with htpasswd.
-    /// The 403 is about the request, not the credential: it clears the per-IP
-    /// failure count instead of adding to it, so a client with a valid read
-    /// token is never locked out for trying to write.
+    /// The 403 is about the request, not the credential: it is not counted as
+    /// a failure, so a client with a valid read token is never locked out for
+    /// trying to write.
     #[tokio::test]
     async fn test_basic_auth_read_only_token_cannot_write_without_htpasswd() {
         let ctx = create_test_context_without_htpasswd();
@@ -2175,8 +2262,8 @@ mod integration_tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
 
+        one_failure_from_lockout(tracker);
         for method in [Method::PUT, Method::POST, Method::DELETE, Method::PATCH] {
-            one_failure_from_lockout(tracker);
             let response = send_with_headers(
                 &ctx.app,
                 method.clone(),
@@ -2187,7 +2274,7 @@ mod integration_tests {
             .await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
             assert!(
-                tracker.check_blocked(&CLIENT_IP).is_none(),
+                tracker.check_blocked(&CLIENT_IP, BASIC_USER).is_none(),
                 "{method}: a valid read token's 403 counted as a failure"
             );
         }
@@ -2285,12 +2372,17 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(ctx.state.auth_failures.check_blocked(&CLIENT_IP).is_none());
+        assert!(ctx
+            .state
+            .auth_failures
+            .check_blocked(&CLIENT_IP, BASIC_USER)
+            .is_none());
     }
 
     /// #1094: an unknown, malformed or expired token over Basic without
-    /// htpasswd answers 401 and counts toward the per-IP lockout; a valid
-    /// token clears the count, as on every other credential path.
+    /// htpasswd answers 401 and counts toward the lockout of the Basic
+    /// username; a valid token of another owner is served but does not clear
+    /// that count (it says nothing about the username's password).
     #[tokio::test]
     async fn test_basic_auth_bad_token_without_htpasswd_is_401_and_counted() {
         let ctx = create_test_context_without_htpasswd();
@@ -2320,12 +2412,14 @@ mod integration_tests {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{password}");
             assert!(response.headers().contains_key("www-authenticate"));
             assert!(
-                tracker.check_blocked(&CLIENT_IP).is_some(),
+                tracker.check_blocked(&CLIENT_IP, BASIC_USER).is_some(),
                 "{password}: not counted as a failure"
             );
-            tracker.record_success(&CLIENT_IP);
+            tracker.record_success(&CLIENT_IP, BASIC_USER);
         }
 
+        // A valid token is served, but it is another owner's credential, not
+        // the Basic username's password: the username's failures stay.
         one_failure_from_lockout(tracker);
         let token = mint(&ctx, crate::tokens::Role::Read);
         let response = send_with_headers(
@@ -2337,10 +2431,10 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        tracker.record_failure(CLIENT_IP);
+        tracker.record_failure(CLIENT_IP, BASIC_USER);
         assert!(
-            tracker.check_blocked(&CLIENT_IP).is_none(),
-            "a valid token clears the count"
+            tracker.check_blocked(&CLIENT_IP, BASIC_USER).is_some(),
+            "a token of another owner cleared the username's failures"
         );
     }
 
@@ -2371,7 +2465,10 @@ mod integration_tests {
             body_bytes(response).await.as_ref(),
             br#"{"error":"Basic auth not configured"}"#
         );
-        assert!(state.auth_failures.check_blocked(&CLIENT_IP).is_none());
+        assert!(state
+            .auth_failures
+            .check_blocked(&CLIENT_IP, BASIC_USER)
+            .is_none());
     }
 
     #[tokio::test]
@@ -3488,10 +3585,11 @@ Jd74nq6dNCjpWG4drIsyhqX+
             .mount(&mock_server)
             .await;
         let ctx = create_oidc_test_context(&mock_server.uri());
-        for _ in 0..6 {
+        // Lock the address out for every username.
+        for n in 0..60 {
             ctx.state
                 .auth_failures
-                .record_failure("127.0.0.1".parse().unwrap());
+                .record_failure("127.0.0.1".parse().unwrap(), &format!("u{n}"));
         }
         let now = now_secs();
         let jwt = make_jwt(
@@ -4093,8 +4191,8 @@ mod client_address_tests {
     }
 
     /// Behind the loopback proxy on a dual-stack socket (X02), one client's
-    /// wrong passwords lock out that client only: another client behind the
-    /// same proxy still gets in.
+    /// wrong passwords lock out that client only: the same account from
+    /// another client behind the same proxy still gets in.
     #[tokio::test]
     async fn a_v4_mapped_proxy_keeps_its_clients_apart() {
         let ctx = create_test_context_with_auth(&[("alice", "alicepw"), ("bob", "bobpw")]);
@@ -4119,7 +4217,8 @@ mod client_address_tests {
                 "{status}"
             );
         }
-        let good = basic("alice", "alicepw");
+        // The same account, from another client behind the same proxy.
+        let good = basic("bob", "bobpw");
         let other = send_from(
             &ctx.app,
             MAPPED_LOOPBACK,
@@ -4248,6 +4347,184 @@ mod client_address_tests {
             .await,
             StatusCode::OK,
             "wrong Bearer tokens locked the address out"
+        );
+    }
+
+    /// Every client of these tests sits behind one NAT address, as a company
+    /// behind its egress does; the loopback proxy in front of NORA is trusted.
+    const NAT: &str = "198.51.100.50";
+
+    /// GET /v2/ from a client behind `xff` with Basic `user:pass`.
+    async fn login(app: &axum::Router, xff: &str, user: &str, pass: &str) -> StatusCode {
+        let auth = basic(user, pass);
+        send_from(
+            app,
+            "127.0.0.1",
+            Method::GET,
+            "/v2/",
+            &[("authorization", &auth), ("x-forwarded-for", xff)],
+        )
+        .await
+    }
+
+    /// Wrong passwords for one account lock out that account on that address,
+    /// not another account behind the same NAT.
+    #[tokio::test]
+    async fn guessing_one_accounts_password_leaves_other_accounts_alone() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw"), ("bob", "bobpw")]);
+        for _ in 0..6 {
+            let _ = login(&ctx.app, NAT, "alice", "wrong").await;
+        }
+        assert_eq!(
+            login(&ctx.app, NAT, "bob", "bobpw").await,
+            StatusCode::OK,
+            "guesses at alice locked bob out"
+        );
+        assert_eq!(
+            login(&ctx.app, NAT, "alice", "alicepw").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the guessed account is not locked out"
+        );
+    }
+
+    /// A login by one account does not clear the failures of another.
+    #[tokio::test]
+    async fn a_login_does_not_clear_another_accounts_failures() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw"), ("bob", "bobpw")]);
+        for _ in 0..4 {
+            assert_eq!(
+                login(&ctx.app, NAT, "alice", "wrong").await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(login(&ctx.app, NAT, "bob", "bobpw").await, StatusCode::OK);
+        assert_eq!(
+            login(&ctx.app, NAT, "alice", "wrong").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            login(&ctx.app, NAT, "alice", "alicepw").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "bob's login cleared alice's failures"
+        );
+    }
+
+    /// Guessing across many usernames from one address is still held: past a
+    /// ceiling of failed passwords per address (ten accounts' worth of the
+    /// per-account threshold) the address gets no password checked, whatever
+    /// the username. Below it, the address is not held, and another address is
+    /// never held by it.
+    #[tokio::test]
+    async fn guessing_many_usernames_from_one_address_is_capped() {
+        let ctx = create_test_context_with_auth(&[("bob", "bobpw")]);
+        // 49 failures, never more than 4 for one username: no account is
+        // locked out and the address is one below its ceiling of 50.
+        for n in 0..49 {
+            let user = format!("u{}", n / 4);
+            assert_eq!(
+                login(&ctx.app, NAT, &user, "wrong").await,
+                StatusCode::UNAUTHORIZED,
+                "guess {n}"
+            );
+        }
+        assert_eq!(
+            login(&ctx.app, NAT, "bob", "bobpw").await,
+            StatusCode::OK,
+            "the address was held below its ceiling"
+        );
+        // The 50th failure, for yet another username, reaches the ceiling.
+        assert_eq!(
+            login(&ctx.app, NAT, "fresh", "wrong").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            login(&ctx.app, NAT, "bob", "bobpw").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "guessing across usernames is not held per address"
+        );
+        assert_eq!(
+            login(&ctx.app, NAT, "other", "wrong").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a new username escapes the address ceiling"
+        );
+        assert_eq!(
+            login(&ctx.app, "192.0.2.77", "bob", "bobpw").await,
+            StatusCode::OK,
+            "another address is held"
+        );
+    }
+
+    /// Control: an empty username is an account like any other, and a header
+    /// with no username at all (no `:`) is malformed and not counted.
+    #[tokio::test]
+    async fn an_empty_or_missing_username_is_held_like_any_other() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let mut statuses = Vec::new();
+        for _ in 0..6 {
+            statuses.push(login(&ctx.app, NAT, "", "wrong").await.as_u16());
+        }
+        assert_eq!(statuses, [401, 401, 401, 401, 401, 429], "empty username");
+        assert_eq!(
+            login(&ctx.app, NAT, "alice", "alicepw").await,
+            StatusCode::OK
+        );
+
+        let no_username = format!("Basic {}", STANDARD.encode("no-colon-here"));
+        for _ in 0..8 {
+            let status = send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[
+                    ("authorization", &no_username),
+                    ("x-forwarded-for", "192.0.2.80"),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a malformed header is counted"
+            );
+        }
+        assert_eq!(
+            login(&ctx.app, "192.0.2.80", "alice", "alicepw").await,
+            StatusCode::OK
+        );
+    }
+
+    /// Docker sends an API token as the Basic password, under a username CI
+    /// jobs share ("docker", "token"). A valid token is served while that
+    /// username is locked out, as over Bearer; a password is not.
+    #[tokio::test]
+    async fn a_valid_api_token_as_the_basic_password_is_served_while_locked_out() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        for _ in 0..6 {
+            let _ = login(
+                &ctx.app,
+                NAT,
+                "docker",
+                "nra_00000000000000000000000000000000",
+            )
+            .await;
+        }
+        assert_eq!(
+            login(&ctx.app, NAT, "docker", "not-a-token").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the username is not locked out"
+        );
+        assert_eq!(
+            login(&ctx.app, NAT, "docker", &token).await,
+            StatusCode::OK,
+            "a valid token as the Basic password is refused while locked out"
         );
     }
 }
