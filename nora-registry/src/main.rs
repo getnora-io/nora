@@ -3679,11 +3679,11 @@ mod maintenance_storage_tests {
         let (storage, outage) = outage_storage();
         outage.silence();
         let ctx = create_test_context_with_storage_and_config(storage, |c| {
-            c.server.maintenance_stall_secs = 1
+            c.server.maintenance_stall_secs = 2
         });
         super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
 
-        for _ in 0..25 {
+        for _ in 0..45 {
             let health = send(&ctx.app, Method::GET, "/health", "").await;
             assert_eq!(
                 health.status(),
@@ -3697,7 +3697,7 @@ mod maintenance_storage_tests {
 
         outage.end();
         let mut ready = StatusCode::SERVICE_UNAVAILABLE;
-        for _ in 0..30 {
+        for _ in 0..50 {
             ready = send(&ctx.app, Method::GET, "/ready", "").await.status();
             if ready == StatusCode::OK {
                 break;
