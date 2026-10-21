@@ -1673,6 +1673,12 @@ mod integration_tests {
         });
         let wheel = zip(&[("corppkg/__init__.py", b"", true)]);
         let sdist = b"sdist bytes".to_vec();
+        // What an upstream served under the name before the import, cached under the same key.
+        ctx.state
+            .storage
+            .put("pypi/corppkg/corppkg-1.0.0-py3-none-any.whl", b"squatted")
+            .await
+            .unwrap();
         let state = tempfile::tempdir().unwrap();
         let res = import_as(
             &ctx.state.storage,
@@ -1771,6 +1777,19 @@ mod integration_tests {
         });
         let one = nupkg("Corp.Lib", "1.0");
         let two = nupkg("Corp.Lib", "2.0.0-Beta.1");
+        // What an upstream served under the id before the import: a version and its list.
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/corp.lib/9.9.9/corp.lib.9.9.9.nupkg",
+                &b"squatted"[..],
+            ),
+            (
+                "nuget/flatcontainer/corp.lib/index.json",
+                br#"{"versions":["9.9.9"]}"#,
+            ),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
         let state = tempfile::tempdir().unwrap();
         let res = import_as(
             &ctx.state.storage,
@@ -1855,6 +1874,29 @@ mod integration_tests {
         )
         .await;
         assert_eq!(squatted.status(), StatusCode::NOT_FOUND);
+        // A hosted version whose package is gone is not found, and not asked of the upstream.
+        ctx.state
+            .storage
+            .delete("nuget/flatcontainer/corp.lib/2.0.0-beta.1/corp.lib.2.0.0-beta.1.nupkg")
+            .await
+            .unwrap();
+        let gone = send(
+            &ctx.app,
+            Method::GET,
+            &format!("{flat}/2.0.0-beta.1/corp.lib.2.0.0-beta.1.nupkg"),
+            "",
+        )
+        .await;
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+        // The registration lists every version inline: there is no page to ask an upstream for.
+        let page = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/corp.lib/page/1.0.0/2.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(page.status(), StatusCode::NOT_FOUND);
         assert_eq!(asked(&upstream).await, Vec::<String>::new());
 
         // Control: an id nothing imported is still the upstream's.
@@ -1894,11 +1936,11 @@ mod integration_tests {
                     // The .nuspec's bytes do not match the CRC-32 the archive records.
                     let mut package = zip(&[(
                         "Pkg.nuspec",
-                        b"<package><metadata><id>Pkg</id><version>1.0.4</version></metadata></package>",
+                        b"<package><metadata><id>Pkg</id><version>1.0.4</version><description>abcde</description></metadata></package>",
                         false,
                     )]);
-                    let at = package.windows(5).position(|w| w == b"1.0.4").unwrap();
-                    package[at] = b'9';
+                    let at = package.windows(5).position(|w| w == b"abcde").unwrap();
+                    package[at] = b'X';
                     package
                 }),
                 (

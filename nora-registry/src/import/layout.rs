@@ -259,6 +259,8 @@ mod tests {
         assert_eq!(compat(RegistryType::Maven), Compat::Full);
         assert_eq!(compat(RegistryType::Raw), Compat::Full);
         assert_eq!(compat(RegistryType::Npm), Compat::Partial);
+        assert_eq!(compat(RegistryType::PyPI), Compat::Partial);
+        assert_eq!(compat(RegistryType::Nuget), Compat::Partial);
         assert_eq!(compat(RegistryType::Cargo), Compat::Unsupported);
         assert_eq!(compat(RegistryType::Docker), Compat::Unsupported);
     }
