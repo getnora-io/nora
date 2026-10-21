@@ -441,6 +441,15 @@ async fn registration_index(
 
     let storage_key = format!("nuget/registration/{}/index.json", id_lower);
 
+    // A hosted package's registration is built from its records; the upstream is not asked.
+    match hosted_versions(&state.storage, &id_lower).await {
+        Hosted::Yes(versions) => return hosted_registration(&state, &id_lower, &versions).await,
+        Hosted::Unknown => {
+            return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower))
+        }
+        Hosted::No => {}
+    }
+
     let base_url = nora_base_url(&state);
     let upstream = rewrite_host(&state);
 
@@ -615,6 +624,16 @@ async fn registration_page(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // A hosted package's registration lists every version inline: it has no pages, and the
+    // upstream is not asked for one.
+    match hosted_versions(&state.storage, &id_lower).await {
+        Hosted::Yes(_) => return StatusCode::NOT_FOUND.into_response(),
+        Hosted::Unknown => {
+            return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower))
+        }
+        Hosted::No => {}
+    }
+
     let base_url = nora_base_url(&state);
     let upstream = rewrite_host(&state);
     let storage_key = format!(
@@ -747,6 +766,22 @@ async fn version_list(state: AppState, id: &str) -> Response {
     }
 
     let storage_key = format!("nuget/flatcontainer/{}/index.json", id_lower);
+
+    // A hosted package's versions are its records — before any list an upstream gave for the id.
+    match hosted_versions(&state.storage, &id_lower).await {
+        Hosted::Yes(versions) => {
+            state.metrics.record_download("nuget");
+            return with_json(
+                serde_json::json!({ "versions": versions })
+                    .to_string()
+                    .into_bytes(),
+            );
+        }
+        Hosted::Unknown => {
+            return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower))
+        }
+        Hosted::No => {}
+    }
 
     // Read cache eagerly so stale data is available on upstream failure.
     let (cached_data, read_failure) =
@@ -921,16 +956,34 @@ async fn flatcontainer_download(
 
     let storage_key = format!("nuget/flatcontainer/{}", path.to_lowercase());
 
+    // A hosted package serves the versions it has records of and nothing else: a version without
+    // one is no version of it, whatever an upstream served under the id before it was imported.
+    let hosted = match hosted_versions(&state.storage, &id_lower).await {
+        Hosted::Yes(versions) => {
+            if !versions.contains(&ver.to_lowercase()) {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            true
+        }
+        Hosted::No => false,
+        Hosted::Unknown => {
+            return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower))
+        }
+    };
+
     // Hoisted to function scope for the digest-quarantine serve gate (#750).
     let mut publish_date: Option<i64> = None;
     // Curation check for .nupkg downloads
     if ends_with_ci(filename, ".nupkg") && !internal {
         // #754: the upstream is asked for a date only on a cache miss — a stored package's
-        // digest is already recorded, and a cache hit pays no upstream round-trip.
-        let ask_upstream = state.config.server.trust_upstream_dates
-            && nuget_date_read(&state)
-            && state.storage.stat(&storage_key).await.is_none();
-        publish_date = nuget_publish_date(&state, &id_lower, ver, ask_upstream).await;
+        // digest is already recorded, and a cache hit pays no upstream round-trip. A hosted
+        // package has no upstream date, and no cached registration of an upstream dates it.
+        if !hosted {
+            let ask_upstream = state.config.server.trust_upstream_dates
+                && nuget_date_read(&state)
+                && state.storage.stat(&storage_key).await.is_none();
+            publish_date = nuget_publish_date(&state, &id_lower, ver, ask_upstream).await;
+        }
 
         if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
@@ -1067,6 +1120,15 @@ async fn flatcontainer_download(
                 .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         }
         return response;
+    }
+
+    // A hosted version NORA cannot read is unavailable, not absent; one it does not hold is not
+    // asked of an upstream.
+    if hosted {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("nuget", &storage_key, e);
+        }
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     // #733: an internal-namespace .nupkg or .nuspec with no local copy is never proxied upstream.
@@ -1854,6 +1916,481 @@ fn rewrite_registration_urls(json_text: &str, upstream_url: &str, base_url: &str
     )
 }
 
+// ── Hosted packages ─────────────────────────────────────────────────────
+//
+// NORA takes no push, but `nora import` brings packages in from the operator's own registry. An
+// imported version is stored under the flat-container keys a client reads — the .nupkg and its
+// .nuspec — and a record of it under `nuget/hosted/<id>/<version>.json`. A package with a record
+// is NORA's own: its version list and registration are built from the records, a version
+// without one is not served, and no upstream is asked for the id.
+
+/// The flat-container key of the .nupkg of `id` at `version`, as a client asks for it: the id and
+/// the normalized version, both in lowercase. `None` when either is not NuGet's. `nora import`
+/// stores a package under this key (contract `import-key-format-equals-handler-key-format`).
+pub(crate) fn package_key(id: &str, version: &str) -> Option<String> {
+    let id = id.to_lowercase();
+    let version = crate::curation::nuget_version_key(version)?;
+    (is_valid_package_id(&id) && is_valid_version(&version))
+        .then(|| format!("nuget/flatcontainer/{id}/{version}/{id}.{version}.nupkg"))
+}
+
+/// The id and version (lowercase, normalized) a [`package_key`] names.
+fn package_key_parts(key: &str) -> Option<(&str, &str)> {
+    let (id, rest) = key.strip_prefix("nuget/flatcontainer/")?.split_once('/')?;
+    let (version, file) = rest.split_once('/')?;
+    (file == format!("{id}.{version}.nupkg")).then_some((id, version))
+}
+
+fn nuspec_key(id_lower: &str, version: &str) -> String {
+    format!("nuget/flatcontainer/{id_lower}/{version}/{id_lower}.nuspec")
+}
+
+fn hosted_prefix(id_lower: &str) -> String {
+    format!("nuget/hosted/{id_lower}/")
+}
+
+fn hosted_record_key(id_lower: &str, version: &str) -> String {
+    format!("{}{version}.json", hosted_prefix(id_lower))
+}
+
+/// Whether a package is hosted, from its records.
+enum Hosted {
+    /// These versions (lowercase, normalized), in NuGet's order.
+    Yes(Vec<String>),
+    No,
+    /// The listing failed: nothing is decided on a guess.
+    Unknown,
+}
+
+async fn hosted_versions(storage: &crate::storage::Storage, id_lower: &str) -> Hosted {
+    let prefix = hosted_prefix(id_lower);
+    if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
+        return Hosted::No;
+    }
+    match storage.list(&prefix).await {
+        Ok(keys) => {
+            let mut versions: Vec<String> = keys
+                .iter()
+                .filter_map(|k| k.strip_prefix(&prefix)?.strip_suffix(".json"))
+                .filter(|v| !v.is_empty() && !v.contains('/'))
+                .map(str::to_string)
+                .collect();
+            if versions.is_empty() {
+                return Hosted::No;
+            }
+            versions.sort_by(|a, b| nuget_version_order(a, b).unwrap_or_else(|| a.cmp(b)));
+            Hosted::Yes(versions)
+        }
+        Err(e) => {
+            tracing::warn!(registry = "nuget", package = %id_lower, error = %e, "nuget: hosted records not listed");
+            Hosted::Unknown
+        }
+    }
+}
+
+/// What NORA records of a hosted version: the .nuspec's id and version (normalized, in the case
+/// the package gives it) and what a registration leaf shows of it.
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq)]
+struct HostedRecord {
+    id: String,
+    version: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    description: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    authors: String,
+    #[serde(rename = "dependencyGroups", default)]
+    dependency_groups: Vec<DependencyGroup>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq)]
+struct DependencyGroup {
+    #[serde(
+        rename = "targetFramework",
+        default,
+        skip_serializing_if = "String::is_empty"
+    )]
+    target_framework: String,
+    #[serde(default)]
+    dependencies: Vec<Dependency>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Debug, PartialEq)]
+struct Dependency {
+    id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    range: String,
+}
+
+/// What `nora import` stores beside an imported .nupkg: its .nuspec and its record, each with
+/// its key. The record is written last — it is what makes the version served.
+pub(crate) struct ImportedPackage {
+    pub nuspec_key: String,
+    pub nuspec: Vec<u8>,
+    pub record_key: String,
+    pub record: Vec<u8>,
+}
+
+/// Why a .nupkg is not imported.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ImportedPackageError {
+    #[error("not a NuGet package key: {0}")]
+    NotAPackageKey(String),
+    #[error("not a zip archive: {0}")]
+    NotAZip(&'static str),
+    #[error("the package has no .nuspec at its root")]
+    NoNuspec,
+    #[error("the package has more than one .nuspec at its root")]
+    SeveralNuspecs,
+    #[error("the .nuspec cannot be read: {0}")]
+    Nuspec(&'static str),
+    #[error("the .nuspec is not well-formed XML: {0}")]
+    Xml(#[from] quick_xml::Error),
+    #[error("the .nuspec is not well-formed XML: {0}")]
+    Encoding(#[from] quick_xml::encoding::EncodingError),
+    #[error("the .nuspec is not well-formed XML: {0}")]
+    Escape(#[from] quick_xml::escape::EscapeError),
+    #[error("the package is {found}, its key names {expected}")]
+    Mismatch { found: String, expected: String },
+    #[error("reading the package: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("writing the record: {0}")]
+    Record(#[from] serde_json::Error),
+}
+
+/// The .nuspec and the record of the .nupkg read from `nupkg`, to be stored under `package_key`.
+/// The .nuspec must name the id and version the key does: a package of another id or version
+/// is not imported under this one.
+pub(crate) fn imported_package(
+    package_key: &str,
+    nupkg: impl std::io::Read + std::io::Seek,
+) -> Result<ImportedPackage, ImportedPackageError> {
+    let (id_lower, version) = package_key_parts(package_key)
+        .ok_or_else(|| ImportedPackageError::NotAPackageKey(package_key.to_string()))?;
+    let nuspec = root_nuspec(nupkg)?;
+    let record = parse_nuspec(&nuspec)?;
+    let found = format!(
+        "{}@{}",
+        record.id.to_lowercase(),
+        crate::curation::nuget_version_key(&record.version).unwrap_or_default()
+    );
+    let expected = format!("{id_lower}@{version}");
+    if found != expected {
+        return Err(ImportedPackageError::Mismatch { found, expected });
+    }
+    Ok(ImportedPackage {
+        nuspec_key: nuspec_key(id_lower, version),
+        nuspec,
+        record_key: hosted_record_key(id_lower, version),
+        record: serde_json::to_vec(&record)?,
+    })
+}
+
+/// The largest .nuspec read from a package. NuGet itself refuses a manifest a fraction this size.
+const NUSPEC_MAX: u64 = 1 << 20;
+/// The largest central directory read from a package: a few hundred thousand entries.
+const CENTRAL_DIRECTORY_MAX: u64 = 64 << 20;
+
+fn le16(b: &[u8], at: usize) -> Option<u64> {
+    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?).into())
+}
+
+fn le32(b: &[u8], at: usize) -> Option<u64> {
+    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?).into())
+}
+
+/// The bytes of the one .nuspec at the root of the zip archive `zip`, checked against the size and
+/// CRC-32 the archive records for it. Stored and deflated entries are read; a zip64 archive is not.
+fn root_nuspec(
+    mut zip: impl std::io::Read + std::io::Seek,
+) -> Result<Vec<u8>, ImportedPackageError> {
+    use std::io::{Read, SeekFrom};
+    use ImportedPackageError::{NotAZip, Nuspec};
+    const END_OF_DIRECTORY: u64 = 0x0605_4b50;
+    const DIRECTORY_ENTRY: u64 = 0x0201_4b50;
+    const LOCAL_HEADER: u64 = 0x0403_4b50;
+
+    let len = zip.seek(SeekFrom::End(0))?;
+    if len < 22 {
+        return Err(NotAZip("shorter than an empty archive"));
+    }
+    // The end-of-directory record is the last 22 bytes before a comment of up to 64 KiB.
+    let tail_len = len.min(22 + 0xFFFF);
+    zip.seek(SeekFrom::Start(len - tail_len))?;
+    let mut tail = vec![0; tail_len as usize];
+    zip.read_exact(&mut tail)?;
+    let end = (0..=tail.len() - 22)
+        .rev()
+        .find(|&at| le32(&tail, at) == Some(END_OF_DIRECTORY))
+        .ok_or(NotAZip("no end of central directory"))?;
+    let entries = le16(&tail, end + 10).ok_or(NotAZip("truncated end record"))?;
+    let directory_len = le32(&tail, end + 12).ok_or(NotAZip("truncated end record"))?;
+    let directory_at = le32(&tail, end + 16).ok_or(NotAZip("truncated end record"))?;
+    if entries == 0xFFFF || directory_at == 0xFFFF_FFFF || directory_len == 0xFFFF_FFFF {
+        return Err(NotAZip("zip64 archives are not read"));
+    }
+    if directory_len > CENTRAL_DIRECTORY_MAX || directory_at + directory_len > len {
+        return Err(NotAZip("central directory out of bounds"));
+    }
+    zip.seek(SeekFrom::Start(directory_at))?;
+    let mut directory = vec![0; directory_len as usize];
+    zip.read_exact(&mut directory)?;
+
+    let mut at = 0usize;
+    let mut found = None;
+    for _ in 0..entries {
+        let entry = directory
+            .get(at..)
+            .ok_or(NotAZip("truncated central directory"))?;
+        let read = |offset: usize, width: usize| {
+            match width {
+                2 => le16(entry, offset),
+                _ => le32(entry, offset),
+            }
+            .ok_or(NotAZip("truncated central directory"))
+        };
+        if read(0, 4)? != DIRECTORY_ENTRY {
+            return Err(NotAZip("bad central directory entry"));
+        }
+        let (method, crc, packed, size) = (read(10, 2)?, read(16, 4)?, read(20, 4)?, read(24, 4)?);
+        let name_len = read(28, 2)? as usize;
+        let skip = (read(30, 2)? + read(32, 2)?) as usize;
+        let local = read(42, 4)?;
+        let name = entry
+            .get(46..46 + name_len)
+            .ok_or(NotAZip("truncated central directory"))?;
+        if !name.contains(&b'/') && name.to_ascii_lowercase().ends_with(b".nuspec") {
+            if found.is_some() {
+                return Err(ImportedPackageError::SeveralNuspecs);
+            }
+            found = Some((method, crc, packed, size, local));
+        }
+        at += 46 + name_len + skip;
+    }
+    let (method, crc, packed, size, local) = found.ok_or(ImportedPackageError::NoNuspec)?;
+    if size > NUSPEC_MAX {
+        return Err(Nuspec("larger than 1 MiB"));
+    }
+    zip.seek(SeekFrom::Start(local))?;
+    let mut header = [0u8; 30];
+    zip.read_exact(&mut header)?;
+    if le32(&header, 0) != Some(LOCAL_HEADER) {
+        return Err(NotAZip("bad local header"));
+    }
+    let skip = le16(&header, 26).unwrap_or(0) + le16(&header, 28).unwrap_or(0);
+    zip.seek(SeekFrom::Current(skip as i64))?;
+    let packed_body = zip.take(packed);
+    let mut nuspec = Vec::new();
+    match method {
+        0 => packed_body.take(NUSPEC_MAX + 1).read_to_end(&mut nuspec)?,
+        8 => flate2::read::DeflateDecoder::new(packed_body)
+            .take(NUSPEC_MAX + 1)
+            .read_to_end(&mut nuspec)?,
+        _ => return Err(Nuspec("compressed with a method other than deflate")),
+    };
+    let mut check = flate2::Crc::new();
+    check.update(&nuspec);
+    if nuspec.len() as u64 != size || u64::from(check.sum()) != crc {
+        return Err(Nuspec(
+            "its bytes do not match the size and CRC-32 the archive records",
+        ));
+    }
+    Ok(nuspec)
+}
+
+/// The record of a .nuspec: `package/metadata`'s id, version (normalized), description, authors
+/// and dependency groups — a `<dependencies>` without groups is one group for every framework.
+fn parse_nuspec(nuspec: &[u8]) -> Result<HostedRecord, ImportedPackageError> {
+    use quick_xml::events::{BytesStart, Event};
+    use ImportedPackageError::Nuspec;
+    fn attribute(element: &BytesStart, name: &[u8]) -> String {
+        element
+            .attributes()
+            .flatten()
+            .find(|a| a.key.local_name().as_ref() == name)
+            .and_then(|a| {
+                let raw = String::from_utf8(a.value.to_vec()).ok()?;
+                Some(quick_xml::escape::unescape(&raw).ok()?.into_owned())
+            })
+            .unwrap_or_default()
+    }
+
+    let mut reader = quick_xml::Reader::from_reader(nuspec);
+    reader.config_mut().trim_text(true);
+    let mut record = HostedRecord::default();
+    let mut path: Vec<Vec<u8>> = Vec::new();
+    // The group the dependencies being read belong to, and the one of dependencies listed
+    // without a group.
+    let (mut group, mut flat): (Option<usize>, Option<usize>) = (None, None);
+    loop {
+        let event = reader.read_event()?;
+        let (element, empty) = match &event {
+            Event::Start(e) => (e, false),
+            Event::Empty(e) => (e, true),
+            Event::End(_) => {
+                path.pop();
+                continue;
+            }
+            // A document that ends inside an element is cut short.
+            Event::Eof if path.is_empty() => break,
+            Event::Eof => return Err(Nuspec("not well-formed XML")),
+            _ => continue,
+        };
+        let name = element.local_name().as_ref().to_vec();
+        let parents: Vec<&[u8]> = path.iter().map(Vec::as_slice).collect();
+        match (parents.as_slice(), name.as_slice()) {
+            (
+                [b"package", b"metadata"],
+                field @ (b"id" | b"version" | b"description" | b"authors"),
+            ) if !empty => {
+                let text = reader.read_text(element.name())?.decode()?.into_owned();
+                let text = quick_xml::escape::unescape(&text)?.trim().to_string();
+                match field {
+                    b"id" => record.id = text,
+                    b"version" => record.version = text,
+                    b"description" => record.description = text,
+                    _ => record.authors = text,
+                }
+                // `read_text` consumed the end tag.
+                continue;
+            }
+            ([b"package", b"metadata", b"dependencies"], b"group") => {
+                record.dependency_groups.push(DependencyGroup {
+                    target_framework: attribute(element, b"targetFramework"),
+                    dependencies: Vec::new(),
+                });
+                group = Some(record.dependency_groups.len() - 1);
+            }
+            ([b"package", b"metadata", b"dependencies", b"group"], b"dependency") => {
+                if let Some(group) = group.and_then(|at| record.dependency_groups.get_mut(at)) {
+                    group.dependencies.push(Dependency {
+                        id: attribute(element, b"id"),
+                        range: attribute(element, b"version"),
+                    });
+                }
+            }
+            ([b"package", b"metadata", b"dependencies"], b"dependency") => {
+                let at = *flat.get_or_insert_with(|| {
+                    record.dependency_groups.push(DependencyGroup::default());
+                    record.dependency_groups.len() - 1
+                });
+                record.dependency_groups[at].dependencies.push(Dependency {
+                    id: attribute(element, b"id"),
+                    range: attribute(element, b"version"),
+                });
+            }
+            _ => {}
+        }
+        if !empty {
+            path.push(name);
+        }
+    }
+    let normalized = crate::curation::nuget_version_key(&record.version)
+        .ok_or(Nuspec("names no NuGet version"))?;
+    if record.id.is_empty() || !is_valid_package_id(&record.id.to_lowercase()) {
+        return Err(Nuspec("names no valid package id"));
+    }
+    // The normalized numbers, and the pre-release labels in the case the package gives them.
+    let numbers = normalized
+        .split_once('-')
+        .map_or(normalized.as_str(), |(n, _)| n);
+    let labels = record
+        .version
+        .split('+')
+        .next()
+        .and_then(|release| release.split_once('-'))
+        .map(|(_, labels)| labels.trim());
+    record.version = match labels {
+        Some(labels) => format!("{numbers}-{labels}"),
+        None => numbers.to_string(),
+    };
+    Ok(record)
+}
+
+/// The registration of a hosted package, built from its records: one inline page that lists every
+/// version with its .nupkg in NORA's flat container and its dependency groups.
+async fn hosted_registration(state: &AppState, id_lower: &str, versions: &[String]) -> Response {
+    let nuget = format!("{}/nuget/v3", nora_base_url(state).trim_end_matches('/'));
+    let registration = format!("{nuget}/registration/{id_lower}/index.json");
+    let mut leaves = Vec::with_capacity(versions.len());
+    let mut range: Option<(String, String)> = None;
+    for version in versions {
+        let key = hosted_record_key(id_lower, version);
+        let record: HostedRecord = match state.storage.get(&key).await {
+            Ok(data) => match serde_json::from_slice(&data) {
+                Ok(record) => record,
+                Err(e) => {
+                    tracing::warn!(key = %key, error = %e, "nuget: hosted record not readable");
+                    return crate::registry::storage_unavailable("nuget", &key);
+                }
+            },
+            // Deleted since the listing: the version is no longer hosted.
+            Err(crate::storage::StorageError::NotFound) => continue,
+            Err(_) => return crate::registry::storage_unavailable("nuget", &key),
+        };
+        let content =
+            format!("{nuget}/flatcontainer/{id_lower}/{version}/{id_lower}.{version}.nupkg");
+        let leaf = format!("{nuget}/registration/{id_lower}/{version}.json");
+        let groups: Vec<serde_json::Value> = record
+            .dependency_groups
+            .iter()
+            .map(|group| {
+                let mut value = serde_json::json!({
+                    "@type": "PackageDependencyGroup",
+                    "dependencies": group.dependencies.iter().map(|d| serde_json::json!({
+                        "@type": "PackageDependency",
+                        "id": d.id,
+                        "range": d.range,
+                    })).collect::<Vec<_>>(),
+                });
+                if !group.target_framework.is_empty() {
+                    value["targetFramework"] = group.target_framework.clone().into();
+                }
+                value
+            })
+            .collect();
+        range = Some(match range {
+            None => (record.version.clone(), record.version.clone()),
+            Some((lower, _)) => (lower, record.version.clone()),
+        });
+        leaves.push(serde_json::json!({
+            "@id": leaf,
+            "@type": "Package",
+            "catalogEntry": {
+                "@id": leaf,
+                "@type": "PackageDetails",
+                "id": record.id,
+                "version": record.version,
+                "description": record.description,
+                "authors": record.authors,
+                "listed": true,
+                "packageContent": content,
+                "dependencyGroups": groups,
+            },
+            "packageContent": content,
+            "registration": registration,
+        }));
+    }
+    let Some((lower, upper)) = range else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let doc = serde_json::json!({
+        "@id": registration,
+        "@type": ["catalog:CatalogRoot", "PackageRegistration", "catalog:Permalink"],
+        "count": 1,
+        "items": [{
+            "@id": format!("{registration}#page/{lower}/{upper}"),
+            "@type": "catalog:CatalogPage",
+            "count": leaves.len(),
+            "lower": lower,
+            "upper": upper,
+            "parent": registration,
+            "items": leaves,
+        }],
+    });
+    state.metrics.record_download("nuget");
+    with_json_gzip(doc.to_string().into_bytes())
+}
+
 /// Validate NuGet version string for use in URL path construction.
 /// Allows: digits, dots, hyphens, plus, alphanumeric (SemVer 2.0 compatible).
 fn is_valid_version(version: &str) -> bool {
@@ -2195,6 +2732,73 @@ mod tests {
 mod integration_tests {
     use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
+
+    /// A .nuspec's record: its id, its version normalized with the labels in their own case, and
+    /// its dependencies — in groups, or listed without one as a group for every framework.
+    #[test]
+    fn a_nuspec_record_keeps_its_id_version_and_dependencies() {
+        let grouped = br#"<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd"><metadata>
+  <id>Corp.Lib</id><version>01.2-RC.1+sha.5</version><authors>a &amp; b</authors>
+  <dependencies>
+    <group targetFramework=".NETStandard2.0"><dependency id="A" version="[1.0,2.0)"/></group>
+    <group targetFramework="net8.0"/>
+  </dependencies>
+</metadata></package>"#;
+        let record = super::parse_nuspec(grouped).unwrap();
+        assert_eq!(record.id, "Corp.Lib");
+        assert_eq!(record.version, "1.2.0-RC.1");
+        assert_eq!(record.authors, "a & b");
+        assert_eq!(record.dependency_groups.len(), 2);
+        assert_eq!(
+            record.dependency_groups[0].target_framework,
+            ".NETStandard2.0"
+        );
+        assert_eq!(record.dependency_groups[0].dependencies[0].id, "A");
+        assert_eq!(
+            record.dependency_groups[0].dependencies[0].range,
+            "[1.0,2.0)"
+        );
+        assert!(record.dependency_groups[1].dependencies.is_empty());
+
+        let flat = br#"<package><metadata><id>Flat</id><version>1.0.0</version>
+  <dependencies><dependency id="A" version="1.0"/><dependency id="B"/></dependencies>
+</metadata></package>"#;
+        let record = super::parse_nuspec(flat).unwrap();
+        assert_eq!(record.dependency_groups.len(), 1);
+        assert_eq!(record.dependency_groups[0].target_framework, "");
+        let ids: Vec<&str> = record.dependency_groups[0]
+            .dependencies
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(ids, ["A", "B"]);
+
+        for bad in [
+            &b"<package><metadata><id>X</id></metadata></package>"[..],
+            b"<package><metadata><version>1.0</version></metadata></package>",
+            b"<package><metadata><id>a/b</id><version>1.0</version></metadata></package>",
+            b"<package><metadata><id>X</id><version>1.0</version>",
+        ] {
+            assert!(
+                super::parse_nuspec(bad).is_err(),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+
+    /// The flat-container key of a package is the one a client asks for: id and normalized
+    /// version in lowercase.
+    #[test]
+    fn a_package_key_is_the_one_a_client_asks_for() {
+        assert_eq!(
+            super::package_key("Corp.Lib", "01.2-RC.1+sha.5").as_deref(),
+            Some("nuget/flatcontainer/corp.lib/1.2.0-rc.1/corp.lib.1.2.0-rc.1.nupkg")
+        );
+        assert_eq!(super::package_key("a/b", "1.0"), None);
+        assert_eq!(super::package_key("Corp.Lib", "latest"), None);
+    }
 
     #[tokio::test]
     async fn test_nuget_disabled_returns_404() {

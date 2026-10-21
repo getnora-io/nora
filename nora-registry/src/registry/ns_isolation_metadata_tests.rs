@@ -1140,30 +1140,23 @@ async fn an_internal_package_on_a_store_that_cannot_be_read_is_unavailable_not_a
         "upstream asked during the outage: {asked:?}"
     );
 
-    // Control: a package outside the internal namespaces is still answered by its upstream —
-    // except on npm, where a store that cannot list a package's published versions leaves NORA
-    // unable to tell whether the name is published here: 503, as for cargo.
-    let nuget = send(
-        &ctx.app,
-        Method::GET,
+    // A package outside the internal namespaces is not handed to its upstream either: a store
+    // that cannot list a package's published versions (npm) or its imported ones (NuGet, PyPI)
+    // leaves NORA unable to tell whether the name is NORA's own: 503, as for cargo. With
+    // listings answering, a public package still goes to its upstream (the test below).
+    for path in [
         "/nuget/v3/flatcontainer/publicpkg/1.0.0/publicpkg.1.0.0.nupkg",
-        "",
-    )
-    .await;
-    assert_eq!(nuget.status(), StatusCode::OK, "nuget during the outage");
-    let npm = send(
-        &ctx.app,
-        Method::GET,
         "/npm/publicpkg/-/publicpkg-1.0.0.tgz",
-        "",
-    )
-    .await;
-    assert_eq!(
-        npm.status(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "npm during the outage"
-    );
-    assert_eq!(upstream_paths(&upstream).await.len(), 1);
+        "/simple/publicpkg/",
+    ] {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path} during the outage"
+        );
+    }
+    assert_eq!(upstream_paths(&upstream).await, Vec::<String>::new());
 }
 
 /// The same when only object reads fail and listings still answer (a store throttling its GETs):
@@ -1239,6 +1232,27 @@ async fn an_internal_package_whose_copy_cannot_be_read_is_unavailable_not_absent
     assert!(
         asked.is_empty(),
         "upstream asked while reads fail: {asked:?}"
+    );
+
+    // Control: listings still answer, so NORA can tell a public package is not its own, and its
+    // upstream answers for it.
+    for path in [
+        "/nuget/v3/flatcontainer/publicpkg/1.0.0/publicpkg.1.0.0.nupkg",
+        "/simple/publicpkg/",
+    ] {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        assert_ne!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path} while reads fail"
+        );
+    }
+    let asked = upstream_paths(&upstream).await;
+    assert!(
+        asked.iter().any(|p| p.contains("/publicpkg/1.0.0/"))
+            && asked.iter().any(|p| p.ends_with("/publicpkg/"))
+            && asked.iter().all(|p| p.contains("publicpkg")),
+        "{asked:?}"
     );
 }
 

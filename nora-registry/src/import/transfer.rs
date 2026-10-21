@@ -234,11 +234,52 @@ pub async fn transfer_artifact(
         None
     };
 
+    // 4c. A .nupkg is stored with its .nuspec and its record, read from the staged file before
+    // anything is committed: a package that is no zip with one .nuspec naming the id and version
+    // of its key leaves nothing behind.
+    let nuget_package = if rt == RegistryType::Nuget {
+        match staged_nuget_package(key, &temp_path).await {
+            Ok(package) => Some(package),
+            Err(e) => {
+                return Outcome::Failed {
+                    reason: format!("{}: {e}", artifact.path),
+                }
+            }
+        }
+    } else {
+        None
+    };
+    // 4d. A PyPI file's project, from the key the layout built (`pypi/<project>/<file>`).
+    let pypi_file = if rt == RegistryType::PyPI {
+        match key
+            .strip_prefix("pypi/")
+            .and_then(|rest| rest.split_once('/'))
+        {
+            Some(parts) => Some(parts),
+            None => {
+                return Outcome::Failed {
+                    reason: format!("{}: not a PyPI file key: {key}", artifact.path),
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     // 5. COMMIT (unless dry-run, which has already streamed+hashed+verified).
     if opts.dry_run {
         return Outcome::Imported { bytes, sha256 }; // rehearsal — guard drops temp
     }
     let _ = provenance; // (Weak provenance is surfaced by the orchestrator's report, not here.)
+                        // The project is made hosted before its first file is stored: from the moment the import
+                        // stores anything of it, its name is not asked of an upstream.
+    if let Some((project, file)) = pypi_file {
+        if let Err(e) = crate::registry::pypi_claim_hosted_file(storage, project, file).await {
+            return Outcome::Failed {
+                reason: format!("{}: making project {project} hosted: {e}", artifact.path),
+            };
+        }
+    }
     if let Err(e) = storage.put_from_path(key, &temp_path, Some(&sha256)).await {
         return Outcome::Failed {
             reason: format!("commit {key}: {e}"),
@@ -254,7 +295,55 @@ pub async fn transfer_artifact(
             };
         }
     }
+    // A PyPI file's digest is recorded as an upload records it. A failed write fails the
+    // artifact: the next run transfers it again and writes the record.
+    if let Some((project, file)) = pypi_file {
+        if let Err(e) =
+            crate::registry::pypi_record_stored_file(storage, project, file, &sha256).await
+        {
+            return Outcome::Failed {
+                reason: format!("commit {key}.sha256: {e}"),
+            };
+        }
+    }
+    // The .nuspec, then the record: the record is what makes the version served, so it always
+    // names a package and a .nuspec that are there. A failed write is retried by the next run.
+    if let Some(package) = nuget_package {
+        for (stored_key, data) in [
+            (&package.nuspec_key, &package.nuspec),
+            (&package.record_key, &package.record),
+        ] {
+            if let Err(e) = storage.put(stored_key, data).await {
+                return Outcome::Failed {
+                    reason: format!("commit {stored_key}: {e}"),
+                };
+            }
+        }
+    }
     Outcome::Imported { bytes, sha256 }
+}
+
+/// Why a .nupkg's .nuspec and record could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum NugetPackageError {
+    #[error(transparent)]
+    Package(#[from] crate::registry::NugetImportedPackageError),
+    #[error("reading the package stopped: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+/// The .nuspec and record of the .nupkg staged at `temp_path`, read off the runtime.
+async fn staged_nuget_package(
+    key: &str,
+    temp_path: &Path,
+) -> std::result::Result<crate::registry::nuget::ImportedPackage, NugetPackageError> {
+    let (key, temp_path) = (key.to_string(), temp_path.to_path_buf());
+    let package = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&temp_path)?;
+        crate::registry::nuget_imported_package(&key, std::io::BufReader::new(file))
+    })
+    .await??;
+    Ok(package)
 }
 
 /// Why an npm tarball's version document could not be written.

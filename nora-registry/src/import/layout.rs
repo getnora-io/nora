@@ -7,7 +7,9 @@
 //! row) — will not see the import. For Maven and Raw (Full support) this module
 //! calls the handler's own `storage_key` builder directly (the single source of
 //! truth); for npm (Partial) it builds the tarball key and pins the exact handler
-//! format with a regression test. Unsupported formats are **skipped, not failed**.
+//! format with a regression test. PyPI and NuGet (Partial) take the key from their
+//! handler's builder too: a distribution file under its project, a .nupkg under the
+//! flat-container key a client asks for. Unsupported formats are **skipped, not failed**.
 //!
 //! Every source string is tainted: a `repo`/`path` of `../../etc` must never
 //! become a raw path. Traversal/empty segments are rejected pre-key-build
@@ -43,7 +45,7 @@ pub fn normalize_format(src_format: &str) -> Option<RegistryType> {
 pub fn compat(rt: RegistryType) -> Compat {
     match rt {
         RegistryType::Maven | RegistryType::Raw => Compat::Full,
-        RegistryType::Npm => Compat::Partial,
+        RegistryType::Npm | RegistryType::PyPI | RegistryType::Nuget => Compat::Partial,
         _ => Compat::Unsupported,
     }
 }
@@ -88,6 +90,17 @@ pub fn map_artifact(rt: RegistryType, art: &ArtifactRef) -> Mapping {
             Some(k) => k,
             None => return Mapping::Skip("npm non-tarball asset (NORA assembles the packument)"),
         },
+        // PyPI: distribution files only, under the project the file names; the index and the
+        // digests are served from them.
+        RegistryType::PyPI => match pypi_key(&art.path) {
+            Ok(k) => k,
+            Err(mapping) => return mapping,
+        },
+        // NuGet: .nupkg files only; the transfer stores each one's .nuspec and record beside it.
+        RegistryType::Nuget => match nuget_key(&art.path) {
+            Ok(k) => k,
+            Err(mapping) => return mapping,
+        },
         _ => return Mapping::Skip("format not hosted by NORA import"),
     };
 
@@ -111,6 +124,85 @@ fn npm_tarball_key(path: &str) -> Option<String> {
         return None;
     }
     Some(format!("npm/{package}/tarballs/{file}"))
+}
+
+/// The key of a PyPI distribution file at source path `path`: `pypi/<project>/<file>`, the key
+/// an upload of the file writes. A wheel or an egg names its project in its first `-` field; an
+/// sdist's name may itself hold a `-`, so its project is the nearest directory of the source
+/// path it is a file of (Artifactory `<project>/<version>/`, Nexus `packages/<project>/<version>/`),
+/// else the name before its last `-`. Anything but a distribution file is skipped.
+fn pypi_key(path: &str) -> Result<String, Mapping> {
+    use nora_registry::pypi_files::{parse_pypi_version, pep503_normalize, served_extension};
+    let (dirs, file) = path.rsplit_once('/').unwrap_or(("", path));
+    let Some(ext) = served_extension(file) else {
+        return Err(Mapping::Skip("PyPI asset that is no distribution file"));
+    };
+    if file.contains("..") {
+        return Err(Mapping::Reject(format!(
+            "PyPI file name {file:?} is not one NORA serves"
+        )));
+    }
+    let stem = &file[..file.len() - ext.len()];
+    let first_field = stem.split('-').next().unwrap_or_default();
+    let last_split = stem
+        .rsplit_once('-')
+        .map(|(name, _)| name)
+        .unwrap_or_default();
+    let candidates: Vec<&str> = if ext == ".whl" || ext == ".egg" {
+        vec![first_field]
+    } else {
+        dirs.rsplit('/').chain([last_split]).collect()
+    };
+    candidates
+        .into_iter()
+        .map(pep503_normalize)
+        .find(|project| {
+            !project.is_empty()
+                && crate::validation::is_one_segment(project)
+                && parse_pypi_version(project, file).is_some()
+        })
+        .map(|project| crate::registry::pypi_storage_key(&project, file))
+        .ok_or_else(|| {
+            Mapping::Reject(format!(
+                "cannot tell the project and version of PyPI file {file:?}"
+            ))
+        })
+}
+
+/// The flat-container key of a .nupkg at source path `path`, from its file name
+/// `<id>.<version>.nupkg`. An id may end in a number, so the directory the file is in decides
+/// where the id ends when it names it (Artifactory `<id>/<id>.<version>.nupkg`); otherwise the
+/// version is the shortest tail of dot-separated fields that is a NuGet version. The transfer
+/// checks the package's .nuspec names the same id and version. Anything but a .nupkg is skipped.
+fn nuget_key(path: &str) -> Result<String, Mapping> {
+    let (dirs, file) = path.rsplit_once('/').unwrap_or(("", path));
+    let Some(stem) = file
+        .len()
+        .checked_sub(".nupkg".len())
+        .filter(|&at| file.is_char_boundary(at) && file[at..].eq_ignore_ascii_case(".nupkg"))
+        .map(|at| &file[..at])
+    else {
+        return Err(Mapping::Skip("NuGet asset that is no .nupkg"));
+    };
+    let dir = dirs.rsplit('/').next().unwrap_or_default();
+    let named_by_dir = (!dir.is_empty()
+        && stem.len() > dir.len() + 1
+        && stem.is_char_boundary(dir.len())
+        && stem[..dir.len()].eq_ignore_ascii_case(dir)
+        && stem.as_bytes()[dir.len()] == b'.')
+        .then(|| (&stem[..dir.len()], &stem[dir.len() + 1..]));
+    let key = named_by_dir
+        .and_then(|(id, version)| crate::registry::nuget_package_key(id, version))
+        .or_else(|| {
+            stem.match_indices('.').find_map(|(at, _)| {
+                crate::registry::nuget_package_key(&stem[..at], &stem[at + 1..])
+            })
+        });
+    key.ok_or_else(|| {
+        Mapping::Reject(format!(
+            "cannot tell the id and version of NuGet package {file:?}"
+        ))
+    })
 }
 
 /// Join a source repo name and a repo-relative path into one relative path,
@@ -226,6 +318,95 @@ mod tests {
             Mapping::Skip(_) => {}
             other => panic!("expected Skip, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn pypi_file_maps_to_the_key_an_upload_writes() {
+        // A wheel names its project in its first field, wherever the source keeps it.
+        assert_eq!(
+            map_artifact(
+                RegistryType::PyPI,
+                &art("pypi-local", "corppkg/1.0.0/CorpPkg-1.0.0-py3-none-any.whl")
+            ),
+            Mapping::Key("pypi/corppkg/CorpPkg-1.0.0-py3-none-any.whl".to_string())
+        );
+        // An sdist's project is the directory of the source that names it.
+        assert_eq!(
+            map_artifact(
+                RegistryType::PyPI,
+                &art("pypi-hosted", "packages/my.pkg/2.0/my-pkg-2.0.tar.gz")
+            ),
+            Mapping::Key("pypi/my-pkg/my-pkg-2.0.tar.gz".to_string())
+        );
+        assert_eq!(
+            map_artifact(RegistryType::PyPI, &art("r", "flat-1.0.zip")),
+            Mapping::Key("pypi/flat/flat-1.0.zip".to_string())
+        );
+        // The key is the one the upload handler writes for the same project and file.
+        assert_eq!(
+            crate::registry::pypi_storage_key("corppkg", "CorpPkg-1.0.0-py3-none-any.whl"),
+            "pypi/corppkg/CorpPkg-1.0.0-py3-none-any.whl"
+        );
+    }
+
+    #[test]
+    fn pypi_assets_that_are_no_distribution_are_skipped() {
+        for path in [
+            "corppkg/1.0.0/corppkg-1.0.0.tar.gz.asc",
+            "corppkg/1.0.0/corppkg-1.0.0-py3-none-any.whl.metadata",
+            "simple/corppkg/index.html",
+        ] {
+            assert!(
+                matches!(
+                    map_artifact(RegistryType::PyPI, &art("r", path)),
+                    Mapping::Skip(_)
+                ),
+                "{path}"
+            );
+        }
+        // A distribution file that names no version is refused, not skipped.
+        assert!(matches!(
+            map_artifact(RegistryType::PyPI, &art("r", "pkg/pkg.tar.gz")),
+            Mapping::Reject(_)
+        ));
+    }
+
+    #[test]
+    fn nupkg_maps_to_the_flat_container_key_a_client_reads() {
+        assert_eq!(
+            map_artifact(
+                RegistryType::Nuget,
+                &art("nuget-local", "Corp.Lib/Corp.Lib.1.0.nupkg")
+            ),
+            Mapping::Key("nuget/flatcontainer/corp.lib/1.0.0/corp.lib.1.0.0.nupkg".to_string())
+        );
+        assert_eq!(
+            map_artifact(
+                RegistryType::Nuget,
+                &art("nuget-local", "Foo.2D.Bar.01.2.3-RC.1+git.nupkg")
+            ),
+            Mapping::Key(
+                "nuget/flatcontainer/foo.2d.bar/1.2.3-rc.1/foo.2d.bar.1.2.3-rc.1.nupkg".to_string()
+            )
+        );
+        // The directory that names the id decides where an id ends in digits.
+        assert_eq!(
+            map_artifact(RegistryType::Nuget, &art("r", "Lib.2/Lib.2.1.0.0.nupkg")),
+            Mapping::Key("nuget/flatcontainer/lib.2/1.0.0/lib.2.1.0.0.nupkg".to_string())
+        );
+        for skipped in ["Corp.Lib/Corp.Lib.1.0.0.snupkg", "Corp.Lib/Corp.Lib.nuspec"] {
+            assert!(
+                matches!(
+                    map_artifact(RegistryType::Nuget, &art("r", skipped)),
+                    Mapping::Skip(_)
+                ),
+                "{skipped}"
+            );
+        }
+        assert!(matches!(
+            map_artifact(RegistryType::Nuget, &art("r", "NoVersion.nupkg")),
+            Mapping::Reject(_)
+        ));
     }
 
     #[test]

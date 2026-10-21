@@ -120,6 +120,12 @@ pub enum ImportCommand {
     /// `[server]` in the same config): without one the bind address is written, and clients
     /// cannot fetch the tarballs.
     ///
+    /// PyPI and NuGet: a project or package imported from a repository of the source is NORA's
+    /// own from then on. Its index, registration and files are served from what the import
+    /// stored, and no upstream is asked for its name — a version NORA does not hold is not found.
+    /// Only distribution files (.whl, .tar.gz, .zip, .egg) and .nupkg files are imported; a
+    /// .nupkg must hold one .nuspec naming the id and version of its file name.
+    ///
     /// Upgrading from 1.4.1 or older: an npm repository those releases imported holds tarballs
     /// without version documents, and NORA does not serve them as published packages. A re-run
     /// skips a repository it finished, so first delete that repository's `<repo>.done` and
@@ -259,10 +265,16 @@ async fn assess(args: AssessArgs, config: &crate::config::Config) -> Result<()> 
                     layout::Compat::Partial => partial += 1,
                     layout::Compat::Unsupported => unsupported += 1,
                 }
-                let note = match c {
-                    layout::Compat::Full => "",
-                    layout::Compat::Partial => "tarballs only; metadata regenerated",
-                    layout::Compat::Unsupported => "no NORA import layout — will be skipped",
+                let note = match (c, rt) {
+                    (layout::Compat::Full, _) => "",
+                    (_, crate::registry_type::RegistryType::PyPI) => {
+                        "distribution files only; served as hosted, never asked of an upstream"
+                    }
+                    (_, crate::registry_type::RegistryType::Nuget) => {
+                        ".nupkg only; served as hosted, never asked of an upstream"
+                    }
+                    (layout::Compat::Partial, _) => "tarballs only; metadata regenerated",
+                    (layout::Compat::Unsupported, _) => "no NORA import layout — will be skipped",
                 };
                 (format!("{c:?}"), note)
             }
@@ -434,8 +446,16 @@ async fn import_repo(
                 if prior.contains(&key) {
                     return Item::ResumeSkip;
                 }
-                // Fast-path only on local (per-object HEAD on S3 = $$ + latency, R5).
-                if !on_s3 && storage.stat(&key).await.is_some() {
+                // Fast-path only on local (per-object HEAD on S3 = $$ + latency, R5). Not for a
+                // PyPI file or a .nupkg: what is stored under the key may be what an upstream
+                // served under the name before the import made it NORA's own, and only a transfer
+                // stores the source's verified bytes and writes every record beside them.
+                let hosted_records = matches!(
+                    rt,
+                    crate::registry_type::RegistryType::PyPI
+                        | crate::registry_type::RegistryType::Nuget
+                );
+                if !on_s3 && !hosted_records && storage.stat(&key).await.is_some() {
                     // An npm tarball an earlier import committed without its version document
                     // (before 1.4.2, or a failed document write) is published now.
                     if rt == crate::registry_type::RegistryType::Npm && !opts.dry_run {
@@ -453,7 +473,7 @@ async fn import_repo(
                     }
                     return Item::CasSkip { key };
                 }
-                let cname = curation_name(rt, &art);
+                let cname = curation_name(rt, &art, &key);
                 let outcome = transfer::transfer_artifact(
                     source, &art, &key, rt, &cname, host, storage, curation, temp_dir, opts,
                 )
@@ -546,8 +566,10 @@ enum Item {
 }
 
 /// Best-effort curation "name" per format (namespace-isolation and blocklist
-/// rules key on it). For npm the package name; otherwise the repo-relative path.
-fn curation_name(rt: crate::registry_type::RegistryType, art: &ArtifactRef) -> String {
+/// rules key on it). For npm the package name, for PyPI the project and for NuGet the id the
+/// handler checks; otherwise the repo-relative path.
+fn curation_name(rt: crate::registry_type::RegistryType, art: &ArtifactRef, key: &str) -> String {
+    let segment = |at: usize| key.split('/').nth(at).unwrap_or(&art.path).to_string();
     match rt {
         crate::registry_type::RegistryType::Npm => art
             .path
@@ -555,6 +577,10 @@ fn curation_name(rt: crate::registry_type::RegistryType, art: &ArtifactRef) -> S
             .next()
             .unwrap_or(&art.path)
             .to_string(),
+        // `pypi/<project>/<file>`
+        crate::registry_type::RegistryType::PyPI => segment(1),
+        // `nuget/flatcontainer/<id>/<version>/<file>`
+        crate::registry_type::RegistryType::Nuget => segment(2),
         _ => art.path.clone(),
     }
 }
@@ -1499,6 +1525,482 @@ mod integration_tests {
         );
     }
 
+    /// Import `arts` from one source repository of `format` into `storage`.
+    async fn import_as(
+        storage: &crate::storage::Storage,
+        rt: crate::registry_type::RegistryType,
+        format: &str,
+        arts: Vec<(String, Vec<u8>)>,
+        state: &std::path::Path,
+    ) -> ImportResult {
+        let src = FakeSource {
+            arts,
+            stream_err: false,
+        };
+        let resume = resume::ResumeStore::open(state, "host").await.unwrap();
+        let curation =
+            crate::curation::CurationEngine::new(crate::config::CurationConfig::default());
+        let repo = RepoRef {
+            name: "r".into(),
+            format: format.into(),
+        };
+        import_repo(
+            &src,
+            &repo,
+            rt,
+            "host",
+            storage,
+            &curation,
+            &state.join("tmp"),
+            &resume,
+            opts(false),
+            4,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The request paths a mock upstream received.
+    async fn asked(upstream: &MockServer) -> Vec<String> {
+        upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect()
+    }
+
+    /// A zip archive of `entries`, each stored or deflated, as `dotnet pack` and wheel builders
+    /// write them.
+    fn zip(entries: &[(&str, &[u8], bool)]) -> Vec<u8> {
+        let (mut out, mut central) = (Vec::new(), Vec::new());
+        for (name, data, deflate) in entries {
+            let mut crc = flate2::Crc::new();
+            crc.update(data);
+            let body = if *deflate {
+                let mut enc =
+                    flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+                std::io::Write::write_all(&mut enc, data).unwrap();
+                enc.finish().unwrap()
+            } else {
+                data.to_vec()
+            };
+            let method: u16 = if *deflate { 8 } else { 0 };
+            let offset = out.len() as u32;
+            let mut common = Vec::new();
+            common.extend_from_slice(&20u16.to_le_bytes()); // version needed
+            common.extend_from_slice(&0u16.to_le_bytes()); // flags
+            common.extend_from_slice(&method.to_le_bytes());
+            common.extend_from_slice(&[0; 4]); // time, date
+            common.extend_from_slice(&crc.sum().to_le_bytes());
+            common.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            common.extend_from_slice(&(data.len() as u32).to_le_bytes());
+            common.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            common.extend_from_slice(&0u16.to_le_bytes()); // extra length
+            out.extend_from_slice(&0x0403_4b50u32.to_le_bytes());
+            out.extend_from_slice(&common);
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(&body);
+            central.extend_from_slice(&0x0201_4b50u32.to_le_bytes());
+            central.extend_from_slice(&20u16.to_le_bytes()); // version made by
+            central.extend_from_slice(&common);
+            central.extend_from_slice(&[0; 10]); // comment length, disk, attributes
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let (cd_offset, cd_size) = (out.len() as u32, central.len() as u32);
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+        out.extend_from_slice(&[0; 4]); // disk numbers
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&cd_size.to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // comment length
+        out
+    }
+
+    /// A .nupkg of `id` at `version` whose .nuspec depends on Newtonsoft.Json for net8.0.
+    fn nupkg(id: &str, version: &str) -> Vec<u8> {
+        let nuspec = format!(
+            r#"<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>{id}</id>
+    <version>{version}</version>
+    <authors>INTERNAL-ARTIFACTORY</authors>
+    <description>INTERNAL-ARTIFACTORY &amp; more</description>
+    <dependencies>
+      <group targetFramework="net8.0">
+        <dependency id="Newtonsoft.Json" version="13.0.1" exclude="Build,Analyzers" />
+      </group>
+    </dependencies>
+  </metadata>
+</package>"#
+        );
+        zip(&[
+            ("[Content_Types].xml", b"<Types/>", false),
+            (&format!("{id}.nuspec"), nuspec.as_bytes(), true),
+            ("lib/net8.0/x.txt", b"x", true),
+        ])
+    }
+
+    /// A PyPI file imported from a hosted repository is NORA's own: the index lists it with its
+    /// digest, the file is served, and neither the index, its dates nor a file NORA does not
+    /// hold are asked of an upstream. A name nothing imported still goes to the upstream.
+    #[tokio::test]
+    async fn an_imported_pypi_project_is_served_as_hosted_without_an_upstream() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/files/corppkg-9.9.9-py3-none-any.whl">corppkg-9.9.9-py3-none-any.whl</a>"#,
+            ))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.enabled = true;
+            cfg.pypi.proxy = Some(format!("{uri}/simple/"));
+            cfg.server.trust_upstream_dates = true;
+        });
+        let wheel = zip(&[("corppkg/__init__.py", b"", true)]);
+        let sdist = b"sdist bytes".to_vec();
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::PyPI,
+            "pypi",
+            vec![
+                (
+                    "corppkg/1.0.0/corppkg-1.0.0-py3-none-any.whl".into(),
+                    wheel.clone(),
+                ),
+                ("packages/CorpPkg/1.0.0/CorpPkg-1.0.0.tar.gz".into(), sdist),
+                (
+                    "corppkg/1.0.0/corppkg-1.0.0.tar.gz.asc".into(),
+                    b"sig".to_vec(),
+                ),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!(
+            (res.imported, res.skipped, res.failed),
+            (2, 1, 0),
+            "{res:?}"
+        );
+
+        let index = send(&ctx.app, Method::GET, "/simple/corppkg/", "").await;
+        assert_eq!(index.status(), StatusCode::OK);
+        let html = String::from_utf8(body_bytes(index).await.to_vec()).unwrap();
+        let wheel_sha = hex::encode(Sha256::digest(&wheel));
+        assert!(
+            html.contains(&format!(
+                "/simple/corppkg/corppkg-1.0.0-py3-none-any.whl#sha256={wheel_sha}"
+            )),
+            "{html}"
+        );
+        assert!(html.contains("CorpPkg-1.0.0.tar.gz#sha256="), "{html}");
+        assert!(!html.contains("9.9.9"), "{html}");
+        let json = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/corppkg/",
+            vec![("accept", "application/vnd.pypi.simple.v1+json")],
+            "",
+        )
+        .await;
+        assert_eq!(json.status(), StatusCode::OK);
+        let file = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/corppkg/corppkg-1.0.0-py3-none-any.whl",
+            "",
+        )
+        .await;
+        assert_eq!(file.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(file).await[..], &wheel[..]);
+        let other = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/corppkg/corppkg-9.9.9-py3-none-any.whl",
+            "",
+        )
+        .await;
+        assert_eq!(other.status(), StatusCode::NOT_FOUND);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+
+        // Control: a project nothing imported is still the upstream's.
+        send(&ctx.app, Method::GET, "/simple/requests/", "").await;
+        assert_eq!(
+            asked(&upstream).await,
+            vec!["/simple/requests/".to_string()]
+        );
+    }
+
+    /// A .nupkg imported from a hosted repository is NORA's own: the flat container lists and
+    /// serves it with its .nuspec, the registration names it with the dependencies its .nuspec
+    /// declares, and no upstream is asked for the id — nor for a version NORA does not hold.
+    /// An id nothing imported still goes to the upstream.
+    #[tokio::test]
+    async fn an_imported_nupkg_is_served_as_hosted_without_an_upstream() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "versions": ["9.9.9"] })),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+            cfg.server.trust_upstream_dates = true;
+        });
+        let one = nupkg("Corp.Lib", "1.0");
+        let two = nupkg("Corp.Lib", "2.0.0-Beta.1");
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![
+                ("Corp.Lib/Corp.Lib.1.0.nupkg".into(), one.clone()),
+                ("Corp.Lib.2.0.0-Beta.1.nupkg".into(), two),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (2, 0), "{res:?}");
+
+        let flat = "/nuget/v3/flatcontainer/corp.lib";
+        let index = send(&ctx.app, Method::GET, &format!("{flat}/index.json"), "").await;
+        assert_eq!(index.status(), StatusCode::OK);
+        let versions: serde_json::Value = serde_json::from_slice(&body_bytes(index).await).unwrap();
+        assert_eq!(versions, json!({ "versions": ["1.0.0", "2.0.0-beta.1"] }));
+        let package = send(
+            &ctx.app,
+            Method::GET,
+            &format!("{flat}/1.0.0/corp.lib.1.0.0.nupkg"),
+            "",
+        )
+        .await;
+        assert_eq!(package.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(package).await[..], &one[..]);
+        let nuspec = send(
+            &ctx.app,
+            Method::GET,
+            &format!("{flat}/1.0.0/corp.lib.nuspec"),
+            "",
+        )
+        .await;
+        assert_eq!(nuspec.status(), StatusCode::OK);
+        let nuspec = String::from_utf8(body_bytes(nuspec).await.to_vec()).unwrap();
+        assert!(nuspec.contains("<id>Corp.Lib</id>"), "{nuspec}");
+
+        let registration = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/corp.lib/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(registration.status(), StatusCode::OK);
+        let gzip = registration
+            .headers()
+            .get("content-encoding")
+            .is_some_and(|v| v == "gzip");
+        let raw = body_bytes(registration).await;
+        let mut text = Vec::new();
+        if gzip {
+            std::io::Read::read_to_end(&mut flate2::read::GzDecoder::new(&raw[..]), &mut text)
+                .unwrap();
+        } else {
+            text = raw.to_vec();
+        }
+        let doc: serde_json::Value = serde_json::from_slice(&text).unwrap();
+        let leaves = doc["items"][0]["items"].as_array().unwrap();
+        assert_eq!(leaves.len(), 2, "{doc}");
+        let entry = &leaves[0]["catalogEntry"];
+        assert_eq!(entry["id"], "Corp.Lib", "{doc}");
+        assert_eq!(entry["version"], "1.0.0");
+        assert_eq!(entry["description"], "INTERNAL-ARTIFACTORY & more");
+        assert_eq!(
+            entry["packageContent"],
+            "http://nora.example/nuget/v3/flatcontainer/corp.lib/1.0.0/corp.lib.1.0.0.nupkg"
+        );
+        let group = &entry["dependencyGroups"][0];
+        assert_eq!(group["targetFramework"], "net8.0", "{doc}");
+        assert_eq!(group["dependencies"][0]["id"], "Newtonsoft.Json");
+        assert_eq!(group["dependencies"][0]["range"], "13.0.1");
+        assert_eq!(leaves[1]["catalogEntry"]["version"], "2.0.0-Beta.1");
+
+        let squatted = send(
+            &ctx.app,
+            Method::GET,
+            &format!("{flat}/9.9.9/corp.lib.9.9.9.nupkg"),
+            "",
+        )
+        .await;
+        assert_eq!(squatted.status(), StatusCode::NOT_FOUND);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+
+        // Control: an id nothing imported is still the upstream's.
+        send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/flatcontainer/other.lib/index.json",
+            "",
+        )
+        .await;
+        assert_eq!(
+            asked(&upstream).await,
+            vec!["/v3-flatcontainer/other.lib/index.json".to_string()]
+        );
+    }
+
+    /// A .nupkg is imported only when it is a package of the id and version its key names: one
+    /// whose .nuspec names another id or version, or that is no zip with a .nuspec, leaves
+    /// nothing behind.
+    #[tokio::test]
+    async fn a_nupkg_that_does_not_name_its_key_is_not_imported() {
+        let h = harness("nuget-mismatch").await;
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &h.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![
+                ("Pkg/Pkg.1.0.0.nupkg".into(), nupkg("Other", "1.0.0")),
+                ("Pkg/Pkg.1.0.1.nupkg".into(), nupkg("Pkg", "1.0.0")),
+                ("Pkg/Pkg.1.0.2.nupkg".into(), b"not a zip".to_vec()),
+                (
+                    "Pkg/Pkg.1.0.3.nupkg".into(),
+                    zip(&[("lib/x.txt", b"x", false)]),
+                ),
+                ("Pkg/Pkg.1.0.4.nupkg".into(), {
+                    // The .nuspec's bytes do not match the CRC-32 the archive records.
+                    let mut package = zip(&[(
+                        "Pkg.nuspec",
+                        b"<package><metadata><id>Pkg</id><version>1.0.4</version></metadata></package>",
+                        false,
+                    )]);
+                    let at = package.windows(5).position(|w| w == b"1.0.4").unwrap();
+                    package[at] = b'9';
+                    package
+                }),
+                (
+                    "Pkg/Pkg.1.0.5.nupkg".into(),
+                    zip(&[
+                        ("Pkg.nuspec", b"<package/>", false),
+                        ("pkg.NUSPEC", b"<package/>", false),
+                    ]),
+                ),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (0, 6), "{res:?}");
+        assert_eq!(
+            h.storage.list("nuget/").await.unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    /// What makes a name hosted is read before an upstream is asked for it: a store that cannot
+    /// answer leaves the request unanswered (503), and the name is not handed to the upstream.
+    #[tokio::test]
+    async fn a_store_that_cannot_tell_a_name_is_hosted_does_not_hand_it_upstream() {
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, outage_storage, send,
+        };
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "versions": [] })))
+            .mount(&upstream)
+            .await;
+        let (storage, outage) = outage_storage();
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &storage,
+            crate::registry_type::RegistryType::PyPI,
+            "pypi",
+            vec![("corppkg/1.0/corppkg-1.0.tar.gz".into(), b"s".to_vec())],
+            state.path(),
+        )
+        .await;
+        assert_eq!(res.imported, 1, "{res:?}");
+        let res = import_as(
+            &storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.0.nupkg".into(), nupkg("Corp.Lib", "1.0.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!(res.imported, 1, "{res:?}");
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.pypi.enabled = true;
+            cfg.pypi.proxy = Some(format!("{uri}/simple/"));
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+        });
+        outage.begin();
+        for path in [
+            "/simple/corppkg/",
+            "/simple/corppkg/corppkg-2.0.tar.gz",
+            "/nuget/v3/flatcontainer/corp.lib/index.json",
+            "/nuget/v3/flatcontainer/corp.lib/2.0.0/corp.lib.2.0.0.nupkg",
+            "/nuget/v3/registration/corp.lib/index.json",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+    }
+
+    /// A second run over a finished import transfers nothing and leaves the store as it was.
+    #[tokio::test]
+    async fn a_pypi_and_nuget_import_runs_again_without_a_change() {
+        let h = harness("rerun").await;
+        let state = tempfile::tempdir().unwrap();
+        let wheel = vec![(
+            "corppkg/1.0.0/corppkg-1.0.0-py3-none-any.whl".to_string(),
+            b"w".to_vec(),
+        )];
+        let package = vec![(
+            "Corp.Lib/Corp.Lib.1.0.0.nupkg".to_string(),
+            nupkg("Corp.Lib", "1.0.0"),
+        )];
+        let pypi = crate::registry_type::RegistryType::PyPI;
+        let nuget = crate::registry_type::RegistryType::Nuget;
+        let first = import_as(&h.storage, pypi, "pypi", wheel.clone(), state.path()).await;
+        assert_eq!((first.imported, first.failed), (1, 0), "{first:?}");
+        let first = import_as(&h.storage, nuget, "nuget", package.clone(), state.path()).await;
+        assert_eq!((first.imported, first.failed), (1, 0), "{first:?}");
+        let mut stored = h.storage.list("").await.unwrap();
+        stored.sort();
+        let again = import_as(&h.storage, pypi, "pypi", wheel, state.path()).await;
+        assert_eq!((again.imported, again.skipped), (0, 1), "{again:?}");
+        let again = import_as(&h.storage, nuget, "nuget", package, state.path()).await;
+        assert_eq!((again.imported, again.skipped), (0, 1), "{again:?}");
+        let mut after = h.storage.list("").await.unwrap();
+        after.sort();
+        assert_eq!(stored, after);
+    }
+
     fn rr() -> RepoRef {
         RepoRef {
             name: "r".into(),
@@ -1670,7 +2172,11 @@ mod integration_tests {
             sha1: None,
         };
         assert_eq!(
-            curation_name(crate::registry_type::RegistryType::Npm, &npm),
+            curation_name(
+                crate::registry_type::RegistryType::Npm,
+                &npm,
+                "npm/@scope/pkg/tarballs/pkg-1.0.0.tgz"
+            ),
             "@scope/pkg"
         );
         let maven = ArtifactRef {
@@ -1682,8 +2188,29 @@ mod integration_tests {
             sha1: None,
         };
         assert_eq!(
-            curation_name(crate::registry_type::RegistryType::Maven, &maven),
+            curation_name(
+                crate::registry_type::RegistryType::Maven,
+                &maven,
+                "maven/com/x/1.0/x.jar"
+            ),
             "com/x/1.0/x.jar"
+        );
+        // PyPI and NuGet rules key on the project and the id the handlers check.
+        assert_eq!(
+            curation_name(
+                crate::registry_type::RegistryType::PyPI,
+                &maven,
+                "pypi/corppkg/CorpPkg-1.0.0.tar.gz"
+            ),
+            "corppkg"
+        );
+        assert_eq!(
+            curation_name(
+                crate::registry_type::RegistryType::Nuget,
+                &maven,
+                "nuget/flatcontainer/corp.lib/1.0.0/corp.lib.1.0.0.nupkg"
+            ),
+            "corp.lib"
         );
     }
 

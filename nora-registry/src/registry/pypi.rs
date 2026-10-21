@@ -139,11 +139,34 @@ async fn package_versions(
     let prefix = format!("pypi/{}/", normalized);
     let base_url = nora_base_url(&state);
 
+    // #68 namespace isolation: an internal-namespace package must never be fetched
+    // upstream (dependency confusion). Skip the upstream merge entirely; a locally
+    // published copy is still served from the local-only branch below, and an
+    // internal name with no local copy is blocked (never proxied). Computed without
+    // the `blocked` metric — the metric fires only on the actual block path below.
+    let is_internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::PyPI,
+        &normalized,
+    );
+    let upstreams = state.config.pypi.upstreams();
+    // A project imported from the operator's own registry is NORA's: neither its index nor its
+    // dates are asked of an upstream. Read only when an upstream would otherwise be asked.
+    let hosted = !is_internal
+        && !upstreams.is_empty()
+        && match hosted_state(&state.storage, &normalized).await {
+            Hosted::Yes => true,
+            Hosted::No => false,
+            Hosted::Unknown => {
+                return crate::registry::storage_unavailable("pypi", &hosted_key(&normalized))
+            }
+        };
+
     // #896: for JSON (Renovate) clients, ensure upstream PEP 700 upload-times are cached
     // so the index can surface them. No-op if already cached / internal / no upstream.
     // The map is read ONCE here and threaded through to [`pep700_meta`] — re-reading
     // `dates.json` per response was a second round-trip on the hot path (#969).
-    let dates = if wants_json(&headers) {
+    let dates = if wants_json(&headers) && !hosted {
         ensure_pypi_dates_cached(&state, &normalized).await
     } else {
         serde_json::Map::new()
@@ -237,21 +260,9 @@ async fn package_versions(
     // the upstream order: the first upstream that lists a file wins (local files
     // win over all upstreams). One upstream's failure or open breaker must not
     // sink the others — skip it and serve the merge of what answered.
-    // #68 namespace isolation: an internal-namespace package must never be fetched
-    // upstream (dependency confusion). Skip the upstream merge entirely; a locally
-    // published copy is still served from the local-only branch below, and an
-    // internal name with no local copy is blocked (never proxied). Computed without
-    // the `blocked` metric — the metric fires only on the actual block path below.
-    let is_internal = crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::PyPI,
-        &normalized,
-    );
-
-    let upstreams = state.config.pypi.upstreams();
     let mut circuit_open = false;
     let mut miss = UpstreamMiss::default();
-    if !is_internal && !upstreams.is_empty() {
+    if !is_internal && !hosted && !upstreams.is_empty() {
         let mut upstream_files: Vec<FileEntry> = Vec::new();
         for up in &upstreams {
             let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
@@ -302,6 +313,11 @@ async fn package_versions(
         };
     }
 
+    // A hosted project with no file left lists nothing; the upstream was not asked.
+    if hosted {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     // #68: an internal-namespace package with no local copy is blocked, never
     // proxied — return the namespace 403 (the only pypi metadata path that
     // increments the blocked metric).
@@ -350,7 +366,7 @@ async fn download_file(
     // Curation check — before storage access
     let version = crate::curation::parse_pypi_version(&normalized, &filename);
 
-    let key = format!("pypi/{}/{}", normalized, filename);
+    let key = storage_key(&normalized, &filename);
 
     // The release date of this file, for min-release-age and to seed the digest-quarantine
     // first-seen clock so a provably-old release is not held as "new to this mirror"
@@ -504,6 +520,21 @@ async fn download_file(
             &normalized,
         )
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
+    // A file of a hosted project that NORA does not hold is no file of it: the upstream is not
+    // asked, so what it has under the name is neither served nor cached beside the hosted files.
+    match hosted_state(&state.storage, &normalized).await {
+        Hosted::Yes => {
+            if let Some(e) = &read_failure {
+                return crate::registry::local_copy_unreadable("pypi", &key, e);
+            }
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        Hosted::Unknown => {
+            return crate::registry::storage_unavailable("pypi", &hosted_key(&normalized))
+        }
+        Hosted::No => {}
     }
 
     // Try each configured upstream in order; the first whose index lists the file
@@ -764,7 +795,7 @@ async fn upload(
     }
 
     // TOCTOU protection: lock per file to prevent concurrent uploads
-    let file_key = format!("pypi/{}/{}", normalized, filename);
+    let file_key = storage_key(&normalized, &filename);
     let lock = state.publish_lock(&file_key);
     let _guard = lock.lock().await;
 
@@ -1064,12 +1095,14 @@ async fn ensure_pypi_dates_cached(
     if let Ok(data) = state.storage.get(&key).await {
         return serde_json::from_slice(&data).unwrap_or_default();
     }
-    // #68: never fetch an internal-namespace package's metadata upstream.
+    // #68: never fetch an internal-namespace package's metadata upstream, nor a hosted
+    // project's — nor one whose hosted state the store cannot tell.
     if crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
         crate::curation::RegistryType::PyPI,
         normalized,
-    ) {
+    ) || !matches!(hosted_state(&state.storage, normalized).await, Hosted::No)
+    {
         return serde_json::Map::new();
     }
     let mut map = serde_json::Map::new();
@@ -1137,6 +1170,81 @@ async fn ensure_pypi_dates_cached(
 /// (`curation::pep503_normalize`): lowercase, every run of `-`, `_` and `.` one `-`.
 fn normalize_name(name: &str) -> String {
     crate::curation::pep503_normalize(name)
+}
+
+/// The key of distribution file `filename` of project `normalized` (PEP 503): the one an upload
+/// writes and a download reads. `nora import` writes the same key (contract
+/// `import-key-format-equals-handler-key-format`).
+pub(crate) fn storage_key(normalized: &str, filename: &str) -> String {
+    format!("pypi/{normalized}/{filename}")
+}
+
+/// Storage prefix of the records of hosted files: `pypi-hosted/<project>/<filename>`.
+///
+/// A project with a record is NORA's own: `nora import` writes one for each file of the project
+/// it brings in from the operator's own registry, and from then on neither the project's index,
+/// its dates nor a file of it is asked of an upstream. The records live outside `pypi/`, so the
+/// listings of `pypi/` that retention, the web UI and the simple index read never take one for a
+/// distribution file.
+pub(crate) const HOSTED_PREFIX: &str = "pypi-hosted/";
+
+/// The prefix of project `normalized`'s records.
+pub(crate) fn hosted_key(normalized: &str) -> String {
+    format!("{HOSTED_PREFIX}{normalized}/")
+}
+
+/// Whether a project is hosted, from a listing of its records.
+enum Hosted {
+    Yes,
+    No,
+    /// The listing failed: nothing is decided on a guess.
+    Unknown,
+}
+
+async fn hosted_state(storage: &crate::storage::Storage, normalized: &str) -> Hosted {
+    let prefix = hosted_key(normalized);
+    if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
+        return Hosted::No;
+    }
+    match storage.list(&prefix).await {
+        Ok(records) if records.is_empty() => Hosted::No,
+        Ok(_) => Hosted::Yes,
+        Err(e) => {
+            tracing::warn!(registry = "pypi", project = %normalized, error = %e, "pypi: hosted records not listed");
+            Hosted::Unknown
+        }
+    }
+}
+
+/// Record file `filename` of project `normalized` as hosted. Written before the file is stored,
+/// so from the moment an import stores anything of the project its name is no longer asked of
+/// an upstream.
+pub(crate) async fn claim_hosted_file(
+    storage: &crate::storage::Storage,
+    normalized: &str,
+    filename: &str,
+) -> crate::storage::Result<()> {
+    storage
+        .put(&format!("{}{filename}", hosted_key(normalized)), b"")
+        .await
+}
+
+/// Record the SHA-256 of a distribution file stored at `storage_key(project, filename)`, as an
+/// upload records it: the `.sha256` sidecar the index serves the digest from, then the hash
+/// marker. A failed sidecar write is returned; a failed marker write is logged, and the index
+/// serves the digest from the sidecar.
+pub(crate) async fn record_stored_file(
+    storage: &crate::storage::Storage,
+    normalized: &str,
+    filename: &str,
+    sha256: &str,
+) -> crate::storage::Result<()> {
+    let file_key = storage_key(normalized, filename);
+    storage
+        .put(&format!("{file_key}.sha256"), sha256.as_bytes())
+        .await?;
+    put_hash_marker(storage, normalized, filename, sha256).await;
+    Ok(())
 }
 
 /// Check Accept header for PEP 691 JSON.
