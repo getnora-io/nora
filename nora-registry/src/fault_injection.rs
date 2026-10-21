@@ -14,11 +14,12 @@ use std::time::Duration;
 
 use crate::AppState;
 
-/// What the next maintenance ticks do: run normally, panic, or hang.
+/// What the next maintenance ticks do: run normally, panic once, panic every time, or hang.
 static MAINTENANCE_FAULT: AtomicU8 = AtomicU8::new(NONE);
 const NONE: u8 = 0;
 const PANIC: u8 = 1;
 const HANG: u8 = 2;
+const PANIC_ONCE: u8 = 3;
 
 /// The fault-injection routes, all under `/__fi/`.
 pub fn routes() -> Router<AppState> {
@@ -26,6 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/__fi/panic", get(handler_panic))
         .route("/__fi/panic-bg", get(background_panic))
         .route("/__fi/panic-maint", get(|| arm(PANIC)))
+        .route("/__fi/panic-maint-once", get(|| arm(PANIC_ONCE)))
         .route("/__fi/hang-maint", get(|| arm(HANG)))
 }
 
@@ -55,6 +57,10 @@ async fn arm(fault: u8) -> &'static str {
 pub async fn maintenance_fault() {
     match MAINTENANCE_FAULT.load(Ordering::SeqCst) {
         PANIC => panic!("fault injection: maintenance tick panic"),
+        PANIC_ONCE => {
+            MAINTENANCE_FAULT.store(NONE, Ordering::SeqCst);
+            panic!("fault injection: maintenance tick panic");
+        }
         HANG => std::future::pending::<()>().await,
         _ => {}
     }

@@ -4,7 +4,7 @@
 #        make build   — release build
 #        make release — tagged release (runs checks first)
 #        make kani    — run Kani bounded-model-checking proofs (needs `cargo kani`)
-#        make release-panic-check — a release binary outlives panics (builds it, ~3 min run)
+#        make release-panic-check — a release binary outlives panics (builds it, ~4 min run)
 
 CARGO := cargo
 
@@ -45,7 +45,7 @@ build:
 	$(CARGO) build --release
 
 # Tests always build with unwind; only a release binary shows what a panic does to the
-# shipped process. Not part of `check`: a release build plus about three minutes of waiting.
+# shipped process. Not part of `check`: a release build plus about four minutes of waiting.
 release-panic-check:
 	scripts/release-panic-check.sh
 

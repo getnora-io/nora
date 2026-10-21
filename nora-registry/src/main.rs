@@ -3268,7 +3268,7 @@ async fn run_server(mut config: Config, storage: Storage) {
 /// Cadence of the maintenance loop.
 const MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long the maintenance loop may go without starting a tick before `/health` fails
+/// How long the maintenance loop may go without completing a tick before `/health` fails
 /// (R2-49): ten missed ticks. Longer than the readiness window of the object-store
 /// reachability cache (150 s), so a slow bucket listing un-readies the pod before it
 /// restarts it.
@@ -3283,9 +3283,10 @@ fn maintenance_max_silence() -> std::time::Duration {
     MAINTENANCE_MAX_SILENCE
 }
 
-/// Run `tick` every `period`, numbering the ticks from 1 and recording the start of each
-/// one on `heartbeat`. The first tick fires at once; a tick that panics is logged and the
-/// loop goes on, a tick that hangs stops the beats.
+/// Run `tick` every `period`, numbering the ticks from 1 and recording on `heartbeat` each
+/// one that completes. The first tick fires at once. A tick that panics is logged and the
+/// loop goes on; ticks that keep panicking or one that hangs stop the beats, since the work
+/// they stand for (token flush, readiness refresh) is no longer done.
 async fn run_maintenance<F, Fut>(
     period: std::time::Duration,
     heartbeat: Arc<health::MaintenanceHeartbeat>,
@@ -3299,13 +3300,15 @@ async fn run_maintenance<F, Fut>(
     loop {
         interval.tick().await;
         tick_count += 1;
-        heartbeat.beat();
         // A panic in one tick must not end the loop: the next one flushes tokens again.
-        if let Err(e) = std::panic::AssertUnwindSafe(tick(tick_count))
+        match std::panic::AssertUnwindSafe(tick(tick_count))
             .catch_unwind()
             .await
         {
-            tracing::error!(panic = ?e, tick = tick_count, "maintenance tick panicked");
+            Ok(()) => heartbeat.beat(),
+            Err(e) => {
+                tracing::error!(panic = ?e, tick = tick_count, "maintenance tick panicked")
+            }
         }
     }
 }
@@ -3402,6 +3405,27 @@ mod maintenance_loop_tests {
             last.load(Ordering::SeqCst)
         );
         assert!(heartbeat.silent_for() < PERIOD * 10, "the loop still beats");
+        task.abort();
+    }
+
+    /// A loop whose every tick panics never flushes tokens or refreshes readiness again,
+    /// though it keeps running: that fails liveness too.
+    #[tokio::test]
+    async fn a_tick_that_panics_every_time_stalls_the_heartbeat() {
+        let heartbeat = Arc::new(MaintenanceHeartbeat::new(PERIOD * 10));
+        let task = tokio::spawn(run_maintenance(
+            PERIOD,
+            Arc::clone(&heartbeat),
+            |n| async move {
+                assert!(n < 2, "a bug in every tick from the second on");
+            },
+        ));
+        tokio::time::sleep(PERIOD * 30).await;
+        assert!(!task.is_finished(), "the loop goes on");
+        assert!(
+            heartbeat.stalled(),
+            "ticks that never complete stop the beats"
+        );
         task.abort();
     }
 

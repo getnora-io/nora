@@ -32,14 +32,15 @@ pub struct StorageHealth {
     pub total_size_bytes: u64,
 }
 
-/// When the maintenance loop (token flush, upload-session expiry, storage gauges) last
-/// started a tick, read by `/health` (R2-49). A panic in the shipped build no longer ends
+/// When the maintenance loop (token flush, upload-session expiry, storage gauges and the
+/// object-store readiness refresh) last completed a tick, read by `/health` (R2-49). A panic in the shipped build no longer ends
 /// the process, so a loop that dies or hangs would otherwise leave a process that answers
-/// probes but never flushes tokens again; a silence longer than `max_silence` fails the
+/// probes but never flushes tokens again (and, on an object store, stays unready for
+/// good); a silence longer than `max_silence` fails the
 /// liveness probe so the orchestrator restarts it.
 pub struct MaintenanceHeartbeat {
     origin: tokio::time::Instant,
-    /// Milliseconds from `origin` to the start of the last tick.
+    /// Milliseconds from `origin` to the end of the last completed tick.
     last_beat_ms: AtomicU64,
     max_silence: Duration,
 }
@@ -54,13 +55,13 @@ impl MaintenanceHeartbeat {
         }
     }
 
-    /// Record the start of a tick.
+    /// Record a completed tick.
     pub fn beat(&self) {
         let ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.last_beat_ms.store(ms, Ordering::Relaxed);
     }
 
-    /// Time since the last tick started.
+    /// Time since the last tick completed.
     pub fn silent_for(&self) -> Duration {
         let now = self.origin.elapsed();
         now.saturating_sub(Duration::from_millis(

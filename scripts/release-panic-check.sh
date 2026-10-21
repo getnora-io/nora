@@ -7,8 +7,10 @@
 # `fault-injection` feature and makes the running server panic:
 #   handler       GET /__fi/panic       -> 500, the process keeps serving
 #   background    GET /__fi/panic-bg    -> an unguarded spawned task panics, the process lives
-#   maintenance   GET /__fi/panic-maint -> every maintenance tick panics, the loop goes on
+#   maintenance   GET /__fi/panic-maint-once -> one maintenance tick panics, the loop goes on
 #                                          (/health stays 200 past the allowed silence)
+#   persistent    GET /__fi/panic-maint -> every tick panics: the loop runs on, but no tick
+#                                          completes, so /health turns 503
 #   stall         GET /__fi/hang-maint  -> the maintenance loop hangs, /health turns 503
 #
 # Usage: scripts/release-panic-check.sh            build and check (exit 0 = all hold)
@@ -28,8 +30,9 @@ if [ -z "${NORA_BIN:-}" ]; then
   CARGO_TARGET_DIR=$target cargo build --release --locked -p nora-registry \
     --features fault-injection --config "profile.release.panic=\"$PANIC_STRATEGY\""
   NORA_BIN=$target/release/nora
+  built=$PANIC_STRATEGY
 fi
-echo "binary: $NORA_BIN (panic=$PANIC_STRATEGY)"
+echo "binary: $NORA_BIN (panic=${built:-prebuilt, profile unknown})"
 
 work=$(mktemp -d)
 pid=
@@ -72,12 +75,23 @@ verdict background "$(holds test "$h" = 200)" "panic-bg answered $(cat "$work/bg
 stop
 
 start maintenance
-code /__fi/panic-maint >/dev/null
+code /__fi/panic-maint-once >/dev/null
 sleep $((TICK + SILENCE + 5))
 alive && h=$(code /health) || h=dead
 n=$(grep -c 'maintenance tick panicked' "$work/maintenance/nora.log" || true)
-verdict maintenance "$(holds test "$h" = 200 -a "$n" -ge 2)" \
-  "/health $h after $((TICK + SILENCE + 5)) s, $n ticks panicked"
+verdict maintenance "$(holds test "$h" = 200 -a "$n" = 1)" \
+  "/health $h after $((TICK + SILENCE + 5)) s, $n tick panicked"
+stop
+
+start persistent
+code /__fi/panic-maint >/dev/null
+h=200
+for _ in $(seq 1 $((TICK + SILENCE + 15))); do
+  alive || { h=dead; break; }
+  h=$(code /health); [ "$h" = 503 ] && break; sleep 1
+done
+n=$(grep -c 'maintenance tick panicked' "$work/persistent/nora.log" || true)
+verdict persistent "$(holds test "$h" = 503 -a "$n" -ge 1)" "/health $h, $n ticks panicked, process alive"
 stop
 
 start stall
