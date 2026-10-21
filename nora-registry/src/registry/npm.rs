@@ -501,43 +501,39 @@ async fn handle_request(
         None
     };
 
+    // #733: an internal-namespace package is operator-owned — skip curation; the cache-hit
+    // serve below handles a locally-published tarball, and the namespace guard at the
+    // cache-miss boundary (below) blocks the upstream branch for internal names.
+    let internal = is_internal(&state, &package_name);
+
     // Curation check — tarball downloads only (metadata passes through)
-    if is_tarball {
-        // #733: an internal-namespace package is operator-owned — skip curation; the cache-hit
-        // serve below handles a locally-published tarball, and the namespace guard at the
-        // cache-miss boundary (below) blocks the upstream branch for internal names.
-        if !crate::curation::is_internal_namespace(
+    if is_tarball && !internal {
+        // Without trusted dates a release is as old as NORA's first sight of it in a
+        // packument: the cache mtime above restarts at every refetch, so a client that
+        // asks more often than the minimum age never saw its release mature. The
+        // quarantine reads neither: a version listed long ago says nothing about bytes
+        // first fetched now, so without trusted dates it counts from the first fetch. A
+        // version the ledger lacks keeps the mtime date.
+        let mut release_date = publish_date;
+        if let Some(ver) = tarball_version
+            .as_deref()
+            .filter(|_| first_seen_tracked(&state))
+        {
+            release_date =
+                first_seen_date(&state.storage, &upstream_packument_key(&package_name), ver)
+                    .await
+                    .or(publish_date);
+        }
+        if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
             crate::curation::RegistryType::Npm,
             &package_name,
+            crate::curation::RequestVersion::of_artifact(tarball_version.as_deref()),
+            release_date,
         ) {
-            // Without trusted dates a release is as old as NORA's first sight of it in a
-            // packument: the cache mtime above restarts at every refetch, so a client that
-            // asks more often than the minimum age never saw its release mature. The
-            // quarantine reads neither: a version listed long ago says nothing about bytes
-            // first fetched now, so without trusted dates it counts from the first fetch. A
-            // version the ledger lacks keeps the mtime date.
-            let mut release_date = publish_date;
-            if let Some(ver) = tarball_version
-                .as_deref()
-                .filter(|_| first_seen_tracked(&state))
-            {
-                release_date =
-                    first_seen_date(&state.storage, &upstream_packument_key(&package_name), ver)
-                        .await
-                        .or(publish_date);
-            }
-            if let Some(response) = crate::curation::check_download(
-                &state.curation().curation_engine,
-                state.bypass_token().as_deref(),
-                &headers,
-                crate::curation::RegistryType::Npm,
-                &package_name,
-                crate::curation::RequestVersion::of_artifact(tarball_version.as_deref()),
-                release_date,
-            ) {
-                return response;
-            }
+            return response;
         }
     }
 
@@ -613,10 +609,10 @@ async fn handle_request(
     // and the metadata serve (unpinned, Unpinned arm) flow the discharged bytes. The
     // .sha256 sidecar check below stays: it is the integrity check on S3 (storage
     // pins are local-only).
-    let cached = if cache_trusted {
-        state.storage.get_verified(&key).await.ok()
+    let (cached, read_failure) = if cache_trusted {
+        crate::registry::cached_read(state.storage.get_verified(&key).await)
     } else {
-        None
+        (None, None)
     };
     if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
@@ -683,6 +679,11 @@ async fn handle_request(
             .headers_mut()
             .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         return response;
+    }
+
+    // An internal package whose copy the store could not read is unavailable, not absent.
+    if let Some(e) = read_failure.as_ref().filter(|_| internal) {
+        return crate::registry::local_copy_unreadable("npm", &key, e);
     }
 
     // --- Namespace isolation: prevent proxying internal namespaces ---
@@ -809,6 +810,16 @@ async fn handle_request(
     }
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// Whether `name` is in an internal namespace: served from its local copies only, never asked of
+/// an upstream (#68, #733).
+fn is_internal(state: &AppState, name: &str) -> bool {
+    crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Npm,
+        name,
+    )
 }
 
 /// Internal prefix holding npm cache provenance sidecars (#1055).
@@ -1252,6 +1263,10 @@ async fn serve_dist_tags(
                 Ok(data) if is_assembled_by_nora(&state.storage, &key, &data).await => {
                     Some(data.to_vec())
                 }
+                // An internal package's tags are in its own keys, which cannot be read now.
+                _ if is_internal(state, name) => {
+                    return crate::registry::storage_unavailable("npm", &key)
+                }
                 _ => None,
             }
         }
@@ -1466,6 +1481,9 @@ async fn serve_metadata(
                     None => packument_response(headers, data),
                     Some(spec) => published_version_manifest(state, name, spec).await,
                 },
+                // An internal package is answered from its own keys only, and they cannot be
+                // read now: unavailable, not absent.
+                _ if is_internal(state, name) => crate::registry::storage_unavailable("npm", &key),
                 _ => uncached_upstream_metadata(state, headers, path, name).await,
             }
         }
@@ -1632,18 +1650,24 @@ async fn upstream_metadata(
 ) -> Response {
     let legacy_key = legacy_cache_key(path);
     let mut cached = None;
+    let mut read_failure = None;
     for key in [cache_key, legacy_key.as_str()] {
         if !cached_copy_trusted(state, path, key, name, None).await {
             continue;
         }
-        if let Ok(outcome) = state.storage.get_verified(key).await {
-            use nora_registry::verified::{verified_body, GateOutcome};
-            let data = match outcome {
-                GateOutcome::Verified(blob) => verified_body(blob),
-                GateOutcome::Unpinned(blob) => blob.into_inner(),
-            };
-            cached = Some((data, key.to_string()));
-            break;
+        match crate::registry::cached_read(state.storage.get_verified(key).await) {
+            (Some(outcome), _) => {
+                use nora_registry::verified::{verified_body, GateOutcome};
+                let data = match outcome {
+                    GateOutcome::Verified(blob) => verified_body(blob),
+                    GateOutcome::Unpinned(blob) => blob.into_inner(),
+                };
+                cached = Some((data, key.to_string()));
+                break;
+            }
+            (None, failure) => {
+                read_failure = read_failure.or_else(|| failure.map(|e| (key.to_string(), e)));
+            }
         }
     }
 
@@ -1703,6 +1727,10 @@ async fn upstream_metadata(
         return StatusCode::BAD_GATEWAY.into_response();
     }
 
+    // An internal package whose cached copy the store could not read is unavailable, not absent.
+    if let Some((key, e)) = read_failure.as_ref().filter(|_| is_internal(state, name)) {
+        return crate::registry::local_copy_unreadable("npm", key, e);
+    }
     if let Some(response) = crate::curation::check_namespace_isolation(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Npm,

@@ -688,6 +688,167 @@ impl crate::storage::StorageBackend for OpCountingBackend {
     }
 }
 
+// ── Storage outage ──────────────────────────────────────────────────────────
+
+/// The switch of an [`outage_storage`]: up, down, or failing object reads only.
+#[derive(Clone)]
+pub struct StorageOutage(Arc<std::sync::atomic::AtomicU8>);
+
+const STORE_UP: u8 = 0;
+const STORE_DOWN: u8 = 1;
+const STORE_READS_FAIL: u8 = 2;
+
+impl StorageOutage {
+    /// Take the store down: every read, listing and write fails from now on.
+    pub fn begin(&self) {
+        self.0.store(STORE_DOWN, Ordering::SeqCst);
+    }
+
+    /// Fail object reads only: listings and `stat` still answer, as a store that throttles its
+    /// GETs does.
+    pub fn fail_reads(&self) {
+        self.0.store(STORE_READS_FAIL, Ordering::SeqCst);
+    }
+
+    fn mode(&self) -> u8 {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
+/// An in-memory object store that can be taken down. While down, every read, listing and write
+/// fails with a network error and `stat` finds nothing, as an object store behind a dropped
+/// connection answers: the store holds what was written, but cannot say so.
+pub struct OutageBackend {
+    inner: crate::storage::ObjectStorage,
+    outage: StorageOutage,
+}
+
+/// An in-memory [`Storage`] to seed while it is up, and its outage switch.
+pub fn outage_storage() -> (Storage, StorageOutage) {
+    let outage = StorageOutage(Arc::default());
+    let backend = OutageBackend {
+        inner: crate::storage::ObjectStorage::in_memory(),
+        outage: outage.clone(),
+    };
+    (Storage::from_backend(Arc::new(backend)), outage)
+}
+
+impl OutageBackend {
+    /// For a listing, `stat`, `pin` or a write: fails while the store is down.
+    fn check(&self) -> crate::storage::Result<()> {
+        match self.outage.mode() {
+            STORE_DOWN => Err(crate::storage::StorageError::Network(
+                "connection refused".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// For an object read: fails while the store is down or failing reads.
+    fn check_read(&self) -> crate::storage::Result<()> {
+        match self.outage.mode() {
+            STORE_UP => Ok(()),
+            _ => Err(crate::storage::StorageError::Network(
+                "connection refused".into(),
+            )),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for OutageBackend {
+    async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+        self.check()?;
+        self.inner.put(key, data, sha256).await
+    }
+
+    async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        self.check_read()?;
+        self.inner.get(key).await
+    }
+
+    async fn pin(&self, key: &str) -> Option<String> {
+        self.check().ok()?;
+        self.inner.pin(key).await
+    }
+
+    async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+        self.check()?;
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+        self.check()?;
+        self.inner.list(prefix).await
+    }
+
+    async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
+        self.check().ok()?;
+        self.inner.stat(key).await
+    }
+
+    async fn list_with_meta(
+        &self,
+        prefix: &str,
+    ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
+        self.check()?;
+        self.inner.list_with_meta(prefix).await
+    }
+
+    async fn health_check(&self) -> bool {
+        self.check().is_ok() && self.inner.health_check().await
+    }
+
+    async fn total_size(&self) -> u64 {
+        self.inner.total_size().await
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "outage-test-store"
+    }
+
+    async fn put_from_path(
+        &self,
+        key: &str,
+        src: &std::path::Path,
+        sha256: Option<&str>,
+    ) -> crate::storage::Result<()> {
+        self.check()?;
+        self.inner.put_from_path(key, src, sha256).await
+    }
+
+    async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
+        self.check()?;
+        self.inner.copy(src, dst, sha256).await
+    }
+
+    async fn get_reader(
+        &self,
+        key: &str,
+    ) -> crate::storage::Result<(
+        u64,
+        Option<String>,
+        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    )> {
+        self.check_read()?;
+        self.inner.get_reader(key).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> crate::storage::Result<(
+        u64,
+        Option<String>,
+        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    )> {
+        self.check_read()?;
+        self.inner.get_range(key, start, end).await
+    }
+}
+
 // ── Per-registry artifact counts, each read from its real source ────────────
 
 /// The three per-registry artifact counts an operator can read for one store.

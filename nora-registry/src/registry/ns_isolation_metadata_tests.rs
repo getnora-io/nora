@@ -1033,3 +1033,196 @@ async fn a_hierarchical_namespace_isolates_pypi_projects_under_it() {
         "a project outside the namespace reaches the upstream"
     );
 }
+
+// ── A store that cannot be read: an internal package is unavailable, not absent ──
+//
+// An internal-namespace package is served from its local copy only. When the store fails to
+// read that copy (an outage, not a missing key), the package is unavailable: 503. A 403 or a
+// 404 tells a client with several feeds to look for the internal name in the next one, and no
+// upstream is asked either way.
+
+/// Each internal path, and the key its local copy lives under.
+const INTERNAL_STORED: [(&str, &str); 11] = [
+    (
+        "/npm/internalpkg/-/internalpkg-1.0.0.tgz",
+        "npm/internalpkg/tarballs/internalpkg-1.0.0.tgz",
+    ),
+    ("/npm/internalpkg", "npm/internalpkg/versions/1.0.0.json"),
+    (
+        "/npm/-/package/internalpkg/dist-tags",
+        "npm/internalpkg/versions/1.0.0.json",
+    ),
+    (
+        "/npm/internalpkg/1.0.0",
+        "npm/internalpkg/versions/1.0.0.json",
+    ),
+    (
+        "/simple/internalpkg/internalpkg-1.0.tar.gz",
+        "pypi/internalpkg/internalpkg-1.0.tar.gz",
+    ),
+    (
+        "/simple/internalpkg/",
+        "pypi/internalpkg/internalpkg-1.0.tar.gz",
+    ),
+    (
+        "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+        "nuget/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+    ),
+    (
+        "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
+        "nuget/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
+    ),
+    (
+        "/nuget/v3/flatcontainer/internalpkg/index.json",
+        "nuget/flatcontainer/internalpkg/index.json",
+    ),
+    (
+        "/nuget/v3/registration/internalpkg/index.json",
+        "nuget/registration/internalpkg/index.json",
+    ),
+    (
+        "/nuget/v3/registration/internalpkg/page/1.0.0/1.0.0.json",
+        "nuget/registration/internalpkg/page/1.0.0/1.0.0.json",
+    ),
+];
+
+#[tokio::test]
+async fn an_internal_package_on_a_store_that_cannot_be_read_is_unavailable_not_absent() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(uri.clone());
+        c.pypi.proxy = Some(uri.clone());
+        c.nuget.enabled = true;
+        c.nuget.proxy = Some(uri);
+    });
+    for (_, key) in INTERNAL_STORED {
+        let body = if key.starts_with("npm/") && key.ends_with(".json") {
+            br#"{"name":"internalpkg","version":"1.0.0"}"#.to_vec()
+        } else if key.ends_with(".json") {
+            br#"{"count":0,"items":[],"versions":["1.0.0"]}"#.to_vec()
+        } else {
+            b"local copy".to_vec()
+        };
+        ctx.state.storage.put(key, &body).await.unwrap();
+    }
+    // The store up: each is served from its local copy.
+    for (path, _) in INTERNAL_STORED {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path} with the store up");
+    }
+
+    outage.begin();
+    let mut wrong = Vec::new();
+    for (path, _) in INTERNAL_STORED {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            wrong.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "internal packages answered other than 503 with the store down: {wrong:#?}"
+    );
+    let asked = upstream_paths(&upstream).await;
+    assert!(
+        asked.is_empty(),
+        "upstream asked during the outage: {asked:?}"
+    );
+
+    // Control: a package outside the internal namespaces is still answered by its upstream.
+    for path in [
+        "/npm/publicpkg/-/publicpkg-1.0.0.tgz",
+        "/nuget/v3/flatcontainer/publicpkg/1.0.0/publicpkg.1.0.0.nupkg",
+    ] {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path} during the outage");
+    }
+    assert_eq!(upstream_paths(&upstream).await.len(), 2);
+}
+
+/// The same when only object reads fail and listings still answer (a store throttling its GETs):
+/// a package that is not published but was cached before its name became internal included.
+#[tokio::test]
+async fn an_internal_package_whose_copy_cannot_be_read_is_unavailable_not_absent() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(uri.clone());
+        c.pypi.proxy = Some(uri.clone());
+        c.nuget.enabled = true;
+        c.nuget.proxy = Some(uri);
+    });
+    let stored = [
+        (
+            "/npm/internalpkg/-/internalpkg-1.0.0.tgz",
+            "npm/internalpkg/tarballs/internalpkg-1.0.0.tgz",
+        ),
+        (
+            "/npm/internalcache",
+            "npm/internalcache/upstream/packument.json",
+        ),
+        (
+            "/simple/internalpkg/internalpkg-1.0.tar.gz",
+            "pypi/internalpkg/internalpkg-1.0.tar.gz",
+        ),
+        (
+            "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+            "nuget/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+        ),
+        (
+            "/nuget/v3/flatcontainer/internalpkg/index.json",
+            "nuget/flatcontainer/internalpkg/index.json",
+        ),
+    ];
+    for (_, key) in stored {
+        let body = if key.ends_with(".json") {
+            br#"{"name":"internalcache","versions":{},"dist-tags":{}}"#.to_vec()
+        } else {
+            b"local copy".to_vec()
+        };
+        ctx.state.storage.put(key, &body).await.unwrap();
+    }
+    for (path, _) in stored {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path} with the store up");
+    }
+
+    outage.fail_reads();
+    let mut wrong = Vec::new();
+    for (path, _) in stored {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            wrong.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "internal packages answered other than 503 with reads failing: {wrong:#?}"
+    );
+    let asked = upstream_paths(&upstream).await;
+    assert!(
+        asked.is_empty(),
+        "upstream asked while reads fail: {asked:?}"
+    );
+}

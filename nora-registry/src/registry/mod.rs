@@ -293,6 +293,56 @@ impl UpstreamMiss {
     }
 }
 
+/// A read of a stored copy split into what it found and why it failed: `(Some, None)` the copy,
+/// `(None, None)` nothing stored there, `(None, Some)` the store failed and says nothing either
+/// way. A cache read may treat the last two alike; a package served only from local copies may
+/// not (see [`local_copy_unreadable`]).
+pub(crate) fn cached_read<T>(
+    read: Result<T, crate::storage::StorageError>,
+) -> (Option<T>, Option<crate::storage::StorageError>) {
+    match read {
+        Ok(found) => (Some(found), None),
+        Err(crate::storage::StorageError::NotFound) => (None, None),
+        Err(e) => (None, Some(e)),
+    }
+}
+
+/// 503 for a package served only from local copies (one in an internal namespace) whose copy the
+/// store could not be asked about. The package is unavailable, not absent: a 403 or a 404 here
+/// sends a client with several feeds to look for the name in the next one.
+pub(crate) fn storage_unavailable(registry: &str, key: &str) -> Response {
+    tracing::warn!(
+        registry,
+        key,
+        "storage cannot be read for a package served only from local copies, returning 503"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("retry-after", "30")],
+        "storage temporarily unavailable",
+    )
+        .into_response()
+}
+
+/// The answer for a package served only from local copies when the store failed to read its copy
+/// at `key`: 500 for a copy that failed its integrity check, else [`storage_unavailable`].
+pub(crate) fn local_copy_unreadable(
+    registry: &str,
+    key: &str,
+    error: &crate::storage::StorageError,
+) -> Response {
+    if matches!(error, crate::storage::StorageError::IntegrityViolation) {
+        tracing::error!(registry, key, "stored copy failed its integrity check");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stored copy failed its integrity check",
+        )
+            .into_response();
+    }
+    tracing::warn!(registry, key, error = %error, "storage read failed");
+    storage_unavailable(registry, key)
+}
+
 /// 503 response for circuit breaker open state with Retry-After header.
 pub(crate) fn circuit_open_response(registry: &str) -> Response {
     (

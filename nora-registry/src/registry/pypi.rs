@@ -434,7 +434,9 @@ async fn download_file(
 
     // Try local storage first. get_verified discharges the integrity witness at
     // the serve site (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -493,6 +495,9 @@ async fn download_file(
 
     // #733: an internal-namespace package with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("pypi", &key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::PyPI,

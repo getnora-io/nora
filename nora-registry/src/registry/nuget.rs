@@ -445,7 +445,8 @@ async fn registration_index(
     let upstream = rewrite_host(&state);
 
     // Read cache eagerly so stale data is available on upstream failure.
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
 
     // TTL cache — rewrite URLs on read (cache may contain pre-fix entries)
     if let Some(ref data) = cached_data {
@@ -468,6 +469,9 @@ async fn registration_index(
             let text = String::from_utf8_lossy(data);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             return with_json_gzip(rewritten.into_bytes());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("nuget", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -619,7 +623,8 @@ async fn registration_page(
     );
 
     // Read cache eagerly so stale data is available on upstream failure.
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
 
     // TTL cache
     if let Some(ref data) = cached_data {
@@ -648,6 +653,9 @@ async fn registration_page(
             let text = String::from_utf8_lossy(data);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             return with_json_gzip(rewritten.into_bytes());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("nuget", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -741,7 +749,8 @@ async fn version_list(state: AppState, id: &str) -> Response {
     let storage_key = format!("nuget/flatcontainer/{}/index.json", id_lower);
 
     // Read cache eagerly so stale data is available on upstream failure.
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
 
     // TTL cache
     if let Some(ref data) = cached_data {
@@ -765,6 +774,9 @@ async fn version_list(state: AppState, id: &str) -> Response {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_hit("nuget");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("nuget", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -948,7 +960,9 @@ async fn flatcontainer_download(
 
     // Immutable cache. get_verified discharges the integrity witness at serve
     // (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -1057,6 +1071,9 @@ async fn flatcontainer_download(
 
     // #733: an internal-namespace .nupkg or .nuspec with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("nuget", &storage_key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Nuget,
