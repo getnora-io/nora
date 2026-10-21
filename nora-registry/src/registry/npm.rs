@@ -1903,6 +1903,108 @@ fn is_valid_attachment_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@'))
 }
 
+/// Why an npm tarball cannot be imported as a published version.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ImportedTarballError {
+    #[error("{0} is not the key of an npm tarball")]
+    NotATarball(String),
+    #[error("the tarball holds no package.json")]
+    NoManifest,
+    #[error("reading the tarball: {0}")]
+    Read(#[from] std::io::Error),
+    #[error("package.json: {0}")]
+    Manifest(#[from] serde_json::Error),
+    #[error("package.json names {found}, the tarball's key {expected}")]
+    Mismatch { found: String, expected: String },
+}
+
+/// The most bytes of `package.json` an imported tarball is read for.
+const IMPORTED_MANIFEST_MAX: u64 = 16 * 1024 * 1024;
+
+/// The package, version and file name an npm tarball key (`npm/<name>/tarballs/<file>`) names.
+fn tarball_key_parts(tarball_key: &str) -> Option<(&str, String, &str)> {
+    let (name, file) = tarball_key
+        .strip_prefix("npm/")?
+        .rsplit_once("/tarballs/")?;
+    let version = crate::curation::parse_npm_tarball_version(name, file)?;
+    Some((name, version, file))
+}
+
+/// The key of the version document that publishes the npm tarball at `tarball_key`.
+pub(crate) fn imported_version_key(tarball_key: &str) -> Option<String> {
+    let (name, version, _) = tarball_key_parts(tarball_key)?;
+    Some(format!("npm/{name}/versions/{version}.json"))
+}
+
+/// What an npm tarball imported from another registry publishes (C73): the key of its version
+/// document, and the document — the tarball's own `package.json` with the `dist` a publish
+/// records: the tarball's URL at `public_base`, its SHA-1 (`shasum`) and SHA-512 (`integrity`).
+/// The manifest must name the package and version the key does. Once the document is stored the
+/// package is published: its packument is assembled from its own keys and never asked of an
+/// upstream (see [`published_state`]).
+pub(crate) fn imported_version_document(
+    tarball_key: &str,
+    tarball: impl std::io::Read,
+    sha1_hex: &str,
+    sha512: &[u8],
+    public_base: &str,
+) -> Result<(String, Vec<u8>), ImportedTarballError> {
+    use std::io::Read;
+    use std::path::Component;
+    let (name, version, file) = tarball_key_parts(tarball_key)
+        .ok_or_else(|| ImportedTarballError::NotATarball(tarball_key.to_string()))?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tarball));
+    let mut manifest = None;
+    for entry in archive.entries()? {
+        let entry = entry?;
+        // `npm pack` puts the manifest at `package/package.json`; older tarballs use another
+        // top directory.
+        let at_top = {
+            let path = entry.path()?;
+            let mut parts = path.components();
+            matches!(
+                (parts.next(), parts.next(), parts.next()),
+                (Some(Component::Normal(_)), Some(Component::Normal(file)), None)
+                    if file == "package.json"
+            )
+        };
+        if at_top {
+            let mut text = Vec::new();
+            entry.take(IMPORTED_MANIFEST_MAX).read_to_end(&mut text)?;
+            manifest = Some(serde_json::from_slice::<serde_json::Value>(&text)?);
+            break;
+        }
+    }
+    let mut doc = manifest.ok_or(ImportedTarballError::NoManifest)?;
+    let found = format!(
+        "{}@{}",
+        doc.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+        doc.get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    );
+    let expected = format!("{name}@{version}");
+    let Some(obj) = doc.as_object_mut().filter(|_| found == expected) else {
+        return Err(ImportedTarballError::Mismatch { found, expected });
+    };
+    obj.insert("_id".to_string(), serde_json::Value::String(expected));
+    obj.insert(
+        "dist".to_string(),
+        serde_json::json!({
+            "tarball": format!("{}/npm/{name}/-/{file}", public_base.trim_end_matches('/')),
+            "shasum": sha1_hex,
+            "integrity": format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode(sha512)
+            ),
+        }),
+    );
+    Ok((
+        format!("npm/{name}/versions/{version}.json"),
+        serde_json::to_vec(&doc)?,
+    ))
+}
+
 /// Why a publish's attachments were refused.
 #[derive(Debug, thiserror::Error)]
 enum AttachmentRefused {

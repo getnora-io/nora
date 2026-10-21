@@ -319,9 +319,11 @@ async fn run_import(
     let temp_dir = state_root.join(".nora-import").join("tmp");
     let resume = resume::ResumeStore::open(&state_root, &args.url).await?;
 
+    let public_base = config.server.public_base_url();
     let opts = transfer::TransferOpts {
         dry_run: args.dry_run,
         allow_sha1: args.allow_sha1,
+        public_base: &public_base,
     };
 
     let repos = filter_repos(source.list_repositories().await?, &args.repos);
@@ -381,7 +383,7 @@ async fn import_repo(
     curation: &crate::curation::CurationEngine,
     temp_dir: &std::path::Path,
     resume: &resume::ResumeStore,
-    opts: transfer::TransferOpts,
+    opts: transfer::TransferOpts<'_>,
     concurrency: usize,
     on_s3: bool,
 ) -> Result<ImportResult> {
@@ -421,6 +423,21 @@ async fn import_repo(
                 }
                 // Fast-path only on local (per-object HEAD on S3 = $$ + latency, R5).
                 if !on_s3 && storage.stat(&key).await.is_some() {
+                    // An npm tarball an earlier import committed without its version document
+                    // (before C73, or a failed document write) is published now.
+                    if rt == crate::registry_type::RegistryType::Npm && !opts.dry_run {
+                        if let Err(e) =
+                            transfer::publish_stored_npm_tarball(storage, &key, opts.public_base)
+                                .await
+                        {
+                            return Item::Done {
+                                key,
+                                outcome: transfer::Outcome::Failed {
+                                    reason: format!("{}: {e}", art.path),
+                                },
+                            };
+                        }
+                    }
                     return Item::CasSkip { key };
                 }
                 let cname = curation_name(rt, &art);
@@ -660,10 +677,11 @@ mod integration_tests {
         .unwrap()
     }
 
-    fn opts(dry_run: bool) -> transfer::TransferOpts {
+    fn opts(dry_run: bool) -> transfer::TransferOpts<'static> {
         transfer::TransferOpts {
             dry_run,
             allow_sha1: false,
+            public_base: "http://nora.example",
         }
     }
 
@@ -1019,6 +1037,7 @@ mod integration_tests {
             transfer::TransferOpts {
                 dry_run: false,
                 allow_sha1: false,
+                public_base: "http://nora.example",
             },
             4,
             false,
@@ -1051,6 +1070,7 @@ mod integration_tests {
             transfer::TransferOpts {
                 dry_run: false,
                 allow_sha1: true,
+                public_base: "http://nora.example",
             },
             4,
             false,
@@ -1237,6 +1257,211 @@ mod integration_tests {
                 .unwrap_or_default();
             Ok(futures::stream::once(async move { Ok(Bytes::from(body)) }).boxed())
         }
+    }
+
+    /// An npm tarball as `npm pack` writes one: `package/package.json` and a file.
+    fn npm_tgz(manifest: &serde_json::Value) -> Vec<u8> {
+        let mut tar = tar::Builder::new(Vec::new());
+        for (path, data) in [
+            ("package/package.json", manifest.to_string().into_bytes()),
+            ("package/index.js", b"module.exports = 1;".to_vec()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, path, &data[..]).unwrap();
+        }
+        let tar = tar.into_inner().unwrap();
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut gz, &tar).unwrap();
+        gz.finish().unwrap()
+    }
+
+    /// C73: an npm tarball `nora import` commits is a published version — its packument and
+    /// tarball are served from NORA's own keys, and the upstream is never asked for the name.
+    #[tokio::test]
+    async fn an_imported_npm_tarball_is_served_as_published_without_an_upstream() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use base64::Engine;
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "name": "c73pkg",
+                "description": "FROM-PUBLIC-UPSTREAM",
+                "versions": {},
+            })))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        let tgz = npm_tgz(&json!({
+            "name": "c73pkg",
+            "version": "1.0.0",
+            "description": "INTERNAL-ARTIFACTORY",
+            "dependencies": { "left-pad": "^1.0.0" },
+        }));
+        let src = FakeSource {
+            arts: vec![("c73pkg/-/c73pkg-1.0.0.tgz".into(), tgz.clone())],
+            stream_err: false,
+        };
+        let state = tempfile::tempdir().unwrap();
+        let resume = resume::ResumeStore::open(state.path(), "host")
+            .await
+            .unwrap();
+        let curation =
+            crate::curation::CurationEngine::new(crate::config::CurationConfig::default());
+        let repo = RepoRef {
+            name: "r".into(),
+            format: "npm".into(),
+        };
+        let res = import_repo(
+            &src,
+            &repo,
+            crate::registry_type::RegistryType::Npm,
+            "host",
+            &ctx.state.storage,
+            &curation,
+            &state.path().join("tmp"),
+            &resume,
+            opts(false),
+            1,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+
+        let resp = send(&ctx.app, Method::GET, "/npm/c73pkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let version = &doc["versions"]["1.0.0"];
+        assert_eq!(version["description"], "INTERNAL-ARTIFACTORY", "{doc}");
+        assert_eq!(version["dependencies"]["left-pad"], "^1.0.0");
+        assert_eq!(
+            version["dist"]["tarball"],
+            "http://nora.example/npm/c73pkg/-/c73pkg-1.0.0.tgz"
+        );
+        assert_eq!(
+            version["dist"]["shasum"],
+            hex::encode(<sha1::Sha1 as Digest>::digest(&tgz))
+        );
+        assert_eq!(
+            version["dist"]["integrity"],
+            format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD
+                    .encode(<sha2::Sha512 as Digest>::digest(&tgz))
+            )
+        );
+        assert_eq!(doc["dist-tags"]["latest"], "1.0.0");
+        let tarball = send(&ctx.app, Method::GET, "/npm/c73pkg/-/c73pkg-1.0.0.tgz", "").await;
+        assert_eq!(tarball.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(tarball).await[..], &tgz[..]);
+        let asked: Vec<String> = upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(
+            asked.is_empty(),
+            "upstream asked for an imported package: {asked:?}"
+        );
+    }
+
+    async fn import_npm(
+        storage: &crate::storage::Storage,
+        arts: Vec<(String, Vec<u8>)>,
+        state: &std::path::Path,
+    ) -> ImportResult {
+        let src = FakeSource {
+            arts,
+            stream_err: false,
+        };
+        let resume = resume::ResumeStore::open(state, "host").await.unwrap();
+        let curation =
+            crate::curation::CurationEngine::new(crate::config::CurationConfig::default());
+        let repo = RepoRef {
+            name: "r".into(),
+            format: "npm".into(),
+        };
+        import_repo(
+            &src,
+            &repo,
+            crate::registry_type::RegistryType::Npm,
+            "host",
+            storage,
+            &curation,
+            &state.join("tmp"),
+            &resume,
+            opts(false),
+            1,
+            false,
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_npm_tarball_that_does_not_name_its_key_is_not_imported() {
+        let h = harness("npm-mismatch").await;
+        let state = tempfile::tempdir().unwrap();
+        let other = npm_tgz(&json!({ "name": "other", "version": "1.0.0" }));
+        let older = npm_tgz(&json!({ "name": "pkg", "version": "0.9.0" }));
+        let bare = {
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            std::io::Write::write_all(
+                &mut gz,
+                &tar::Builder::new(Vec::new()).into_inner().unwrap(),
+            )
+            .unwrap();
+            gz.finish().unwrap()
+        };
+        let res = import_npm(
+            &h.storage,
+            vec![
+                ("pkg/-/pkg-1.0.0.tgz".into(), other),
+                ("pkg/-/pkg-1.0.1.tgz".into(), older),
+                ("pkg/-/pkg-1.0.2.tgz".into(), bare),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (0, 3), "{res:?}");
+        assert_eq!(h.storage.list("npm/").await.unwrap(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn a_tarball_an_earlier_import_committed_alone_is_published_by_the_next_run() {
+        let h = harness("npm-upgrade").await;
+        let tgz = npm_tgz(&json!({ "name": "pkg", "version": "1.0.0" }));
+        // What an import before C73 left: the tarball, no version document.
+        h.storage
+            .put("npm/pkg/tarballs/pkg-1.0.0.tgz", &tgz)
+            .await
+            .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let res = import_npm(
+            &h.storage,
+            vec![("pkg/-/pkg-1.0.0.tgz".into(), tgz)],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.skipped, res.failed), (1, 0), "{res:?}");
+        let doc: serde_json::Value =
+            serde_json::from_slice(&h.storage.get("npm/pkg/versions/1.0.0.json").await.unwrap())
+                .unwrap();
+        assert_eq!(
+            doc["dist"]["tarball"],
+            "http://nora.example/npm/pkg/-/pkg-1.0.0.tgz"
+        );
     }
 
     fn rr() -> RepoRef {
