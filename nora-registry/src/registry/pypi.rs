@@ -530,10 +530,11 @@ async fn download_file(
         };
 
         // The file may live on a later upstream — keep walking the list.
-        let Some(file_url) = find_file_url(&html, &filename, &page_url) else {
+        let Some(indexed) = find_file_url(&html, &filename, &page_url) else {
             miss.answered();
             continue;
         };
+        let file_url = indexed.url;
 
         // The upstream's credential goes to the upstream's own origin only: an index may name its
         // files on another host, which must not receive it (pip scopes a credential the same way).
@@ -553,6 +554,23 @@ async fn download_file(
         .await
         {
             Ok(data) => {
+                // The bytes are the file the index named only when they have the digest it
+                // gave: pip checks the same digest, and a cached file would be listed with
+                // NORA's own instead, so wrong bytes are refused before anything is stored.
+                let hash = hex::encode(sha2::Sha256::digest(&data));
+                if indexed.sha256.as_ref().is_some_and(|want| *want != hash) {
+                    tracing::warn!(
+                        package = %normalized,
+                        filename = %filename,
+                        upstream = %up.url(),
+                        "PyPI upstream file does not match the index sha256, refusing it"
+                    );
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        "upstream file does not match the sha256 its index gives",
+                    )
+                        .into_response();
+                }
                 // The allowlist's pinned integrity holds on the first download too, before anything
                 // is cached: the cache-hit branch checks the same rule.
                 if let Some(response) = crate::curation::verify_integrity(
@@ -585,7 +603,6 @@ async fn download_file(
                 let repo_index = Arc::clone(&state.repo_index);
                 tokio::spawn(async move {
                     if storage.put(&key_clone, &data_clone).await.is_ok() {
-                        let hash = hex::encode(sha2::Sha256::digest(&data_clone));
                         let _ = storage
                             .put(&format!("{}.sha256", key_clone), hash.as_bytes())
                             .await;
@@ -1304,7 +1321,15 @@ fn same_origin(a: &str, b: &str) -> bool {
     }
 }
 
-fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<String> {
+/// A file the upstream index names: where to fetch it, and the sha256 its href carries
+/// (`#sha256=<hex>`, PEP 503) — the digest pip checks the bytes against.
+#[derive(Debug, PartialEq)]
+struct IndexedFile {
+    url: String,
+    sha256: Option<String>,
+}
+
+fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<IndexedFile> {
     let mut remaining = html;
 
     while let Some(href_start) = remaining.find("href=\"") {
@@ -1320,16 +1345,20 @@ fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<St
                 // unchanged — it must stay encoded to fetch from the upstream (#664).
                 let decoded = percent_encoding::percent_decode_str(filename).decode_utf8_lossy();
                 if decoded.as_ref() == target_filename {
-                    let raw = url.split('#').next().unwrap_or(url).to_string();
+                    let (raw, fragment) = url.split_once('#').unwrap_or((url, ""));
+                    let sha256 = fragment
+                        .strip_prefix("sha256=")
+                        .map(|digest| digest.to_ascii_lowercase());
                     // Resolve relative URLs against the page URL (#877).
-                    if raw.starts_with("http://") || raw.starts_with("https://") {
-                        return Some(raw);
-                    }
-                    return reqwest::Url::parse(page_url)
-                        .ok()
-                        .and_then(|base| base.join(&raw).ok())
-                        .map(|u| u.to_string())
-                        .or(Some(raw));
+                    let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+                        raw.to_string()
+                    } else {
+                        reqwest::Url::parse(page_url)
+                            .ok()
+                            .and_then(|base| base.join(raw).ok())
+                            .map_or_else(|| raw.to_string(), |u| u.to_string())
+                    };
+                    return Some(IndexedFile { url, sha256 });
                 }
             }
 
@@ -1464,7 +1493,7 @@ mod tests {
             r#"torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl</a>"#,
         );
         assert_eq!(
-            find_file_url(html, "torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl", "https://pypi.org/simple/torch/").as_deref(),
+            find_file_url(html, "torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl", "https://pypi.org/simple/torch/").map(|f| f.url).as_deref(),
             Some(
                 "https://download.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp310-cp310-linux_x86_64.whl"
             )
@@ -1477,6 +1506,7 @@ mod tests {
                 "torch-0.1.10-cp36-cp36m-macosx.whl",
                 "https://pypi.org/simple/torch/"
             )
+            .map(|f| f.url)
             .as_deref(),
             Some("https://x/torch-0.1.10-cp36-cp36m-macosx.whl")
         );
@@ -1572,7 +1602,8 @@ mod tests {
     #[test]
     fn test_find_file_url_found() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz#sha256=abc">flask-2.0.tar.gz</a>"#;
-        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/");
+        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/")
+            .map(|f| f.url);
         assert_eq!(
             result,
             Some("https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz".to_string())
@@ -1582,7 +1613,8 @@ mod tests {
     #[test]
     fn test_find_file_url_not_found() {
         let html = r#"<a href="https://example.com/other-1.0.tar.gz">other</a>"#;
-        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/");
+        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/")
+            .map(|f| f.url);
         assert_eq!(result, None);
     }
 
@@ -1590,7 +1622,13 @@ mod tests {
     fn test_find_file_url_strips_hash() {
         let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=deadbeef">pkg</a>"#;
         let result = find_file_url(html, "pkg-1.0.whl", "https://pypi.org/simple/pkg/");
-        assert_eq!(result, Some("https://example.com/pkg-1.0.whl".to_string()));
+        assert_eq!(
+            result,
+            Some(IndexedFile {
+                url: "https://example.com/pkg-1.0.whl".to_string(),
+                sha256: Some("deadbeef".to_string()),
+            })
+        );
     }
 
     // -- #877: relative URL resolution --
@@ -1602,7 +1640,8 @@ mod tests {
             html,
             "torch-2.4.0.whl",
             "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/torch/",
-        );
+        )
+        .map(|f| f.url);
         assert_eq!(
             result,
             Some(
@@ -1619,7 +1658,8 @@ mod tests {
             html,
             "pkg-1.0.whl",
             "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/pkg/",
-        );
+        )
+        .map(|f| f.url);
         assert_eq!(
             result,
             Some("https://files.pythonhosted.org/packages/ab/cd/pkg-1.0.whl".to_string())
@@ -1629,7 +1669,8 @@ mod tests {
     #[test]
     fn test_find_file_url_path_only() {
         let html = r#"<a href="/packages/pkg-1.0.whl#sha256=ff">pkg-1.0.whl</a>"#;
-        let result = find_file_url(html, "pkg-1.0.whl", "https://pypi.example.com/simple/pkg/");
+        let result = find_file_url(html, "pkg-1.0.whl", "https://pypi.example.com/simple/pkg/")
+            .map(|f| f.url);
         assert_eq!(
             result,
             Some("https://pypi.example.com/packages/pkg-1.0.whl".to_string())
@@ -4466,5 +4507,97 @@ mod release_age_without_the_json_index {
         let resp = send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(up.received_requests().await.unwrap().is_empty());
+    }
+}
+
+/// A file the upstream index names with `#sha256=` is served only when its bytes have that
+/// digest: pip checks it against the index NORA serves, and once NORA cached the file its own
+/// digest would stand in for the upstream's, so wrong bytes would pass on the next install.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod upstream_index_digest {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FILE: &str = "hm-1.0-py3-none-any.whl";
+
+    fn sha256(bytes: &[u8]) -> String {
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    /// An upstream whose index names `FILE` with `fragment` and whose file host answers `bytes`.
+    async fn upstream(fragment: &str, bytes: &[u8]) -> MockServer {
+        let up = MockServer::start().await;
+        let uri = up.uri();
+        Mock::given(method("GET"))
+            .and(path("/hm/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body><a href="{uri}/files/{FILE}{fragment}">{FILE}</a></body></html>"#
+            )))
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/files/{FILE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .mount(&up)
+            .await;
+        up
+    }
+
+    fn context(up: &MockServer) -> TestContext {
+        let uri = up.uri();
+        create_test_context_with_config(move |cfg| cfg.pypi.proxy = Some(uri))
+    }
+
+    async fn download(ctx: &TestContext) -> (StatusCode, Vec<u8>) {
+        let resp = send(&ctx.app, Method::GET, &format!("/simple/hm/{FILE}"), "").await;
+        let status = resp.status();
+        (status, body_bytes(resp).await.to_vec())
+    }
+
+    #[tokio::test]
+    async fn bytes_that_do_not_match_the_index_digest_are_refused_and_not_cached() {
+        let up = upstream(&format!("#sha256={}", sha256(b"genuine")), b"tampered").await;
+        let ctx = context(&up);
+        for attempt in 1..=2 {
+            let (status, body) = download(&ctx).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "attempt {attempt}");
+            assert_ne!(body, b"tampered", "attempt {attempt}");
+        }
+        assert!(
+            ctx.state
+                .storage
+                .stat(&format!("pypi/hm/{FILE}"))
+                .await
+                .is_none(),
+            "refused bytes are not cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn bytes_that_match_the_index_digest_are_served() {
+        // The digest as the index writes it, any case.
+        for digest in [sha256(b"genuine"), sha256(b"genuine").to_uppercase()] {
+            let up = upstream(&format!("#sha256={digest}"), b"genuine").await;
+            let ctx = context(&up);
+            assert_eq!(
+                download(&ctx).await,
+                (StatusCode::OK, b"genuine".to_vec()),
+                "{digest}"
+            );
+        }
+    }
+
+    /// An index that publishes no sha256 for the file leaves nothing to check it against.
+    #[tokio::test]
+    async fn a_file_the_index_gives_no_sha256_for_is_served() {
+        for fragment in ["", "#md5=0123456789abcdef0123456789abcdef"] {
+            let up = upstream(fragment, b"bytes").await;
+            let ctx = context(&up);
+            assert_eq!(download(&ctx).await.0, StatusCode::OK, "{fragment:?}");
+        }
     }
 }
