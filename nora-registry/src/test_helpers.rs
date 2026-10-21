@@ -169,6 +169,7 @@ fn build_context_full(
             header_read_timeout: 30,
             keep_alive_timeout: 120,
             max_connections: 4096,
+            maintenance_stall_secs: 300,
             trust_upstream_dates: true,
         },
         storage: StorageConfig {
@@ -376,6 +377,7 @@ fn build_context_full(
             crate::build_no_redirect_client(&config.tls),
         ),
     };
+    let maintenance = Arc::new(crate::maintenance_heartbeat(&config.server));
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -407,9 +409,7 @@ fn build_context_full(
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),
         pull_stats: std::sync::Arc::new(crate::registry::docker::PullStatsAccumulator::default()),
-        maintenance: Arc::new(crate::health::MaintenanceHeartbeat::new(
-            crate::MAINTENANCE_MAX_SILENCE,
-        )),
+        maintenance,
     };
 
     // Build router identical to run_server() but without TcpListener / rate-limiting

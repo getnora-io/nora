@@ -231,6 +231,19 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// The silence `/health` tolerates is `server.maintenance_stall_secs`: with a 1 s window
+    /// and no tick completing, the probe fails after it; with the default it does not.
+    #[tokio::test]
+    async fn the_stall_window_is_the_configured_one() {
+        let short = create_test_context_with_config(|c| c.server.maintenance_stall_secs = 1);
+        let default = create_test_context();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let response = send(&short.app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = send(&default.app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn test_health_json_has_version() {
         let ctx = create_test_context();

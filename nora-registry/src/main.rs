@@ -2922,6 +2922,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let signer = build_signer(&config, &enabled_registries);
 
+    let maintenance = Arc::new(maintenance_heartbeat(&config.server));
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -2951,7 +2952,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         leak_finders,
         cancel_token: cancel_token.clone(),
         pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
-        maintenance: Arc::new(health::MaintenanceHeartbeat::new(maintenance_max_silence())),
+        maintenance,
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
@@ -3268,19 +3269,17 @@ async fn run_server(mut config: Config, storage: Storage) {
 /// Cadence of the maintenance loop.
 const MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long the maintenance loop may go without completing a tick before `/health` fails
-/// (R2-49): ten missed ticks. Longer than the readiness window of the object-store
-/// reachability cache (150 s), so a slow bucket listing un-readies the pod before it
-/// restarts it.
-pub(crate) const MAINTENANCE_MAX_SILENCE: std::time::Duration = std::time::Duration::from_secs(300);
-
-/// The silence `/health` tolerates from the maintenance loop.
-fn maintenance_max_silence() -> std::time::Duration {
+/// The maintenance heartbeat `/health` reads (R2-49): stalled after
+/// `server.maintenance_stall_secs` without a completed tick. The server and the test router
+/// both build it here.
+pub(crate) fn maintenance_heartbeat(server: &config::ServerConfig) -> health::MaintenanceHeartbeat {
     #[cfg(feature = "fault-injection")]
     if let Some(silence) = fault_injection::maintenance_max_silence() {
-        return silence;
+        return health::MaintenanceHeartbeat::new(silence);
     }
-    MAINTENANCE_MAX_SILENCE
+    health::MaintenanceHeartbeat::new(std::time::Duration::from_secs(
+        server.maintenance_stall_secs,
+    ))
 }
 
 /// Run `tick` every `period`, numbering the ticks from 1 and recording on `heartbeat` each

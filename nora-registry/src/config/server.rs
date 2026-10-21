@@ -57,7 +57,16 @@ pub struct ServerConfig {
     /// until one closes. Keep it below the process's open-file limit. Default 4096.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+    /// Seconds without a completed maintenance tick (token flush, upload-session expiry,
+    /// storage refresh; one every 30 s) after which `/health` answers 503, so an
+    /// orchestrator restarts the process. Default 300; at least 90, three ticks: one
+    /// failing tick and a slow one must not fail liveness.
+    #[serde(default = "default_maintenance_stall_secs")]
+    pub maintenance_stall_secs: u64,
 }
+
+/// The smallest `maintenance_stall_secs`: three maintenance ticks.
+pub const MIN_MAINTENANCE_STALL_SECS: u64 = 90;
 
 pub(super) fn default_server_host() -> String {
     String::from("127.0.0.1")
@@ -95,6 +104,10 @@ pub(super) fn default_max_connections() -> usize {
     4096
 }
 
+pub(super) fn default_maintenance_stall_secs() -> u64 {
+    300
+}
+
 /// TLS configuration for outbound connections to upstream registries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -115,6 +128,7 @@ impl Default for ServerConfig {
             header_read_timeout: default_header_read_timeout(),
             keep_alive_timeout: default_keep_alive_timeout(),
             max_connections: default_max_connections(),
+            maintenance_stall_secs: default_maintenance_stall_secs(),
             trust_upstream_dates: default_trust_upstream_dates(),
         }
     }
@@ -223,6 +237,13 @@ impl ServerConfig {
         if let Ok(val) = env::var("NORA_MAX_CONNECTIONS") {
             super::parse_env_warn("NORA_MAX_CONNECTIONS", &val, &mut self.max_connections);
         }
+        if let Ok(val) = env::var("NORA_MAINTENANCE_STALL_SECS") {
+            super::parse_env_warn(
+                "NORA_MAINTENANCE_STALL_SECS",
+                &val,
+                &mut self.maintenance_stall_secs,
+            );
+        }
         if let Ok(val) = env::var("NORA_TRUST_UPSTREAM_DATES") {
             super::parse_env_warn(
                 "NORA_TRUST_UPSTREAM_DATES",
@@ -270,6 +291,17 @@ mod tests {
         assert_eq!(config.header_read_timeout, 5);
         assert_eq!(config.keep_alive_timeout, 300);
         assert_eq!(config.max_connections, 64);
+    }
+
+    #[test]
+    fn maintenance_stall_default_and_env_override() {
+        let _lock = crate::test_env::env_lock();
+        assert_eq!(ServerConfig::default().maintenance_stall_secs, 300);
+        let mut config = ServerConfig::default();
+        std::env::set_var("NORA_MAINTENANCE_STALL_SECS", "120");
+        config.apply_env_overrides();
+        std::env::remove_var("NORA_MAINTENANCE_STALL_SECS");
+        assert_eq!(config.maintenance_stall_secs, 120);
     }
 
     fn server(host: &str, port: u16) -> ServerConfig {

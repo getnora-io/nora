@@ -1077,6 +1077,14 @@ impl Config {
             }
         }
 
+        if self.server.maintenance_stall_secs < server::MIN_MAINTENANCE_STALL_SECS {
+            errors.push(format!(
+                "server.maintenance_stall_secs must be at least {} (three maintenance ticks), got {}",
+                server::MIN_MAINTENANCE_STALL_SECS,
+                self.server.maintenance_stall_secs
+            ));
+        }
+
         // 1b. Wildcard host requires public_url (non-routable address → broken client URLs)
         {
             let host = &self.server.host;
@@ -3483,6 +3491,21 @@ proxies = [
             let (_, errors) = config.validate();
             assert_eq!(errors, vec![format!("server.{key} must not be 0")]);
         }
+    }
+
+    /// Below three maintenance ticks one failing tick would fail liveness.
+    #[test]
+    fn test_validate_maintenance_stall_floor() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.server.maintenance_stall_secs = 89;
+        let (_, errors) = config.validate();
+        assert_eq!(
+            errors,
+            vec!["server.maintenance_stall_secs must be at least 90 (three maintenance ticks), got 89"]
+        );
+        config.server.maintenance_stall_secs = 90;
+        assert!(config.validate().1.is_empty());
     }
 
     #[test]
