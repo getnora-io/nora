@@ -3060,6 +3060,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             pull_stats: std::sync::Arc::new(
                 crate::registry::docker::PullStatsAccumulator::default(),
             ),
+            tasks: ctx.state.tasks.clone(),
             maintenance: ctx.state.maintenance.clone(),
         };
 

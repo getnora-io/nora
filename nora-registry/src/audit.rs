@@ -161,8 +161,13 @@ impl AuditLog {
         );
 
         let writer_mode = mode.clone();
+        // Without its writer the audit log would take entries and record none, so a panic
+        // there ends the process (supervise.rs, `OnPanic::Exit`).
         let handle = tokio::task::spawn_blocking(move || {
-            Self::writer_loop(rx, file, writer_mode);
+            let exit = crate::supervise::process_exit();
+            crate::supervise::blocking("audit", &exit, move || {
+                Self::writer_loop(rx, file, writer_mode)
+            });
         });
 
         Self {
@@ -184,6 +189,10 @@ impl AuditLog {
         // or the channel is closed. This is correct because we're inside
         // spawn_blocking.
         while let Some(entry) = rx.blocking_recv() {
+            #[cfg(feature = "fault-injection")]
+            if crate::fault_injection::task_fault("audit") {
+                panic!("fault injection: audit task panic");
+            }
             Self::write_entry(&entry, &mut file, &mode);
         }
 

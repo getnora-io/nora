@@ -66,6 +66,7 @@ mod secrets;
 mod server_conn;
 mod signing;
 mod storage;
+mod supervise;
 mod tokens;
 mod ui;
 mod validation;
@@ -425,8 +426,10 @@ pub struct AppState {
     /// to a `.stats.json` sidecar, so `.meta.json` is never rewritten by a pull.
     /// In-memory, rebuildable-empty after a restart.
     pub(crate) pull_stats: Arc<registry::docker::PullStatsAccumulator>,
-    /// When the maintenance loop last ticked; `/health` fails once it is silent too long.
-    pub(crate) maintenance: Arc<health::MaintenanceHeartbeat>,
+    /// The supervisor of the long-lived background tasks; `/health` asks it (supervise.rs).
+    pub(crate) tasks: Arc<supervise::Supervisor>,
+    /// The maintenance loop's heartbeat, which `tasks` reads.
+    pub(crate) maintenance: Arc<supervise::Heartbeat>,
 }
 
 impl AppState {
@@ -2922,7 +2925,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let signer = build_signer(&config, &enabled_registries);
 
-    let maintenance = Arc::new(maintenance_heartbeat(&config.server));
+    let (tasks, maintenance) = supervision(&config.server);
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -2952,6 +2955,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         leak_finders,
         cancel_token: cancel_token.clone(),
         pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
+        tasks,
         maintenance,
     };
 
@@ -2972,10 +2976,13 @@ async fn run_server(mut config: Config, storage: Storage) {
     // every PULL_STATS_FLUSH_INTERVAL and once more on shutdown. Pushed to the
     // scheduler handles so the final flush completes within the shutdown drain,
     // keeping the stats loss to at most one interval only on a hard crash.
-    scheduler_handles.push(tokio::spawn(registry::docker::pull_stats_flush_loop(
-        state.clone(),
-        registry::docker::PULL_STATS_FLUSH_INTERVAL,
-    )));
+    let flush_state = state.clone();
+    scheduler_handles.push(state.tasks.spawn("pull_stats", move || {
+        registry::docker::pull_stats_flush_loop(
+            flush_state.clone(),
+            registry::docker::PULL_STATS_FLUSH_INTERVAL,
+        )
+    }));
 
     // Retention is pushed first: it deletes expired versions, creating the
     // orphans the GC pass then sweeps in the same cycle.
@@ -3070,11 +3077,15 @@ async fn run_server(mut config: Config, storage: Storage) {
     }
 
     if !cleanup_passes.is_empty() {
-        scheduler_handles.push(cleanup::spawn_cleanup_scheduler(
-            cleanup_passes,
-            cleanup_lock,
-            cancel_token.clone(),
-        ));
+        let passes = Arc::new(cleanup_passes);
+        let cancel = cancel_token.clone();
+        scheduler_handles.push(state.tasks.spawn("cleanup", move || {
+            cleanup::run_cleanup_scheduler(
+                Arc::clone(&passes),
+                Arc::clone(&cleanup_lock),
+                cancel.clone(),
+            )
+        }));
     }
 
     let app = Router::new()
@@ -3186,30 +3197,38 @@ async fn run_server(mut config: Config, storage: Storage) {
     );
 
     // Background task: flush token last_used + periodic maintenance every 30 seconds
+    // Under the supervisor: a panicking tick restarts the loop, and the heartbeat (beaten
+    // after each completed tick) fails /health when ticks stop completing (R2-49).
     let maintenance_state = state.clone();
-    tokio::spawn(run_maintenance(
-        MAINTENANCE_PERIOD,
-        Arc::clone(&state.maintenance),
-        move |tick_count| {
-            let state = maintenance_state.clone();
-            async move { maintenance_tick(&state, tick_count).await }
-        },
-    ));
+    state.tasks.spawn("maintenance", move || {
+        let state = maintenance_state.clone();
+        run_maintenance(
+            MAINTENANCE_PERIOD,
+            Arc::clone(&state.maintenance),
+            move |tick_count| {
+                let state = state.clone();
+                async move { maintenance_tick(&state, tick_count).await }
+            },
+        )
+    });
 
     // SIGHUP handler: hot-reload curation policy
     #[cfg(unix)]
     {
         let reload_state = state.clone();
-        tokio::spawn(async move {
-            let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())
-                .expect("Failed to install SIGHUP handler");
-            loop {
-                sighup.recv().await;
-                info!("SIGHUP received — reloading curation policy");
-                match reload_curation(&reload_state) {
-                    Ok(()) => info!("Curation policy reloaded successfully"),
-                    Err(e) => {
-                        error!(error = %e, "Curation policy reload failed, keeping previous config")
+        state.tasks.spawn("sighup", move || {
+            let reload_state = reload_state.clone();
+            async move {
+                let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())
+                    .expect("Failed to install SIGHUP handler");
+                loop {
+                    sighup.recv().await;
+                    info!("SIGHUP received — reloading curation policy");
+                    match reload_curation(&reload_state) {
+                        Ok(()) => info!("Curation policy reloaded successfully"),
+                        Err(e) => {
+                            error!(error = %e, "Curation policy reload failed, keeping previous config")
+                        }
                     }
                 }
             }
@@ -3269,26 +3288,27 @@ async fn run_server(mut config: Config, storage: Storage) {
 /// Cadence of the maintenance loop.
 const MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// The maintenance heartbeat `/health` reads (R2-49): stalled after
-/// `server.maintenance_stall_secs` without a completed tick. The server and the test router
-/// both build it here.
-pub(crate) fn maintenance_heartbeat(server: &config::ServerConfig) -> health::MaintenanceHeartbeat {
+/// The supervisor of the server's long-lived tasks, and the maintenance loop's heartbeat it
+/// reads: stalled after `server.maintenance_stall_secs` without a completed tick (R2-49).
+/// The server and the test router both build them here.
+pub(crate) fn supervision(
+    server: &config::ServerConfig,
+) -> (Arc<supervise::Supervisor>, Arc<supervise::Heartbeat>) {
+    let stall = std::time::Duration::from_secs(server.maintenance_stall_secs);
     #[cfg(feature = "fault-injection")]
-    if let Some(silence) = fault_injection::maintenance_max_silence() {
-        return health::MaintenanceHeartbeat::new(silence);
-    }
-    health::MaintenanceHeartbeat::new(std::time::Duration::from_secs(
-        server.maintenance_stall_secs,
-    ))
+    let stall = fault_injection::maintenance_max_silence().unwrap_or(stall);
+    let heartbeat = Arc::new(supervise::Heartbeat::new(stall));
+    let tasks = supervise::Supervisor::new(vec![("maintenance", Arc::clone(&heartbeat))]);
+    (Arc::new(tasks), heartbeat)
 }
 
 /// Run `tick` every `period`, numbering the ticks from 1 and recording on `heartbeat` each
-/// one that completes. The first tick fires at once. A tick that panics is logged and the
-/// loop goes on; ticks that keep panicking or one that hangs stop the beats, since the work
-/// they stand for (token flush, readiness refresh) is no longer done.
+/// one that completes. The first tick fires at once. A panicking tick ends the loop, which
+/// its supervisor restarts; ticks that keep panicking or one that hangs stop the beats,
+/// since the work they stand for (token flush, readiness refresh) is no longer done.
 async fn run_maintenance<F, Fut>(
     period: std::time::Duration,
-    heartbeat: Arc<health::MaintenanceHeartbeat>,
+    heartbeat: Arc<supervise::Heartbeat>,
     mut tick: F,
 ) where
     F: FnMut(u64) -> Fut,
@@ -3299,16 +3319,8 @@ async fn run_maintenance<F, Fut>(
     loop {
         interval.tick().await;
         tick_count += 1;
-        // A panic in one tick must not end the loop: the next one flushes tokens again.
-        match std::panic::AssertUnwindSafe(tick(tick_count))
-            .catch_unwind()
-            .await
-        {
-            Ok(()) => heartbeat.beat(),
-            Err(e) => {
-                tracing::error!(panic = ?e, tick = tick_count, "maintenance tick panicked")
-            }
-        }
+        tick(tick_count).await;
+        heartbeat.beat();
     }
 }
 
@@ -3344,8 +3356,8 @@ async fn maintenance_tick(state: &AppState, tick_count: u64) {
         ))
         .catch_unwind()
         .await;
-        if let Err(e) = gauges {
-            tracing::error!(panic = ?e, "artifact gauge refresh panicked");
+        if let Err(panic) = gauges {
+            supervise::report_panic("maintenance", &panic);
         }
         metrics::UPTIME_SECONDS.set(state.start_time.elapsed().as_secs() as i64);
     }
@@ -3373,77 +3385,104 @@ async fn maintenance_tick(state: &AppState, tick_count: u64) {
 
 #[cfg(test)]
 mod maintenance_loop_tests {
-    //! The maintenance loop outlives a panicking tick, and a hung tick shows on the
-    //! heartbeat (R2-49). Real time at a 20 ms cadence: the margins are whole ticks.
-    use super::{health::MaintenanceHeartbeat, run_maintenance};
+    //! The maintenance loop under its supervisor (R2-49): a panicking tick restarts the
+    //! loop, ticks that never complete and a hung tick fail `/health`. Real time at a 20 ms
+    //! cadence: the margins are whole ticks.
+    use super::run_maintenance;
+    use crate::supervise::{Heartbeat, Supervisor, Timing};
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
 
     const PERIOD: Duration = Duration::from_millis(20);
 
+    fn supervised(silence: Duration) -> (Arc<Supervisor>, Arc<Heartbeat>) {
+        let heartbeat = Arc::new(Heartbeat::new(silence));
+        let timing = Timing {
+            backoff_min: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(20),
+            stable_run: Duration::from_secs(60),
+            crash_loop: 5,
+        };
+        let tasks = Supervisor::with(vec![("maintenance", Arc::clone(&heartbeat))], timing);
+        (Arc::new(tasks), heartbeat)
+    }
+
     #[tokio::test]
-    async fn a_panicking_tick_does_not_end_the_loop() {
-        let heartbeat = Arc::new(MaintenanceHeartbeat::new(Duration::from_secs(300)));
-        let last = Arc::new(AtomicU64::new(0));
-        let seen = Arc::clone(&last);
-        let task = tokio::spawn(run_maintenance(PERIOD, Arc::clone(&heartbeat), move |n| {
-            seen.store(n, Ordering::SeqCst);
-            async move {
-                assert_ne!(n, 2, "a bug in the second tick");
-            }
-        }));
+    async fn a_panicking_tick_restarts_the_loop() {
+        let (tasks, heartbeat) = supervised(Duration::from_secs(300));
+        let runs = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new(AtomicU64::new(0));
+        let (r, c, hb) = (
+            Arc::clone(&runs),
+            Arc::clone(&completed),
+            Arc::clone(&heartbeat),
+        );
+        let task = tasks.spawn("maintenance", move || {
+            let run = r.fetch_add(1, Ordering::SeqCst);
+            let c = Arc::clone(&c);
+            run_maintenance(PERIOD, Arc::clone(&hb), move |n| {
+                let c = Arc::clone(&c);
+                async move {
+                    assert!(
+                        !(run == 0 && n == 2),
+                        "a bug in the second tick of the first run"
+                    );
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        });
         tokio::time::sleep(PERIOD * 20).await;
         assert!(
             !task.is_finished(),
             "the loop ended with the panicking tick"
         );
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "restarted once");
         assert!(
-            last.load(Ordering::SeqCst) >= 4,
-            "ticks after the panic run: {}",
-            last.load(Ordering::SeqCst)
+            completed.load(Ordering::SeqCst) >= 4,
+            "ticks after the panic complete"
         );
         assert!(heartbeat.silent_for() < PERIOD * 10, "the loop still beats");
+        assert_eq!(tasks.failing(), None);
         task.abort();
     }
 
     /// A loop whose every tick panics never flushes tokens or refreshes readiness again,
-    /// though it keeps running: that fails liveness too.
+    /// though the supervisor keeps restarting it: that fails liveness.
     #[tokio::test]
-    async fn a_tick_that_panics_every_time_stalls_the_heartbeat() {
-        let heartbeat = Arc::new(MaintenanceHeartbeat::new(PERIOD * 10));
-        let task = tokio::spawn(run_maintenance(
-            PERIOD,
-            Arc::clone(&heartbeat),
-            |n| async move {
-                assert!(n < 2, "a bug in every tick from the second on");
-            },
-        ));
+    async fn a_tick_that_panics_every_time_fails_liveness() {
+        let (tasks, _heartbeat) = supervised(PERIOD * 10);
+        let hb = Arc::clone(&_heartbeat);
+        let task = tasks.spawn("maintenance", move || {
+            run_maintenance(PERIOD, Arc::clone(&hb), |_| async {
+                panic!("a bug in every tick");
+            })
+        });
         tokio::time::sleep(PERIOD * 30).await;
-        assert!(!task.is_finished(), "the loop goes on");
-        assert!(
-            heartbeat.stalled(),
-            "ticks that never complete stop the beats"
-        );
+        assert!(!task.is_finished(), "the supervisor goes on restarting it");
+        assert_eq!(tasks.failing(), Some("maintenance"));
         task.abort();
     }
 
     #[tokio::test]
-    async fn a_hung_tick_stalls_the_heartbeat() {
-        let heartbeat = Arc::new(MaintenanceHeartbeat::new(PERIOD * 10));
-        let task = tokio::spawn(run_maintenance(
-            PERIOD,
-            Arc::clone(&heartbeat),
-            |n| async move {
+    async fn a_hung_tick_fails_liveness() {
+        let (tasks, heartbeat) = supervised(PERIOD * 10);
+        let hb = Arc::clone(&heartbeat);
+        let task = tasks.spawn("maintenance", move || {
+            run_maintenance(PERIOD, Arc::clone(&hb), |n| async move {
                 if n == 2 {
                     std::future::pending::<()>().await;
                 }
-            },
-        ));
+            })
+        });
         tokio::time::sleep(PERIOD * 2).await;
-        assert!(!heartbeat.stalled(), "within the silence it may keep");
+        assert_eq!(tasks.failing(), None, "within the silence it may keep");
         tokio::time::sleep(PERIOD * 20).await;
-        assert!(heartbeat.stalled(), "a hung tick stops the beats");
+        assert_eq!(
+            tasks.failing(),
+            Some("maintenance"),
+            "a hung tick stops the beats"
+        );
         task.abort();
     }
 }

@@ -377,7 +377,7 @@ fn build_context_full(
             crate::build_no_redirect_client(&config.tls),
         ),
     };
-    let maintenance = Arc::new(crate::maintenance_heartbeat(&config.server));
+    let (tasks, maintenance) = crate::supervision(&config.server);
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -409,6 +409,7 @@ fn build_context_full(
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),
         pull_stats: std::sync::Arc::new(crate::registry::docker::PullStatsAccumulator::default()),
+        tasks,
         maintenance,
     };
 

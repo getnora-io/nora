@@ -27,12 +27,29 @@ pub(crate) struct CleanupPass {
     pub run: Box<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>,
 }
 
+/// The scheduler as a task of its own, for the tests of the schedule; the server runs
+/// [`run_cleanup_scheduler`] under its supervisor.
+#[cfg(test)]
 pub(crate) fn spawn_cleanup_scheduler(
     passes: Vec<CleanupPass>,
     cleanup_lock: Arc<tokio::sync::Mutex<()>>,
     cancel: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+    tokio::spawn(run_cleanup_scheduler(
+        Arc::new(passes),
+        cleanup_lock,
+        cancel,
+    ))
+}
+
+/// Run every due pass, in order, under one acquisition of `cleanup_lock`, until `cancel`.
+/// Every pass is due when this starts, so a restart runs them again.
+pub(crate) async fn run_cleanup_scheduler(
+    passes: Arc<Vec<CleanupPass>>,
+    cleanup_lock: Arc<tokio::sync::Mutex<()>>,
+    cancel: CancellationToken,
+) {
+    {
         // Every pass is due at boot: a process restarting more often than its
         // interval must still clean.
         let mut due: Vec<Instant> = vec![Instant::now(); passes.len()];
@@ -65,11 +82,12 @@ pub(crate) fn spawn_cleanup_scheduler(
                 // Wake-time based, so same-interval passes stay phase-locked
                 // and a pass overrunning its interval fires on the next loop.
                 due[i] = now + pass.interval;
-                if std::panic::AssertUnwindSafe((pass.run)())
+                // A panicking pass is reported like a task panic, and the others still run.
+                if let Err(panic) = std::panic::AssertUnwindSafe((pass.run)())
                     .catch_unwind()
                     .await
-                    .is_err()
                 {
+                    crate::supervise::report_panic("cleanup", &panic);
                     warn!(
                         pass = pass.name,
                         "cleanup pass panicked — continuing with remaining passes"
@@ -79,7 +97,7 @@ pub(crate) fn spawn_cleanup_scheduler(
 
             drop(guard);
         }
-    })
+    }
 }
 
 #[cfg(test)]

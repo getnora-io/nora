@@ -89,6 +89,12 @@ with `registry=~"pypi(:.*)?"`, not `registry="pypi"`.
 | `nora_gc_last_run_timestamp` | gauge | — | Unix timestamp of last GC run |
 | `nora_gc_metadata_phantoms_total` | counter | — | Metadata entries without corresponding blobs |
 
+### Background tasks
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `nora_task_panics_total` | counter | task | Panics of a long-lived background task: `maintenance` (token flush, session expiry, storage refresh), `pull_stats`, `cleanup` (GC and retention), `sighup` (curation reload), `audit` (audit writer). Each one is logged as `background task panicked` with the task's name. A task is restarted after a backoff; one that keeps panicking, or a maintenance loop with no completed tick for `server.maintenance_stall_secs`, makes `/health` answer 503 with `failing_task`. A panic of `audit` ends the process (exit 70): NORA does not serve without its audit trail. Any increase is a bug |
+
 ## Grafana Dashboard
 
 The included dashboard (`dist/grafana-dashboard.json`) provides:
@@ -155,6 +161,13 @@ groups:
         labels: { severity: critical }
         annotations:
           summary: "NORA refusing to serve an artifact (hash-pin integrity failure)"
+
+      - alert: NoraTaskPanic
+        expr: increase(nora_task_panics_total[15m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "A NORA background task panicked and was restarted"
 ```
 
 A ready-to-load version of these rules ships at [`deploy/prometheus-rules.yml`](deploy/prometheus-rules.yml); point Prometheus at it via `rule_files:`.

@@ -31,6 +31,18 @@ pub static HTTP_REQUESTS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
     .expect("failed to create HTTP_REQUESTS_TOTAL metric at startup")
 });
 
+/// Panics of the server's long-lived background tasks, by task (`maintenance`,
+/// `pull_stats`, `cleanup`, `sighup`, `audit`). Any increase is a bug: the task was
+/// restarted, or the process exited (see `supervise.rs`).
+pub static TASK_PANICS_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_task_panics_total",
+        "Panics of long-lived background tasks",
+        &["task"]
+    )
+    .expect("failed to create TASK_PANICS_TOTAL metric at startup")
+});
+
 /// Curation engine decisions, by effective outcome. Makes allow/deny visible in
 /// telemetry — previously curation only kept internal counters, so an operator
 /// could not see from Prometheus how often curation allowed vs blocked.
