@@ -4,6 +4,8 @@
 use axum::{extract::State, http::StatusCode, response::Json, routing::get, Router};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use utoipa::ToSchema;
 
 use crate::circuit_breaker::UpstreamHealth;
@@ -30,6 +32,48 @@ pub struct StorageHealth {
     pub total_size_bytes: u64,
 }
 
+/// When the maintenance loop (token flush, upload-session expiry, storage gauges) last
+/// started a tick, read by `/health` (R2-49). A panic in the shipped build no longer ends
+/// the process, so a loop that dies or hangs would otherwise leave a process that answers
+/// probes but never flushes tokens again; a silence longer than `max_silence` fails the
+/// liveness probe so the orchestrator restarts it.
+pub struct MaintenanceHeartbeat {
+    origin: tokio::time::Instant,
+    /// Milliseconds from `origin` to the start of the last tick.
+    last_beat_ms: AtomicU64,
+    max_silence: Duration,
+}
+
+impl MaintenanceHeartbeat {
+    /// A heartbeat that counts as a beat now, and is stalled after `max_silence` without one.
+    pub fn new(max_silence: Duration) -> Self {
+        Self {
+            origin: tokio::time::Instant::now(),
+            last_beat_ms: AtomicU64::new(0),
+            max_silence,
+        }
+    }
+
+    /// Record the start of a tick.
+    pub fn beat(&self) {
+        let ms = u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.last_beat_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Time since the last tick started.
+    pub fn silent_for(&self) -> Duration {
+        let now = self.origin.elapsed();
+        now.saturating_sub(Duration::from_millis(
+            self.last_beat_ms.load(Ordering::Relaxed),
+        ))
+    }
+
+    /// Whether the loop has been silent for longer than it may be.
+    pub fn stalled(&self) -> bool {
+        self.silent_for() > self.max_silence
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/health", get(health_check))
@@ -37,10 +81,14 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<HealthStatus>) {
+    // Read when the probe arrives, before the storage checks below take their time.
+    let maintenance_stalled = state.maintenance.stalled();
     let storage_reachable = check_storage_reachable(&state).await;
     let total_size = state.storage.total_size().await;
 
-    let status = if storage_reachable {
+    let status = if maintenance_stalled {
+        "unhealthy"
+    } else if storage_reachable {
         "healthy"
     } else {
         "degraded"
@@ -69,11 +117,19 @@ async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<Health
         upstreams,
     };
 
-    // Always 200: /health is a liveness signal — the process is up and serving.
-    // Storage reachability is informational (`status: degraded`); gating liveness
-    // or the LB on it turns a storage blip into a restart loop / full 502 outage
-    // for every route, storage-backed or not (#869). Readiness (`/ready`) is the
-    // storage gate.
+    // /health is a liveness signal — the process is up and serving. Storage
+    // reachability is informational (`status: degraded`); gating liveness or the LB
+    // on it turns a storage blip into a restart loop / full 502 outage for every
+    // route, storage-backed or not (#869). Readiness (`/ready`) is the storage gate.
+    // A maintenance loop silent too long (R2-49) is the process's own fault, which a
+    // restart clears: that one fails liveness.
+    if maintenance_stalled {
+        tracing::warn!(
+            silent_secs = state.maintenance.silent_for().as_secs(),
+            "maintenance loop stalled, failing liveness"
+        );
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(health));
+    }
     (StatusCode::OK, Json(health))
 }
 
@@ -128,10 +184,14 @@ fn build_upstreams(state: &AppState) -> HashMap<String, UpstreamHealth> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::MaintenanceHeartbeat;
     use crate::test_helpers::{
         body_bytes, create_test_context, create_test_context_with_config, send,
     };
     use axum::http::{Method, StatusCode};
+    use axum::Router;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[tokio::test]
     async fn test_health_returns_200() {
@@ -141,6 +201,33 @@ mod tests {
         let body = body_bytes(response).await;
         let body_str = std::str::from_utf8(&body).unwrap();
         assert!(body_str.contains("healthy"));
+    }
+
+    /// A maintenance loop that stopped ticking fails liveness (R2-49): `/health` answers 503
+    /// once the loop has been silent longer than it may be, and 200 again after a tick.
+    #[tokio::test]
+    async fn health_is_503_while_the_maintenance_loop_is_silent_too_long() {
+        let silence = Duration::from_secs(2);
+        let ctx = create_test_context();
+        let mut state = ctx.state.clone();
+        state.maintenance = Arc::new(MaintenanceHeartbeat::new(silence));
+        let app = Router::new()
+            .merge(super::routes())
+            .with_state(state.clone());
+
+        state.maintenance.beat();
+        let response = send(&app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        tokio::time::sleep(silence + Duration::from_millis(500)).await;
+        let response = send(&app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(json["status"], "unhealthy");
+
+        state.maintenance.beat();
+        let response = send(&app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]

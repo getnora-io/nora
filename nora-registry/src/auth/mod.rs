@@ -2930,6 +2930,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             pull_stats: std::sync::Arc::new(
                 crate::registry::docker::PullStatsAccumulator::default(),
             ),
+            maintenance: ctx.state.maintenance.clone(),
         };
 
         // Rebuild router with new state

@@ -44,6 +44,8 @@ mod curation;
 mod dashboard_metrics;
 mod digest_quarantine;
 mod docker_key_migration;
+#[cfg(feature = "fault-injection")]
+mod fault_injection;
 mod gc;
 mod hash_pin_store;
 mod health;
@@ -421,6 +423,8 @@ pub struct AppState {
     /// to a `.stats.json` sidecar, so `.meta.json` is never rewritten by a pull.
     /// In-memory, rebuildable-empty after a restart.
     pub(crate) pull_stats: Arc<registry::docker::PullStatsAccumulator>,
+    /// When the maintenance loop last ticked; `/health` fails once it is silent too long.
+    pub(crate) maintenance: Arc<health::MaintenanceHeartbeat>,
 }
 
 impl AppState {
@@ -702,6 +706,154 @@ pub(crate) fn request_layers(router: Router<AppState>, state: &AppState) -> Rout
             state.clone(),
             auth::auth_middleware,
         ))
+        // Outermost of these, so a panic in auth, a middleware or a handler answers 500
+        // (counted by the metrics layer outside) and the panic message goes to the log only.
+        .layer(tower_http::catch_panic::CatchPanicLayer::new())
+}
+
+#[cfg(test)]
+mod panic_strategy_tests {
+    //! The shipped build unwinds (C67): under `panic = "abort"` every `catch_unwind` guard
+    //! and the panic layer are dead code, and one panic ends the only replica. Tests always
+    //! build with unwind, whatever the profile says, so this reads the build inputs instead:
+    //! the Cargo manifests and the files that run a release build.
+    use std::path::{Path, PathBuf};
+
+    /// Lines of a build file that select the abort strategy: a profile key, a
+    /// `CARGO_PROFILE_*_PANIC` variable, `--config profile.*.panic` or `-C panic`. Compared
+    /// without whitespace, quotes or case, so each spelling of one setting is one form.
+    fn abort_switches(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .map(|line| {
+                line.chars()
+                    .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+                    .collect::<String>()
+                    .to_ascii_lowercase()
+            })
+            .filter(|line| line.contains("panic=abort") || line.contains("panic:abort"))
+            .collect()
+    }
+
+    /// The manifests, Cargo configs, Dockerfiles, workflows and Makefile of the workspace.
+    fn build_inputs(root: &Path) -> Vec<PathBuf> {
+        let mut files = vec![
+            root.join("Cargo.toml"),
+            root.join("nora-registry/Cargo.toml"),
+            root.join(".cargo/config.toml"),
+            root.join(".cargo/config"),
+            root.join("Makefile"),
+        ];
+        for dir in [root.to_path_buf(), root.join(".github/workflows")] {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("Dockerfile")
+                    || name.ends_with(".yml")
+                    || name.ends_with(".yaml")
+                {
+                    files.push(entry.path());
+                }
+            }
+        }
+        files.into_iter().filter(|f| f.is_file()).collect()
+    }
+
+    #[test]
+    fn no_build_input_selects_panic_abort() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let inputs = build_inputs(root);
+        assert!(
+            inputs.iter().any(|f| f.ends_with("Dockerfile")),
+            "the release Dockerfile is among the inputs read"
+        );
+        for file in inputs {
+            let found = abort_switches(&std::fs::read_to_string(&file).unwrap());
+            assert!(found.is_empty(), "{}: {found:?}", file.display());
+        }
+    }
+
+    /// The `/__fi/` panic routes are in no shipped build: the feature is not a default, no
+    /// other feature pulls it in, and no build file names it.
+    #[test]
+    fn no_shipped_build_enables_fault_injection() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let manifest = root.join("nora-registry/Cargo.toml");
+        let doc: toml::Table = std::fs::read_to_string(&manifest).unwrap().parse().unwrap();
+        let features = doc["features"].as_table().unwrap();
+        assert!(features.contains_key("fault-injection"));
+        for (name, enables) in features {
+            let enables = enables.as_array().unwrap();
+            assert!(
+                !enables
+                    .iter()
+                    .any(|f| f.as_str() == Some("fault-injection")),
+                "feature {name} enables fault-injection"
+            );
+        }
+        for file in build_inputs(root).into_iter().filter(|f| *f != manifest) {
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(!text.contains("fault-injection"), "{}", file.display());
+        }
+    }
+
+    #[test]
+    fn every_spelling_of_abort_is_found_and_unwind_is_not() {
+        for abort in [
+            "[profile.release]\npanic = \"abort\"",
+            "release = { panic = 'abort' }",
+            "ENV CARGO_PROFILE_RELEASE_PANIC=abort",
+            "  CARGO_PROFILE_RELEASE_PANIC: abort",
+            "cargo build --release --config 'profile.release.panic=\"abort\"'",
+            "RUSTFLAGS=\"-C panic=abort\" cargo build --release",
+            "PANIC = \"ABORT\"",
+        ] {
+            assert_eq!(abort_switches(abort).len(), 1, "{abort}");
+        }
+        for fine in [
+            "[profile.release]\npanic = \"unwind\"",
+            "# panic = \"abort\" was the setting before C67",
+            "tracing::error!(\"background cache task panicked\")",
+        ] {
+            assert!(abort_switches(fine).is_empty(), "{fine}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod panic_layer_tests {
+    //! A panic in a handler or in a middleware of `request_layers` answers that request with
+    //! 500 and leaves the router serving (C67).
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::{Method, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+
+    #[tokio::test]
+    async fn a_panicking_handler_answers_500_and_the_next_request_is_served() {
+        let ctx = create_test_context();
+        let routes = Router::new()
+            .route(
+                "/boom",
+                get(|| async {
+                    panic!("secret-detail-of-the-bug");
+                    #[allow(unreachable_code)]
+                    "never"
+                }),
+            )
+            .route("/fine", get(|| async { "fine" }));
+        let app = crate::request_layers(routes, &ctx.state).with_state(ctx.state.clone());
+
+        let response = send(&app, Method::GET, "/boom", "").await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_bytes(response).await;
+        assert!(
+            !String::from_utf8_lossy(&body).contains("secret-detail"),
+            "the panic message goes to the log, not to the client"
+        );
+
+        let response = send(&app, Method::GET, "/fine", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
 
 #[cfg(test)]
@@ -2352,6 +2504,11 @@ async fn run_server(mut config: Config, storage: Storage) {
         .merge(metrics::routes())
         .merge(ui::routes())
         .merge(openapi::routes());
+    #[cfg(feature = "fault-injection")]
+    let public_routes = {
+        warn!("fault-injection build: /__fi/ routes make the server panic, not for production");
+        public_routes.merge(fault_injection::routes())
+    };
 
     let app_routes = if rate_limit_enabled {
         let (routes, enforced) = rate_limited_routes(
@@ -2449,6 +2606,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         leak_finders,
         cancel_token: cancel_token.clone(),
         pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
+        maintenance: Arc::new(health::MaintenanceHeartbeat::new(maintenance_max_silence())),
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
@@ -2682,66 +2840,15 @@ async fn run_server(mut config: Config, storage: Storage) {
     );
 
     // Background task: flush token last_used + periodic maintenance every 30 seconds
-    let metrics_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        let mut tick_count: u64 = 0;
-        loop {
-            interval.tick().await;
-            tick_count += 1;
-            if let Some(ref token_store) = metrics_state.tokens {
-                token_store.flush_last_used().await;
-            }
-            registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
-            metrics_state.auth_failures.cleanup();
-
-            // Every 60s (odd ticks — the interval's first tick fires immediately, so the
-            // boot pass runs right away: object-store reachability (#869) and the storage
-            // gauge are populated before the first readiness probe, not 30s in).
-            if !tick_count.is_multiple_of(2) {
-                metrics_state.storage.refresh_total_size_cache().await;
-                metrics::STORAGE_BYTES
-                    .with_label_values(&["total"])
-                    .set(metrics_state.storage.total_size().await as i64);
-                // Per-registry artifact counts + logical bytes from the index, plus
-                // process uptime (#446). The "total" storage_bytes label above is the
-                // full physical footprint; per-registry is summed artifact size.
-                // A panic in an index builder must not end this loop: it also flushes
-                // tokens and expires upload sessions.
-                let gauges = std::panic::AssertUnwindSafe(refresh_artifact_gauges(
-                    &metrics_state.repo_index,
-                    &metrics_state.storage,
-                    &metrics_state.enabled_registries,
-                ))
-                .catch_unwind()
-                .await;
-                if let Err(e) = gauges {
-                    tracing::error!(panic = ?e, "artifact gauge refresh panicked");
-                }
-                metrics::UPTIME_SECONDS.set(metrics_state.start_time.elapsed().as_secs() as i64);
-            }
-
-            // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
-            // + clean up stale proxy and upload temp files (#580)
-            if tick_count.is_multiple_of(10) {
-                let mut locks = metrics_state.publish_locks.lock();
-                locks.retain(|_, arc| Arc::strong_count(arc) > 1);
-                let storage_path = metrics_state.config.storage.path.clone();
-                tokio::task::spawn_blocking(move || {
-                    registry::docker::cleanup_proxy_temp_dir(&storage_path);
-                    registry::hf::cleanup_fill_temp_dir(&storage_path);
-                    // Reclaim upload temp files orphaned by a storage-write failure
-                    // without waiting for a restart. cleanup_expired_sessions only
-                    // frees temps still tracked by a live (expired) session, so an
-                    // orphan whose session entry is already gone would otherwise
-                    // survive on disk until the next boot. Age-guarded by SESSION_TTL,
-                    // so in-progress uploads are never reaped.
-                    registry::docker::cleanup_upload_temp_dir(&storage_path);
-                    registry::raw::cleanup_upload_temp_dir(&storage_path);
-                });
-            }
-        }
-    });
+    let maintenance_state = state.clone();
+    tokio::spawn(run_maintenance(
+        MAINTENANCE_PERIOD,
+        Arc::clone(&state.maintenance),
+        move |tick_count| {
+            let state = maintenance_state.clone();
+            async move { maintenance_tick(&state, tick_count).await }
+        },
+    ));
 
     // SIGHUP handler: hot-reload curation policy
     #[cfg(unix)]
@@ -2804,6 +2911,166 @@ async fn run_server(mut config: Config, storage: Storage) {
         uptime_seconds = state.start_time.elapsed().as_secs(),
         "Nora shutdown complete"
     );
+}
+
+/// Cadence of the maintenance loop.
+const MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How long the maintenance loop may go without starting a tick before `/health` fails
+/// (R2-49): ten missed ticks. Longer than the readiness window of the object-store
+/// reachability cache (150 s), so a slow bucket listing un-readies the pod before it
+/// restarts it.
+pub(crate) const MAINTENANCE_MAX_SILENCE: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The silence `/health` tolerates from the maintenance loop.
+fn maintenance_max_silence() -> std::time::Duration {
+    #[cfg(feature = "fault-injection")]
+    if let Some(silence) = fault_injection::maintenance_max_silence() {
+        return silence;
+    }
+    MAINTENANCE_MAX_SILENCE
+}
+
+/// Run `tick` every `period`, numbering the ticks from 1 and recording the start of each
+/// one on `heartbeat`. The first tick fires at once; a tick that panics is logged and the
+/// loop goes on, a tick that hangs stops the beats.
+async fn run_maintenance<F, Fut>(
+    period: std::time::Duration,
+    heartbeat: Arc<health::MaintenanceHeartbeat>,
+    mut tick: F,
+) where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut interval = tokio::time::interval(period);
+    let mut tick_count: u64 = 0;
+    loop {
+        interval.tick().await;
+        tick_count += 1;
+        heartbeat.beat();
+        // A panic in one tick must not end the loop: the next one flushes tokens again.
+        if let Err(e) = std::panic::AssertUnwindSafe(tick(tick_count))
+            .catch_unwind()
+            .await
+        {
+            tracing::error!(panic = ?e, tick = tick_count, "maintenance tick panicked");
+        }
+    }
+}
+
+/// One tick of the maintenance loop: flush token `last_used`, expire upload sessions and
+/// failure-tracker entries; every second tick refresh the storage gauges, every tenth
+/// evict unused publish locks and stale temp files.
+async fn maintenance_tick(state: &AppState, tick_count: u64) {
+    #[cfg(feature = "fault-injection")]
+    fault_injection::maintenance_fault().await;
+    if let Some(ref token_store) = state.tokens {
+        token_store.flush_last_used().await;
+    }
+    registry::docker::cleanup_expired_sessions(&state.upload_sessions);
+    state.auth_failures.cleanup();
+
+    // Every 60s (odd ticks — the interval's first tick fires immediately, so the
+    // boot pass runs right away: object-store reachability (#869) and the storage
+    // gauge are populated before the first readiness probe, not 30s in).
+    if !tick_count.is_multiple_of(2) {
+        state.storage.refresh_total_size_cache().await;
+        metrics::STORAGE_BYTES
+            .with_label_values(&["total"])
+            .set(state.storage.total_size().await as i64);
+        // Per-registry artifact counts + logical bytes from the index, plus
+        // process uptime (#446). The "total" storage_bytes label above is the
+        // full physical footprint; per-registry is summed artifact size.
+        // A panic in an index builder must not end this loop: it also flushes
+        // tokens and expires upload sessions.
+        let gauges = std::panic::AssertUnwindSafe(refresh_artifact_gauges(
+            &state.repo_index,
+            &state.storage,
+            &state.enabled_registries,
+        ))
+        .catch_unwind()
+        .await;
+        if let Err(e) = gauges {
+            tracing::error!(panic = ?e, "artifact gauge refresh panicked");
+        }
+        metrics::UPTIME_SECONDS.set(state.start_time.elapsed().as_secs() as i64);
+    }
+
+    // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
+    // + clean up stale proxy and upload temp files (#580)
+    if tick_count.is_multiple_of(10) {
+        let mut locks = state.publish_locks.lock();
+        locks.retain(|_, arc| Arc::strong_count(arc) > 1);
+        let storage_path = state.config.storage.path.clone();
+        tokio::task::spawn_blocking(move || {
+            registry::docker::cleanup_proxy_temp_dir(&storage_path);
+            registry::hf::cleanup_fill_temp_dir(&storage_path);
+            // Reclaim upload temp files orphaned by a storage-write failure
+            // without waiting for a restart. cleanup_expired_sessions only
+            // frees temps still tracked by a live (expired) session, so an
+            // orphan whose session entry is already gone would otherwise
+            // survive on disk until the next boot. Age-guarded by SESSION_TTL,
+            // so in-progress uploads are never reaped.
+            registry::docker::cleanup_upload_temp_dir(&storage_path);
+            registry::raw::cleanup_upload_temp_dir(&storage_path);
+        });
+    }
+}
+
+#[cfg(test)]
+mod maintenance_loop_tests {
+    //! The maintenance loop outlives a panicking tick, and a hung tick shows on the
+    //! heartbeat (R2-49). Real time at a 20 ms cadence: the margins are whole ticks.
+    use super::{health::MaintenanceHeartbeat, run_maintenance};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const PERIOD: Duration = Duration::from_millis(20);
+
+    #[tokio::test]
+    async fn a_panicking_tick_does_not_end_the_loop() {
+        let heartbeat = Arc::new(MaintenanceHeartbeat::new(Duration::from_secs(300)));
+        let last = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&last);
+        let task = tokio::spawn(run_maintenance(PERIOD, Arc::clone(&heartbeat), move |n| {
+            seen.store(n, Ordering::SeqCst);
+            async move {
+                assert_ne!(n, 2, "a bug in the second tick");
+            }
+        }));
+        tokio::time::sleep(PERIOD * 20).await;
+        assert!(
+            !task.is_finished(),
+            "the loop ended with the panicking tick"
+        );
+        assert!(
+            last.load(Ordering::SeqCst) >= 4,
+            "ticks after the panic run: {}",
+            last.load(Ordering::SeqCst)
+        );
+        assert!(heartbeat.silent_for() < PERIOD * 10, "the loop still beats");
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn a_hung_tick_stalls_the_heartbeat() {
+        let heartbeat = Arc::new(MaintenanceHeartbeat::new(PERIOD * 10));
+        let task = tokio::spawn(run_maintenance(
+            PERIOD,
+            Arc::clone(&heartbeat),
+            |n| async move {
+                if n == 2 {
+                    std::future::pending::<()>().await;
+                }
+            },
+        ));
+        tokio::time::sleep(PERIOD * 2).await;
+        assert!(!heartbeat.stalled(), "within the silence it may keep");
+        tokio::time::sleep(PERIOD * 20).await;
+        assert!(heartbeat.stalled(), "a hung tick stops the beats");
+        task.abort();
+    }
 }
 
 /// How serving ended after the shutdown signal.
