@@ -2274,7 +2274,8 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567"
         );
         // A white list, by exact name: whatever else the upstream sent stays with NORA.
-        // `x-request-id` is NORA's own (its request-id middleware), never the upstream's.
+        // `x-request-id` and `content-security-policy` are NORA's own (its request-id
+        // middleware, the sandbox every registry answer carries), never the upstream's.
         for name in resp.headers().keys() {
             assert!(
                 [
@@ -2282,13 +2283,15 @@ mod tests {
                     "content-length",
                     "x-repo-commit",
                     "link",
-                    "x-request-id"
+                    "x-request-id",
+                    "content-security-policy"
                 ]
                 .contains(&name.as_str()),
                 "{name} reached the client"
             );
         }
         assert_ne!(header(&resp, "x-request-id"), "upstream");
+        assert_eq!(header(&resp, "content-security-policy"), "sandbox");
         assert!(
             !resp.headers().contains_key("link"),
             "a Xet-only Link reached the client"

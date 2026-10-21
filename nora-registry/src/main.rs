@@ -1995,6 +1995,84 @@ mod rate_limited_routes_tests {
         out
     }
 
+    /// Every registry answer is inert in a browser: what a client or an upstream put in a
+    /// registry — HTML, SVG, an XML document with a stylesheet — cannot run script on NORA's
+    /// origin, whatever type the format serves it as. Package clients do not read the header.
+    #[tokio::test]
+    async fn every_registry_answer_carries_a_sandbox_policy() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::{body::Body, http::Method};
+        let ctx = create_test_context_with_config(|c| {
+            c.registries = Some(crate::config::RegistriesSection {
+                enable: Some(crate::config::EnableSpec::List(
+                    RegistryType::all()
+                        .iter()
+                        .map(|r| r.as_str().to_string())
+                        .collect(),
+                )),
+            });
+        });
+        assert_eq!(
+            ctx.state.enabled_registries.len(),
+            RegistryType::all().len(),
+            "every registry is mounted"
+        );
+        let sandboxed = |resp: &axum::response::Response| {
+            resp.headers()
+                .get_all("content-security-policy")
+                .iter()
+                .filter_map(|v| v.to_str().ok())
+                .any(|v| v.split(';').any(|d| d.trim() == "sandbox"))
+        };
+        // One route each registry answers, whatever its status.
+        let routes = [
+            (RegistryType::Docker, "/v2/_catalog"),
+            (RegistryType::Maven, "/maven2/com/example/x/1.0/x.html"),
+            (RegistryType::Npm, "/npm/x"),
+            (RegistryType::Cargo, "/cargo/index/config.json"),
+            (RegistryType::PyPI, "/simple/x/"),
+            (RegistryType::Go, "/go/example.com/x/@v/list"),
+            (RegistryType::Raw, "/raw/x/x.html"),
+            (RegistryType::Gems, "/gems/specs.4.8.gz"),
+            (
+                RegistryType::Terraform,
+                "/terraform/.well-known/terraform.json",
+            ),
+            (RegistryType::Ansible, "/ansible/"),
+            (RegistryType::Nuget, "/nuget/v3/autocomplete"),
+            (RegistryType::PubDart, "/pub/api/packages"),
+            (RegistryType::Conan, "/conan/v1/ping"),
+            (RegistryType::Rpm, "/rpm/x/x.html"),
+            (RegistryType::Deb, "/deb/x/x.html"),
+            (RegistryType::Cpan, "/cpan/modules/03modlist.data.gz"),
+            (RegistryType::HuggingFace, "/hf/api/models/x/y"),
+        ];
+        let covered: std::collections::HashSet<_> = routes.iter().map(|(rt, _)| *rt).collect();
+        assert_eq!(
+            covered.len(),
+            RegistryType::all().len(),
+            "a route for every registry"
+        );
+        for (rt, uri) in routes {
+            let resp = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+            assert!(
+                sandboxed(&resp),
+                "{}: {uri}: {}",
+                rt.as_str(),
+                resp.status()
+            );
+        }
+        // A stored Maven document, answered inline as XML.
+        let pom = b"<?xml version=\"1.0\"?><project/>";
+        let uri = "/maven2/com/example/a/1.0/a-1.0.pom";
+        let put = send(&ctx.app, Method::PUT, uri, Body::from(&pom[..])).await;
+        assert!(put.status().is_success(), "{}", put.status());
+        let get = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(get.status(), axum::http::StatusCode::OK);
+        assert_eq!(get.headers()["content-type"], "application/xml");
+        assert!(sandboxed(&get));
+    }
+
     // Registry routes are limited by the upload_* settings and only by
     // them; auth routes by auth_* and general_*. Bursts differ (auth 1, upload 2, general 3), one
     // request a second, so the first refusal tells which limiter answered.
@@ -2950,7 +3028,14 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
             }
         }
     }
-    registry_routes
+    // A registry answer is never a page of NORA's: whatever a client or an upstream stored —
+    // HTML, SVG, an XML document with a stylesheet — a browser runs no script from it, on any
+    // format and any type the format serves it as. Package clients ignore the header; the
+    // UI's own pages are not under these routes.
+    registry_routes.layer(tower_http::set_header::SetResponseHeaderLayer::overriding(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("sandbox"),
+    ))
 }
 
 /// Print note about registries that have data but no retention rules configured.

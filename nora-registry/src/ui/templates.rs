@@ -250,7 +250,7 @@ pub fn render_registry_list_paginated(
                 };
                 format!(
                     r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
@@ -259,13 +259,13 @@ pub fn render_registry_list_paginated(
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "##,
-                    detail_url,
+                    html_escape(&detail_url),
                     icon,
-                    detail_url,
+                    html_escape(&detail_url),
                     html_escape(&repo.name),
                     versions_display,
                     format_size(repo.size),
-                    &repo.updated
+                    html_escape(&repo.updated)
                 )
             })
             .collect::<Vec<_>>()
@@ -472,7 +472,7 @@ pub fn render_docker_detail(
             "##,
                     html_escape(&tag.name),
                     format_size(tag.size),
-                    &tag.created
+                    html_escape(&tag.created)
                 )
             })
             .collect::<Vec<_>>()
@@ -605,7 +605,7 @@ pub fn render_raw_dir(
             };
             format!(
                 r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
@@ -614,8 +614,8 @@ pub fn render_raw_dir(
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "##,
-                href, icon, href, html_escape(&entry.name),
-                versions_display, format_size(entry.size), &entry.updated
+                html_escape(&href), icon, html_escape(&href), html_escape(&entry.name),
+                versions_display, format_size(entry.size), html_escape(&entry.updated)
             )
         })
         .collect();
@@ -714,7 +714,7 @@ pub fn render_maven_dir(
                 let _ = write!(
                     breadcrumbs,
                     r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
-                    crumb_path,
+                    encode_path(&crumb_path),
                     html_escape(seg)
                 );
             }
@@ -729,11 +729,11 @@ pub fn render_maven_dir(
             let href = if path.is_empty() {
                 format!("/ui/maven/{}", encode_uri_component(&entry.name))
             } else {
-                format!("/ui/maven/{}/{}", path, encode_uri_component(&entry.name))
+                format!("/ui/maven/{}/{}", encode_path(path), encode_uri_component(&entry.name))
             };
             format!(
                 r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
@@ -742,13 +742,13 @@ pub fn render_maven_dir(
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "##,
-                href,
+                html_escape(&href),
                 folder_icon,
-                href,
+                html_escape(&href),
                 html_escape(&entry.name),
                 entry.versions,
                 format_size(entry.size),
-                &entry.updated,
+                html_escape(&entry.updated),
             )
         })
         .collect();
@@ -838,7 +838,7 @@ pub fn render_go_dir(
                 let _ = write!(
                     breadcrumbs,
                     r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/go/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
-                    crumb_path,
+                    encode_path(&crumb_path),
                     html_escape(seg)
                 );
             }
@@ -855,13 +855,13 @@ pub fn render_go_dir(
             } else {
                 format!(
                     "/ui/go/{}/{}",
-                    path,
+                    encode_path(path),
                     encode_uri_component(&entry.name)
                 )
             };
             format!(
                 r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
@@ -870,13 +870,13 @@ pub fn render_go_dir(
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{}</td>
                 </tr>
             "##,
-                href,
+                html_escape(&href),
                 folder_icon,
-                href,
+                html_escape(&href),
                 html_escape(&entry.name),
                 entry.versions,
                 format_size(entry.size),
-                &entry.updated,
+                html_escape(&entry.updated),
             )
         })
         .collect();
@@ -970,7 +970,7 @@ pub fn render_ansible_dir(
                 let _ = write!(
                     breadcrumbs,
                     r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/ansible/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
-                    crumb_path,
+                    encode_path(&crumb_path),
                     html_escape(seg)
                 );
             }
@@ -987,22 +987,22 @@ pub fn render_ansible_dir(
             } else {
                 format!(
                     "/ui/ansible/{}/{}",
-                    path,
+                    encode_path(path),
                     encode_uri_component(&entry.name)
                 )
             };
             format!(
                 r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
                 </tr>
             "##,
-                href,
+                html_escape(&href),
                 folder_icon,
-                href,
+                html_escape(&href),
                 html_escape(&entry.name),
                 entry.versions,
             )
@@ -1126,16 +1126,16 @@ pub fn render_cpan_dir(
             };
             format!(
                 r##"
-                <tr class="hover:bg-slate-700 cursor-pointer" onclick="window.location='{}'">
+                <tr class="hover:bg-slate-700 cursor-pointer" data-href="{}" onclick="window.location=this.dataset.href">
                     <td class="px-3 md:px-6 py-3 md:py-4">
                         <div class="flex items-center gap-3">{}<a href="{}" class="text-blue-400 hover:text-blue-300 font-medium">{}</a></div>
                     </td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
                 </tr>
             "##,
-                href,
+                html_escape(&href),
                 folder_icon,
-                href,
+                html_escape(&href),
                 html_escape(&entry.name),
                 entry.versions,
             )
@@ -1273,7 +1273,7 @@ pub fn render_package_detail(
                     badge = cached_badge,
                     annotations = annotations,
                     size = size_display,
-                    pub_date = &v.published
+                    pub_date = html_escape(&v.published)
                 )
             })
             .collect::<Vec<_>>()
@@ -1552,7 +1552,11 @@ pub fn render_maven_detail(
         r##"<tr><td colspan="2" class="px-6 py-8 text-center text-slate-500">No artifacts found</td></tr>"##.to_string()
     } else {
         detail.artifacts.iter().map(|a| {
-            let download_url = format!("/maven2/{}/{}", path, a.filename);
+            let download_url = format!(
+                "/maven2/{}/{}",
+                encode_path(path),
+                encode_uri_component(&a.filename)
+            );
             format!(r##"
                 <tr class="hover:bg-slate-700">
                     <td class="px-3 md:px-6 py-3 md:py-4">
@@ -1560,7 +1564,7 @@ pub fn render_maven_detail(
                     </td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{}</td>
                 </tr>
-            "##, download_url, html_escape(&a.filename), format_size(a.size))
+            "##, html_escape(&download_url), html_escape(&a.filename), format_size(a.size))
         }).collect::<Vec<_>>().join("")
     };
 
@@ -1599,7 +1603,7 @@ pub fn render_maven_detail(
             let _ = write!(
                 breadcrumbs,
                 r#"<span class="mx-2 text-slate-500">/</span><a href="/ui/maven/{}" class="text-blue-400 hover:text-blue-300">{}</a>"#,
-                crumb_path,
+                encode_path(&crumb_path),
                 html_escape(seg)
             );
         }
@@ -2013,6 +2017,15 @@ fn render_metadata_panel(meta: &PackageMetadata) -> String {
     )
 }
 
+/// A `/`-separated path with each segment URL-encoded, for a link built from a stored path:
+/// a quote, angle bracket or ampersand in a name can never reach the attribute it goes in.
+pub fn encode_path(path: &str) -> String {
+    path.split('/')
+        .map(encode_uri_component)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Simple URL encoding for path components
 pub fn encode_uri_component(s: &str) -> String {
     let mut result = String::new();
@@ -2033,6 +2046,147 @@ pub fn encode_uri_component(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ui::api::PackageDetail;
+
+    /// Every name the UI renders — a path segment, an entry, a file, a tag, a version, package
+    /// metadata — reaches the page escaped, in attributes as in text: no quote or angle bracket
+    /// of it survives raw, so none can close an attribute or open an element.
+    #[test]
+    fn a_hostile_name_never_reaches_a_page_raw() {
+        use crate::ui::api::{MavenArtifact, TagInfo, VersionInfo};
+        const H: &str = "h\"q'l<g>t";
+        let entry = |name: String, is_file| RepoInfo {
+            name,
+            versions: 1,
+            size: 1,
+            updated: H.into(),
+            is_file,
+        };
+        let entries = vec![entry(H.into(), false), entry(format!("{H}.bin"), true)];
+        let path = format!("a/{H}/b");
+        let tag = TagInfo {
+            name: H.into(),
+            size: 1,
+            created: H.into(),
+            downloads: 0,
+            last_pulled: Some(H.into()),
+            os: H.into(),
+            arch: H.into(),
+            layers_count: 1,
+            pull_command: format!("docker pull nora/{H}"),
+        };
+        let package = PackageDetail {
+            versions: vec![VersionInfo {
+                version: H.into(),
+                size: 1,
+                published: H.into(),
+                cached: false,
+                annotations: nora_registry::annotations::Annotations::default(),
+            }],
+            prerelease_count: 0,
+            total_stable: 1,
+            metadata: PackageMetadata {
+                description: Some(H.into()),
+                license: Some(H.into()),
+                author: Some(H.into()),
+                homepage: None,
+                repository: None,
+                keywords: vec![H.into()],
+            },
+        };
+        let maven = MavenDetail {
+            artifacts: vec![MavenArtifact {
+                filename: format!("{H}.jar"),
+                size: 1,
+            }],
+        };
+        let pages = [
+            (
+                "list",
+                render_registry_list_paginated(
+                    "maven",
+                    "Maven",
+                    &entries,
+                    1,
+                    50,
+                    2,
+                    Lang::En,
+                    false,
+                ),
+            ),
+            (
+                "raw dir",
+                render_raw_dir(&path, &entries, 2, Lang::En, false),
+            ),
+            (
+                "maven dir",
+                render_maven_dir(&path, &entries, 2, Lang::En, false),
+            ),
+            ("go dir", render_go_dir(&path, &entries, 2, Lang::En, false)),
+            (
+                "ansible dir",
+                render_ansible_dir(&path, &entries, 2, Lang::En, false),
+            ),
+            (
+                "cpan dir",
+                render_cpan_dir(&path, &entries, 2, Lang::En, false),
+            ),
+            (
+                "maven detail",
+                render_maven_detail(&path, &maven, Lang::En, false),
+            ),
+            (
+                "docker detail",
+                render_docker_detail(
+                    &format!("lib/{H}"),
+                    &DockerDetail { tags: vec![tag] },
+                    Lang::En,
+                    "http://nora",
+                    false,
+                ),
+            ),
+            (
+                "package detail",
+                render_package_detail("npm", H, &package, Lang::En, "http://nora", false),
+            ),
+            ("activity", render_activity_row(H, "PULL", H, H, H)),
+        ];
+        let raw: Vec<String> = pages
+            .iter()
+            .flat_map(|(page, html)| {
+                ["h\"q", "q'l", "l<g", "g>t"]
+                    .into_iter()
+                    .flat_map(move |part| html.match_indices(part).map(move |(i, _)| (part, i)))
+                    .map(move |(part, i)| {
+                        let from = html.floor_char_boundary(i.saturating_sub(70));
+                        format!("{page}: {part:?} in …{}", &html[from..i + part.len()])
+                    })
+            })
+            .collect();
+        assert!(raw.is_empty(), "reached a page raw: {raw:#?}");
+        // A link is followed from an attribute, never evaluated as script source.
+        for (page, html) in &pages {
+            assert!(!html.contains("window.location='"), "{page}");
+        }
+        // And it leads where the name is: every segment URL-encoded.
+        let enc = "h%22q%27l%3Cg%3Et";
+        let links = [
+            ("maven dir", format!("href=\"/ui/maven/a/{enc}/b/{enc}\"")),
+            ("go dir", format!("href=\"/ui/go/a/{enc}/b/{enc}\"")),
+            (
+                "ansible dir",
+                format!("href=\"/ui/ansible/a/{enc}/b/{enc}\""),
+            ),
+            ("maven dir", format!("href=\"/ui/maven/a/{enc}\"")),
+            (
+                "maven detail",
+                format!("href=\"/maven2/a/{enc}/b/{enc}.jar\""),
+            ),
+        ];
+        for (page, link) in links {
+            let html = &pages.iter().find(|(p, _)| *p == page).unwrap().1;
+            assert!(html.contains(&link), "{page}: no {link}");
+        }
+    }
 
     fn empty_detail() -> PackageDetail {
         PackageDetail {

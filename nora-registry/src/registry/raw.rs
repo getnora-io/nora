@@ -132,11 +132,12 @@ async fn download(
                         .response_headers()
                         .map(|(name, value)| (name.clone(), value.to_string())),
                 );
-                if let Some(response) = crate::registry::range::range_response(
+                if let Some(response) = crate::registry::range::range_response_of(
                     &state.storage,
                     &[&key],
                     &headers,
                     len,
+                    recorded.sha256.as_deref(),
                     content_type,
                     &extra,
                 )
@@ -1852,6 +1853,137 @@ mod integration_tests {
         assert_eq!(put.status(), StatusCode::OK);
         let put = send(&ctx.app, Method::PUT, "/raw/d/f.txt/a/b/x", b"x".to_vec()).await;
         assert_eq!(put.status(), StatusCode::CONFLICT);
+    }
+
+    /// #1153: a ranged GET answers from the version its headers describe. An object replaced
+    /// between the read that set the ETag and the ranged read is served whole from the first
+    /// read, under that read's ETag — never one version's ETag over another's bytes; an object
+    /// rewritten with the same bytes, and an unchanged one, are served as a 206.
+    #[tokio::test]
+    async fn a_range_is_served_only_from_the_version_its_etag_names() {
+        use crate::storage::{
+            FileMeta, ObjectStorage, Recorded, Result as SResult, StorageBackend,
+        };
+        use axum::body::Bytes;
+        use nora_registry::annotations::Annotations;
+        use sha2::Digest;
+        use std::path::Path;
+        use std::pin::Pin;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use tokio::io::AsyncRead;
+
+        /// Writes `next` under the key just before a ranged read, once armed.
+        struct WrittenBeforeRange(ObjectStorage, AtomicBool, Mutex<Vec<u8>>);
+        #[async_trait::async_trait]
+        impl StorageBackend for WrittenBeforeRange {
+            async fn put(&self, k: &str, d: &[u8], s: &str, a: &Annotations) -> SResult<()> {
+                self.0.put(k, d, s, a).await
+            }
+            async fn get(&self, k: &str) -> SResult<(Bytes, Recorded)> {
+                self.0.get(k).await
+            }
+            async fn recorded(&self, k: &str) -> Recorded {
+                self.0.recorded(k).await
+            }
+            async fn delete(&self, k: &str) -> SResult<()> {
+                self.0.delete(k).await
+            }
+            async fn list(&self, p: &str) -> SResult<Vec<String>> {
+                self.0.list(p).await
+            }
+            async fn stat(&self, k: &str) -> Option<FileMeta> {
+                self.0.stat(k).await
+            }
+            async fn health_check(&self) -> bool {
+                true
+            }
+            async fn total_size(&self) -> u64 {
+                0
+            }
+            fn backend_name(&self) -> &'static str {
+                "s3"
+            }
+            async fn put_from_path(
+                &self,
+                k: &str,
+                src: &Path,
+                s: Option<&str>,
+                a: &Annotations,
+            ) -> SResult<()> {
+                self.0.put_from_path(k, src, s, a).await
+            }
+            async fn copy(&self, a: &str, b: &str, s: Option<&str>) -> SResult<()> {
+                self.0.copy(a, b, s).await
+            }
+            async fn get_reader(
+                &self,
+                k: &str,
+            ) -> SResult<(u64, Recorded, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+                self.0.get_reader(k).await
+            }
+            async fn get_range(
+                &self,
+                k: &str,
+                start: u64,
+                end: u64,
+            ) -> SResult<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)>
+            {
+                if self.1.swap(false, Ordering::SeqCst) {
+                    let next = self.2.lock().unwrap().clone();
+                    let sha = hex::encode(sha2::Sha256::digest(&next));
+                    self.0.put(k, &next, &sha, &Annotations::default()).await?;
+                }
+                self.0.get_range(k, start, end).await
+            }
+        }
+        let backend = Arc::new(WrittenBeforeRange(
+            ObjectStorage::in_memory(),
+            AtomicBool::new(false),
+            Mutex::new(Vec::new()),
+        ));
+        let ctx = crate::test_helpers::create_test_context_with_storage(Storage::from_backend(
+            backend.clone(),
+        ));
+        let etag = |b: &[u8]| format!("\"{}\"", hex::encode(sha2::Sha256::digest(b)));
+        let ranged = || async {
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/raw/f.bin",
+                vec![("range", "bytes=0-6")],
+                Vec::new(),
+            )
+            .await;
+            let status = resp.status();
+            let tag = resp.headers()["etag"].to_str().unwrap().to_string();
+            (status, tag, body_bytes(resp).await)
+        };
+        let v1: &[u8] = b"version one bytes";
+        let v2: &[u8] = b"VERSION TWO BYTES"; // same size: only the pin tells them apart
+        let put = send(&ctx.app, Method::PUT, "/raw/f.bin", v1.to_vec()).await;
+        assert_eq!(put.status(), StatusCode::OK);
+
+        // Replaced by other bytes between the two reads: the first read is served whole.
+        *backend.2.lock().unwrap() = v2.to_vec();
+        backend.1.store(true, Ordering::SeqCst);
+        let (status, tag, body) = ranged().await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(tag, etag(v1));
+        assert_eq!(&body[..], v1);
+
+        // Rewritten with the same bytes: the same version, a 206.
+        backend.1.store(true, Ordering::SeqCst);
+        let (status, tag, body) = ranged().await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(tag, etag(v2));
+        assert_eq!(&body[..], &v2[..7]);
+
+        // Unchanged: a 206 of the version the ETag names.
+        let (status, tag, body) = ranged().await;
+        assert_eq!(status, StatusCode::PARTIAL_CONTENT);
+        assert_eq!(tag, etag(v2));
+        assert_eq!(&body[..], &v2[..7]);
     }
 
     /// on an object store a name is never taken, so a write that fails for

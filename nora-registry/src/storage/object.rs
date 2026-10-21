@@ -561,7 +561,7 @@ impl StorageBackend for ObjectStorage {
         key: &str,
         start: u64,
         end: u64,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         let make_opts = || GetOptions {
             range: Some(object_store::GetRange::Bounded(start..(end + 1))),
             ..Default::default()
@@ -579,9 +579,11 @@ impl StorageBackend for ObjectStorage {
             Err(e) => return Err(map_err(e)),
         };
         let size = result.meta.size;
+        // The ranged GET answers with the object's attributes: the pin of the version read.
+        let pin = read_recorded(&result.attributes).sha256;
         let stream = result.into_stream().map_err(std::io::Error::other);
         let reader = tokio_util::io::StreamReader::new(stream);
-        Ok((size as u64, Box::pin(reader)))
+        Ok((size as u64, pin, Box::pin(reader)))
     }
 }
 

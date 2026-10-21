@@ -438,6 +438,28 @@ impl LocalStorage {
         crate::acquire_publish_lock(&self.commit_locks, key)
     }
 
+    /// Open `key` with its pin, both of one version (#1153). A write publishes body and pin
+    /// under the key's commit lock, renaming the body first; a read in between would pair the
+    /// new body with the old pin. A key written by this process has a lock, and the read waits
+    /// for it. A key without one is read without waiting, then asked again: a write that began
+    /// meanwhile created its lock before its rename, and the read is done again under it.
+    /// Reads never add locks, so they cost the lock map nothing.
+    async fn open_version(&self, key: &str) -> Result<(fs::File, std::fs::Metadata, Recorded)> {
+        let path = self.key_to_path(key);
+        let held = || self.commit_locks.lock().get(key).cloned();
+        if held().is_none() {
+            let (file, meta) = open_object(&path).await?;
+            let recorded = self.pins.get(key);
+            if held().is_none() {
+                return Ok((file, meta, recorded));
+            }
+        }
+        let lock = self.commit_lock(key);
+        let _commit = lock.lock().await;
+        let (file, meta) = open_object(&path).await?;
+        Ok((file, meta, self.pins.get(key)))
+    }
+
     /// Record `sha256` for `key`, on the blocking pool (the append is
     /// filesystem I/O). Fails closed: an artifact whose pin did not reach the
     /// disk would silently downgrade to open-world after the next restart — the
@@ -462,13 +484,22 @@ impl LocalStorage {
             })
     }
 
+    /// Drop the pin of `key`, for a write that stored bytes without a digest: the pin of the
+    /// bytes it replaced must not outlive them (#1154). The object store gets this from the
+    /// write itself, which replaces the object's attributes. A key without a pin writes nothing.
+    /// Fails closed, as [`record`](Self::record) does: a stale pin left behind would
+    /// fail every later read of the new bytes.
     async fn forget(&self, key: &str) -> Result<()> {
         let pins = Arc::clone(&self.pins);
         let key_owned = key.to_string();
         tokio::task::spawn_blocking(move || pins.remove(&key_owned))
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
-            .map_err(StorageError::Io)
+            .map_err(|e| {
+                StorageError::Io(std::io::Error::other(format!(
+                    "hash-pin tombstone failed: {e}"
+                )))
+            })
     }
 
     /// Create a new temp file for a write of `dest`, in this instance's staging
@@ -900,7 +931,7 @@ impl StorageBackend for LocalStorage {
         }
         match sha256 {
             Some(hash) => self.record(key, hash, annotations).await,
-            None => Ok(()),
+            None => self.forget(key).await,
         }
     }
 
@@ -984,9 +1015,8 @@ impl StorageBackend for LocalStorage {
         &self,
         key: &str,
     ) -> Result<(u64, Recorded, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
-        let path = self.key_to_path(key);
-        let (file, meta) = open_object(&path).await?;
-        Ok((meta.len(), self.pins.get(key), Box::pin(file)))
+        let (file, meta, recorded) = self.open_version(key).await?;
+        Ok((meta.len(), recorded, Box::pin(file)))
     }
 
     async fn get_range(
@@ -994,16 +1024,15 @@ impl StorageBackend for LocalStorage {
         key: &str,
         start: u64,
         end: u64,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let path = self.key_to_path(key);
-        let (mut file, meta) = open_object(&path).await?;
+        let (mut file, meta, recorded) = self.open_version(key).await?;
         let size = meta.len();
         if start > 0 {
             file.seek(std::io::SeekFrom::Start(start)).await?;
         }
         let len = end.saturating_sub(start) + 1;
-        Ok((size, Box::pin(file.take(len))))
+        Ok((size, recorded.sha256, Box::pin(file.take(len))))
     }
 }
 
@@ -2356,6 +2385,90 @@ mod tests {
         }
     }
 
+    /// #1154: a write without a digest whose tombstone cannot reach the disk reports it, as a
+    /// pin that cannot is reported: the stale pin left behind would fail every read of the new
+    /// bytes.
+    #[tokio::test]
+    async fn a_write_whose_tombstone_cannot_be_written_fails() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let storage = LocalStorage::new(store.to_str().unwrap());
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let sha = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
+        let none = Annotations::default();
+        for key in ["raw/k", "raw/t"] {
+            storage
+                .put_from_path(key, &file("v1", b"v1"), Some(&sha(b"v1")), &none)
+                .await
+                .unwrap();
+        }
+        storage
+            .put_from_path("raw/u", &file("u", b"u"), None, &none)
+            .await
+            .unwrap();
+        // The pin file can no longer be appended to.
+        let pins = store.join(PIN_FILE);
+        std::fs::remove_file(&pins).unwrap();
+        std::fs::create_dir(&pins).unwrap();
+        assert!(storage
+            .put_from_path("raw/k", &file("v2", b"v2"), None, &none)
+            .await
+            .is_err());
+        assert!(storage.copy("raw/u", "raw/t", None).await.is_err());
+    }
+
+    /// #1153: a read of a key whose write is under way waits for it, so bytes and pin come
+    /// from one version; the write renames the body before it records the pin.
+    #[tokio::test]
+    async fn a_read_during_a_write_returns_one_version() {
+        use sha2::Digest;
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
+        let sha = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
+        let none = Annotations::default();
+        storage
+            .put("raw/k", b"one", &sha(b"one"), &none)
+            .await
+            .unwrap();
+        for range in [false, true] {
+            // A write of the key holds its commit lock from the rename to the pin.
+            let lock = storage.commit_lock("raw/k");
+            let commit = lock.lock().await;
+            let reader = {
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    let (_, pin, mut r) = if range {
+                        storage.get_range("raw/k", 0, 2).await.unwrap()
+                    } else {
+                        let (size, recorded, r) = storage.get_reader("raw/k").await.unwrap();
+                        (size, recorded.sha256, r)
+                    };
+                    let mut bytes = Vec::new();
+                    r.read_to_end(&mut bytes).await.unwrap();
+                    (bytes, pin)
+                })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(
+                !reader.is_finished(),
+                "range={range}: the read waits for the write"
+            );
+            let next: &[u8] = if range { b"two" } else { b"new" };
+            std::fs::write(dir.path().join("raw/k"), next).unwrap();
+            storage.record("raw/k", &sha(next), &none).await.unwrap();
+            drop(commit);
+            let (bytes, pin) = reader.await.unwrap();
+            assert_eq!(bytes, next, "range={range}");
+            assert_eq!(pin, Some(sha(next)), "range={range}");
+        }
+    }
+
     /// Only the staging directory itself, at the root and spelled exactly, is left out; a key
     /// whose path merely contains or starts with that name is listed as the full walk lists it.
     #[tokio::test]
@@ -2367,14 +2480,20 @@ mod tests {
             crate::validation::validate_storage_key(key).unwrap();
             put_key(&storage, key).await;
         }
-        // Not writable through the API, but on disk the full walk lists it (case-sensitive fs).
-        std::fs::create_dir_all(dir.path().join(".NORA-STAGING/x")).unwrap();
-        std::fs::write(dir.path().join(".NORA-STAGING/x/f"), b"x").unwrap();
-        for (prefix, key) in [
+        let mut rows = vec![
             ("raw/g/.nora-staging/", "raw/g/.nora-staging/f"),
             (".nora-stagingx/a/", ".nora-stagingx/a/f"),
-            (".NORA-STAGING/x/", ".NORA-STAGING/x/f"),
-        ] {
+        ];
+        // Not writable through the API, but on disk the full walk lists it. On a file system
+        // that ignores case (APFS, NTFS) `.NORA-STAGING` is the staging directory itself, so
+        // the spelling the row tells apart exists only where the file system keeps it (#1156).
+        std::fs::write(dir.path().join("case-probe"), b"").unwrap();
+        if !dir.path().join("CASE-PROBE").exists() {
+            std::fs::create_dir_all(dir.path().join(".NORA-STAGING/x")).unwrap();
+            std::fs::write(dir.path().join(".NORA-STAGING/x/f"), b"x").unwrap();
+            rows.push((".NORA-STAGING/x/", ".NORA-STAGING/x/f"));
+        }
+        for (prefix, key) in rows {
             let mut full = Vec::new();
             LocalStorage::list_files_sync(
                 &dir.path().to_path_buf(),
