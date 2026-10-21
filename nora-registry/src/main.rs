@@ -3606,12 +3606,11 @@ mod maintenance_loop_tests {
         // A 150 ms deadline: tick 2 (at 50 ms) is cut at 200 ms, past the slots at 100 and 150.
         let (tasks, heartbeat) = supervised(SLOT * 10);
         let hb = Arc::clone(&heartbeat);
-        let starts = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let s = Arc::clone(&starts);
+        let (started, mut start_times) = tokio::sync::mpsc::unbounded_channel();
         let task = tasks.spawn("maintenance", move || {
-            let s = Arc::clone(&s);
+            let started = started.clone();
             run_maintenance(SLOT, Arc::clone(&hb), move |n| {
-                s.lock().push(tokio::time::Instant::now());
+                let _ = started.send(tokio::time::Instant::now());
                 async move {
                     if n == 2 {
                         std::future::pending::<()>().await;
@@ -3621,7 +3620,10 @@ mod maintenance_loop_tests {
         });
         tokio::time::sleep(SLOT * 8).await;
         task.abort();
-        let starts = starts.lock();
+        let mut starts = Vec::new();
+        while let Ok(start) = start_times.try_recv() {
+            starts.push(start);
+        }
         assert!(
             starts.len() >= 4,
             "ticks after the cut one: {}",
