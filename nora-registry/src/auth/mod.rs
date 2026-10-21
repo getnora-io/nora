@@ -4312,6 +4312,66 @@ mod client_address_tests {
         resolve_client_ip(peer.parse().unwrap(), &headers, trusted)
     }
 
+    /// Measured in kind (ingress behind the image's `::` listener): the peer, the
+    /// trusted_proxies entry and the X-Forwarded-For entries meet in IPv4 form.
+    #[test]
+    fn an_ipv4_peer_on_a_dual_stack_listener_is_the_ipv4_address() {
+        let resolve = |peer: &str, xff: Option<&str>, trusted: &str| {
+            let mut headers = HeaderMap::new();
+            if let Some(xff) = xff {
+                headers.insert("x-forwarded-for", xff.parse().unwrap());
+            }
+            let peer: IpAddr = peer.parse().unwrap();
+            resolve_client_ip(peer, &headers, &TrustedProxies::parse(trusted)).to_string()
+        };
+        // the ingress, trusted by its IPv4 address, seen on a `::` listener
+        assert_eq!(
+            resolve("::ffff:10.244.0.5", Some("10.244.0.7"), "10.244.0.5/32"),
+            "10.244.0.7"
+        );
+        assert_eq!(
+            resolve("::ffff:10.244.0.5", Some("10.244.0.7"), "10.244.0.0/16"),
+            "10.244.0.7"
+        );
+        // a trusted proxy written in the mapped form, seen as IPv4
+        assert_eq!(
+            resolve("10.244.0.5", Some("10.244.0.7"), "::ffff:10.244.0.5"),
+            "10.244.0.7"
+        );
+        // a hop that writes its peer in the mapped form is walked past
+        assert_eq!(
+            resolve(
+                "::ffff:10.244.0.5",
+                Some("10.244.0.7, ::ffff:10.244.0.6"),
+                "10.244.0.0/16"
+            ),
+            "10.244.0.7"
+        );
+        // an untrusted peer is its IPv4 address, so it shares its limits with itself only
+        assert_eq!(
+            resolve("::ffff:203.0.113.9", None, "10.0.0.0/8"),
+            "203.0.113.9"
+        );
+        // a proxy that writes the client in the mapped form names it in IPv4
+        assert_eq!(
+            resolve(
+                "::ffff:10.244.0.5",
+                Some("::ffff:10.244.0.7"),
+                "10.244.0.0/16"
+            ),
+            "10.244.0.7"
+        );
+        // the list itself, asked directly
+        let ipv4 = TrustedProxies::parse("10.0.0.0/8");
+        assert!(ipv4.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!ipv4.contains("::ffff:11.1.2.3".parse().unwrap()));
+        // a real IPv6 peer stays IPv6 and is not an IPv4 network's member
+        assert_eq!(
+            resolve("2001:db8::1", Some("10.244.0.7"), "10.0.0.0/8"),
+            "2001:db8::1"
+        );
+    }
+
     /// An IPv4 address is one client whether it arrives over an IPv4 or a
     /// dual-stack socket, as the peer, in X-Forwarded-For, in X-Real-IP or in
     /// `trusted_proxies`: the resolved address is the plain IPv4 one.
