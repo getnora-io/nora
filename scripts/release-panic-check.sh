@@ -151,11 +151,11 @@ start audit
 curl -s -m 5 -o /dev/null "$url/__fi/panic-task/audit" || true
 rc=alive
 for _ in $(seq 1 50); do
-  if ! alive; then wait "$pid" && rc=0 || rc=$?; break; fi
+  if ! alive; then wait "$pid" && rc=0 || rc=$?; pid=; break; fi
   sleep 0.1
 done
-pid=
 n=$(panicked audit audit)
 verdict audit "$(holds test "$rc" = 70 -a "$n" = 1)" "process ended with $rc, logged $n"
+[ -n "$pid" ] && stop
 
 exit $failed
