@@ -421,7 +421,9 @@ fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Res
                 .and_then(|t| t.as_str())
                 .map(|s| s.to_string())
             {
-                let rewritten = tarball_url.replace(upstream_trimmed, &nora_npm_base);
+                let rewritten = upstream_url_forms(upstream_trimmed)
+                    .iter()
+                    .fold(tarball_url, |url, form| url.replace(form, &nora_npm_base));
                 if let Some(dist) = version_data.get_mut("dist") {
                     dist["tarball"] = serde_json::Value::String(rewritten);
                 }
@@ -451,12 +453,18 @@ fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) 
     if upstream_url.is_empty() {
         return data.to_vec();
     }
-    let needle = upstream_url.as_bytes();
+    let mut result = data.to_vec();
+    for form in upstream_url_forms(upstream_url) {
+        result = replace_all_bytes(&result, form.as_bytes(), nora_npm_base.as_bytes());
+    }
+    result
+}
+
+/// Every occurrence of `needle` in `data` replaced by `replacement`.
+fn replace_all_bytes(data: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
     if memchr::memmem::find(data, needle).is_none() {
         return data.to_vec();
     }
-    // Replace all occurrences of the upstream URL prefix
-    let replacement = nora_npm_base.as_bytes();
     let mut result = Vec::with_capacity(data.len());
     let mut start = 0;
     let finder = memchr::memmem::Finder::new(needle);
@@ -467,6 +475,23 @@ fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) 
     }
     result.extend_from_slice(&data[start..]);
     result
+}
+
+/// The upstream's URL as configured, and the same host and path under the other scheme. A
+/// registry reached over `https://` may name its tarballs `http://` (one behind a TLS terminator
+/// writes the scheme it sees), and the other way round: both name the upstream, and a link left
+/// under either sends the client past NORA.
+fn upstream_url_forms(upstream_url: &str) -> Vec<String> {
+    let twin = if let Some(rest) = upstream_url.strip_prefix("https://") {
+        Some(format!("http://{rest}"))
+    } else {
+        upstream_url
+            .strip_prefix("http://")
+            .map(|rest| format!("https://{rest}"))
+    };
+    std::iter::once(upstream_url.to_string())
+        .chain(twin)
+        .collect()
 }
 
 /// npm whoami handler: returns `{"username": "..."}`
@@ -8940,5 +8965,120 @@ mod published_names_stay_local {
         .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(asked(&upstream).await, Vec::<String>::new());
+    }
+}
+
+/// A packument from an upstream may name its tarballs under the other scheme of the upstream's
+/// own host (an https registry behind a TLS terminator writes `http://` links). Those links are the
+/// upstream's too: left as they are, the client fetches the tarball past NORA (X16).
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod rewrite_both_schemes {
+    use super::{replace_upstream_bytes, rewrite_tarball_urls};
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn packument(links: &[(&str, &str)]) -> Vec<u8> {
+        let versions: serde_json::Map<String, serde_json::Value> = links
+            .iter()
+            .map(|(version, link)| {
+                (
+                    version.to_string(),
+                    serde_json::json!({ "version": version, "dist": { "tarball": link } }),
+                )
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "name": "pkg", "versions": versions })).unwrap()
+    }
+
+    fn tarballs(doc: &[u8]) -> Vec<String> {
+        let doc: serde_json::Value = serde_json::from_slice(doc).unwrap();
+        doc["versions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|v| v["dist"]["tarball"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_link_under_either_scheme_of_the_upstream_host_is_rewritten() {
+        for (upstream, own, twin) in [
+            (
+                "https://registry.example.com",
+                "https://registry.example.com",
+                "http://registry.example.com",
+            ),
+            (
+                "http://registry.example.com",
+                "http://registry.example.com",
+                "https://registry.example.com",
+            ),
+            (
+                "https://registry.example.com/api/npm/repo/",
+                "https://registry.example.com/api/npm/repo",
+                "http://registry.example.com/api/npm/repo",
+            ),
+        ] {
+            let doc = packument(&[
+                ("1.0.0", &format!("{own}/pkg/-/pkg-1.0.0.tgz")),
+                ("1.0.1", &format!("{twin}/pkg/-/pkg-1.0.1.tgz")),
+                ("1.0.2", "http://other.example.com/pkg/-/pkg-1.0.2.tgz"),
+            ]);
+            let rewritten = rewrite_tarball_urls(&doc, "http://nora:5000", upstream).unwrap();
+            assert_eq!(
+                tarballs(&rewritten),
+                vec![
+                    "http://nora:5000/npm/pkg/-/pkg-1.0.0.tgz",
+                    "http://nora:5000/npm/pkg/-/pkg-1.0.1.tgz",
+                    // Another host is not the upstream's to rewrite.
+                    "http://other.example.com/pkg/-/pkg-1.0.2.tgz",
+                ],
+                "{upstream}"
+            );
+            // The byte-level rewrite, for a document that does not parse, does the same.
+            let raw = format!("not json {twin}/pkg/-/pkg-1.0.1.tgz {own}/pkg/-/pkg-1.0.0.tgz");
+            let rewritten = replace_upstream_bytes(
+                raw.as_bytes(),
+                upstream.trim_end_matches('/'),
+                "http://nora:5000/npm",
+            );
+            assert_eq!(
+                String::from_utf8(rewritten).unwrap(),
+                "not json http://nora:5000/npm/pkg/-/pkg-1.0.1.tgz http://nora:5000/npm/pkg/-/pkg-1.0.0.tgz",
+                "{upstream}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_served_packument_names_no_tarball_of_the_upstream_host_under_either_scheme() {
+        let upstream = MockServer::start().await;
+        let host = upstream.uri().replacen("http://", "", 1);
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(packument(&[
+                ("1.0.0", &format!("http://{host}/pkg/-/pkg-1.0.0.tgz")),
+                ("1.0.1", &format!("https://{host}/pkg/-/pkg-1.0.1.tgz")),
+            ])))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(
+            tarballs(&body),
+            vec![
+                "http://nora.example/npm/pkg/-/pkg-1.0.0.tgz",
+                "http://nora.example/npm/pkg/-/pkg-1.0.1.tgz",
+            ]
+        );
     }
 }
