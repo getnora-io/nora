@@ -127,11 +127,13 @@ pub enum ImportCommand {
     /// .nupkg must hold one .nuspec naming the id and version of its file name.
     ///
     /// Upgrading from 1.4.1 or older: an npm repository those releases imported holds tarballs
-    /// without version documents, and NORA does not serve them as published packages. A re-run
-    /// skips a repository it finished, so first delete that repository's `<repo>.done` and
-    /// `<repo>.progress` from the source's directory under `<storage path>/.nora-import/`, then
-    /// run the import again: on local storage it writes the missing documents beside the tarballs
-    /// already stored; on S3 it transfers the tarballs again.
+    /// without version documents, and NORA does not serve them as published packages; a PyPI or
+    /// NuGet repository they imported holds nothing, every file of it skipped. A re-run skips a
+    /// repository it finished, so first delete that repository's `<repo>__<hash>.done` and
+    /// `<repo>__<hash>.progress` from the source's directory under `<storage path>/.nora-import/`,
+    /// then run the import again: on local storage it writes the missing npm documents beside the
+    /// tarballs already stored; on S3 it transfers the tarballs again; PyPI and NuGet files are
+    /// transferred.
     Run(RunArgs),
 }
 
@@ -1312,9 +1314,10 @@ mod integration_tests {
         for needle in [
             "NORA_PUBLIC_URL",
             ".nora-import",
-            ".done",
-            ".progress",
+            "<repo>__<hash>.done",
+            "<repo>__<hash>.progress",
             "1.4.1",
+            "PyPI or NuGet repository",
         ] {
             assert!(help.contains(needle), "{needle} missing from:\n{help}");
         }
