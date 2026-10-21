@@ -3331,7 +3331,7 @@ async fn maintenance_tick(state: &AppState, tick_count: u64) {
     #[cfg(feature = "fault-injection")]
     fault_injection::maintenance_fault().await;
     if let Some(ref token_store) = state.tokens {
-        token_store.flush_last_used().await;
+        token_store.flush_last_used_detached().await;
     }
     registry::docker::cleanup_expired_sessions(&state.upload_sessions);
     state.auth_failures.cleanup();
@@ -3511,6 +3511,40 @@ mod maintenance_loop_tests {
             "a hung tick stops the beats"
         );
         task.abort();
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod maintenance_storage_tests {
+    //! The server's own maintenance loop and tick when a tick is cut at its deadline.
+    use crate::test_helpers::create_test_context_with_auth;
+    use std::time::Duration;
+
+    /// A tick cut while it flushes token `last_used` (its deadline can fall at any await)
+    /// does not cut the flush: the timestamps it took still land on disk.
+    #[tokio::test]
+    async fn a_cut_tick_finishes_its_token_flush() {
+        let ctx = create_test_context_with_auth(&[("admin", "pw")]);
+        let tokens = ctx.state.tokens.as_ref().unwrap();
+        let token = tokens
+            .create_token("admin", 30, None, crate::tokens::Role::Read)
+            .unwrap();
+        tokens.verify_token(&token).unwrap();
+
+        // Polled once and dropped: the flush has taken the pending timestamps.
+        let cut = futures::FutureExt::now_or_never(super::maintenance_tick(&ctx.state, 2));
+        assert!(cut.is_none(), "the tick is cut mid-flush");
+
+        let mut last_used = None;
+        for _ in 0..50 {
+            last_used = tokens.list_tokens("admin")[0].last_used;
+            if last_used.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(last_used.is_some(), "the flush ran to its end");
     }
 }
 

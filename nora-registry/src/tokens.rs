@@ -135,6 +135,8 @@ pub struct TokenStore {
     /// (the last_used flush, the legacy-hash migration) that read the file
     /// before a revoke cannot put it back after the revoke removed it.
     file_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Held by a running [`TokenStore::flush_last_used_detached`], so at most one runs.
+    flushing: Arc<tokio::sync::Mutex<()>>,
     /// Bumped by every revoke, under the cache lock. A verify reads it before
     /// it reads the token file and caches its result only if no revoke came in
     /// between, so a verify racing a revoke cannot cache the revoked token.
@@ -172,6 +174,7 @@ impl TokenStore {
             cache_ttl,
             pending_last_used: Arc::new(RwLock::new(HashMap::new())),
             file_lock: Arc::new(tokio::sync::Mutex::new(())),
+            flushing: Arc::new(tokio::sync::Mutex::new(())),
             revocations: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -463,6 +466,28 @@ impl TokenStore {
         let mut cache = self.cache.write();
         cache.retain(|key, cached| !revoked(key, cached));
         self.revocations.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// [`TokenStore::flush_last_used`] in a task of its own, awaited here. Dropping this
+    /// future (a maintenance tick cut at its deadline) does not stop the task, so a file being
+    /// rewritten stays under the file lock until its rename lands — a revoke is never undone
+    /// by a rename that comes after it — and the timestamps the flush took are written. While
+    /// an earlier one still runs this returns at once; what is pending waits for the next call.
+    /// A panic of the flush is raised here.
+    pub async fn flush_last_used_detached(&self) {
+        let Ok(running) = Arc::clone(&self.flushing).try_lock_owned() else {
+            return;
+        };
+        let store = self.clone();
+        let flush = tokio::spawn(async move {
+            store.flush_last_used().await;
+            drop(running);
+        });
+        if let Err(e) = flush.await {
+            if e.is_panic() {
+                std::panic::resume_unwind(e.into_panic());
+            }
+        }
     }
 
     /// Remove a token from the in-memory cache (called on revoke).
@@ -1089,6 +1114,27 @@ mod tests {
         // And the token still verifies from disk (fresh store = no warm cache).
         let cold = TokenStore::new(temp_dir.path());
         assert!(cold.verify_token(&token).is_ok());
+    }
+
+    /// One detached flush at a time: while one runs, another returns at once and leaves the
+    /// pending timestamps for the next.
+    #[tokio::test]
+    async fn detached_flush_runs_one_at_a_time() {
+        let temp_dir = TempDir::new().unwrap();
+        let store = TokenStore::new(temp_dir.path());
+        let token = store.create_token("ci", 30, None, Role::Read).unwrap();
+        store.verify_token(&token).unwrap();
+        let last_used = || store.list_tokens("ci")[0].last_used;
+
+        let running = Arc::clone(&store.flushing).lock_owned().await;
+        store.flush_last_used_detached().await;
+        assert_eq!(last_used(), None, "a second flush does not start");
+        drop(running);
+        store.flush_last_used_detached().await;
+        assert!(
+            last_used().is_some(),
+            "the next one writes what was pending"
+        );
     }
 
     /// A token revoked while `flush_last_used` is rewriting its file stays
