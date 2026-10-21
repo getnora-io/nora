@@ -851,7 +851,7 @@ mod tests {
     /// Over a dual-stack socket an IPv4 peer is `::ffff:a.b.c.d`. The limiters
     /// key it as its IPv4 address: the loopback proxy stays trusted, so each
     /// client behind it gets its own bucket, and a direct client gets the same
-    /// bucket over either socket (X02).
+    /// bucket over either socket.
     #[test]
     fn a_v4_mapped_peer_keys_as_its_ipv4_address() {
         use axum::http::Request;

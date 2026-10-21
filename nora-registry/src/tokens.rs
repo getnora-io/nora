@@ -1078,7 +1078,7 @@ mod tests {
 
     /// A token revoked while `flush_last_used` is rewriting its file stays
     /// revoked: the flush must not put the file back. The flush is started
-    /// first and has read the file when the revoke runs (X01).
+    /// first and has read the file when the revoke runs.
     #[tokio::test]
     async fn revoke_during_flush_stays_revoked() {
         let temp_dir = TempDir::new().unwrap();
@@ -1187,7 +1187,7 @@ mod tests {
 
     /// Every mint gets at most MAX_TOKEN_TTL_DAYS days, however long it asks
     /// for: a lifetime that overflows when counted in seconds included, which
-    /// used to wrap around to a token of a few hours (C10).
+    /// used to wrap around to a token of a few hours.
     #[test]
     fn create_token_caps_the_lifetime_centrally() {
         let temp_dir = TempDir::new().unwrap();

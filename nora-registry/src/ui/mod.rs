@@ -1030,8 +1030,8 @@ fn decide_ui_token_mint(
 /// The lifetime in seconds of a token asked for `requested_days` days, capped
 /// by an optional ceiling in seconds — an OIDC caller's provider
 /// `max_token_lifetime_secs` (#1094). A ceiling shorter than a day is kept to
-/// the second: the token never outlives what the caller's own credential may
-/// (R2-01). `None` (Basic/opaque callers, which carry no ceiling) leaves the
+/// the second: the token never outlives what the caller's own credential may.
+/// `None` (Basic/opaque callers, which carry no ceiling) leaves the
 /// lifetime unchanged.
 fn cap_ttl_secs(requested_days: u64, ceiling_secs: Option<u64>) -> u64 {
     let requested = requested_days.saturating_mul(86_400);
@@ -1366,7 +1366,7 @@ mod base_path_tests {
         assert_eq!(cap_ttl_secs(3, Some(7 * DAY)), 3 * DAY);
         // Exactly one day.
         assert_eq!(cap_ttl_secs(3650, Some(DAY)), DAY);
-        // A sub-day ceiling is kept to the second (R2-01), not rounded up to a day.
+        // A sub-day ceiling is kept to the second, not rounded up to a day.
         assert_eq!(cap_ttl_secs(3650, Some(900)), 900);
         assert_eq!(cap_ttl_secs(3650, Some(0)), 0);
         // A lifetime too long to count in seconds still caps.

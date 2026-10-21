@@ -347,7 +347,7 @@ mod tests {
 }
 
 /// Every route that mints a token caps its lifetime the same way and leaves an
-/// audit entry naming who minted what (C10, R2-04).
+/// audit entry naming who minted what.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod mint_tests {

@@ -3,7 +3,7 @@
 
 //! The long-lived background tasks of the server, and what happens when one panics.
 //!
-//! The shipped build unwinds (C67), so a panic ends only the task it happened in. Left at
+//! The shipped build unwinds, so a panic ends only the task it happened in. Left at
 //! that, a dead task is silent: the process serves on while tokens stop being flushed or
 //! the audit trail stops being written. Every long-lived task therefore runs here, and a
 //! panic in one is always logged as an error naming the task and counted in
@@ -17,7 +17,7 @@
 //!
 //! A task may also have a [`Heartbeat`]: proof of progress, not only of life. The
 //! maintenance loop beats after each completed tick, so one that hangs, or whose ticks keep
-//! failing, fails `/health` too (R2-49). `/health` asks [`Supervisor::failing`] and nothing
+//! failing, fails `/health` too. `/health` asks [`Supervisor::failing`] and nothing
 //! else.
 
 use std::future::Future;

@@ -3043,7 +3043,7 @@ mod gem_file_decided_once {
     }
 }
 
-/// What a gem file name costs before it is answered (X03). The name arrives from any client, so
+/// What a gem file name costs before it is answered. The name arrives from any client, so
 /// the work done on it before it is refused must not grow with what the client sends: the
 /// handlers run that work inline, on a runtime worker.
 #[cfg(test)]

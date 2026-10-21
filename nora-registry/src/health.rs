@@ -81,7 +81,7 @@ async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<Health
     // reachability is informational (`status: degraded`); gating liveness or the LB
     // on it turns a storage blip into a restart loop / full 502 outage for every
     // route, storage-backed or not (#869). Readiness (`/ready`) is the storage gate.
-    // A background task that stopped making progress or keeps panicking (R2-49,
+    // A background task that stopped making progress or keeps panicking (see
     // supervise.rs) is the process's own fault, which a restart clears: that one fails
     // liveness.
     if let Some(task) = failing_task {
@@ -161,7 +161,7 @@ mod tests {
         assert!(body_str.contains("healthy"));
     }
 
-    /// A maintenance loop that stopped ticking fails liveness (R2-49): `/health` answers 503
+    /// A maintenance loop that stopped ticking fails liveness: `/health` answers 503
     /// once the loop has been silent longer than it may be, and 200 again after a tick.
     #[tokio::test]
     async fn health_is_503_while_the_maintenance_loop_is_silent_too_long() {

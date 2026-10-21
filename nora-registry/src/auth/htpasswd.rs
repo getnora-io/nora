@@ -18,7 +18,7 @@ const VERDICT_CAPACITY: usize = 4096;
 /// blocking pool, a few at a time, and each verdict is remembered. The file is read once at
 /// startup, so a username and password get the same answer for the life of the process;
 /// the second request with them (a CI job's next pull, an API token sent as the password of
-/// an htpasswd username) pays no bcrypt (C02).
+/// an htpasswd username) pays no bcrypt.
 pub struct HtpasswdAuth {
     users: HashMap<String, String>, // username -> bcrypt hash
     /// Verdicts by a keyed digest of username and password, never the password itself.

@@ -1221,7 +1221,7 @@ impl Config {
 
         // 7b. An OIDC provider without an audience: the `aud` claim is not
         // checked, so a token its issuer minted for any other relying party is
-        // accepted. A warning; strict mode refuses it (C08).
+        // accepted. A warning; strict mode refuses it.
         if self.auth.oidc.enabled {
             for provider in self.auth.oidc.providers.iter() {
                 if !provider.enabled || !provider.audience.is_empty() {
@@ -3183,7 +3183,7 @@ proxies = [
 
     /// An enabled OIDC provider without an audience accepts a token its issuer
     /// minted for any other service: NORA warns at start naming the provider,
-    /// and strict mode refuses to start on it (C08, NFR-SA-008).
+    /// and strict mode refuses to start on it.
     #[test]
     fn an_oidc_provider_without_audience_is_reported() {
         let _lock = env_lock();

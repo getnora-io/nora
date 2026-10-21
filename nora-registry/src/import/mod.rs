@@ -437,7 +437,7 @@ async fn import_repo(
                 // Fast-path only on local (per-object HEAD on S3 = $$ + latency, R5).
                 if !on_s3 && storage.stat(&key).await.is_some() {
                     // An npm tarball an earlier import committed without its version document
-                    // (before C73, or a failed document write) is published now.
+                    // (before 1.4.2, or a failed document write) is published now.
                     if rt == crate::registry_type::RegistryType::Npm && !opts.dry_run {
                         if let Err(e) =
                             transfer::publish_stored_npm_tarball(storage, &key, opts.public_base)
@@ -1313,7 +1313,7 @@ mod integration_tests {
         gz.finish().unwrap()
     }
 
-    /// C73: an npm tarball `nora import` commits is a published version — its packument and
+    /// An npm tarball `nora import` commits is a published version — its packument and
     /// tarball are served from NORA's own keys, and the upstream is never asked for the name.
     #[tokio::test]
     async fn an_imported_npm_tarball_is_served_as_published_without_an_upstream() {
@@ -1477,7 +1477,7 @@ mod integration_tests {
     async fn a_tarball_an_earlier_import_committed_alone_is_published_by_the_next_run() {
         let h = harness("npm-upgrade").await;
         let tgz = npm_tgz(&json!({ "name": "pkg", "version": "1.0.0" }));
-        // What an import before C73 left: the tarball, no version document.
+        // What an import before 1.4.2 left: the tarball, no version document.
         h.storage
             .put("npm/pkg/tarballs/pkg-1.0.0.tgz", &tgz)
             .await

@@ -2,7 +2,7 @@
 # Copyright (c) 2026 The NORA Authors
 # SPDX-License-Identifier: MIT
 #
-# What a panic does to a release binary (C67, R2-49, supervised tasks). Tests always build
+# What a panic does to a release binary (unwinding, maintenance liveness, supervised tasks). Tests always build
 # with unwind, whatever the release profile says, so this builds the release profile with
 # the `fault-injection` feature and makes the running server panic:
 #   handler       GET /__fi/panic            -> 500, the process keeps serving

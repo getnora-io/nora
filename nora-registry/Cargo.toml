@@ -56,7 +56,7 @@ zeroize = { version = "1.8", features = ["derive"] }
 argon2 = { version = "0.5", features = ["std", "rand"] }
 tower-http = { version = "0.6", features = ["set-header", "catch-panic"] }
 # The HTTP/1 and HTTP/2 server under axum, driven directly for the header and keep-alive
-# timeouts axum::serve does not set (C61); all three already in the tree through axum.
+# timeouts axum::serve does not set; all three already in the tree through axum.
 hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["http1", "http2", "server-graceful", "tokio"] }
 tower = { version = "0.5", features = ["util"] }

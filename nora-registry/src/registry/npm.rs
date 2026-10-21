@@ -1942,7 +1942,7 @@ pub(crate) fn imported_version_key(tarball_key: &str) -> Option<String> {
     Some(format!("npm/{name}/versions/{version}.json"))
 }
 
-/// What an npm tarball imported from another registry publishes (C73): the key of its version
+/// What an npm tarball imported from another registry publishes: the key of its version
 /// document, and the document — the tarball's own `package.json` with the `dist` a publish
 /// records: the tarball's URL at `public_base`, its SHA-1 (`shasum`) and SHA-512 (`integrity`).
 /// The manifest must name the package and version the key does. Once the document is stored the
@@ -8760,7 +8760,7 @@ mod quarantine_first_seen {
     }
 }
 
-/// A publish stores the tarballs of the versions it publishes, and nothing else (R2-19). An
+/// A publish stores the tarballs of the versions it publishes, and nothing else. An
 /// attachment named for another version — one already published included — or for a key beside
 /// a tarball would replace bytes clients already installed, and the pin NORA checks them against.
 #[cfg(test)]
@@ -8934,7 +8934,7 @@ mod publish_attachments {
     }
 }
 
-/// A package published here is NORA's: its name is never an upstream's to answer for (R2-20). A
+/// A package published here is NORA's: its name is never an upstream's to answer for. A
 /// tarball of it that NORA does not store is no version of it — the upstream is not asked, so a
 /// squatter's bytes are neither served nor stored beside the published ones — and a bulk audit
 /// does not hand its name to the upstream.
@@ -9132,7 +9132,7 @@ mod published_names_stay_local {
 
 /// A packument from an upstream may name its tarballs under the other scheme of the upstream's
 /// own host (an https registry behind a TLS terminator writes `http://` links). Those links are the
-/// upstream's too: left as they are, the client fetches the tarball past NORA (X16).
+/// upstream's too: left as they are, the client fetches the tarball past NORA.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod rewrite_both_schemes {

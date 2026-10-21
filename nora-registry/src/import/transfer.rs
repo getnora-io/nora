@@ -217,7 +217,7 @@ pub async fn transfer_artifact(
         };
     }
 
-    // 4b. An npm tarball is published by its version document (C73), read from the staged
+    // 4b. An npm tarball is published by its version document, read from the staged
     // file before anything is committed: a tarball whose manifest does not name its package and
     // version leaves nothing behind. Without the document NORA takes the package for an
     // upstream's and asks the upstream for its name.
@@ -293,7 +293,7 @@ async fn staged_npm_version(
 }
 
 /// Write the version document of an npm tarball already stored at `key` when it has none: an
-/// import before C73, or one whose document write failed, committed the tarball alone. `Ok(true)`
+/// import before 1.4.2, or one whose document write failed, committed the tarball alone. `Ok(true)`
 /// when a document was written.
 pub async fn publish_stored_npm_tarball(
     storage: &Storage,

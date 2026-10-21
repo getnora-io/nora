@@ -718,7 +718,7 @@ pub(crate) fn request_layers(router: Router<AppState>, state: &AppState) -> Rout
 
 #[cfg(test)]
 mod panic_strategy_tests {
-    //! The shipped build unwinds (C67): under `panic = "abort"` every `catch_unwind` guard
+    //! The shipped build unwinds: under `panic = "abort"` every `catch_unwind` guard
     //! and the panic layer are dead code, and one panic ends the only replica. Tests always
     //! build with unwind, whatever the profile says, so this reads the build inputs instead:
     //! the Cargo manifests and the files that run a release build.
@@ -816,7 +816,7 @@ mod panic_strategy_tests {
         }
         for fine in [
             "[profile.release]\npanic = \"unwind\"",
-            "# panic = \"abort\" was the setting before C67",
+            "# panic = \"abort\" was the setting before 1.4.2",
             "tracing::error!(\"background cache task panicked\")",
         ] {
             assert!(abort_switches(fine).is_empty(), "{fine}");
@@ -827,7 +827,7 @@ mod panic_strategy_tests {
 #[cfg(test)]
 mod panic_layer_tests {
     //! A panic in a handler or in a middleware of `request_layers` answers that request with
-    //! 500 and leaves the router serving (C67).
+    //! 500 and leaves the router serving.
     use crate::test_helpers::{body_bytes, create_test_context, send};
     use axum::http::{Method, StatusCode};
     use axum::routing::get;
@@ -1169,7 +1169,7 @@ mod shutdown_drain_tests {
 #[allow(clippy::unwrap_used)]
 mod connection_limit_tests {
     //! A connection whose request head does not arrive in time is closed, an idle keep-alive
-    //! connection lives longer than that, and open connections are capped (C61).
+    //! connection lives longer than that, and open connections are capped.
     use super::{serve_with_drain, ConnLimits, ServeEnd};
     use axum::extract::ConnectInfo;
     use axum::routing::get;
@@ -3198,7 +3198,7 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Background task: flush token last_used + periodic maintenance every 30 seconds
     // Under the supervisor: a panicking tick restarts the loop, and the heartbeat (beaten
-    // after each completed tick) fails /health when ticks stop completing (R2-49).
+    // after each completed tick) fails /health when ticks stop completing.
     let maintenance_state = state.clone();
     state.tasks.spawn("maintenance", move || {
         let state = maintenance_state.clone();
@@ -3289,7 +3289,7 @@ async fn run_server(mut config: Config, storage: Storage) {
 const MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The supervisor of the server's long-lived tasks, and the maintenance loop's heartbeat it
-/// reads: stalled after `server.maintenance_stall_secs` without a completed tick (R2-49).
+/// reads: stalled after `server.maintenance_stall_secs` without a completed tick.
 /// The server and the test router both build them here.
 pub(crate) fn supervision(
     server: &config::ServerConfig,
@@ -3385,7 +3385,7 @@ async fn maintenance_tick(state: &AppState, tick_count: u64) {
 
 #[cfg(test)]
 mod maintenance_loop_tests {
-    //! The maintenance loop under its supervisor (R2-49): a panicking tick restarts the
+    //! The maintenance loop under its supervisor: a panicking tick restarts the
     //! loop, ticks that never complete and a hung tick fail `/health`. Real time at a 20 ms
     //! cadence: the margins are whole ticks.
     use super::run_maintenance;

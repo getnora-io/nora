@@ -1,7 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-//! One client connection of the HTTP server, served under the limits of `[server]` (C61).
+//! One client connection of the HTTP server, served under the limits of `[server]`.
 //!
 //! hyper has one timer for a request head and starts it whenever the connection waits for
 //! a head, also on an idle keep-alive connection, so with only hyper's setting the header

@@ -623,7 +623,7 @@ pub async fn auth_middleware(
 
     // Verify credentials: htpasswd first, then the token store (#736, #1094);
     // `decide_basic_auth` has the rules, this applies its decision. The htpasswd check is
-    // async (bcrypt runs off the async workers, C02), so it runs here, on the credentials
+    // async (bcrypt runs off the async workers), so it runs here, on the credentials
     // `decide_basic_auth` reads, and hands it the verdict.
     let tokens = state
         .tokens
@@ -849,7 +849,7 @@ fn is_write_method(method: &Method) -> bool {
 /// The username of a Base64-encoded Basic credential that htpasswd has already accepted,
 /// `None` otherwise. Used by the opportunistic-auth path on open web surfaces so that
 /// authenticated users get their real identity even on publicly browsable pages. It runs
-/// no bcrypt (C02): an open path has no lockout and no limiter, so a flood of Basic
+/// no bcrypt: an open path has no lockout and no limiter, so a flood of Basic
 /// headers there would cost a bcrypt each. Credentials count once a gated path (where the
 /// browser is challenged) has checked them.
 fn try_basic_auth(encoded: &str, auth: Option<&HtpasswdAuth>) -> Option<String> {
@@ -2029,7 +2029,7 @@ mod integration_tests {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// C02: a probe or another open path never pays bcrypt for the Basic header it
+    /// A probe or another open path never pays bcrypt for the Basic header it
     /// carries, right or wrong; only the gated paths check htpasswd credentials.
     #[tokio::test]
     async fn an_open_path_never_runs_bcrypt() {
@@ -2051,7 +2051,7 @@ mod integration_tests {
         assert_eq!(bcrypt_runs(&ctx), 0, "an open path ran bcrypt");
     }
 
-    /// C02: a CI job whose Basic username is an htpasswd user and whose password is an
+    /// A CI job whose Basic username is an htpasswd user and whose password is an
     /// API token pays bcrypt once, not on every request; it still authenticates as the
     /// token's owner each time.
     #[tokio::test]
@@ -2095,7 +2095,7 @@ mod integration_tests {
         assert_eq!(bcrypt_runs(&ctx), 1);
     }
 
-    /// C02: bcrypt does not run on an async worker. On a one-thread runtime a probe sent
+    /// Bcrypt does not run on an async worker. On a one-thread runtime a probe sent
     /// while a Basic login is being checked against a slow hash answers at once, instead
     /// of after the hash.
     #[tokio::test]
@@ -3365,7 +3365,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
     /// the provider's `max_token_lifetime_secs` (900s here). An unrestricted
     /// write identity (main-ref rule, provider `["*"]`) may mint — it is not
     /// scope-refused — but the 3650-day request is capped to the ceiling itself,
-    /// not rounded up to a day (R2-01), and never outlives the JWT that minted
+    /// not rounded up to a day, and never outlives the JWT that minted
     /// it: here the JWT expires in 600s, under the ceiling.
     #[tokio::test]
     async fn test_oidc_minted_token_lifetime_capped_at_provider_ceiling() {
@@ -3820,8 +3820,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
     }
 
     /// A valid OIDC JWT is served while the client address is locked out for
-    /// wrong passwords: the lockout counts passwords, not signed tokens
-    /// (R2-48).
+    /// wrong passwords: the lockout counts passwords, not signed tokens.
     #[tokio::test]
     async fn test_oidc_valid_jwt_served_while_passwords_locked_out() {
         let mock_server = MockServer::start().await;
@@ -4084,7 +4083,7 @@ mod web_surface_gating_tests {
     // -- #934: opportunistic auth on open web surfaces --
 
     /// try_basic_auth returns the username for valid htpasswd credentials once htpasswd
-    /// has checked them, and runs no bcrypt itself (C02): before the check, the caller is
+    /// has checked them, and runs no bcrypt itself: before the check, the caller is
     /// anonymous.
     #[tokio::test]
     async fn test_try_basic_auth_valid() {
@@ -4156,8 +4155,8 @@ mod web_surface_gating_tests {
             );
         }
 
-        // Valid Basic creds htpasswd has not checked yet: the open path runs no bcrypt
-        // (C02), so the caller browses as anonymous.
+        // Valid Basic creds htpasswd has not checked yet: the open path runs no bcrypt,
+        // so the caller browses as anonymous.
         let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
         let dashboard = || {
             send_with_headers(
@@ -4492,7 +4491,7 @@ mod client_address_tests {
 
     /// X-Forwarded-For from a peer outside `trusted_proxies` is ignored, and
     /// NORA says so once: the warning names the peer and the setting, and
-    /// never the header, which the client wrote (NFR-SA-007).
+    /// never the header, which the client wrote.
     #[test]
     fn forwarding_from_an_untrusted_peer_is_warned_about_once() {
         let trusted = TrustedProxies::parse("10.9.9.9");
@@ -4543,7 +4542,7 @@ mod client_address_tests {
         format!("Basic {}", STANDARD.encode(format!("{user}:{pass}")))
     }
 
-    /// Behind the loopback proxy on a dual-stack socket (X02), one client's
+    /// Behind the loopback proxy on a dual-stack socket, one client's
     /// wrong passwords lock out that client only: the same account from
     /// another client behind the same proxy still gets in.
     #[tokio::test]
@@ -4606,7 +4605,7 @@ mod client_address_tests {
         );
     }
 
-    /// The lockout counts wrong passwords (R2-48): while an address is locked
+    /// The lockout counts wrong passwords: while an address is locked
     /// out, a valid API token sent as Bearer is served, and wrong Bearer tokens
     /// do not lock an address out at all. A password stays refused.
     #[tokio::test]
