@@ -847,4 +847,40 @@ mod tests {
         let result = extractor.extract(&req);
         assert!(result.is_err());
     }
+
+    /// Over a dual-stack socket an IPv4 peer is `::ffff:a.b.c.d`. The limiters
+    /// key it as its IPv4 address: the loopback proxy stays trusted, so each
+    /// client behind it gets its own bucket, and a direct client gets the same
+    /// bucket over either socket (X02).
+    #[test]
+    fn a_v4_mapped_peer_keys_as_its_ipv4_address() {
+        use axum::http::Request;
+
+        let extractor = TrustedProxyKeyExtractor::new(TrustedProxies::default_loopback());
+        let key = |peer: &str, xff: Option<&str>| {
+            let mut req = Request::builder().body(()).unwrap();
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo(SocketAddr::new(
+                    peer.parse().unwrap(),
+                    1234,
+                )));
+            if let Some(xff) = xff {
+                req.headers_mut()
+                    .insert("x-forwarded-for", xff.parse().unwrap());
+            }
+            extractor.extract(&req).unwrap()
+        };
+        assert_eq!(
+            key("::ffff:127.0.0.1", Some("198.51.100.7")),
+            IpAddr::from([198, 51, 100, 7])
+        );
+        assert_eq!(
+            key("::ffff:127.0.0.1", Some("203.0.113.10")),
+            IpAddr::from([203, 0, 113, 10])
+        );
+        assert_eq!(
+            key("::ffff:203.0.113.5", None),
+            IpAddr::from([203, 0, 113, 5])
+        );
+    }
 }

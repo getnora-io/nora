@@ -62,10 +62,12 @@ pub fn audit_actor(user: &Option<axum::Extension<AuthenticatedUser>>) -> &str {
     }
 }
 
-/// Tracks failed authentication attempts per IP for brute-force protection.
+/// Tracks wrong passwords per client address for brute-force protection.
 ///
-/// After `max_failures` consecutive failures, the IP is locked out with
-/// exponential backoff: 2^(failures - max_failures) seconds, capped at 15 minutes.
+/// After `max_failures` consecutive failures, the address is locked out of
+/// password authentication with exponential backoff: 2^(failures -
+/// max_failures) seconds, capped at 15 minutes. Bearer credentials (API
+/// tokens, OIDC JWTs) cannot be guessed and are neither counted nor refused.
 pub struct AuthFailureTracker {
     /// IP -> (consecutive failures, last failure time)
     entries: parking_lot::Mutex<HashMap<IpAddr, (u32, Instant)>>,
@@ -171,14 +173,21 @@ fn is_admin_path(path: &str) -> bool {
 /// Extract client IP from request, honoring XFF/X-Real-IP only from trusted proxies.
 ///
 /// If the direct peer IP is not in `trusted_proxies`, XFF/X-Real-IP headers are
-/// ignored and the peer IP is returned. This prevents attackers from spoofing
-/// their IP to bypass `AuthFailureTracker` lockout.
+/// ignored (with one warning per setting) and the peer IP is returned. This
+/// prevents attackers from spoofing their IP to bypass `AuthFailureTracker`
+/// lockout. Every address is canonical: an IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`, an IPv4 peer of a dual-stack socket) is its IPv4
+/// address, so one client is one key whichever socket or proxy it came by.
 pub(crate) fn resolve_client_ip(
     peer: IpAddr,
     headers: &HeaderMap,
     trusted_proxies: &crate::config::TrustedProxies,
 ) -> IpAddr {
+    let peer = peer.to_canonical();
     if !trusted_proxies.contains(peer) {
+        if headers.contains_key("x-forwarded-for") || headers.contains_key("x-real-ip") {
+            trusted_proxies.warn_untrusted_forwarding(peer);
+        }
         return peer;
     }
 
@@ -189,7 +198,7 @@ pub(crate) fn resolve_client_ip(
     if let Some(xri) = headers.get("x-real-ip") {
         if let Ok(s) = xri.to_str() {
             if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                return ip;
+                return ip.to_canonical();
             }
         }
     }
@@ -216,6 +225,7 @@ fn forwarded_for_client(
         let Some(ip) = std::str::from_utf8(entry)
             .ok()
             .and_then(|s| s.trim().parse::<IpAddr>().ok())
+            .map(|ip| ip.to_canonical())
         else {
             break;
         };
@@ -417,24 +427,8 @@ pub async fn auth_middleware(
     // Compute realm from public_url for WWW-Authenticate header
     let realm = state.config.server.public_url.as_deref().unwrap_or("Nora");
 
-    // Check if client IP is blocked due to too many failed attempts
+    // The client address the password lockout counts by.
     let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
-    if let Some(ip) = client_ip {
-        if let Some(retry_after) = state.auth_failures.check_blocked(&ip) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [
-                    (header::RETRY_AFTER, retry_after.to_string()),
-                    (header::CONTENT_TYPE, "application/json".to_string()),
-                ],
-                format!(
-                    r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                    retry_after
-                ),
-            )
-                .into_response();
-        }
-    }
 
     // Extract Authorization header
     let auth_header = request
@@ -453,9 +447,6 @@ pub async fn auth_middleware(
         if let Some(ref token_store) = state.tokens {
             match token_store.verify_token(token) {
                 Ok((user, role)) => {
-                    if let Some(ip) = client_ip {
-                        state.auth_failures.record_success(&ip);
-                    }
                     if is_write_method(request.method()) && !role.can_write() {
                         return (StatusCode::FORBIDDEN, "Read-only token").into_response();
                     }
@@ -494,9 +485,6 @@ pub async fn auth_middleware(
             if oidc_validator.is_active() {
                 match oidc_validator.validate_token(token).await {
                     Ok(identity) => {
-                        if let Some(ip) = client_ip {
-                            state.auth_failures.record_success(&ip);
-                        }
                         tracing::debug!(
                             provider = %identity.provider,
                             subject = %identity.subject,
@@ -551,16 +539,35 @@ pub async fn auth_middleware(
             }
         }
 
-        // Both token and OIDC failed
-        if let Some(ip) = client_ip {
-            state.auth_failures.record_failure(ip);
-        }
+        // Both token and OIDC failed. A Bearer credential cannot be guessed
+        // (a random API token or a signed JWT), so a wrong one does not count
+        // toward the password lockout: a client replaying an expired token
+        // must not lock everyone behind its address out of their passwords.
         return unauthorized_response("Invalid or expired token", realm);
     }
 
     // Parse Basic auth
     if !auth_header.starts_with("Basic ") {
         return unauthorized_response("Basic or Bearer authentication required", realm);
+    }
+
+    // A client address locked out for wrong passwords gets no password
+    // checked. Bearer credentials above are not held by it.
+    if let Some(ip) = client_ip {
+        if let Some(retry_after) = state.auth_failures.check_blocked(&ip) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    (header::RETRY_AFTER, retry_after.to_string()),
+                    (header::CONTENT_TYPE, "application/json".to_string()),
+                ],
+                format!(
+                    r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
+                    retry_after
+                ),
+            )
+                .into_response();
+        }
     }
 
     // Verify credentials: htpasswd first, then the token store (#736, #1094);
@@ -3466,6 +3473,49 @@ Jd74nq6dNCjpWG4drIsyhqX+
         );
     }
 
+    /// A valid OIDC JWT is served while the client address is locked out for
+    /// wrong passwords: the lockout counts passwords, not signed tokens
+    /// (R2-48).
+    #[tokio::test]
+    async fn test_oidc_valid_jwt_served_while_passwords_locked_out() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        for _ in 0..6 {
+            ctx.state
+                .auth_failures
+                .record_failure("127.0.0.1".parse().unwrap());
+        }
+        let now = now_secs();
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {jwt}");
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/locked-out/a.txt",
+            vec![("authorization", &bearer)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert!(
+            response.status().is_success(),
+            "a valid OIDC JWT from a locked-out address is refused: {}",
+            response.status()
+        );
+    }
+
     #[tokio::test]
     async fn test_oidc_token_lifetime_exceeded() {
         let mock_server = MockServer::start().await;
@@ -3829,6 +3879,374 @@ mod web_surface_gating_tests {
         assert!(
             !npm["proxy_upstreams"].as_array().unwrap().is_empty(),
             "bearer-authenticated must see populated proxy_upstreams"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client address and lockout: the key the lockout and the limiters count by
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod client_address_tests {
+    use super::resolve_client_ip;
+    use crate::config::TrustedProxies;
+    use crate::test_helpers::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{HeaderMap, Method, Request, StatusCode};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::{Arc, Mutex};
+
+    /// A dual-stack socket (`NORA_HOST=::`, the image default) sees an IPv4
+    /// peer as `::ffff:a.b.c.d`.
+    const MAPPED_LOOPBACK: &str = "::ffff:127.0.0.1";
+
+    fn resolve(
+        peer: &str,
+        xff: &[&str],
+        real_ip: Option<&str>,
+        trusted: &TrustedProxies,
+    ) -> IpAddr {
+        let mut headers = HeaderMap::new();
+        for line in xff {
+            headers.append("x-forwarded-for", line.parse().unwrap());
+        }
+        if let Some(ip) = real_ip {
+            headers.insert("x-real-ip", ip.parse().unwrap());
+        }
+        resolve_client_ip(peer.parse().unwrap(), &headers, trusted)
+    }
+
+    /// An IPv4 address is one client whether it arrives over an IPv4 or a
+    /// dual-stack socket, as the peer, in X-Forwarded-For, in X-Real-IP or in
+    /// `trusted_proxies`: the resolved address is the plain IPv4 one.
+    #[test]
+    fn a_v4_mapped_address_is_its_ipv4_address() {
+        let loopback = TrustedProxies::default_loopback();
+        let pods = TrustedProxies::parse("10.0.0.0/8");
+        let mapped_pods = TrustedProxies::parse("::ffff:10.0.0.0/104");
+        let v4 = |s: &str| s.parse::<IpAddr>().unwrap();
+        let cases: [(&str, &[&str], Option<&str>, &TrustedProxies, IpAddr); 7] = [
+            // the loopback proxy over a dual-stack socket is still trusted
+            (
+                MAPPED_LOOPBACK,
+                &["198.51.100.7"],
+                None,
+                &loopback,
+                v4("198.51.100.7"),
+            ),
+            // a direct client over a dual-stack socket keys as its IPv4 address
+            (
+                "::ffff:203.0.113.5",
+                &[],
+                None,
+                &loopback,
+                v4("203.0.113.5"),
+            ),
+            // a mapped address written by a proxy
+            (
+                "127.0.0.1",
+                &["::ffff:198.51.100.7"],
+                None,
+                &loopback,
+                v4("198.51.100.7"),
+            ),
+            (
+                "127.0.0.1",
+                &[],
+                Some("::ffff:203.0.113.9"),
+                &loopback,
+                v4("203.0.113.9"),
+            ),
+            // a mapped trusted hop in the chain is walked past
+            (
+                "10.1.2.3",
+                &["198.51.100.7, ::ffff:10.0.0.5"],
+                None,
+                &pods,
+                v4("198.51.100.7"),
+            ),
+            // a pod network named in either form trusts the other
+            (
+                "::ffff:10.1.2.3",
+                &["198.51.100.7"],
+                None,
+                &pods,
+                v4("198.51.100.7"),
+            ),
+            (
+                "10.1.2.3",
+                &["198.51.100.7"],
+                None,
+                &mapped_pods,
+                v4("198.51.100.7"),
+            ),
+        ];
+        for (peer, xff, real_ip, trusted, want) in cases {
+            let got = resolve(peer, xff, real_ip, trusted);
+            assert_eq!(got, want, "peer {peer} xff {xff:?} real_ip {real_ip:?}");
+            assert!(got.is_ipv4(), "{got} is not canonical");
+        }
+        // The setting answers for a mapped address as for its IPv4 address.
+        assert!(loopback.contains(MAPPED_LOOPBACK.parse().unwrap()));
+        assert!(pods.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!pods.contains("::ffff:11.0.0.1".parse().unwrap()));
+        // A real IPv6 client stays itself.
+        assert_eq!(
+            resolve("2001:db8::7", &[], None, &loopback),
+            "2001:db8::7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The warnings `run` logs.
+    fn warnings_of(run: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::prelude::*;
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(sink.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, run);
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        out.lines()
+            .filter(|l| l.contains("WARN"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// X-Forwarded-For from a peer outside `trusted_proxies` is ignored, and
+    /// NORA says so once: the warning names the peer and the setting, and
+    /// never the header, which the client wrote (NFR-SA-007).
+    #[test]
+    fn forwarding_from_an_untrusted_peer_is_warned_about_once() {
+        let trusted = TrustedProxies::parse("10.9.9.9");
+        let warnings = warnings_of(|| {
+            for _ in 0..3 {
+                let ip = resolve("127.0.0.1", &["203.0.113.10"], None, &trusted);
+                assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+            }
+            // a clone is the same setting (the limiters hold clones)
+            let _ = resolve("127.0.0.1", &["203.0.113.10"], None, &trusted.clone());
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("127.0.0.1"), "{}", warnings[0]);
+        assert!(warnings[0].contains("trusted_proxies"), "{}", warnings[0]);
+        assert!(!warnings[0].contains("203.0.113.10"), "{}", warnings[0]);
+
+        // No warning when there is nothing to ignore.
+        let quiet = warnings_of(|| {
+            let loopback = TrustedProxies::default_loopback();
+            let _ = resolve("127.0.0.1", &["203.0.113.10"], None, &loopback);
+            let _ = resolve(MAPPED_LOOPBACK, &["203.0.113.10"], None, &loopback);
+            let _ = resolve("203.0.113.5", &[], None, &TrustedProxies::parse("10.9.9.9"));
+        });
+        assert!(quiet.is_empty(), "{quiet:#?}");
+    }
+
+    /// Send a request from `peer` (the TCP address the server sees).
+    async fn send_from(
+        app: &axum::Router,
+        peer: &str,
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 4000)));
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    fn basic(user: &str, pass: &str) -> String {
+        format!("Basic {}", STANDARD.encode(format!("{user}:{pass}")))
+    }
+
+    /// Behind the loopback proxy on a dual-stack socket (X02), one client's
+    /// wrong passwords lock out that client only: another client behind the
+    /// same proxy still gets in.
+    #[tokio::test]
+    async fn a_v4_mapped_proxy_keeps_its_clients_apart() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw"), ("bob", "bobpw")]);
+        let wrong = basic("bob", "wrong");
+        for _ in 0..6 {
+            let status = send_from(
+                &ctx.app,
+                MAPPED_LOOPBACK,
+                Method::GET,
+                "/v2/",
+                &[
+                    ("authorization", &wrong),
+                    ("x-forwarded-for", "203.0.113.10"),
+                ],
+            )
+            .await;
+            assert!(
+                matches!(
+                    status,
+                    StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS
+                ),
+                "{status}"
+            );
+        }
+        let good = basic("alice", "alicepw");
+        let other = send_from(
+            &ctx.app,
+            MAPPED_LOOPBACK,
+            Method::GET,
+            "/v2/",
+            &[
+                ("authorization", &good),
+                ("x-forwarded-for", "198.51.100.7"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            other,
+            StatusCode::OK,
+            "another client behind the proxy is locked out"
+        );
+        let same = send_from(
+            &ctx.app,
+            MAPPED_LOOPBACK,
+            Method::GET,
+            "/v2/",
+            &[
+                ("authorization", &good),
+                ("x-forwarded-for", "203.0.113.10"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            same,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the guessing client is not locked out"
+        );
+    }
+
+    /// The lockout counts wrong passwords (R2-48): while an address is locked
+    /// out, a valid API token sent as Bearer is served, and wrong Bearer tokens
+    /// do not lock an address out at all. A password stays refused.
+    #[tokio::test]
+    async fn a_valid_bearer_token_is_served_while_passwords_are_locked_out() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        let bearer = format!("Bearer {token}");
+        let wrong = basic("alice", "wrong");
+        for _ in 0..6 {
+            let _ = send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[("authorization", &wrong)],
+            )
+            .await;
+        }
+        let good = basic("alice", "alicepw");
+        assert_eq!(
+            send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[("authorization", &good)]
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "passwords from a locked-out address are refused"
+        );
+        assert_eq!(
+            send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[("authorization", &bearer)]
+            )
+            .await,
+            StatusCode::OK,
+            "a valid Bearer token from a locked-out address is refused"
+        );
+        // The served token did not lift the lockout of passwords.
+        assert_eq!(
+            send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[("authorization", &good)]
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a Bearer token lifted the password lockout"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_bearer_tokens_do_not_lock_an_address_out() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let bad = "Bearer nra_00000000000000000000000000000000";
+        for _ in 0..8 {
+            assert_eq!(
+                send_from(
+                    &ctx.app,
+                    "127.0.0.1",
+                    Method::GET,
+                    "/v2/",
+                    &[("authorization", bad)]
+                )
+                .await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let good = basic("alice", "alicepw");
+        assert_eq!(
+            send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[("authorization", &good)]
+            )
+            .await,
+            StatusCode::OK,
+            "wrong Bearer tokens locked the address out"
         );
     }
 }

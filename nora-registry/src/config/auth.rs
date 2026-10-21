@@ -5,14 +5,23 @@
 
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// CIDR-aware trusted proxy list for X-Forwarded-For validation.
 ///
 /// Only connections from trusted proxies have their XFF/X-Real-IP headers
 /// honored. Untrusted sources always use the peer (TCP) IP address.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, how a dual-stack socket sees
+/// an IPv4 peer) is its IPv4 address, in an entry and in an address checked.
 #[derive(Debug, Clone)]
 pub struct TrustedProxies {
     entries: Vec<(std::net::IpAddr, u8)>, // (network address, prefix length)
+    /// Set once forwarding headers from an untrusted peer have been warned
+    /// about; shared by the clones the limiters and the middleware hold.
+    untrusted_forwarding_warned: Arc<AtomicBool>,
 }
 
 impl TrustedProxies {
@@ -31,6 +40,7 @@ impl TrustedProxies {
                 ) {
                     let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
                     if prefix <= max_prefix {
+                        let (addr, prefix) = canonical_network(addr, prefix);
                         if prefix == 0 {
                             tracing::warn!(
                                 value = %item,
@@ -46,27 +56,34 @@ impl TrustedProxies {
                     tracing::warn!(value = %item, "Cannot parse CIDR, skipping");
                 }
             } else if let Ok(addr) = item.parse::<std::net::IpAddr>() {
+                let addr = addr.to_canonical();
                 let prefix = if addr.is_ipv4() { 32 } else { 128 };
                 entries.push((addr, prefix));
             } else {
                 tracing::warn!(value = %item, "Cannot parse IP address, skipping");
             }
         }
-        Self { entries }
+        Self::from_entries(entries)
+    }
+
+    fn from_entries(entries: Vec<(IpAddr, u8)>) -> Self {
+        Self {
+            entries,
+            untrusted_forwarding_warned: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Default: loopback only (127.0.0.1 and ::1).
     pub fn default_loopback() -> Self {
-        Self {
-            entries: vec![
-                (std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 32),
-                (std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 128),
-            ],
-        }
+        Self::from_entries(vec![
+            (std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 32),
+            (std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 128),
+        ])
     }
 
     /// Check if an IP address is within the trusted proxy list.
     pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        let ip = ip.to_canonical();
         self.entries.iter().any(|(network, prefix)| {
             match (network, ip) {
                 (std::net::IpAddr::V4(net), std::net::IpAddr::V4(addr)) => {
@@ -106,6 +123,55 @@ impl TrustedProxies {
     pub fn has_prefix_zero(&self) -> bool {
         self.entries.iter().any(|(_, prefix)| *prefix == 0)
     }
+
+    /// Warn, once for this setting, that `peer` sent forwarding headers that
+    /// are ignored because it is not a trusted proxy: every client behind such
+    /// a proxy is then one address to the lockout and the rate limits. Names
+    /// the peer and the setting, never the headers, which the client wrote.
+    pub fn warn_untrusted_forwarding(&self, peer: IpAddr) {
+        if self
+            .untrusted_forwarding_warned
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        tracing::warn!(
+            peer = %peer,
+            trusted_proxies = %self.listed(),
+            "X-Forwarded-For from a peer outside auth.trusted_proxies is ignored: the lockout and \
+             the rate limits count every client behind this peer as the peer itself. If NORA runs \
+             behind a proxy, add the proxy to auth.trusted_proxies (NORA_AUTH_TRUSTED_PROXIES)"
+        );
+    }
+
+    /// The entries as the comma-separated list the setting is written in.
+    fn listed(&self) -> String {
+        let parts: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(addr, prefix)| {
+                let max = if addr.is_ipv4() { 32 } else { 128 };
+                if *prefix == max {
+                    addr.to_string()
+                } else {
+                    format!("{}/{}", addr, prefix)
+                }
+            })
+            .collect();
+        parts.join(",")
+    }
+}
+
+/// A network given as an IPv4-mapped IPv6 address that covers only mapped
+/// addresses (prefix 96 or longer) is that IPv4 network.
+fn canonical_network(addr: IpAddr, prefix: u8) -> (IpAddr, u8) {
+    match addr {
+        IpAddr::V6(v6) if prefix >= 96 => match v6.to_ipv4_mapped() {
+            Some(v4) => (IpAddr::V4(v4), prefix - 96),
+            None => (addr, prefix),
+        },
+        _ => (addr, prefix),
+    }
 }
 
 impl Default for TrustedProxies {
@@ -121,19 +187,7 @@ impl Serialize for TrustedProxies {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        let parts: Vec<String> = self
-            .entries
-            .iter()
-            .map(|(addr, prefix)| {
-                let max = if addr.is_ipv4() { 32 } else { 128 };
-                if *prefix == max {
-                    addr.to_string()
-                } else {
-                    format!("{}/{}", addr, prefix)
-                }
-            })
-            .collect();
-        parts.join(",").serialize(serializer)
+        self.listed().serialize(serializer)
     }
 }
 
