@@ -42,6 +42,21 @@ pub struct ServerConfig {
     /// (up to 10 s) it fits Kubernetes' default 30 s grace period.
     #[serde(default = "default_shutdown_timeout")]
     pub shutdown_timeout: u64,
+    /// Seconds a client has to send a complete request head: the first one of a connection
+    /// from the accept, a later one from its first byte. A client that sends its head a byte
+    /// at a time cannot hold a connection longer. Default 30.
+    #[serde(default = "default_header_read_timeout")]
+    pub header_read_timeout: u64,
+    /// Seconds an idle keep-alive connection waits for the next request before it is
+    /// closed. Default 120: above the idle timeout of the reverse proxies in front (traefik
+    /// keeps idle backend connections 90 s, nginx 60 s), so the proxy, not NORA, closes an
+    /// idle connection and never sends a request into one NORA is closing.
+    #[serde(default = "default_keep_alive_timeout")]
+    pub keep_alive_timeout: u64,
+    /// Open client connections at most. Past it new connections wait in the listen backlog
+    /// until one closes. Keep it below the process's open-file limit. Default 4096.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 }
 
 pub(super) fn default_server_host() -> String {
@@ -68,6 +83,18 @@ pub(super) fn default_shutdown_timeout() -> u64 {
     15
 }
 
+pub(super) fn default_header_read_timeout() -> u64 {
+    30
+}
+
+pub(super) fn default_keep_alive_timeout() -> u64 {
+    120
+}
+
+pub(super) fn default_max_connections() -> usize {
+    4096
+}
+
 /// TLS configuration for outbound connections to upstream registries.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -85,6 +112,9 @@ impl Default for ServerConfig {
             body_limit_mb: default_body_limit_mb(),
             proxy_coalesce: default_proxy_coalesce(),
             shutdown_timeout: default_shutdown_timeout(),
+            header_read_timeout: default_header_read_timeout(),
+            keep_alive_timeout: default_keep_alive_timeout(),
+            max_connections: default_max_connections(),
             trust_upstream_dates: default_trust_upstream_dates(),
         }
     }
@@ -176,6 +206,23 @@ impl ServerConfig {
         if let Ok(val) = env::var("NORA_SHUTDOWN_TIMEOUT") {
             super::parse_env_warn("NORA_SHUTDOWN_TIMEOUT", &val, &mut self.shutdown_timeout);
         }
+        if let Ok(val) = env::var("NORA_HEADER_READ_TIMEOUT") {
+            super::parse_env_warn(
+                "NORA_HEADER_READ_TIMEOUT",
+                &val,
+                &mut self.header_read_timeout,
+            );
+        }
+        if let Ok(val) = env::var("NORA_KEEP_ALIVE_TIMEOUT") {
+            super::parse_env_warn(
+                "NORA_KEEP_ALIVE_TIMEOUT",
+                &val,
+                &mut self.keep_alive_timeout,
+            );
+        }
+        if let Ok(val) = env::var("NORA_MAX_CONNECTIONS") {
+            super::parse_env_warn("NORA_MAX_CONNECTIONS", &val, &mut self.max_connections);
+        }
         if let Ok(val) = env::var("NORA_TRUST_UPSTREAM_DATES") {
             super::parse_env_warn(
                 "NORA_TRUST_UPSTREAM_DATES",
@@ -203,15 +250,33 @@ mod tests {
         assert_eq!(config.shutdown_timeout, 4);
     }
 
+    /// The connection limits default to a 30 s head, a 120 s idle keep-alive (above
+    /// traefik's 90 s) and 4096 connections, and follow the env.
+    #[test]
+    fn connection_limits_default_and_env_override() {
+        let _lock = crate::test_env::env_lock();
+        let defaults = ServerConfig::default();
+        assert_eq!(defaults.header_read_timeout, 30);
+        assert_eq!(defaults.keep_alive_timeout, 120);
+        assert_eq!(defaults.max_connections, 4096);
+        let mut config = ServerConfig::default();
+        std::env::set_var("NORA_HEADER_READ_TIMEOUT", "5");
+        std::env::set_var("NORA_KEEP_ALIVE_TIMEOUT", "300");
+        std::env::set_var("NORA_MAX_CONNECTIONS", "64");
+        config.apply_env_overrides();
+        std::env::remove_var("NORA_HEADER_READ_TIMEOUT");
+        std::env::remove_var("NORA_KEEP_ALIVE_TIMEOUT");
+        std::env::remove_var("NORA_MAX_CONNECTIONS");
+        assert_eq!(config.header_read_timeout, 5);
+        assert_eq!(config.keep_alive_timeout, 300);
+        assert_eq!(config.max_connections, 64);
+    }
+
     fn server(host: &str, port: u16) -> ServerConfig {
         ServerConfig {
             host: host.to_string(),
             port,
-            public_url: None,
-            body_limit_mb: 2048,
-            proxy_coalesce: true,
-            trust_upstream_dates: false,
-            shutdown_timeout: 15,
+            ..ServerConfig::default()
         }
     }
 

@@ -1063,6 +1063,20 @@ impl Config {
             errors.push("server.port must not be 0".to_string());
         }
 
+        // 1a. Connection limits: a zero would close every connection at once or accept none.
+        for (key, value) in [
+            (
+                "server.header_read_timeout",
+                self.server.header_read_timeout,
+            ),
+            ("server.keep_alive_timeout", self.server.keep_alive_timeout),
+            ("server.max_connections", self.server.max_connections as u64),
+        ] {
+            if value == 0 {
+                errors.push(format!("{key} must not be 0"));
+            }
+        }
+
         // 1b. Wildcard host requires public_url (non-routable address → broken client URLs)
         {
             let host = &self.server.host;
@@ -3449,6 +3463,26 @@ proxies = [
         assert!(errors.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("body_limit_mb"));
+    }
+
+    /// A zero connection limit would close every connection at once or accept none.
+    #[test]
+    fn test_validate_connection_limits_zero() {
+        let _lock = env_lock();
+        for key in [
+            "header_read_timeout",
+            "keep_alive_timeout",
+            "max_connections",
+        ] {
+            let mut config = Config::default();
+            match key {
+                "header_read_timeout" => config.server.header_read_timeout = 0,
+                "keep_alive_timeout" => config.server.keep_alive_timeout = 0,
+                _ => config.server.max_connections = 0,
+            }
+            let (_, errors) = config.validate();
+            assert_eq!(errors, vec![format!("server.{key} must not be 0")]);
+        }
     }
 
     #[test]

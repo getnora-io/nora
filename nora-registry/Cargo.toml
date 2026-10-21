@@ -55,6 +55,11 @@ parking_lot = "0.12"
 zeroize = { version = "1.8", features = ["derive"] }
 argon2 = { version = "0.5", features = ["std", "rand"] }
 tower-http = { version = "0.6", features = ["set-header", "catch-panic"] }
+# The HTTP/1 and HTTP/2 server under axum, driven directly for the header and keep-alive
+# timeouts axum::serve does not set (C61); all three already in the tree through axum.
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "http2", "server-graceful", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
 percent-encoding = "2"
 subtle = "2"
 tokio-util = "0.7"
@@ -87,7 +92,6 @@ proptest = "1"
 tempfile = "3"
 wiremock = "0.6"
 criterion = { version = "0.8", features = ["html_reports"] }
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 insta = { version = "1", features = ["json"] }
 # Reads `impl Storage` for the list test of the UI storage boundary (already in the lock).

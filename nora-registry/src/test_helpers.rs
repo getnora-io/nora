@@ -166,6 +166,9 @@ fn build_context_full(
             // tests exercise the upstream-date path (prod default is false/secure;
             // the trust=false path has its own dedicated tests).
             shutdown_timeout: 15,
+            header_read_timeout: 30,
+            keep_alive_timeout: 120,
+            max_connections: 4096,
             trust_upstream_dates: true,
         },
         storage: StorageConfig {
