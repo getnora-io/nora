@@ -622,19 +622,27 @@ pub async fn auth_middleware(
         .and_then(|(ip, user)| state.auth_failures.check_blocked(ip, user));
 
     // Verify credentials: htpasswd first, then the token store (#736, #1094);
-    // `decide_basic_auth` has the rules, this applies its decision.
-    let htpasswd = state
-        .auth
-        .as_deref()
-        .map(|auth| move |user: &str, password: &str| auth.authenticate(user, password));
+    // `decide_basic_auth` has the rules, this applies its decision. The htpasswd check is
+    // async (bcrypt runs off the async workers, C02), so it runs here, on the credentials
+    // `decide_basic_auth` reads, and hands it the verdict.
     let tokens = state
         .tokens
         .as_ref()
         .map(|store| move |password: &str| store.verify_token(password));
     let decision = match locked_out {
-        None => decide_basic_auth(encoded, htpasswd, tokens, request.method(), is_admin),
-        // A locked-out account gets no password checked. An API token sent as
-        // the password cannot be guessed, so it is still verified, as over
+        None => {
+            let htpasswd_match = match (state.auth.as_deref(), basic_credentials(encoded)) {
+                (Some(htpasswd), Ok((user, password))) => htpasswd.verify(&user, &password).await,
+                _ => false,
+            };
+            let htpasswd = state
+                .auth
+                .as_deref()
+                .map(|_| move |_: &str, _: &str| htpasswd_match);
+            decide_basic_auth(encoded, htpasswd, tokens, request.method(), is_admin)
+        }
+        // A locked-out account gets no password checked, so no bcrypt runs for it. An API
+        // token sent as the password cannot be guessed, so it is still verified, as over
         // Bearer: Docker has no other way to present one.
         Some(retry_after) => match decide_basic_auth(
             encoded,
@@ -838,21 +846,15 @@ fn is_write_method(method: &Method) -> bool {
     [Method::PUT, Method::POST, Method::DELETE, Method::PATCH].contains(method)
 }
 
-/// Attempt to validate a Base64-encoded Basic auth credential against the
-/// htpasswd store. Returns the username on success, `None` on any failure.
-/// Used by the opportunistic-auth path on open web surfaces so that
-/// authenticated users get their real identity even on publicly browsable
-/// pages.
+/// The username of a Base64-encoded Basic credential that htpasswd has already accepted,
+/// `None` otherwise. Used by the opportunistic-auth path on open web surfaces so that
+/// authenticated users get their real identity even on publicly browsable pages. It runs
+/// no bcrypt (C02): an open path has no lockout and no limiter, so a flood of Basic
+/// headers there would cost a bcrypt each. Credentials count once a gated path (where the
+/// browser is challenged) has checked them.
 fn try_basic_auth(encoded: &str, auth: Option<&HtpasswdAuth>) -> Option<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let decoded = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
-    let (username, password) = decoded.split_once(':')?;
-    let htpasswd = auth?;
-    if htpasswd.authenticate(username, password) {
-        Some(username.to_string())
-    } else {
-        None
-    }
+    let (username, password) = basic_credentials(encoded).ok()?;
+    (auth?.verified(&username, &password) == Some(true)).then_some(username)
 }
 
 fn unauthorized_response(message: &str, realm: &str) -> Response {
@@ -2014,6 +2016,134 @@ mod integration_tests {
         assert!(
             !token_file_migrated(&ctx, "nra_witness"),
             "htpasswd matched, yet the token store read the password's token file"
+        );
+    }
+
+    /// bcrypt verifications the context's htpasswd provider has run.
+    fn bcrypt_runs(ctx: &crate::test_helpers::TestContext) -> usize {
+        ctx.state
+            .auth
+            .as_ref()
+            .unwrap()
+            .bcrypt_runs
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// C02: a probe or another open path never pays bcrypt for the Basic header it
+    /// carries, right or wrong; only the gated paths check htpasswd credentials.
+    #[tokio::test]
+    async fn an_open_path_never_runs_bcrypt() {
+        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        for creds in ["admin:wrong", "admin:secret"] {
+            for path in ["/health", "/ready", "/"] {
+                let header_val = format!("Basic {}", STANDARD.encode(creds));
+                let response = send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    path,
+                    vec![("authorization", &header_val)],
+                    Vec::new(),
+                )
+                .await;
+                assert_ne!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            }
+        }
+        assert_eq!(bcrypt_runs(&ctx), 0, "an open path ran bcrypt");
+    }
+
+    /// C02: a CI job whose Basic username is an htpasswd user and whose password is an
+    /// API token pays bcrypt once, not on every request; it still authenticates as the
+    /// token's owner each time.
+    #[tokio::test]
+    async fn basic_with_an_api_token_pays_bcrypt_once() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let token = mint(&ctx, crate::tokens::Role::Read);
+        let header_val = basic_header("alice", &token);
+        for _ in 0..5 {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/npm/-/whoami",
+                vec![("authorization", &header_val)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let json: serde_json::Value =
+                serde_json::from_slice(&body_bytes(response).await).unwrap();
+            assert_eq!(json["username"], TOKEN_OWNER);
+        }
+        assert_eq!(bcrypt_runs(&ctx), 1);
+    }
+
+    /// The same for a valid htpasswd login: one bcrypt, then the verdict is remembered.
+    #[tokio::test]
+    async fn a_valid_htpasswd_login_pays_bcrypt_once() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let header_val = basic_header("alice", "alicepw");
+        for _ in 0..5 {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/npm/-/whoami",
+                vec![("authorization", &header_val)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(bcrypt_runs(&ctx), 1);
+    }
+
+    /// C02: bcrypt does not run on an async worker. On a one-thread runtime a probe sent
+    /// while a Basic login is being checked against a slow hash answers at once, instead
+    /// of after the hash.
+    #[tokio::test]
+    async fn a_probe_is_not_held_up_by_a_bcrypt_check() {
+        use std::time::{Duration, Instant};
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("htpasswd");
+        let hash = bcrypt::hash("slowpw", 10).unwrap();
+        std::fs::write(&path, format!("slow:{hash}\n")).unwrap();
+        let started = Instant::now();
+        assert!(!bcrypt::verify("wrong", &hash).unwrap());
+        let one_check = started.elapsed();
+        assert!(one_check >= Duration::from_millis(20), "{one_check:?}");
+
+        let mut state = ctx.state.clone();
+        state.auth = Some(std::sync::Arc::new(
+            super::HtpasswdAuth::from_file(&path).unwrap(),
+        ));
+        // The probe is the open path `/` with no I/O of its own (`/health` fsyncs a probe
+        // file, which under a loaded disk takes long enough to blur the measure).
+        let routes = axum::Router::new()
+            .route("/raw/x", axum::routing::get(|| async { "x" }))
+            .route("/", axum::routing::get(|| async { "probe" }));
+        let app = crate::request_layers(routes, &state).with_state(state);
+
+        // One thread: the login is polled first. Checked on this thread, its bcrypt runs
+        // before the probe is polled at all, and the probe's time since t0 includes it.
+        let header_val = basic_header("slow", "wrong");
+        let t0 = Instant::now();
+        let (login, (probe, probe_took)) = tokio::join!(
+            send_with_headers(
+                &app,
+                Method::GET,
+                "/raw/x",
+                vec![("authorization", &header_val)],
+                Vec::new(),
+            ),
+            async {
+                let response = send_with_headers(&app, Method::GET, "/", vec![], Vec::new()).await;
+                (response.status(), t0.elapsed())
+            }
+        );
+        assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(probe, StatusCode::OK);
+        assert!(
+            probe_took < one_check / 2,
+            "the probe waited for bcrypt: {probe_took:?} (one check {one_check:?})"
         );
     }
 
@@ -3952,18 +4082,29 @@ mod web_surface_gating_tests {
 
     // -- #934: opportunistic auth on open web surfaces --
 
-    /// try_basic_auth returns the username for valid htpasswd credentials.
-    #[test]
-    fn test_try_basic_auth_valid() {
+    /// try_basic_auth returns the username for valid htpasswd credentials once htpasswd
+    /// has checked them, and runs no bcrypt itself (C02): before the check, the caller is
+    /// anonymous.
+    #[tokio::test]
+    async fn test_try_basic_auth_valid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("htpasswd");
         let hash = bcrypt::hash("secret", 4).unwrap();
         std::fs::write(&path, format!("admin:{hash}\n")).unwrap();
         let htpasswd = super::HtpasswdAuth::from_file(&path).unwrap();
         let encoded = STANDARD.encode("admin:secret");
+        assert_eq!(super::try_basic_auth(&encoded, Some(&htpasswd)), None);
+        assert!(htpasswd.verify("admin", "secret").await);
         assert_eq!(
             super::try_basic_auth(&encoded, Some(&htpasswd)),
             Some("admin".to_string())
+        );
+        assert_eq!(
+            htpasswd
+                .bcrypt_runs
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the check ran bcrypt"
         );
     }
 
@@ -3992,8 +4133,8 @@ mod web_surface_gating_tests {
         assert_eq!(super::try_basic_auth("%%%not-base64%%%", None), None);
     }
 
-    /// On an open web surface (anonymous_read=true), valid Basic credentials
-    /// must produce a real AuthenticatedUser — not "anonymous". Verified via
+    /// On an open web surface (anonymous_read=true), valid Basic credentials that
+    /// htpasswd has checked must produce a real AuthenticatedUser — not "anonymous". Verified via
     /// /api/ui/dashboard: anonymous sees empty proxy_upstreams; authenticated
     /// sees the configured npm upstream.
     #[tokio::test]
@@ -4014,16 +4155,50 @@ mod web_surface_gating_tests {
             );
         }
 
-        // Valid Basic creds: proxy_upstreams populated
+        // Valid Basic creds htpasswd has not checked yet: the open path runs no bcrypt
+        // (C02), so the caller browses as anonymous.
         let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let dashboard = || {
+            send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/api/ui/dashboard",
+                vec![("authorization", &header_val)],
+                "",
+            )
+        };
+        let npm_upstreams = |json: serde_json::Value| {
+            json["mount_points"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["registry"].as_str() == Some("npm"))
+                .expect("npm mount")["proxy_upstreams"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let resp = dashboard().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(
+            npm_upstreams(json),
+            0,
+            "unchecked credentials are anonymous"
+        );
+
+        // A gated page checks them (a browser sends them after its challenge); from then on
+        // the open surface knows the caller: proxy_upstreams populated.
         let resp = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/api/ui/dashboard",
+            "/api/ui/tokens",
             vec![("authorization", &header_val)],
             "",
         )
         .await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = dashboard().await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();

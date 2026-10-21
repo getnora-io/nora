@@ -87,7 +87,7 @@ async fn create_token(
         None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
     };
 
-    if !auth.authenticate(&req.username, &req.password) {
+    if !auth.verify(&req.username, &req.password).await {
         state.auth_failures.record_failure(client_ip, &req.username);
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
@@ -186,7 +186,7 @@ async fn list_tokens(
         None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
     };
 
-    if !auth.authenticate(&req.username, &req.password) {
+    if !auth.verify(&req.username, &req.password).await {
         state.auth_failures.record_failure(client_ip, &req.username);
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
@@ -254,7 +254,7 @@ async fn revoke_token(
         None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
     };
 
-    if !auth.authenticate(&req.username, &req.password) {
+    if !auth.verify(&req.username, &req.password).await {
         state.auth_failures.record_failure(client_ip, &req.username);
         return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
     }
