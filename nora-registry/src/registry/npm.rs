@@ -1800,6 +1800,63 @@ fn is_valid_attachment_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@'))
 }
 
+/// Why a publish's attachments were refused.
+#[derive(Debug, thiserror::Error)]
+enum AttachmentRefused {
+    #[error("Invalid attachment filename")]
+    InvalidName,
+    #[error("attachment {0} is not the tarball of a version this publish carries")]
+    NotThisPublish(String),
+    #[error("Invalid base64 in attachment")]
+    Base64(#[from] base64::DecodeError),
+}
+
+/// The tarballs a publish stores: each attachment decoded, under its tarball key. Every attachment
+/// must be the tarball (`<name>-<version>.tgz`, the name with or without its scope) of a version
+/// the same payload publishes; anything else — another version's tarball, a key beside one,
+/// another package's — refuses the whole publish before anything is stored, so a publish cannot
+/// replace bytes clients installed or the pin they are checked against.
+fn publish_tarballs(
+    package_name: &str,
+    attachments: &serde_json::Map<String, serde_json::Value>,
+    versions: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<(String, Vec<u8>)>, AttachmentRefused> {
+    let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
+    let mut tarballs = Vec::with_capacity(attachments.len());
+    for (filename, attachment) in attachments {
+        // Scoped packages (e.g. @scope/name) may have attachment filenames
+        // like "@scope/name-1.0.0.tgz". Strip the scope prefix since it is
+        // already captured in the package name — the filename part must be a
+        // flat name without path separators to prevent path traversal.
+        let normalized_name = match package_name.find('/') {
+            Some(scope_end) => filename
+                .strip_prefix(&package_name[..=scope_end])
+                .unwrap_or(filename),
+            None => filename,
+        };
+        if !is_valid_attachment_name(normalized_name) {
+            return Err(AttachmentRefused::InvalidName);
+        }
+        let of_this_publish = versions
+            .keys()
+            .any(|version| normalized_name == format!("{short_name}-{version}.tgz"));
+        if !of_this_publish {
+            return Err(AttachmentRefused::NotThisPublish(
+                normalized_name.to_string(),
+            ));
+        }
+        let Some(data) = attachment.get("data").and_then(|d| d.as_str()) else {
+            continue;
+        };
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+        tarballs.push((
+            format!("npm/{package_name}/tarballs/{normalized_name}"),
+            bytes,
+        ));
+    }
+    Ok(tarballs)
+}
+
 async fn handle_publish(
     State(state): State<AppState>,
     Path(path): Path<String>,
@@ -1851,6 +1908,19 @@ async fn handle_publish(
     let new_versions = match payload.get("versions").and_then(|v| v.as_object()) {
         Some(v) => v,
         None => return (StatusCode::BAD_REQUEST, "Missing versions").into_response(),
+    };
+
+    // Every attachment is checked, and decoded, before anything is stored.
+    let tarballs = match publish_tarballs(&package_name, attachments, new_versions) {
+        Ok(tarballs) => tarballs,
+        Err(refused) => {
+            tracing::warn!(
+                package = %package_name,
+                reason = %refused,
+                "SECURITY: npm publish rejected — attachment refused"
+            );
+            return (StatusCode::BAD_REQUEST, refused.to_string()).into_response();
+        }
     };
 
     // Lock per package to serialize the packument regeneration within one process.
@@ -1945,47 +2015,14 @@ async fn handle_publish(
     }
 
     // Store tarballs
-    for (filename, attachment_data) in attachments {
-        // Scoped packages (e.g. @scope/name) may have attachment filenames
-        // like "@scope/name-1.0.0.tgz". Strip the scope prefix since it is
-        // already captured in the package name — the filename part must be a
-        // flat name without path separators to prevent path traversal.
-        let normalized_name = if let Some(scope_end) = package_name.find('/') {
-            let scope_prefix = &package_name[..=scope_end];
-            filename.strip_prefix(scope_prefix).unwrap_or(filename)
-        } else {
-            filename
-        };
-
-        if !is_valid_attachment_name(normalized_name) {
-            tracing::warn!(
-                filename = %filename,
-                package = %package_name,
-                "SECURITY: npm publish rejected — invalid attachment filename"
-            );
-            return (StatusCode::BAD_REQUEST, "Invalid attachment filename").into_response();
-        }
-
-        let base64_data = match attachment_data.get("data").and_then(|d| d.as_str()) {
-            Some(d) => d,
-            None => continue,
-        };
-
-        let tarball_bytes = match base64::engine::general_purpose::STANDARD.decode(base64_data) {
-            Ok(b) => b,
-            Err(_) => {
-                return (StatusCode::BAD_REQUEST, "Invalid base64 in attachment").into_response()
-            }
-        };
-
-        let tarball_key = format!("npm/{}/tarballs/{}", package_name, normalized_name);
-        if let Err(e) = state.storage.put(&tarball_key, &tarball_bytes).await {
+    for (tarball_key, tarball_bytes) in &tarballs {
+        if let Err(e) = state.storage.put(tarball_key, tarball_bytes).await {
             tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to store tarball");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
 
         // Store sha256
-        let hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
+        let hash = hex::encode(sha2::Sha256::digest(tarball_bytes));
         let hash_key = format!("{}.sha256", tarball_key);
         if let Err(e) = state.storage.put(&hash_key, hash.as_bytes()).await {
             tracing::warn!(key = %hash_key, error = ?e, "npm publish: failed to store hash sidecar");
@@ -8455,5 +8492,179 @@ mod quarantine_first_seen {
         let up = upstream().await;
         let ctx = context(&up, true);
         assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
+    }
+}
+
+/// A publish stores the tarballs of the versions it publishes, and nothing else (R2-19). An
+/// attachment named for another version — one already published included — or for a key beside
+/// a tarball would replace bytes clients already installed, and the pin NORA checks them against.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod publish_attachments {
+    use crate::test_helpers::{create_test_context, send, TestContext};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use base64::Engine;
+    use sha2::Digest;
+    use std::collections::BTreeMap;
+
+    /// PUT a publish of `name` carrying `versions` and `attachments` (file name, bytes).
+    async fn publish(
+        ctx: &TestContext,
+        name: &str,
+        versions: &[&str],
+        attachments: &[(&str, &[u8])],
+    ) -> StatusCode {
+        let versions: serde_json::Map<String, serde_json::Value> = versions
+            .iter()
+            .map(|v| {
+                (
+                    v.to_string(),
+                    serde_json::json!({ "name": name, "version": v, "dist": {} }),
+                )
+            })
+            .collect();
+        let attachments: serde_json::Map<String, serde_json::Value> = attachments
+            .iter()
+            .map(|(file, data)| {
+                (
+                    file.to_string(),
+                    serde_json::json!({
+                        "data": base64::engine::general_purpose::STANDARD.encode(data)
+                    }),
+                )
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "name": name,
+            "versions": versions,
+            "_attachments": attachments,
+        });
+        send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/npm/{name}"),
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await
+        .status()
+    }
+
+    /// Every object stored for `name`, and its bytes.
+    async fn stored(ctx: &TestContext, name: &str) -> BTreeMap<String, Vec<u8>> {
+        let mut objects = BTreeMap::new();
+        for key in ctx
+            .state
+            .storage
+            .list(&format!("npm/{name}/"))
+            .await
+            .unwrap()
+        {
+            let data = ctx.state.storage.get(&key).await.unwrap();
+            objects.insert(key, data.to_vec());
+        }
+        objects
+    }
+
+    #[tokio::test]
+    async fn a_publish_cannot_replace_a_published_tarball_or_its_pin() {
+        let ctx = create_test_context();
+        assert_eq!(
+            publish(&ctx, "foo", &["1.0.0"], &[("foo-1.0.0.tgz", b"good")]).await,
+            StatusCode::CREATED
+        );
+        let before = stored(&ctx, "foo").await;
+        assert_eq!(before["npm/foo/tarballs/foo-1.0.0.tgz"], b"good");
+        let evil_pin = hex::encode(sha2::Sha256::digest(b"evil"));
+        let refused: [&[(&str, &[u8])]; 6] = [
+            // The tarball of a version already published, beside the one being published.
+            &[("foo-1.0.1.tgz", b"next"), ("foo-1.0.0.tgz", b"evil")],
+            // The pin beside a published tarball.
+            &[
+                ("foo-1.0.1.tgz", b"next"),
+                ("foo-1.0.0.tgz.sha256", evil_pin.as_bytes()),
+            ],
+            // Another package's tarball.
+            &[("foo-1.0.1.tgz", b"next"), ("bar-1.0.1.tgz", b"bar")],
+            // A key beside the tarball being published.
+            &[("foo-1.0.1.tgz", b"next"), ("foo-1.0.1.tgz.sha256", b"pin")],
+            // Only a published version's tarball.
+            &[("foo-1.0.0.tgz", b"evil")],
+            // A version's tarball under another name.
+            &[("foo-1.0.1.tar.gz", b"next")],
+        ];
+        for attachments in refused {
+            let names: Vec<&str> = attachments.iter().map(|(file, _)| *file).collect();
+            assert_eq!(
+                publish(&ctx, "foo", &["1.0.1"], attachments).await,
+                StatusCode::BAD_REQUEST,
+                "{names:?}"
+            );
+            assert_eq!(
+                stored(&ctx, "foo").await,
+                before,
+                "a refused publish stored something: {names:?}"
+            );
+        }
+        // An attachment that does not decode refuses the publish before its other tarballs are
+        // stored.
+        let payload = serde_json::json!({
+            "name": "foo",
+            "versions": {
+                "1.0.1": { "name": "foo", "version": "1.0.1", "dist": {} },
+                "1.0.2": { "name": "foo", "version": "1.0.2", "dist": {} },
+            },
+            "_attachments": {
+                "foo-1.0.1.tgz": { "data": base64::engine::general_purpose::STANDARD.encode(b"next") },
+                "foo-1.0.2.tgz": { "data": "not base64!" },
+            },
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/foo",
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(stored(&ctx, "foo").await, before);
+        // The tarball of the version it publishes is all a publish needs.
+        assert_eq!(
+            publish(&ctx, "foo", &["1.0.1"], &[("foo-1.0.1.tgz", b"next")]).await,
+            StatusCode::CREATED
+        );
+        let after = stored(&ctx, "foo").await;
+        assert_eq!(after["npm/foo/tarballs/foo-1.0.0.tgz"], b"good");
+        assert_eq!(after["npm/foo/tarballs/foo-1.0.1.tgz"], b"next");
+    }
+
+    #[tokio::test]
+    async fn a_scoped_publish_carries_its_own_tarball_only() {
+        let ctx = create_test_context();
+        assert_eq!(
+            publish(&ctx, "@s/pkg", &["1.0.0"], &[("@s/pkg-1.0.0.tgz", b"good")]).await,
+            StatusCode::CREATED
+        );
+        let before = stored(&ctx, "@s/pkg").await;
+        assert_eq!(
+            publish(
+                &ctx,
+                "@s/pkg",
+                &["1.0.1"],
+                &[("@s/pkg-1.0.1.tgz", b"next"), ("@s/pkg-1.0.0.tgz", b"evil")]
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(stored(&ctx, "@s/pkg").await, before);
+        // The attachment may name the package with its scope or without it.
+        assert_eq!(
+            publish(&ctx, "@s/pkg", &["1.0.1"], &[("pkg-1.0.1.tgz", b"next")]).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            stored(&ctx, "@s/pkg").await["npm/@s/pkg/tarballs/pkg-1.0.1.tgz"],
+            b"next"
+        );
     }
 }
