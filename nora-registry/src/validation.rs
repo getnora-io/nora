@@ -389,12 +389,24 @@ pub fn validate_docker_reference(reference: &str) -> Result<(), ValidationError>
     Ok(())
 }
 
-/// Middleware that rejects requests with null bytes in the URI path.
+/// Middleware that rejects requests with null bytes or double-encoding in the URI path.
 ///
 /// Null bytes in URLs are used in path-traversal attacks. Axum URL-decodes
 /// `%00` before passing the path to handlers, which can cause panics or
 /// unexpected 500 errors. This middleware intercepts null bytes early and
 /// returns a clean 400 Bad Request.
+///
+/// It ALSO rejects any raw path carrying an encoded percent sign (`%25`), the
+/// signature of double- (or deeper) encoding. Handlers validate and match names
+/// on the path as the router decoded it ONCE (`validate_storage_key`, the
+/// curation blocklist, `internal_namespaces`), but the effective name/path is
+/// decoded AGAIN downstream — by `reqwest`/`Url` when building the upstream URL
+/// (`%2e%2e` collapses → path traversal past the upstream prefix, carrying NORA's
+/// proxy credential) and by the upstream server itself (`%65`→`e`, `%40`→`@` →
+/// a blocklisted or internal name slips the guard). A legitimate registry path
+/// never carries a literal `%`, so refusing `%25` closes the whole over-encoding
+/// class at every depth and for every format at one chokepoint, before auth and
+/// before any handler.
 pub async fn reject_null_bytes_middleware(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path();
 
@@ -404,6 +416,19 @@ pub async fn reject_null_bytes_middleware(request: Request<Body>, next: Next) ->
         return (
             StatusCode::BAD_REQUEST,
             "Bad Request: null byte in URL path",
+        )
+            .into_response();
+    }
+
+    // Reject double-encoding: a raw `%25` is an encoded `%`, so the string the
+    // handler sees after one decode still holds a `%XX` that a downstream decode
+    // (reqwest/Url, or the upstream server) resolves — smuggling `..`/`/` or an
+    // alias past name- and path-based checks. Registry paths never carry a
+    // literal `%`; refuse it (covers `%252e`, `%2565`, `%2540`, `%25252e`, …).
+    if path.contains("%25") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "Bad Request: double-encoded sequence in URL path",
         )
             .into_response();
     }
@@ -1157,5 +1182,82 @@ mod namespace_match_tests {
         ] {
             assert!(!namespace_match(pattern, value), "{pattern} {value}");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod encoding_guard_tests {
+    //! Direct unit tests for `reject_null_bytes_middleware` on its OWN minimal
+    //! router. The integration test router (test_helpers) deliberately omits the
+    //! edge middleware stack (pinned by `middleware_stack_whitelist`), so this
+    //! edge guard is exercised here, not there. Regression for the double-encoding
+    //! class: upstream-URL traversal carrying the proxy credential, and the curation
+    //! blocklist / internal_namespaces alias — both ride `%25` double-encoding.
+    use super::reject_null_bytes_middleware;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+    use tower::ServiceExt;
+
+    fn guarded() -> Router {
+        Router::new()
+            .route("/{*p}", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn(reject_null_bytes_middleware))
+    }
+
+    async fn status(uri: &str) -> StatusCode {
+        let req = Request::builder().uri(uri).body(Body::empty()).unwrap();
+        guarded().oneshot(req).await.unwrap().status()
+    }
+
+    #[tokio::test]
+    async fn rejects_double_encoding_at_every_depth_and_form() {
+        for uri in [
+            "/npm/%252e%252e/x",     // double-encoded `..`  -> traversal past prefix
+            "/go/%25252e%25252e/x",  // triple-encoded `..`  -> second decode downstream
+            "/npm/%2565vil-pkg",     // double-encoded `e`   -> blocklist alias
+            "/npm/%2540acme%2Fcore", // double-encoded `@`   -> internal-namespace alias
+        ] {
+            assert_eq!(
+                status(uri).await,
+                StatusCode::BAD_REQUEST,
+                "must reject {uri}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn passes_legitimate_singly_encoded_paths() {
+        // No literal `%` reaches the handler once decoded: the edge guard is a
+        // no-op and the handler-level checks own these paths. `%2F` is a slash,
+        // not `%25`, so a scoped npm name passes the edge.
+        for uri in ["/npm/acme-core", "/npm/@acme%2Fcore"] {
+            assert_eq!(status(uri).await, StatusCode::OK, "must pass {uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn null_byte_clause_keeps_precedence() {
+        // `%2500` matches both clauses; the null-byte check runs first.
+        let req = Request::builder()
+            .uri("/x/%2500")
+            .body(Body::empty())
+            .unwrap();
+        let resp = guarded().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let b = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        assert!(String::from_utf8_lossy(&b).contains("null byte"));
+
+        // A pure `%25` (not `%2500`) reports the double-encoding reason.
+        let req = Request::builder()
+            .uri("/npm/%252e")
+            .body(Body::empty())
+            .unwrap();
+        let resp = guarded().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let b = to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        assert!(String::from_utf8_lossy(&b).contains("double-encoded"));
     }
 }
