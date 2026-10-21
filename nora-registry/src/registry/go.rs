@@ -130,7 +130,8 @@ async fn handle(
     //    revalidated against upstream before serving — otherwise a newly published version never
     //    appears — unless there is no upstream (locally authoritative) or the cached copy is still
     //    within the positive `metadata_ttl` window. `cached` is kept for the stale-on-error path.
-    let cached = state.storage.get(&storage_key).await.ok();
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
     let modified = if cached.is_some() && is_mutable {
         state.storage.stat(&storage_key).await.map(|m| m.modified)
     } else {
@@ -230,6 +231,20 @@ async fn handle(
     }
 
     // 2. Try upstream proxy
+    // An internal-namespace module whose copy the store could not read is unavailable, not
+    // absent — with or without an upstream.
+    if let Some(e) = &read_failure {
+        let module_path =
+            decode_module_path(&module_encoded).unwrap_or_else(|_| module_encoded.clone());
+        if crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Go,
+            &module_path,
+        ) {
+            return crate::registry::local_copy_unreadable("go", &storage_key, e);
+        }
+    }
+
     let proxy_url = match &state.config.go.proxy {
         Some(url) => url.clone(),
         None => return StatusCode::NOT_FOUND.into_response(),

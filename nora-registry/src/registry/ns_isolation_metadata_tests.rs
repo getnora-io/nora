@@ -1226,3 +1226,70 @@ async fn an_internal_package_whose_copy_cannot_be_read_is_unavailable_not_absent
         "upstream asked while reads fail: {asked:?}"
     );
 }
+
+/// The same for the other formats' downloads: an internal package's copy that the store could
+/// not read answers 503, never 403 or 404.
+#[tokio::test]
+async fn an_internal_download_of_every_other_format_on_a_store_that_cannot_be_read_is_503() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    let stored = [
+        (
+            "/gems/gems/internalpkg-1.0.0.gem",
+            "gems/gems/internalpkg-1.0.0.gem",
+        ),
+        (
+            "/gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
+            "gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
+        ),
+        (
+            "/maven2/internalpkg/lib/1.0/lib-1.0.jar",
+            "maven/internalpkg/lib/1.0/lib-1.0.jar",
+        ),
+        (
+            "/maven2/internalpkg/lib/maven-metadata.xml",
+            "maven/internalpkg/lib/maven-metadata.xml",
+        ),
+        (
+            "/pub/packages/internalpkg/versions/1.0.0.tar.gz",
+            "pub/packages/internalpkg/versions/1.0.0.tar.gz",
+        ),
+        (
+            "/ansible/download/internalns-coll-1.0.0.tar.gz",
+            "ansible/download/internalns-coll-1.0.0.tar.gz",
+        ),
+        (
+            "/go/internal.corp/lib/@v/v1.0.0.zip",
+            "go/internal.corp/lib/@v/v1.0.0.zip",
+        ),
+        (
+            "/cargo/api/v1/crates/internalpkg/1.0.0/download",
+            "cargo/internalpkg/1.0.0/internalpkg-1.0.0.crate",
+        ),
+    ];
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.gems.enabled = true;
+        c.pub_dart.enabled = true;
+        c.ansible.enabled = true;
+    });
+    for (_, key) in stored {
+        ctx.state.storage.put(key, b"local copy").await.unwrap();
+    }
+    for (path, _) in stored {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path} with the store up");
+    }
+    outage.begin();
+    let mut wrong = Vec::new();
+    for (path, _) in stored {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            wrong.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "internal packages answered other than 503 with the store down: {wrong:#?}"
+    );
+}

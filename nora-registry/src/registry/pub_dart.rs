@@ -534,7 +534,9 @@ async fn download_archive(
     // get_verified discharges the integrity witness at the serve site (compile-time
     // guarantee — see crate::verified). The .sha256 sidecar check below is kept: it
     // is the integrity check on S3 (storage pins are local-only).
-    if let Ok(outcome) = state.storage.get_verified(&key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -625,6 +627,9 @@ async fn download_archive(
 
     // #733: an internal-namespace package with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("pub", &key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::PubDart,

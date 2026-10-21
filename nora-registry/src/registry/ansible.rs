@@ -350,7 +350,9 @@ async fn download_tarball(
 
     // Immutable cache. get_verified discharges the integrity witness at serve
     // (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -426,6 +428,9 @@ async fn download_tarball(
 
     // #733: an internal-namespace collection with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("ansible", &storage_key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Ansible,

@@ -551,7 +551,9 @@ async fn download(
     // raw or merely tamper-evident bytes on this path is a compile error. An
     // open-world read (unpinned key / S3 backend) is served knowingly, never
     // silently. (Typestate rollout — see `crate::verified`, raw.rs is the PoC.)
-    if let Ok(outcome) = state.storage.get_verified(&key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         // A stored copy of a version that is not published, under a name with a canon record: of a
         // published crate it is an upstream's bytes or a removed version and is never served; under a
@@ -654,6 +656,9 @@ async fn download(
 
     // #733: an internal-namespace crate with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("cargo", &key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Cargo,

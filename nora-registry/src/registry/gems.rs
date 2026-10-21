@@ -474,7 +474,9 @@ async fn download_gem(
 
     // Immutable: if cached, serve directly. get_verified discharges the integrity
     // witness at the serve site (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -519,8 +521,12 @@ async fn download_gem(
         return response;
     }
 
-    // #733: an internal-namespace gem with no local copy is never proxied upstream.
+    // #733: an internal-namespace gem with no local copy is never proxied upstream; one whose
+    // copy the store could not read is unavailable, not absent.
     if let Some(name) = &internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("gems", &storage_key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Gems,
@@ -621,7 +627,9 @@ async fn download_gemspec(
     };
 
     // Immutable cache. get_verified discharges the integrity witness at serve.
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -664,7 +672,11 @@ async fn download_gemspec(
     }
 
     // #68 namespace isolation: a cached internal gem's spec was served above; an
-    // internal name with no local copy must not be fetched upstream.
+    // internal name with no local copy must not be fetched upstream, and one whose copy the
+    // store could not read is unavailable, not absent.
+    if let Some(e) = read_failure.as_ref().filter(|_| internal.is_some()) {
+        return crate::registry::local_copy_unreadable("gems", &storage_key, e);
+    }
     if let Some(response) = internal.as_deref().and_then(|name| {
         crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
