@@ -796,9 +796,17 @@ async fn handle_request(
     // A tarball of a published package that NORA does not store is no version of it: the upstream
     // is not asked, so what it has under the name is neither served nor stored beside the published
     // versions (as for cargo, #1158). The packument lists the published versions only, so only a
-    // direct or locked URL gets here.
-    if let Published::Yes(_) = published_state(&state.storage, &package_name).await {
-        return StatusCode::NOT_FOUND.into_response();
+    // direct or locked URL gets here. When the published versions cannot be listed NORA cannot
+    // tell whether the name is its own: unavailable (503), the upstream not asked.
+    match published_state(&state.storage, &package_name).await {
+        Published::Yes(_) => return StatusCode::NOT_FOUND.into_response(),
+        Published::Unknown => {
+            return crate::registry::storage_unavailable(
+                "npm",
+                &format!("npm/{package_name}/versions/"),
+            )
+        }
+        Published::No => {}
     }
 
     // --- Proxy fetch path ---
@@ -1366,11 +1374,8 @@ async fn serve_dist_tags(
                 Ok(data) if is_assembled_by_nora(&state.storage, &key, &data).await => {
                     Some(data.to_vec())
                 }
-                // An internal package's tags are in its own keys, which cannot be read now.
-                _ if is_internal(state, name) => {
-                    return crate::registry::storage_unavailable("npm", &key)
-                }
-                _ => None,
+                // Without one NORA cannot tell whether the tags are its own.
+                _ => return crate::registry::storage_unavailable("npm", &key),
             }
         }
         Published::No => None,
@@ -1576,7 +1581,7 @@ async fn serve_metadata(
         }
         // The listing failed. A packument NORA assembled is still here: the package is published,
         // and its documents are served as they are, read only. Without one, or with an upstream copy
-        // in its place, the upstream answers this request and nothing is cached.
+        // in its place, the package is unavailable and no upstream is asked.
         Published::Unknown => {
             let key = published_packument_key(name);
             match state.storage.get(&key).await {
@@ -1584,10 +1589,10 @@ async fn serve_metadata(
                     None => packument_response(headers, data),
                     Some(spec) => published_version_manifest(state, name, spec).await,
                 },
-                // An internal package is answered from its own keys only, and they cannot be
-                // read now: unavailable, not absent.
-                _ if is_internal(state, name) => crate::registry::storage_unavailable("npm", &key),
-                _ => uncached_upstream_metadata(state, headers, path, name).await,
+                // Without one NORA cannot tell whether the package is its own: unavailable (503), as
+                // cargo answers a crate it cannot tell is published. A published name is never an
+                // upstream's to answer for.
+                _ => crate::registry::storage_unavailable("npm", &key),
             }
         }
     }
@@ -1701,7 +1706,8 @@ fn rewrite_for_nora(state: &AppState, data: &[u8], proxy_url: &str, path: &str) 
 }
 
 /// The document an upstream serves for `path`, for this request only: nothing is cached. Used
-/// when NORA cannot tell whether the package is published, so no guess is stored.
+/// for registry endpoints such as search, and for the dist-tags of a package NORA has not
+/// published.
 async fn uncached_upstream_metadata(
     state: &AppState,
     headers: &HeaderMap,
@@ -7791,7 +7797,8 @@ mod published_and_upstream_keys {
         let resp = send(&ctx.app, Method::GET, "/npm/corp-lib/1.0.0", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(asked(&server, "corp-lib").await, 0);
-        // An upstream copy in its place is not taken for NORA's own: the upstream answers.
+        // An upstream copy in its place is not taken for NORA's own, and NORA cannot tell whether
+        // the package is published: unavailable, the upstream not asked.
         let copy = serde_json::to_vec(&doc("corp-lib", &["9.9.9"])).unwrap();
         put_with_origin(
             &ctx.state.storage,
@@ -7801,8 +7808,9 @@ mod published_and_upstream_keys {
         )
         .await
         .unwrap();
-        assert_eq!(versions(&ctx, "/npm/corp-lib").await, ["9.9.9"]);
-        assert!(asked(&server, "corp-lib").await > 0);
+        let resp = send(&ctx.app, Method::GET, "/npm/corp-lib", "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(asked(&server, "corp-lib").await, 0);
     }
 
     /// Round 1 fixture (M02): with the versions listing failing and the assembled packument
@@ -8017,6 +8025,7 @@ mod published_and_upstream_keys {
         )
         .await
         .unwrap();
+        // With an upstream copy in its place NORA cannot tell whether the tags are its own.
         let resp = send(
             &ctx.app,
             Method::GET,
@@ -8024,8 +8033,8 @@ mod published_and_upstream_keys {
             "",
         )
         .await;
-        let tags: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(tags["latest"], "9.9.9");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     /// R9 finding: a store that lists no versions for a published package (a local directory it
@@ -8075,10 +8084,12 @@ mod published_and_upstream_keys {
         assert_eq!(asked(&server, "corp-lib").await, 0);
     }
 
-    /// Table row 2.5: with the listing failing and no packument NORA assembled, a version
-    /// manifest is the upstream's answer to this request, and nothing is written.
+    /// Table row 2.5: with the listing failing and no packument NORA assembled, NORA cannot tell
+    /// whether the package is published: its version manifest is unavailable (503), as cargo
+    /// answers a crate it cannot tell is published. A published name is never an upstream's to
+    /// answer for, so the upstream is not asked, and nothing is cached on a guess.
     #[tokio::test]
-    async fn a_version_manifest_with_a_failed_listing_is_not_cached() {
+    async fn a_version_manifest_with_a_failed_listing_is_unavailable() {
         let server = upstream("corp-lib", &["9.9.9"]).await;
         let uri = server.uri();
         let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
@@ -8086,13 +8097,77 @@ mod published_and_upstream_keys {
             move |cfg| cfg.npm.proxy = Some(uri),
         );
         let resp = send(&ctx.app, Method::GET, "/npm/corp-lib/9.9.9", "").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let manifest: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(manifest["version"], "9.9.9");
-        // The cache write runs in the background: give it time to land before looking.
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
         tokio::time::sleep(Duration::from_millis(200)).await;
         let written = ctx.state.storage.list("npm/").await.unwrap();
         assert!(written.is_empty(), "nothing cached on a guess: {written:?}");
+    }
+
+    /// The same for the packument, the dist-tags and a tarball of a package whose published
+    /// versions cannot be listed.
+    #[tokio::test]
+    async fn a_failed_versions_listing_makes_the_package_unavailable() {
+        let server = upstream("left-pad", &["1.3.0"]).await;
+        Mock::given(method("GET"))
+            .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream".to_vec()))
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            faulty(true, false),
+            move |cfg| cfg.npm.proxy = Some(uri),
+        );
+        let mut wrong = Vec::new();
+        for path in [
+            "/npm/left-pad",
+            "/npm/-/package/left-pad/dist-tags",
+            "/npm/left-pad/-/left-pad-1.3.0.tgz",
+        ] {
+            let status = send(&ctx.app, Method::GET, path, "").await.status();
+            if status != StatusCode::SERVICE_UNAVAILABLE {
+                wrong.push(format!("{path} -> {status}"));
+            }
+        }
+        assert!(wrong.is_empty(), "answered other than 503: {wrong:?}");
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(asked.is_empty(), "upstream asked: {asked:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let written = ctx.state.storage.list("npm/").await.unwrap();
+        assert!(written.is_empty(), "nothing cached on a guess: {written:?}");
+    }
+
+    /// Second control: a package the listing shows is not published here is proxied as before.
+    #[tokio::test]
+    async fn a_package_the_listing_shows_unpublished_is_still_proxied() {
+        let server = upstream("left-pad", &["1.3.0"]).await;
+        Mock::given(method("GET"))
+            .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream".to_vec()))
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            faulty(false, false),
+            move |cfg| cfg.npm.proxy = Some(uri),
+        );
+        assert_eq!(versions(&ctx, "/npm/left-pad").await, ["1.3.0"]);
+        let tarball = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/left-pad/-/left-pad-1.3.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(tarball.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(tarball).await[..], b"upstream");
     }
 
     /// Table row 3.2: dist-tags of a published package, with a listing that answers "nothing
@@ -8367,21 +8442,6 @@ mod published_and_upstream_keys {
                 .unwrap(),
             legacy
         );
-    }
-
-    #[tokio::test]
-    async fn a_failed_versions_listing_serves_the_upstream_without_caching() {
-        let server = upstream("left-pad", &["1.3.0"]).await;
-        let storage = faulty(true, false);
-        let uri = server.uri();
-        let ctx =
-            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
-                cfg.npm.proxy = Some(uri);
-            });
-        assert_eq!(versions(&ctx, "/npm/left-pad").await, ["1.3.0"]);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let written = ctx.state.storage.list("npm/").await.unwrap();
-        assert!(written.is_empty(), "nothing cached on a guess: {written:?}");
     }
 
     /// A publish over an upstream copy an older release cached at the published key: its

@@ -1140,15 +1140,30 @@ async fn an_internal_package_on_a_store_that_cannot_be_read_is_unavailable_not_a
         "upstream asked during the outage: {asked:?}"
     );
 
-    // Control: a package outside the internal namespaces is still answered by its upstream.
-    for path in [
-        "/npm/publicpkg/-/publicpkg-1.0.0.tgz",
+    // Control: a package outside the internal namespaces is still answered by its upstream —
+    // except on npm, where a store that cannot list a package's published versions leaves NORA
+    // unable to tell whether the name is published here: 503, as for cargo.
+    let nuget = send(
+        &ctx.app,
+        Method::GET,
         "/nuget/v3/flatcontainer/publicpkg/1.0.0/publicpkg.1.0.0.nupkg",
-    ] {
-        let resp = send(&ctx.app, Method::GET, path, "").await;
-        assert_eq!(resp.status(), StatusCode::OK, "{path} during the outage");
-    }
-    assert_eq!(upstream_paths(&upstream).await.len(), 2);
+        "",
+    )
+    .await;
+    assert_eq!(nuget.status(), StatusCode::OK, "nuget during the outage");
+    let npm = send(
+        &ctx.app,
+        Method::GET,
+        "/npm/publicpkg/-/publicpkg-1.0.0.tgz",
+        "",
+    )
+    .await;
+    assert_eq!(
+        npm.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "npm during the outage"
+    );
+    assert_eq!(upstream_paths(&upstream).await.len(), 1);
 }
 
 /// The same when only object reads fail and listings still answer (a store throttling its GETs):
