@@ -113,6 +113,19 @@ pub enum ImportCommand {
     /// test. Writes nothing, sets no markers.
     Assess(AssessArgs),
     /// Pull repos + artifacts into NORA storage (verify-before-commit, resumable).
+    ///
+    /// npm: each tarball is imported with the version document a publish writes, and that
+    /// document names the tarball under the public URL in effect when the import runs. Run the
+    /// import with the public URL the server uses (NORA_PUBLIC_URL, or `public_url` under
+    /// `[server]` in the same config): without one the bind address is written, and clients
+    /// cannot fetch the tarballs.
+    ///
+    /// Upgrading from 1.4.1 or older: an npm repository those releases imported holds tarballs
+    /// without version documents, and NORA does not serve them as published packages. A re-run
+    /// skips a repository it finished, so first delete that repository's `<repo>.done` and
+    /// `<repo>.progress` from the source's directory under `<storage path>/.nora-import/`, then
+    /// run the import again: on local storage it writes the missing documents beside the tarballs
+    /// already stored; on S3 it transfers the tarballs again.
     Run(RunArgs),
 }
 
@@ -1256,6 +1269,28 @@ mod integration_tests {
                 .map(|(_, b)| b.clone())
                 .unwrap_or_default();
             Ok(futures::stream::once(async move { Ok(Bytes::from(body)) }).boxed())
+        }
+    }
+
+    /// `nora import run --help` tells an operator what an npm import depends on: the public URL the
+    /// version documents are written under, and how to publish an import made by 1.4.1 or older.
+    #[test]
+    fn run_help_names_the_public_url_and_the_upgrade_path() {
+        use clap::Subcommand;
+        let mut import = ImportCommand::augment_subcommands(clap::Command::new("import"));
+        let help = import
+            .find_subcommand_mut("run")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        for needle in [
+            "NORA_PUBLIC_URL",
+            ".nora-import",
+            ".done",
+            ".progress",
+            "1.4.1",
+        ] {
+            assert!(help.contains(needle), "{needle} missing from:\n{help}");
         }
     }
 
