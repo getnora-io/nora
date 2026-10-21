@@ -118,15 +118,15 @@ stop
 
 start storage_wait
 code /__fi/hang-maint >/dev/null
-h=200
-for _ in $(seq 1 $((TICK + SILENCE + 5))); do
+h=200; s=0
+for s in $(seq 1 $((TICK + SILENCE + 5))); do
   alive || { h=dead; break; }
   h=$(code /health); [ "$h" = 200 ] || break; sleep 1
 done
 cut=$(grep -c 'maintenance tick cut at its deadline' "$work/storage_wait/nora.log" || true)
 m=$(curl -s -m 5 "$url/metrics" | awk '$1 == "nora_maintenance_timeouts_total" {print $2}')
 verdict storage_wait "$(holds test "$h" = 200 -a "$cut" -ge 2 -a "${m:-0}" -ge 2)" \
-  "/health $h for $((TICK + SILENCE + 5)) s of waiting ticks, $cut cut and logged, counted ${m:-0}"
+  "/health $h at $s s of $((TICK + SILENCE + 5)) s of waiting ticks, $cut cut and logged, counted ${m:-0}"
 stop
 
 start stall
