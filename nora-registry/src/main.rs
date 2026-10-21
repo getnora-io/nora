@@ -3464,6 +3464,33 @@ mod maintenance_loop_tests {
         task.abort();
     }
 
+    /// Ticks that each fail only after running a while — past the supervisor's stable run,
+    /// so no crash loop shows — still never complete: the heartbeat fails liveness.
+    #[tokio::test]
+    async fn ticks_that_fail_late_every_time_fail_liveness() {
+        let heartbeat = Arc::new(Heartbeat::new(PERIOD * 10));
+        let timing = Timing {
+            backoff_min: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(5),
+            stable_run: PERIOD,
+            crash_loop: 5,
+        };
+        let tasks = Arc::new(Supervisor::with(
+            vec![("maintenance", Arc::clone(&heartbeat))],
+            timing,
+        ));
+        let hb = Arc::clone(&heartbeat);
+        let task = tasks.spawn("maintenance", move || {
+            run_maintenance(PERIOD, Arc::clone(&hb), |_| async {
+                tokio::time::sleep(PERIOD * 2).await;
+                panic!("a bug that shows after a while");
+            })
+        });
+        tokio::time::sleep(PERIOD * 30).await;
+        assert_eq!(tasks.failing(), Some("maintenance"));
+        task.abort();
+    }
+
     #[tokio::test]
     async fn a_hung_tick_fails_liveness() {
         let (tasks, heartbeat) = supervised(PERIOD * 10);
