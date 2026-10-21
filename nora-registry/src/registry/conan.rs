@@ -206,7 +206,8 @@ async fn recipe_latest(
     let storage_key = format!("conan/{}/latest.json", ref_str);
 
     // Eager cache read — preserve data for serve-stale fallback
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
@@ -229,6 +230,9 @@ async fn recipe_latest(
             state.metrics.record_download("conan");
             state.metrics.record_cache_hit("conan");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -262,7 +266,8 @@ async fn recipe_revisions(
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
     let storage_key = format!("conan/{}/revisions.json", ref_str);
 
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
@@ -285,6 +290,9 @@ async fn recipe_revisions(
             state.metrics.record_download("conan");
             state.metrics.record_cache_hit("conan");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -324,14 +332,26 @@ async fn recipe_file_list(
     let storage_key = format!("conan/{}/revisions/{}/files.json", ref_str, rrev);
 
     // Immutable: if cached, serve directly
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    if let Some(data) = cached {
         state.metrics.record_download("conan");
         state.metrics.record_cache_hit("conan");
         return with_json(data.to_vec());
     }
 
     // #68 namespace isolation: a cached internal recipe's file list was served above;
-    // an internal name with no local copy must not be fetched upstream.
+    // an internal name with no local copy must not be fetched upstream, and one whose copy the
+    // store could not read is unavailable, not absent.
+    if let Some(e) = read_failure.as_ref().filter(|_| {
+        crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Conan,
+            &name,
+        )
+    }) {
+        return crate::registry::local_copy_unreadable("conan", &storage_key, e);
+    }
     if let Some(response) = crate::curation::check_namespace_isolation(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Conan,
@@ -415,7 +435,9 @@ async fn recipe_file_download(
 
     // Immutable cache. get_verified discharges the integrity witness at serve
     // (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -494,6 +516,9 @@ async fn recipe_file_download(
 
     // #733: an internal-namespace recipe with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Conan,
@@ -618,7 +643,8 @@ async fn package_latest(
         ref_str, rrev, pkg_id
     );
 
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
@@ -641,6 +667,9 @@ async fn package_latest(
             state.metrics.record_download("conan");
             state.metrics.record_cache_hit("conan");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -692,7 +721,8 @@ async fn package_revisions(
         ref_str, rrev, pkg_id
     );
 
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
@@ -715,6 +745,9 @@ async fn package_revisions(
             state.metrics.record_download("conan");
             state.metrics.record_cache_hit("conan");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -769,14 +802,26 @@ async fn package_file_list(
     );
 
     // Immutable
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    if let Some(data) = cached {
         state.metrics.record_download("conan");
         state.metrics.record_cache_hit("conan");
         return with_json(data.to_vec());
     }
 
     // #68 namespace isolation: a cached internal package's file list was served above;
-    // an internal name with no local copy must not be fetched upstream.
+    // an internal name with no local copy must not be fetched upstream, and one whose copy the
+    // store could not read is unavailable, not absent.
+    if let Some(e) = read_failure.as_ref().filter(|_| {
+        crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Conan,
+            &name,
+        )
+    }) {
+        return crate::registry::local_copy_unreadable("conan", &storage_key, e);
+    }
     if let Some(response) = crate::curation::check_namespace_isolation(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Conan,
@@ -869,7 +914,9 @@ async fn package_file_download(
 
     // Immutable cache. get_verified discharges the integrity witness at serve
     // (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -948,6 +995,9 @@ async fn package_file_download(
 
     // #733: an internal-namespace package with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Conan,

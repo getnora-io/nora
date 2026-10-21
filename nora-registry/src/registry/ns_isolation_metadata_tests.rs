@@ -1280,6 +1280,42 @@ async fn an_internal_download_of_every_other_format_on_a_store_that_cannot_be_re
             "/cargo/api/v1/crates/internalpkg/1.0.0/download",
             "cargo/internalpkg/1.0.0/internalpkg-1.0.0.crate",
         ),
+        (
+            "/cpan/authors/id/I/IN/INTERNAL/internalpkg-1.0.tar.gz",
+            "cpan/authors/id/I/IN/INTERNAL/internalpkg-1.0.tar.gz",
+        ),
+        (
+            "/conan/v2/conans/internalpkg/1.0/_/_/latest",
+            "conan/internalpkg/1.0/_/_/latest.json",
+        ),
+        (
+            "/conan/v2/conans/internalpkg/1.0/_/_/revisions",
+            "conan/internalpkg/1.0/_/_/revisions.json",
+        ),
+        (
+            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/files",
+            "conan/internalpkg/1.0/_/_/revisions/abc1/files.json",
+        ),
+        (
+            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/files/conanfile.py",
+            "conan/internalpkg/1.0/_/_/revisions/abc1/files/conanfile.py",
+        ),
+        (
+            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/latest",
+            "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/latest.json",
+        ),
+        (
+            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions",
+            "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions.json",
+        ),
+        (
+            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files",
+            "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files.json",
+        ),
+        (
+            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files/conaninfo.txt",
+            "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files/conaninfo.txt",
+        ),
     ];
     let (storage, outage) = outage_storage();
     let ctx = create_test_context_with_storage_and_config(storage, |c| {
@@ -1287,14 +1323,23 @@ async fn an_internal_download_of_every_other_format_on_a_store_that_cannot_be_re
         c.gems.enabled = true;
         c.pub_dart.enabled = true;
         c.ansible.enabled = true;
+        c.cpan.enabled = true;
+        c.conan.enabled = true;
     });
     for (_, key) in stored {
         ctx.state.storage.put(key, b"local copy").await.unwrap();
     }
+    let mut up = Vec::new();
     for (path, _) in stored {
-        let resp = send(&ctx.app, Method::GET, path, "").await;
-        assert_eq!(resp.status(), StatusCode::OK, "{path} with the store up");
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::OK {
+            up.push(format!("{path} -> {status}"));
+        }
     }
+    assert!(
+        up.is_empty(),
+        "internal packages not served from their local copy with the store up: {up:#?}"
+    );
     outage.begin();
     let mut wrong = Vec::new();
     for (path, _) in stored {
@@ -1307,4 +1352,58 @@ async fn an_internal_download_of_every_other_format_on_a_store_that_cannot_be_re
         wrong.is_empty(),
         "internal packages answered other than 503 with the store down: {wrong:#?}"
     );
+}
+
+/// A CPAN distribution can be internal by its author path, not only by its name: such a
+/// distribution is served from its local copy, and without one it is refused and never fetched.
+#[tokio::test]
+async fn a_cpan_distribution_internal_by_its_author_path_stays_local() {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UPSTREAM".to_vec()))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let ctx = create_test_context_with_config(move |c| {
+        c.curation.internal_namespaces = vec!["I/IN/INTERNAL/**".to_string()];
+        c.cpan.enabled = true;
+        c.cpan.proxy = Some(uri);
+    });
+    ctx.state
+        .storage
+        .put(
+            "cpan/authors/id/I/IN/INTERNAL/Corp-Lib-1.0.tar.gz",
+            b"local copy",
+        )
+        .await
+        .unwrap();
+    let served = send(
+        &ctx.app,
+        Method::GET,
+        "/cpan/authors/id/I/IN/INTERNAL/Corp-Lib-1.0.tar.gz",
+        "",
+    )
+    .await;
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(served).await[..], b"local copy");
+    let missing = send(
+        &ctx.app,
+        Method::GET,
+        "/cpan/authors/id/I/IN/INTERNAL/Corp-Lib-2.0.tar.gz",
+        "",
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    assert_eq!(upstream_paths(&upstream).await, Vec::<String>::new());
+    // Control: another author's distribution is fetched.
+    let other = send(
+        &ctx.app,
+        Method::GET,
+        "/cpan/authors/id/P/PU/PUBLIC/Corp-Lib-2.0.tar.gz",
+        "",
+    )
+    .await;
+    assert_eq!(other.status(), StatusCode::OK);
 }

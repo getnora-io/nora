@@ -192,16 +192,28 @@ async fn distribution_proxy(
         }
         None => crate::curation::RequestVersion::Unspecified,
     };
-    if let Some(response) = crate::curation::check_download(
-        &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
-        crate::curation::RegistryType::Cpan,
-        dist_name,
-        request_version,
-        None,
-    ) {
-        return response;
+    // #733 serve-local: a distribution in an internal namespace (by its name, or by its author
+    // path) is operator-owned — curation is skipped and any local copy is served below; with none
+    // it is refused, never fetched.
+    let internal = [dist_name, dist_path].into_iter().any(|name| {
+        crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Cpan,
+            name,
+        )
+    });
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Cpan,
+            dist_name,
+            request_version,
+            None,
+        ) {
+            return response;
+        }
     }
 
     let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -220,7 +232,9 @@ async fn distribution_proxy(
     );
 
     // Verified-cache fast path — serve with integrity guarantee
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -259,13 +273,22 @@ async fn distribution_proxy(
         return with_binary(data.to_vec(), "application/octet-stream");
     }
 
-    // Internal namespace check
-    if let Some(response) = crate::curation::check_namespace_isolation(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Cpan,
-        dist_path,
-    ) {
-        return response;
+    // An internal distribution with no local copy is never fetched upstream; one whose copy the
+    // store could not read is unavailable, not absent.
+    if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("cpan", &storage_key, e);
+        }
+        return [dist_name, dist_path]
+            .into_iter()
+            .find_map(|name| {
+                crate::curation::check_namespace_isolation(
+                    &state.curation().curation_engine,
+                    crate::curation::RegistryType::Cpan,
+                    name,
+                )
+            })
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     // Fetch from upstream — none when the operator switched it off.
