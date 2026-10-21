@@ -290,6 +290,9 @@ pub struct AuthConfig {
 /// [[auth.oidc.providers]]
 /// name = "github-actions"
 /// issuer = "https://token.actions.githubusercontent.com"
+/// # Required: the `aud` the jobs request. Without it a token GitHub minted for
+/// # any other service would be accepted, so NORA refuses to start. To accept
+/// # any `aud` instead, set `any_audience = true` (warned about at start).
 /// audience = "nora"
 /// algorithms = ["RS256", "ES256"]
 /// max_token_lifetime_secs = 900
@@ -391,9 +394,16 @@ pub struct OidcProvider {
     /// JWKS endpoint doesn't follow the standard `/.well-known/jwks.json` path.
     #[serde(default)]
     pub jwks_uri: Option<String>,
-    /// Expected audience (`aud` claim). If empty, audience is not validated.
+    /// Expected audience (`aud` claim): the value the CI jobs request, e.g.
+    /// `nora`. Required unless `any_audience` is set — a shared issuer such as
+    /// GitHub Actions mints tokens for every repository on the host, and
+    /// without this check a token minted for another service is accepted.
     #[serde(default)]
     pub audience: String,
+    /// Accept a token whatever its `aud` claim, in place of `audience`. NORA
+    /// warns at start for every provider that sets it.
+    #[serde(default)]
+    pub any_audience: bool,
     /// Allowed JWT algorithms (default: RS256, ES256). Reject all others.
     #[serde(default = "default_oidc_algorithms")]
     pub algorithms: Vec<String>,
@@ -422,6 +432,34 @@ pub struct OidcProvider {
     /// First match wins. No match = deny.
     #[serde(default)]
     pub role_rules: Vec<OidcRoleRule>,
+}
+
+/// How a provider checks the `aud` claim of a token, read from `audience` and
+/// `any_audience`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudienceCheck<'a> {
+    /// The `aud` claim must name this value. An `audience` is checked even
+    /// beside `any_audience = true`.
+    Expect(&'a str),
+    /// `any_audience = true` and no `audience`: the claim is not checked.
+    Any,
+    /// Neither is set. Config validation refuses it, and the validator admits
+    /// no token through such a provider.
+    Missing,
+}
+
+impl OidcProvider {
+    /// How this provider checks the `aud` claim. Config validation and the
+    /// token validator both read it, so they cannot disagree.
+    pub fn audience_check(&self) -> AudienceCheck<'_> {
+        if !self.audience.is_empty() {
+            AudienceCheck::Expect(&self.audience)
+        } else if self.any_audience {
+            AudienceCheck::Any
+        } else {
+            AudienceCheck::Missing
+        }
+    }
 }
 
 /// Maps a subject pattern to a NORA role.

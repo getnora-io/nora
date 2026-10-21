@@ -26,7 +26,8 @@ pub use self::signing_cfg::SigningConfig;
 // Re-exports maintain API surface: `crate::config::OidcRoleRule` etc. used by test code in auth/, circuit_breaker/
 #[allow(unused_imports)]
 pub use self::auth::{
-    AuthConfig, OidcConfig, OidcProvider, OidcRoleRule, ScopeEnforcement, TrustedProxies,
+    AudienceCheck, AuthConfig, OidcConfig, OidcProvider, OidcRoleRule, ScopeEnforcement,
+    TrustedProxies,
 };
 #[allow(unused_imports)]
 pub use self::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerOverride};
@@ -1219,24 +1220,32 @@ impl Config {
             );
         }
 
-        // 7b. An OIDC provider without an audience: the `aud` claim is not
-        // checked, so a token its issuer minted for any other relying party is
-        // accepted. A warning; strict mode refuses it.
+        // 7b. An OIDC provider without an audience would accept a token its
+        // issuer minted for any other service — on a shared issuer such as
+        // GitHub Actions, any repository on the host. It is refused; turning
+        // the check off takes `any_audience = true`, which is warned about.
         if self.auth.oidc.enabled {
-            for provider in self.auth.oidc.providers.iter() {
-                if !provider.enabled || !provider.audience.is_empty() {
-                    continue;
-                }
-                let message = format!(
-                    "auth.oidc provider \"{}\" has an empty audience — the `aud` claim is not \
-                     validated, so a token its issuer minted for any other service is accepted. \
-                     Set audience to the value the CI jobs request (e.g. \"nora\")",
-                    provider.name
-                );
-                if config_strict_from_env() {
-                    errors.push(message);
-                } else {
-                    warnings.push(message);
+            for provider in self.auth.oidc.providers.iter().filter(|p| p.enabled) {
+                match provider.audience_check() {
+                    AudienceCheck::Missing => errors.push(format!(
+                        "auth.oidc provider \"{}\" has no audience, so a token its issuer \
+                         minted for any other service would be accepted. Set audience = \"<the aud \
+                         your CI jobs request>\" (e.g. audience = \"nora\"), or any_audience = true \
+                         to accept a token for any audience",
+                        provider.name
+                    )),
+                    AudienceCheck::Any => warnings.push(format!(
+                        "auth.oidc provider \"{}\" has any_audience = true — the `aud` claim is \
+                         not checked, so a token its issuer minted for any other service is \
+                         accepted",
+                        provider.name
+                    )),
+                    AudienceCheck::Expect(_) if provider.any_audience => warnings.push(format!(
+                        "auth.oidc provider \"{}\" sets both audience and any_audience — \
+                         any_audience is ignored and the audience is checked",
+                        provider.name
+                    )),
+                    AudienceCheck::Expect(_) => {}
                 }
             }
         }
@@ -3181,49 +3190,105 @@ proxies = [
         ));
     }
 
-    /// An enabled OIDC provider without an audience accepts a token its issuer
-    /// minted for any other service: NORA warns at start naming the provider,
-    /// and strict mode refuses to start on it.
+    /// OIDC config text with a provider `gh` (extra keys appended) and a
+    /// provider `gl` that names its audience.
+    fn oidc_config_with(gh_keys: &str) -> String {
+        format!(
+            "[auth]\nenabled = true\n[auth.oidc]\nenabled = true\n\
+             [[auth.oidc.providers]]\nname = \"gh\"\nissuer = \"https://gh.example\"\n{gh_keys}\n\
+             [[auth.oidc.providers]]\nname = \"gl\"\nissuer = \"https://gl.example\"\naudience = \"nora\"\n"
+        )
+    }
+
+    /// The messages that speak about the `aud` check.
+    fn about_audience(msgs: &[String]) -> Vec<String> {
+        msgs.iter()
+            .filter(|m| m.contains("audience"))
+            .cloned()
+            .collect()
+    }
+
+    /// An enabled OIDC provider without an audience would accept a token its
+    /// issuer minted for any other service: NORA refuses to start, naming the
+    /// provider and both ways to fix it, in default and strict mode alike.
     #[test]
-    fn an_oidc_provider_without_audience_is_reported() {
+    fn an_oidc_provider_without_audience_refuses_to_start() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("oidc.toml").to_string_lossy().into_owned();
+        std::fs::write(&path, oidc_config_with("")).unwrap();
+        for strict in [false, true] {
+            let err = Config::load_from(Some(path.clone()), "", strict)
+                .expect_err("a provider without an audience must refuse to start");
+            let ConfigLoadError::Invalid(errors) = &err else {
+                panic!("expected a validation error, got {err}");
+            };
+            let refused = about_audience(errors);
+            assert_eq!(refused.len(), 1, "{errors:#?}");
+            assert!(refused[0].contains("\"gh\""), "{}", refused[0]);
+            assert!(!refused[0].contains("\"gl\""), "{}", refused[0]);
+            assert!(refused[0].contains("audience = \""), "{}", refused[0]);
+            assert!(refused[0].contains("any_audience = true"), "{}", refused[0]);
+        }
+
+        // A disabled provider, or OIDC switched off, validates no token.
+        let mut config: Config = toml::from_str(&oidc_config_with("enabled = false")).unwrap();
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(about_audience(&errors).is_empty(), "{errors:#?}");
+        assert!(about_audience(&warnings).is_empty(), "{warnings:#?}");
+        config.auth.oidc.providers[0].enabled = true;
+        config.auth.oidc.enabled = false;
+        assert!(about_audience(&config.validate_with_config_path(None).1).is_empty());
+    }
+
+    /// `any_audience = true` is the explicit way to run a provider without the
+    /// `aud` check: NORA starts and warns naming the provider.
+    #[test]
+    fn any_audience_starts_with_a_warning() {
         let _lock = env_lock();
         std::env::remove_var("NORA_CONFIG_STRICT");
-        let mut config = Config::default();
-        config.auth.enabled = true;
-        config.auth.oidc = toml::from_str(
-            "enabled = true\n\
-             [[providers]]\nname = \"gh\"\nissuer = \"https://gh.example\"\n\
-             [[providers]]\nname = \"gl\"\nissuer = \"https://gl.example\"\naudience = \"nora\"",
-        )
-        .unwrap();
-        let about_audience = |msgs: &[String]| -> Vec<String> {
-            msgs.iter()
-                .filter(|m| m.contains("audience"))
-                .cloned()
-                .collect()
-        };
-
+        let config: Config = toml::from_str(&oidc_config_with("any_audience = true")).unwrap();
         let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(about_audience(&errors).is_empty(), "{errors:#?}");
         let warned = about_audience(&warnings);
         assert_eq!(warned.len(), 1, "{warnings:#?}");
         assert!(warned[0].contains("\"gh\""), "{}", warned[0]);
-        assert!(!warned[0].contains("\"gl\""), "{}", warned[0]);
-        assert!(about_audience(&errors).is_empty(), "{errors:#?}");
+        assert!(warned[0].contains("any_audience"), "{}", warned[0]);
+    }
 
-        std::env::set_var("NORA_CONFIG_STRICT", "true");
+    /// `any_audience = true` beside an `audience` does nothing: the audience is
+    /// checked. NORA starts and says the key is ignored.
+    #[test]
+    fn any_audience_beside_an_audience_is_reported_unused() {
+        let _lock = env_lock();
+        let config: Config = toml::from_str(&oidc_config_with(
+            "audience = \"nora\"\nany_audience = true",
+        ))
+        .unwrap();
         let (warnings, errors) = config.validate_with_config_path(None);
-        std::env::remove_var("NORA_CONFIG_STRICT");
-        let refused = about_audience(&errors);
-        assert_eq!(refused.len(), 1, "strict mode must refuse: {errors:#?}");
-        assert!(refused[0].contains("\"gh\""), "{}", refused[0]);
-        assert!(about_audience(&warnings).is_empty(), "{warnings:#?}");
+        assert!(about_audience(&errors).is_empty(), "{errors:#?}");
+        let warned = about_audience(&warnings);
+        assert_eq!(warned.len(), 1, "{warnings:#?}");
+        assert!(warned[0].contains("\"gh\""), "{}", warned[0]);
+        assert!(warned[0].contains("ignored"), "{}", warned[0]);
+    }
 
-        // A disabled provider, or OIDC switched off, validates no token.
-        config.auth.oidc.providers[0].enabled = false;
-        assert!(about_audience(&config.validate_with_config_path(None).0).is_empty());
-        config.auth.oidc.providers[0].enabled = true;
-        config.auth.oidc.enabled = false;
-        assert!(about_audience(&config.validate_with_config_path(None).0).is_empty());
+    /// A SIGHUP reload whose file has a provider without an audience is refused,
+    /// so the running configuration stays.
+    #[test]
+    fn reload_refuses_an_oidc_provider_without_audience() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("oidc.toml").to_string_lossy().into_owned();
+        std::fs::write(&path, oidc_config_with("")).unwrap();
+        std::env::set_var("NORA_CONFIG_PATH", &path);
+        let refused = Config::try_load();
+        std::fs::write(&path, oidc_config_with("any_audience = true")).unwrap();
+        let opted_out = Config::try_load();
+        std::env::remove_var("NORA_CONFIG_PATH");
+        let err = refused.expect_err("a reload without an audience must be refused");
+        assert!(err.contains("\"gh\"") && err.contains("audience"), "{err}");
+        assert!(opted_out.is_ok(), "{:?}", opted_out.err());
     }
 
     /// `NORA_CONFIG_STRICT` follows the other boolean switches: `true` (any case) or `1`.

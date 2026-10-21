@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::config::{OidcConfig, OidcProvider, ScopeEnforcement};
+use crate::config::{AudienceCheck, OidcConfig, OidcProvider, ScopeEnforcement};
 use crate::tokens::Role;
 
 /// Result of a successful OIDC authentication.
@@ -272,10 +272,17 @@ impl OidcValidator {
         validation.set_issuer(&[&provider.issuer]);
         validation.leeway = self.config.leeway_secs;
 
-        if !provider.audience.is_empty() {
-            validation.set_audience(&[&provider.audience]);
-        } else {
-            validation.validate_aud = false;
+        match provider.audience_check() {
+            AudienceCheck::Expect(audience) => validation.set_audience(&[audience]),
+            AudienceCheck::Any => validation.validate_aud = false,
+            // Config validation refuses such a provider; one that reaches the
+            // validator anyway admits nothing rather than any audience.
+            AudienceCheck::Missing => {
+                return Err(format!(
+                    "Provider {} has no audience: set audience or any_audience",
+                    provider.name
+                ));
+            }
         }
 
         let token_data: TokenData<Claims> = decode(token, &decoding_key, &validation)
@@ -723,6 +730,7 @@ mod tests {
             issuer: "https://test".to_string(),
             jwks_uri: None,
             audience: "nora".to_string(),
+            any_audience: false,
             algorithms: vec!["RS256".to_string()],
             max_token_lifetime_secs: 900,
             namespace_scope: vec!["*".to_string()],
@@ -797,6 +805,7 @@ mod tests {
                 issuer: issuer.clone(),
                 jwks_uri: jwks_uri.map(|p| format!("{issuer}{p}")),
                 audience: "nora".to_string(),
+                any_audience: false,
                 algorithms: vec!["RS256".to_string()],
                 max_token_lifetime_secs: 900,
                 namespace_scope: vec!["*".to_string()],
@@ -846,6 +855,7 @@ mod tests {
             issuer: "https://disabled.invalid".to_string(),
             jwks_uri: None,
             audience: "nora".to_string(),
+            any_audience: false,
             algorithms: vec!["RS256".to_string()],
             max_token_lifetime_secs: 99_999_999,
             namespace_scope: vec!["*".to_string()],

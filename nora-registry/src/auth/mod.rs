@@ -2955,6 +2955,23 @@ Jd74nq6dNCjpWG4drIsyhqX+
         provider_scope: &[&str],
         main_rule_scope: Option<Vec<String>>,
     ) -> TestContext {
+        create_oidc_test_context_with(mock_issuer_url, provider_scope, main_rule_scope, |_| {})
+    }
+
+    /// Like [`create_oidc_test_context`], with `tweak` applied to the provider.
+    fn create_oidc_test_context_tweaked(
+        mock_issuer_url: &str,
+        tweak: impl FnOnce(&mut OidcProvider),
+    ) -> TestContext {
+        create_oidc_test_context_with(mock_issuer_url, &["*"], None, tweak)
+    }
+
+    fn create_oidc_test_context_with(
+        mock_issuer_url: &str,
+        provider_scope: &[&str],
+        main_rule_scope: Option<Vec<String>>,
+        tweak: impl FnOnce(&mut OidcProvider),
+    ) -> TestContext {
         let issuer = mock_issuer_url.to_string();
         let provider_scope: Vec<String> = provider_scope.iter().map(|s| s.to_string()).collect();
         let mut ctx = create_test_context_with_config(move |cfg| {
@@ -2969,6 +2986,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     issuer: issuer.clone(),
                     jwks_uri: None,
                     audience: "nora".to_string(),
+                    any_audience: false,
                     algorithms: vec!["RS256".to_string()],
                     max_token_lifetime_secs: 900,
                     namespace_scope: provider_scope.clone(),
@@ -3009,6 +3027,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     ],
                 }],
             };
+            tweak(&mut cfg.auth.oidc.providers[0]);
         });
 
         // Wire up the OidcValidator on the existing state
@@ -3777,6 +3796,78 @@ Jd74nq6dNCjpWG4drIsyhqX+
             response.status(),
             StatusCode::UNAUTHORIZED,
             "Token with wrong audience should be rejected"
+        );
+    }
+
+    /// The router answer to a write-role token with `aud`, against a mock
+    /// issuer whose provider gets `tweak`.
+    async fn oidc_status_for_aud(aud: &str, tweak: impl FnOnce(&mut OidcProvider)) -> StatusCode {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context_tweaked(&mock_server.uri(), tweak);
+        let now = now_secs();
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            aud,
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {token}");
+        send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/aud/file.txt",
+            vec![("authorization", &bearer)],
+            "data",
+        )
+        .await
+        .status()
+    }
+
+    /// With an audience set, a token minted for that audience writes and one
+    /// minted for another service is refused.
+    #[tokio::test]
+    async fn test_oidc_audience_admits_only_its_own_aud() {
+        assert!(oidc_status_for_aud("nora", |_| {}).await.is_success());
+        assert_eq!(
+            oidc_status_for_aud("another-service", |_| {}).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// `any_audience = true` turns the `aud` check off: a token minted for
+    /// another service writes.
+    #[tokio::test]
+    async fn test_oidc_any_audience_admits_any_aud() {
+        let any = |p: &mut OidcProvider| {
+            p.audience = String::new();
+            p.any_audience = true;
+        };
+        assert!(oidc_status_for_aud("another-service", any)
+            .await
+            .is_success());
+        assert!(oidc_status_for_aud("nora", any).await.is_success());
+    }
+
+    /// A provider with neither an audience nor `any_audience` admits no token,
+    /// even if it reaches the validator without passing config validation.
+    #[tokio::test]
+    async fn test_oidc_provider_without_audience_admits_no_token() {
+        let none = |p: &mut OidcProvider| p.audience = String::new();
+        assert_eq!(
+            oidc_status_for_aud("another-service", none).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            oidc_status_for_aud("nora", none).await,
+            StatusCode::UNAUTHORIZED
         );
     }
 
