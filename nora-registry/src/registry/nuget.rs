@@ -932,6 +932,10 @@ async fn flatcontainer_download(
         }
     }
 
+    // The quarantine takes a release date only when upstream dates are trusted (#750). Without
+    // trust the date above is a cached registration's age — when NORA last wrote a listing, not
+    // when it first fetched these bytes — so the quarantine keeps its own clock.
+    let first_seen = publish_date.filter(|_| state.config.server.trust_upstream_dates);
     let content_type = if ends_with_ci(filename, ".nuspec") {
         "application/xml"
     } else {
@@ -1002,7 +1006,7 @@ async fn flatcontainer_download(
             &q_mode,
             q_secs,
             "cache",
-            publish_date,
+            first_seen,
         ) {
             return resp;
         }
@@ -1170,7 +1174,7 @@ async fn flatcontainer_download(
                 &q_mode,
                 q_secs,
                 &url,
-                publish_date,
+                first_seen,
             ) {
                 return resp;
             }
@@ -1314,12 +1318,12 @@ fn registered(doc: &[u8], version: &str) -> Registered {
     Registered::Absent
 }
 
-/// When `version` of `id` was published, for release age and the quarantine clock.
+/// When `version` of `id` was published: its release age, and with trusted dates the quarantine's
+/// first-seen too.
 ///
 /// Without trusted upstream dates (#513) a version is as old as the cached registration that
 /// lists it — NORA held it listed since that document was written — and undated when no cached
-/// one lists it: a version published after the index was cached was not seen by NORA then, and
-/// the index's age would let the quarantine record it as first seen long ago.
+/// one lists it: a version published after the index was cached was not seen by NORA then.
 ///
 /// With trusted dates a version is as old as its `published`. One the cached registration does
 /// not date is looked up upstream when `ask_upstream`: a `dotnet restore` reads only the flat
@@ -3497,11 +3501,36 @@ mod nuget_release_dates {
             .count()
     }
 
-    /// Without trusted dates the cached registration dates only the versions it lists: a
-    /// version published after it was cached was never seen by NORA then, and dating it by
-    /// the index's age would let the quarantine record it as first seen a month ago.
+    /// Without trusted dates the quarantine counts from NORA's own first sight of the bytes: a
+    /// cached registration's age says when NORA last wrote a listing, not when it first fetched
+    /// this package, and a month-old index would let a version first fetched now pass as mature.
     #[tokio::test]
-    async fn a_version_the_cached_registration_does_not_list_is_not_dated_by_it() {
+    async fn without_trusted_dates_the_quarantine_counts_from_the_first_fetch() {
+        let up = upstream().await;
+        let ctx = context(&up, false, quarantine_7d);
+        let listed = registration(vec![inline_page(
+            "1.2.3",
+            "1.2.4",
+            vec![
+                leaf("1.2.3", "2019-01-01T00:00:00Z"),
+                leaf("1.2.4", "2019-01-02T00:00:00Z"),
+            ],
+        )]);
+        cached_registration(&ctx, &listed, 30).await;
+        for version in ["1.2.4", "1.2.5"] {
+            assert_eq!(
+                download(&ctx, version).await,
+                StatusCode::FORBIDDEN,
+                "{version}: first fetched now, held for 7d whatever the index's age"
+            );
+        }
+    }
+
+    /// Without trusted dates release age is the cached registration's age for a version it
+    /// lists (#513), and unknown for one it does not: a version published after the index was
+    /// cached was not seen by NORA then.
+    #[tokio::test]
+    async fn without_trusted_dates_the_index_dates_only_the_versions_it_lists() {
         let up = upstream().await;
         let ctx = context(&up, false, quarantine_7d);
         let listed = registration(vec![inline_page(
@@ -3510,16 +3539,42 @@ mod nuget_release_dates {
             vec![leaf("1.2.3", "2019-01-01T00:00:00Z")],
         )]);
         cached_registration(&ctx, &listed, 30).await;
-        assert_eq!(
-            download(&ctx, "1.2.4").await,
-            StatusCode::FORBIDDEN,
-            "a version NORA first fetches now is held for 7d"
+        let month_ago = chrono::Utc::now().timestamp() - 30 * 86400;
+        let listed = super::nuget_publish_date(&ctx.state, ID, "1.2.3", true).await;
+        assert!(
+            listed.is_some_and(|date| (date - month_ago).abs() < 60),
+            "{listed:?}"
         );
+        assert_eq!(
+            super::nuget_publish_date(&ctx.state, ID, "1.2.4", true).await,
+            None
+        );
+        assert_eq!(
+            registration_requests(&up).await,
+            0,
+            "nothing asked upstream"
+        );
+    }
+
+    /// Release age without trusted dates is NORA's own: a version the registration listed when
+    /// NORA cached it minutes ago is minutes old, one it did not list is undated and left to the
+    /// quarantine.
+    #[tokio::test]
+    async fn without_trusted_dates_release_age_is_the_listing_age() {
+        let up = upstream().await;
+        let ctx = context(&up, false, min_age_1h);
+        let listed = registration(vec![inline_page(
+            "1.2.3",
+            "1.2.3",
+            vec![leaf("1.2.3", "2019-01-01T00:00:00Z")],
+        )]);
+        cached_registration(&ctx, &listed, 0).await;
         assert_eq!(
             download(&ctx, "1.2.3").await,
-            StatusCode::OK,
-            "a version NORA saw listed 30 days ago has matured"
+            StatusCode::FORBIDDEN,
+            "listed when NORA cached it just now"
         );
+        assert_eq!(download(&ctx, "1.2.4").await, StatusCode::OK, "undated");
     }
 
     /// With trusted dates a version the cache has no date for is dated by the upstream
