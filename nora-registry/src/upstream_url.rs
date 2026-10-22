@@ -81,4 +81,23 @@ mod tests {
         }
         assert!(!named_in(b"anything", b""));
     }
+
+    /// Every occurrence that ends is replaced, one that begins inside an occurrence that did
+    /// not end (an upstream path ending in `h`, right before `https://`) included.
+    #[test]
+    fn every_occurrence_that_ends_is_replaced() {
+        let up = "https://up.invalid/path";
+        assert_eq!(
+            super::replace_str("https://up.invalid/pathttps://up.invalid/path/x", up, "N"),
+            "https://up.invalid/patN/x"
+        );
+        assert_eq!(
+            super::replace_str(
+                r#""https://up.invalid/path" "https://up.invalid/paths""#,
+                up,
+                "N"
+            ),
+            r#""N" "https://up.invalid/paths""#
+        );
+    }
 }
