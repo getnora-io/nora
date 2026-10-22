@@ -277,7 +277,7 @@ impl TokenStore {
 
         // Slow path: read from disk and verify Argon2. A revoke after this
         // point keeps the result out of the cache (see `revocations`).
-        let revocations = self.revocations.load(Ordering::SeqCst);
+        let revocations = self.revocations_seen();
         let file_path = self.storage_path.join(format!("{}.json", &cache_key[..16]));
 
         let content = match fs::read_to_string(&file_path) {
@@ -333,20 +333,16 @@ impl TokenStore {
 
         // Populate cache (key must match the fast-path lookup: full 64-char
         // SHA-256 hex), unless a revoke came in since the file was read.
-        {
-            let mut cache = self.cache.write();
-            if self.revocations.load(Ordering::SeqCst) == revocations {
-                cache.insert(
-                    cache_key.clone(),
-                    CachedToken {
-                        user: info.user.clone(),
-                        role: info.role.clone(),
-                        expires_at: info.expires_at,
-                        cached_at: Instant::now(),
-                    },
-                );
-            }
-        }
+        self.cache_unless_revoked(
+            revocations,
+            cache_key.clone(),
+            CachedToken {
+                user: info.user.clone(),
+                role: info.role.clone(),
+                expires_at: info.expires_at,
+                cached_at: Instant::now(),
+            },
+        );
 
         // Schedule deferred last_used update
         self.pending_last_used
@@ -446,13 +442,34 @@ impl TokenStore {
         tracing::debug!(count = pending.len(), "Flushed pending last_used updates");
     }
 
+    /// The revocation count a verify reads before it reads the token file.
+    fn revocations_seen(&self) -> u64 {
+        self.revocations.load(Ordering::SeqCst)
+    }
+
+    /// Cache a verified token, unless a revoke came in since the verify read
+    /// `seen` from [`TokenStore::revocations_seen`].
+    fn cache_unless_revoked(&self, seen: u64, cache_key: String, verified: CachedToken) {
+        let mut cache = self.cache.write();
+        if self.revocations.load(Ordering::SeqCst) == seen {
+            cache.insert(cache_key, verified);
+        }
+    }
+
+    /// Drop the cached verifications a revoke removed and count the revoke,
+    /// under the cache lock, so a verify that read a token file before the
+    /// revoke cannot cache it afterwards. Every revoke path goes through here.
+    fn evict_revoked(&self, revoked: impl Fn(&str, &CachedToken) -> bool) {
+        let mut cache = self.cache.write();
+        cache.retain(|key, cached| !revoked(key, cached));
+        self.revocations.fetch_add(1, Ordering::SeqCst);
+    }
+
     /// Remove a token from the in-memory cache (called on revoke).
     /// Cache keys are full 64-char SHA-256 hex; revoke only knows the 16-char prefix,
     /// so we must scan for matching entries.
     fn invalidate_cache(&self, hash_prefix: &str) {
-        let mut cache = self.cache.write();
-        cache.retain(|k, _| !k.starts_with(hash_prefix));
-        self.revocations.fetch_add(1, Ordering::SeqCst);
+        self.evict_revoked(|key, _| key.starts_with(hash_prefix));
     }
 
     /// Revoke a token by its hash prefix.
@@ -502,9 +519,7 @@ impl TokenStore {
 
         // Evict cached entries for this user so revoked tokens fail immediately
         if count > 0 {
-            let mut cache = self.cache.write();
-            cache.retain(|_, v| v.user != user);
-            self.revocations.fetch_add(1, Ordering::SeqCst);
+            self.evict_revoked(|_, cached| cached.user == user);
         }
 
         count
