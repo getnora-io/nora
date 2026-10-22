@@ -1,7 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use arc_swap::ArcSwap;
@@ -9,8 +9,12 @@ use sha2::{Digest, Sha256};
 use tokio::sync::Semaphore;
 use zeroize::Zeroizing;
 
-/// Verdicts remembered at most; past it the memory starts over.
-const VERDICT_CAPACITY: usize = 4096;
+/// Accepted pairs remembered at most; past it that memory starts over. Only a valid password
+/// adds to it, so refusals never push an accepted pair out.
+const ACCEPTED_CAPACITY: usize = 4096;
+
+/// Refused pairs remembered at most; past it that memory starts over, the accepted pairs kept.
+const REFUSED_CAPACITY: usize = 4096;
 
 /// Htpasswd-based authentication.
 ///
@@ -18,12 +22,19 @@ const VERDICT_CAPACITY: usize = 4096;
 /// blocking pool, a few at a time, and each verdict is remembered. The file is read once at
 /// startup, so a username and password get the same answer for the life of the process;
 /// the second request with them (a CI job's next pull, an API token sent as the password of
-/// an htpasswd username) pays no bcrypt.
+/// an htpasswd username) pays no bcrypt. Accepted and refused pairs are remembered apart, so a
+/// flood of wrong passwords cannot make an accepted pair pay bcrypt again: an accepted pair
+/// pays it once while it is among the [`ACCEPTED_CAPACITY`] remembered.
 pub struct HtpasswdAuth {
     users: HashMap<String, String>, // username -> bcrypt hash
-    /// Verdicts by a keyed digest of username and password, never the password itself.
-    /// Read on every request, written only after a bcrypt check.
-    verdicts: ArcSwap<HashMap<[u8; 32], bool>>,
+    /// Pairs bcrypt accepted, by a keyed digest of username and password, never the password
+    /// itself. Read on every request, written only after a bcrypt check.
+    accepted: ArcSwap<HashSet<[u8; 32]>>,
+    /// Pairs bcrypt refused, keyed the same way.
+    refused: ArcSwap<HashSet<[u8; 32]>>,
+    /// Pairs remembered at most in each: [`ACCEPTED_CAPACITY`] and [`REFUSED_CAPACITY`], and
+    /// less in tests.
+    capacity: Capacity,
     /// Key of those digests, random per process.
     key: [u8; 32],
     /// bcrypt checks running at once at most: half the cores, so a flood of logins leaves
@@ -32,6 +43,13 @@ pub struct HtpasswdAuth {
     /// bcrypt verifications run, for tests that prove a path runs none.
     #[cfg(test)]
     pub(crate) bcrypt_runs: std::sync::atomic::AtomicUsize,
+}
+
+/// How many accepted and refused pairs [`HtpasswdAuth`] remembers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Capacity {
+    accepted: usize,
+    refused: usize,
 }
 
 impl HtpasswdAuth {
@@ -56,7 +74,12 @@ impl HtpasswdAuth {
             let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
             Some(Self {
                 users,
-                verdicts: ArcSwap::default(),
+                accepted: ArcSwap::default(),
+                refused: ArcSwap::default(),
+                capacity: Capacity {
+                    accepted: ACCEPTED_CAPACITY,
+                    refused: REFUSED_CAPACITY,
+                },
                 key: rand::random(),
                 checks: Semaphore::new((cores / 2).max(1)),
                 #[cfg(test)]
@@ -118,17 +141,28 @@ impl HtpasswdAuth {
     }
 
     fn remembered(&self, key: &[u8; 32]) -> Option<bool> {
-        self.verdicts.load().get(key).copied()
+        if self.accepted.load().contains(key) {
+            Some(true)
+        } else if self.refused.load().contains(key) {
+            Some(false)
+        } else {
+            None
+        }
     }
 
     fn remember(&self, key: [u8; 32], verdict: bool) {
-        self.verdicts.rcu(|verdicts| {
-            let mut next = if verdicts.len() >= VERDICT_CAPACITY {
-                HashMap::new()
+        let (pairs, capacity) = if verdict {
+            (&self.accepted, self.capacity.accepted)
+        } else {
+            (&self.refused, self.capacity.refused)
+        };
+        pairs.rcu(|pairs| {
+            let mut next = if pairs.len() >= capacity {
+                HashSet::new()
             } else {
-                HashMap::clone(verdicts)
+                HashSet::clone(pairs)
             };
-            next.insert(key, verdict);
+            next.insert(key);
             next
         });
     }
@@ -235,6 +269,108 @@ mod tests {
         );
         assert_eq!(auth.verified("a", "pw-a"), Some(true));
         assert_eq!(auth.verified("a", "pw-b"), Some(false));
+    }
+
+    /// Check every pair at once, as a flood of requests would.
+    async fn verify_all(auth: &HtpasswdAuth, pairs: &[(String, String)]) -> Vec<bool> {
+        use futures::StreamExt;
+        futures::stream::iter(pairs)
+            .map(|(user, password)| auth.verify(user, password))
+            .buffered(16)
+            .collect()
+            .await
+    }
+
+    fn runs(auth: &HtpasswdAuth) -> usize {
+        auth.bcrypt_runs.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The server remembers at least 4096 accepted and 4096 refused pairs, the numbers the
+    /// type's documentation and the authentication guarantee name.
+    #[test]
+    fn the_server_remembers_at_least_4096_accepted_and_4096_refused_pairs() {
+        let file = create_test_htpasswd(&[("a", "pw")]);
+        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
+        assert!(auth.capacity.accepted >= 4096, "{:?}", auth.capacity);
+        assert!(auth.capacity.refused >= 4096, "{:?}", auth.capacity);
+    }
+
+    /// At the server's capacities: refusals past the number remembered, cheap ones from a
+    /// user whose hash bcrypt cannot read, leave an accepted pair remembered.
+    #[tokio::test]
+    async fn refusals_past_the_server_capacity_keep_an_accepted_pair_remembered() {
+        let mut file = create_test_htpasswd(&[("a", "pw")]);
+        writeln!(file, "z:{{SHA}}W6ph5Mm5Pz8GgiULbPgzG37mj9g=").unwrap();
+        file.flush().unwrap();
+        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
+        assert!(auth.verify("a", "pw").await);
+        let refused: Vec<_> = (0..=auth.capacity.refused)
+            .map(|i| ("z".to_owned(), format!("guess{i}")))
+            .collect();
+        assert!(verify_all(&auth, &refused).await.iter().all(|ok| !ok));
+        let before = runs(&auth);
+        assert_eq!(auth.verified("a", "pw"), Some(true));
+        assert!(auth.verify("a", "pw").await);
+        assert_eq!(runs(&auth), before, "an accepted pair pays bcrypt again");
+    }
+
+    /// A flood of wrong passwords, more than the refusals remembered, does not make a pair
+    /// already accepted pay bcrypt again; up to the capacity every refusal is remembered too.
+    #[tokio::test]
+    async fn a_flood_of_wrong_passwords_keeps_an_accepted_pair_remembered() {
+        let file = create_test_htpasswd(&[("a", "pw")]);
+        let mut auth = HtpasswdAuth::from_file(file.path()).unwrap();
+        auth.capacity = Capacity {
+            accepted: 8,
+            refused: 8,
+        };
+        assert!(auth.verify("a", "pw").await);
+        let wrong: Vec<_> = (0..8)
+            .map(|i| ("a".to_owned(), format!("wrong{i}")))
+            .collect();
+        assert!(verify_all(&auth, &wrong).await.iter().all(|ok| !ok));
+        for (user, password) in &wrong {
+            assert_eq!(auth.verified(user, password), Some(false), "{password}");
+        }
+        let flood: Vec<_> = (0..100)
+            .map(|i| ("a".to_owned(), format!("flood{i}")))
+            .collect();
+        assert!(verify_all(&auth, &flood).await.iter().all(|ok| !ok));
+        let before = runs(&auth);
+        assert_eq!(auth.verified("a", "pw"), Some(true));
+        assert!(auth.verify("a", "pw").await);
+        assert_eq!(runs(&auth), before, "an accepted pair pays bcrypt again");
+    }
+
+    /// As many accepted pairs as the capacity are all remembered: none pays bcrypt twice.
+    /// One past it, that memory starts over.
+    #[tokio::test]
+    async fn accepted_pairs_up_to_the_capacity_pay_bcrypt_once() {
+        let hash = bcrypt::hash("pw", 4).unwrap();
+        let mut file = NamedTempFile::new().unwrap();
+        for i in 0..9 {
+            writeln!(file, "u{i}:{hash}").unwrap();
+        }
+        file.flush().unwrap();
+        let mut auth = HtpasswdAuth::from_file(file.path()).unwrap();
+        auth.capacity = Capacity {
+            accepted: 8,
+            refused: 8,
+        };
+        let pairs: Vec<_> = (0..8).map(|i| (format!("u{i}"), "pw".to_owned())).collect();
+        assert!(verify_all(&auth, &pairs).await.iter().all(|ok| *ok));
+        assert_eq!(runs(&auth), 8);
+        for (user, password) in &pairs {
+            assert_eq!(auth.verified(user, password), Some(true), "{user}");
+        }
+        assert!(verify_all(&auth, &pairs).await.iter().all(|ok| *ok));
+        assert_eq!(runs(&auth), 8);
+        assert!(auth.verify("u8", "pw").await);
+        assert_eq!(
+            auth.verified("u0", "pw"),
+            None,
+            "past the capacity it starts over"
+        );
     }
 
     /// One username and password make one key; moving bytes across the boundary between
