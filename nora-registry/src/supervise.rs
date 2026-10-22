@@ -60,9 +60,31 @@ impl Default for Timing {
 /// How a process is ended; replaced in tests.
 pub type ExitHook = Arc<dyn Fn(i32) + Send + Sync>;
 
-/// [`ExitHook`] of the real process.
+/// [`ExitHook`] of the real process. In tests it records the exit code instead
+/// ([`exits_requested`]), so a test can see that a task the process cannot run without ends
+/// it, and the test runner lives on.
 pub fn process_exit() -> ExitHook {
+    #[cfg(test)]
+    return Arc::new(exits::record);
+    #[cfg(not(test))]
     Arc::new(|code| std::process::exit(code))
+}
+
+#[cfg(test)]
+pub use exits::requested as exits_requested;
+
+#[cfg(test)]
+mod exits {
+    static REQUESTED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+
+    pub(super) fn record(code: i32) {
+        REQUESTED.lock().unwrap().push(code);
+    }
+
+    /// The exit codes [`super::process_exit`] has been asked for in this test process.
+    pub fn requested() -> Vec<i32> {
+        REQUESTED.lock().unwrap().clone()
+    }
 }
 
 /// When a task last showed progress. Stalled after `max_silence` without a beat.

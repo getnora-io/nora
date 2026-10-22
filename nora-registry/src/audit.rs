@@ -189,6 +189,10 @@ impl AuditLog {
         // or the channel is closed. This is correct because we're inside
         // spawn_blocking.
         while let Some(entry) = rx.blocking_recv() {
+            #[cfg(test)]
+            if entry.action == tests::WRITER_PANIC {
+                panic!("a bug in the audit writer");
+            }
             #[cfg(feature = "fault-injection")]
             if crate::fault_injection::task_fault("audit") {
                 panic!("fault injection: audit task panic");
@@ -321,6 +325,35 @@ pub async fn curation_refusal_middleware(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// An entry whose action this is makes the writer panic.
+    pub(super) const WRITER_PANIC: &str = "test-writer-panic";
+
+    /// A panic in the writer of the server's audit log ends the process with the code its
+    /// units restart on: the log would otherwise take entries and record none.
+    #[tokio::test]
+    async fn a_writer_panic_ends_the_process() {
+        let exits = || {
+            crate::supervise::exits_requested()
+                .into_iter()
+                .filter(|code| *code == crate::supervise::EXIT_TASK_PANICKED)
+                .count()
+        };
+        let before = exits();
+        let tmp = TempDir::new().unwrap();
+        let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::File);
+        log.log(AuditEntry::new("pull", "user1", "lodash", "npm", ""));
+        log.log(AuditEntry::new(WRITER_PANIC, "user1", "lodash", "npm", ""));
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while exits() == before {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the writer's panic did not end the process"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(exits(), before + 1);
+    }
 
     #[test]
     fn test_audit_entry_new() {
