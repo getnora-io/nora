@@ -695,13 +695,21 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 // ── Storage outage ──────────────────────────────────────────────────────────
 
 /// The switch of an [`outage_storage`]: up, down, silent, failing object reads only, or failing
-/// the reads of some keys, each with its own [`ReadFault`].
+/// the reads of some keys, each with its own [`ReadFault`], and the listings of some prefixes.
 #[derive(Clone)]
 pub struct StorageOutage(
     Arc<std::sync::atomic::AtomicU8>,
-    Arc<std::sync::Mutex<Vec<(String, ReadFault)>>>,
-    Arc<std::sync::Mutex<Vec<String>>>,
+    Arc<std::sync::Mutex<Faults>>,
 );
+
+/// The keys and prefixes an [`outage_storage`] fails.
+#[derive(Default)]
+struct Faults {
+    /// Key suffixes whose reads fail, and how.
+    reads: Vec<(String, ReadFault)>,
+    /// Prefixes whose listings fail.
+    listings: Vec<String>,
+}
 
 /// How the read of a key fails.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -741,10 +749,7 @@ impl StorageOutage {
     /// Fail the reads of the keys ending with `suffix` with `fault`; other keys read. Faults
     /// add up: each key fails with the first fault whose suffix it ends with.
     pub fn fault_reads_of(&self, suffix: &str, fault: ReadFault) {
-        self.1
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((suffix.to_string(), fault));
+        self.faults().reads.push((suffix.to_string(), fault));
         self.0.store(STORE_READS_OF_FAIL, Ordering::SeqCst);
     }
 
@@ -760,38 +765,22 @@ impl StorageOutage {
         self.0.store(STORE_SIZE_PANICS, Ordering::SeqCst);
     }
 
-    /// Bring the store back and clear every fault: operations waiting on a silent store go on,
-    /// and every later one is answered.
-    pub fn end(&self) {
-        self.1
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        self.2
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clear();
-        self.0.store(STORE_UP, Ordering::SeqCst);
-    }
-
     /// Fail the listings of `prefix` exactly with a network error; other listings and every
     /// read answer.
     pub fn fail_listings_of(&self, prefix: &str) {
-        self.2
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(prefix.to_string());
+        self.faults().listings.push(prefix.to_string());
     }
 
-    /// Whether a listing of `prefix` fails now.
-    fn listing_fails(&self, prefix: &str) -> bool {
-        self.mode() == STORE_DOWN
-            || self
-                .2
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .iter()
-                .any(|failing| failing == prefix)
+    /// Bring the store back and clear every fault: operations waiting on a silent store go on,
+    /// and every later one is answered.
+    pub fn end(&self) {
+        *self.faults() = Faults::default();
+        self.0.store(STORE_UP, Ordering::SeqCst);
+    }
+
+    /// The faults set; held for one statement, never across an await.
+    fn faults(&self) -> std::sync::MutexGuard<'_, Faults> {
+        self.1.lock().unwrap()
     }
 
     fn mode(&self) -> u8 {
@@ -805,14 +794,18 @@ impl StorageOutage {
         }
     }
 
+    /// Whether a listing of `prefix` fails now.
+    fn listing_fails(&self, prefix: &str) -> bool {
+        self.mode() == STORE_DOWN || self.faults().listings.iter().any(|p| p == prefix)
+    }
+
     /// The fault an object read of `key` meets now, if any.
     fn read_fault(&self, key: &str) -> Option<ReadFault> {
         match self.mode() {
             STORE_UP => None,
             STORE_READS_OF_FAIL => self
-                .1
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .faults()
+                .reads
                 .iter()
                 .find(|(suffix, _)| key.ends_with(suffix.as_str()))
                 .map(|(_, fault)| *fault),
@@ -831,7 +824,7 @@ pub struct OutageBackend {
 
 /// An in-memory [`Storage`] to seed while it is up, and its outage switch.
 pub fn outage_storage() -> (Storage, StorageOutage) {
-    let outage = StorageOutage(Arc::default(), Arc::default(), Arc::default());
+    let outage = StorageOutage(Arc::default(), Arc::default());
     let backend = OutageBackend {
         inner: crate::storage::ObjectStorage::in_memory(),
         outage: outage.clone(),

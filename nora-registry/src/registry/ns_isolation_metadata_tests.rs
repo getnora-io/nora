@@ -1439,8 +1439,10 @@ async fn a_cpan_distribution_internal_by_its_author_path_stays_local() {
 
 /// An internal terraform provider and module: each stored key and its bytes, and each path they
 /// are served from with its status with the store up.
-#[allow(clippy::type_complexity)]
-fn internal_terraform() -> (Vec<(String, Vec<u8>)>, [(String, StatusCode); 8]) {
+/// Each stored key of [`internal_terraform`] and its bytes.
+type StoredObjects = Vec<(String, Vec<u8>)>;
+
+fn internal_terraform() -> (StoredObjects, [(String, StatusCode); 8]) {
     let zip = "terraform-provider-infra_1.0.0_linux_amd64.zip";
     let stored: Vec<(String, Vec<u8>)> = vec![
         (
