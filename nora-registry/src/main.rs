@@ -3912,6 +3912,26 @@ mod maintenance_loop_tests {
         task.abort();
     }
 
+    /// A tick cut at its deadline is counted in `nora_maintenance_timeouts_total`, which an
+    /// alert on a store that does not answer reads. The counter is the process's, shared with
+    /// tests running beside this one, which only add to it.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_tick_is_counted() {
+        let period = super::MAINTENANCE_PERIOD;
+        let silence = Duration::from_secs(90);
+        let cuts = || crate::metrics::MAINTENANCE_TIMEOUTS_TOTAL.get();
+        let before = cuts();
+        let heartbeat = Arc::new(Heartbeat::new(silence));
+        let task = tokio::spawn(run_maintenance(period, heartbeat, |n| async move {
+            if n == 1 {
+                std::future::pending::<()>().await;
+            }
+        }));
+        tokio::time::sleep(tick_deadline(period, silence) + Duration::from_secs(1)).await;
+        assert!(cuts() > before, "a cut tick is not counted");
+        task.abort();
+    }
+
     /// After a cut tick the next one starts at its slot: the slots the cut tick overran are
     /// skipped, not run back to back against a store that is not answering.
     #[tokio::test]
