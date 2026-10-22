@@ -427,30 +427,88 @@ impl Drop for ProbeDone {
 /// Name prefix of the write probe's file, in the storage root.
 const HEALTH_PROBE_PREFIX: &str = ".nora-health-probe.";
 
-/// Create, write, fsync and remove a probe file under `base`: only a store that takes a
-/// durable write passes. `base.exists()` is not a health signal — a read-only mount or a
-/// full disk where the directory already exists would still pass.
-fn write_probe(base: &Path) -> bool {
-    use std::io::Write as _;
-    #[cfg(test)]
-    crate::test_helpers::wait_while_disk_hangs(base);
-    if std::fs::create_dir_all(base).is_err() {
+/// A step of the local write probe, in the order [`probe`] takes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeStep {
+    /// Create the storage directory if it is not there.
+    Directory,
+    /// Create a new probe file: one that exists already passes on a read-only directory.
+    Create,
+    Write,
+    /// fsync the file: a disk that takes a write into the page cache and fails to flush it
+    /// takes no artifact either.
+    Sync,
+    Remove,
+}
+
+/// What the write probe does on a disk, one call per step.
+trait ProbeDisk {
+    fn run(&mut self, step: ProbeStep) -> std::io::Result<()>;
+}
+
+/// Take the probe's steps on `disk`: the directory, a new file, a write, an fsync, the file
+/// removed. The disk takes writes only if every step succeeds; once the file is created it
+/// is removed whatever fails after.
+fn probe(disk: &mut impl ProbeDisk) -> bool {
+    if disk.run(ProbeStep::Directory).is_err() || disk.run(ProbeStep::Create).is_err() {
         return false;
     }
-    // A new file every time: writing into a file that already exists passes on a read-only
-    // directory, and can pass on a full disk.
+    let written = disk.run(ProbeStep::Write).is_ok() && disk.run(ProbeStep::Sync).is_ok();
+    let removed = disk.run(ProbeStep::Remove).is_ok();
+    written && removed
+}
+
+/// The probe's steps on the local disk, on the file `path` under `base`.
+struct OnDisk<'a> {
+    base: &'a Path,
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl OnDisk<'_> {
+    fn file(&mut self) -> std::io::Result<&mut std::fs::File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("no probe file"))
+    }
+}
+
+impl ProbeDisk for OnDisk<'_> {
+    fn run(&mut self, step: ProbeStep) -> std::io::Result<()> {
+        use std::io::Write as _;
+        match step {
+            ProbeStep::Directory => std::fs::create_dir_all(self.base),
+            ProbeStep::Create => {
+                self.file = Some(std::fs::File::create_new(&self.path)?);
+                Ok(())
+            }
+            ProbeStep::Write => self.file()?.write_all(b"ok"),
+            ProbeStep::Sync => self.file()?.sync_all(),
+            ProbeStep::Remove => {
+                self.file = None;
+                std::fs::remove_file(&self.path)
+            }
+        }
+    }
+}
+
+/// The write probe under `base` ([`probe`]): only a store that takes a durable write passes.
+/// `base.exists()` is not a health signal — a read-only mount or a full disk where the
+/// directory already exists would still pass.
+fn write_probe(base: &Path) -> bool {
+    #[cfg(test)]
+    crate::test_helpers::wait_while_disk_hangs(base);
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let probe = base.join(format!(
+    let path = base.join(format!(
         "{HEALTH_PROBE_PREFIX}{}.{}",
         std::process::id(),
         seq
     ));
-    let writable = match std::fs::File::create_new(&probe) {
-        Ok(mut file) => file.write_all(b"ok").is_ok() && file.sync_all().is_ok(),
-        Err(_) => false,
-    };
-    let _ = std::fs::remove_file(&probe); // best-effort cleanup
-    writable
+    probe(&mut OnDisk {
+        base,
+        path,
+        file: None,
+    })
 }
 
 /// Bytes of the stored artifacts under `path`, walking the whole tree. At the root it
@@ -2173,6 +2231,78 @@ mod tests {
         let writable = storage.health_check().await;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(!writable, "a read-only directory");
+    }
+
+    /// A disk that records the probe's steps and fails the one it is told to.
+    struct Recording {
+        fails: Option<super::ProbeStep>,
+        taken: Vec<super::ProbeStep>,
+    }
+
+    impl super::ProbeDisk for Recording {
+        fn run(&mut self, step: super::ProbeStep) -> std::io::Result<()> {
+            self.taken.push(step);
+            if self.fails == Some(step) {
+                return Err(std::io::Error::other("the disk refused"));
+            }
+            Ok(())
+        }
+    }
+
+    /// The probe passes only when every step succeeds, the fsync included; the steps run in
+    /// order up to the one that fails, and a created file is removed whatever fails after.
+    #[test]
+    fn the_probe_passes_only_when_every_step_succeeds() {
+        use super::ProbeStep::{Create, Directory, Remove, Sync, Write};
+        for (fails, passes, taken) in [
+            (None, true, vec![Directory, Create, Write, Sync, Remove]),
+            (Some(Directory), false, vec![Directory]),
+            (Some(Create), false, vec![Directory, Create]),
+            (Some(Write), false, vec![Directory, Create, Write, Remove]),
+            (
+                Some(Sync),
+                false,
+                vec![Directory, Create, Write, Sync, Remove],
+            ),
+            (
+                Some(Remove),
+                false,
+                vec![Directory, Create, Write, Sync, Remove],
+            ),
+        ] {
+            let mut disk = Recording {
+                fails,
+                taken: Vec::new(),
+            };
+            assert_eq!(super::probe(&mut disk), passes, "{fails:?} fails");
+            assert_eq!(disk.taken, taken, "{fails:?} fails");
+        }
+    }
+
+    /// On the local disk each step is the call it names: a write or an fsync with no file
+    /// created fails, a probe that passes leaves no file behind.
+    #[test]
+    fn the_probe_steps_on_the_disk_act_on_the_probe_file() {
+        use super::{ProbeDisk, ProbeStep};
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("probe");
+        let mut disk = super::OnDisk {
+            base: temp_dir.path(),
+            path: path.clone(),
+            file: None,
+        };
+        assert!(disk.run(ProbeStep::Write).is_err(), "a write with no file");
+        assert!(disk.run(ProbeStep::Sync).is_err(), "an fsync with no file");
+        assert!(disk.run(ProbeStep::Remove).is_err(), "no file to remove");
+        assert!(disk.run(ProbeStep::Create).is_ok());
+        assert!(disk.run(ProbeStep::Create).is_err(), "the file is new");
+        assert!(disk.run(ProbeStep::Write).is_ok());
+        assert!(disk.run(ProbeStep::Sync).is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), b"ok");
+        assert!(disk.run(ProbeStep::Remove).is_ok());
+        assert!(!path.exists());
+        assert!(super::write_probe(temp_dir.path()));
+        assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]
