@@ -443,11 +443,11 @@ async fn registration_index(
 
     // A hosted package's registration is built from its records; the upstream is not asked.
     match hosted_versions(&state.storage, &id_lower).await {
-        Hosted::Yes(versions) => return hosted_registration(&state, &id_lower, &versions).await,
-        Hosted::Unknown => {
-            return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower))
+        Some(versions) if versions.hosted() => {
+            return hosted_registration(&state, &id_lower, versions.listed()).await
         }
-        Hosted::No => {}
+        Some(_) => {}
+        None => return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower)),
     }
 
     let base_url = nora_base_url(&state);
@@ -627,11 +627,9 @@ async fn registration_page(
     // A hosted package's registration lists every version inline: it has no pages, and the
     // upstream is not asked for one.
     match hosted_versions(&state.storage, &id_lower).await {
-        Hosted::Yes(_) => return StatusCode::NOT_FOUND.into_response(),
-        Hosted::Unknown => {
-            return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower))
-        }
-        Hosted::No => {}
+        Some(versions) if versions.hosted() => return StatusCode::NOT_FOUND.into_response(),
+        Some(_) => {}
+        None => return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower)),
     }
 
     let base_url = nora_base_url(&state);
@@ -769,18 +767,16 @@ async fn version_list(state: AppState, id: &str) -> Response {
 
     // A hosted package's versions are its records — before any list an upstream gave for the id.
     match hosted_versions(&state.storage, &id_lower).await {
-        Hosted::Yes(versions) => {
+        Some(versions) if versions.hosted() => {
             state.metrics.record_download("nuget");
             return with_json(
-                serde_json::json!({ "versions": versions })
+                serde_json::json!({ "versions": versions.listed() })
                     .to_string()
                     .into_bytes(),
             );
         }
-        Hosted::Unknown => {
-            return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower))
-        }
-        Hosted::No => {}
+        Some(_) => {}
+        None => return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower)),
     }
 
     // Read cache eagerly so stale data is available on upstream failure.
@@ -958,17 +954,13 @@ async fn flatcontainer_download(
 
     // A hosted package serves the versions it has records of and nothing else: a version without
     // one is no version of it, whatever an upstream served under the id before it was imported.
-    let hosted = match hosted_versions(&state.storage, &id_lower).await {
-        Hosted::Yes(versions) => {
-            if !versions.contains(&ver.to_lowercase()) {
-                return StatusCode::NOT_FOUND.into_response();
-            }
-            true
-        }
-        Hosted::No => false,
-        Hosted::Unknown => {
-            return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower))
-        }
+    let Some(versions) = hosted_versions(&state.storage, &id_lower).await else {
+        return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower));
+    };
+    let hosted = match versions.version(&ver.to_lowercase()) {
+        hosted::Version::Own => true,
+        hosted::Version::Foreign => return StatusCode::NOT_FOUND.into_response(),
+        hosted::Version::Proxied => false,
     };
 
     // Hoisted to function scope for the digest-quarantine serve gate (#750).
@@ -1933,37 +1925,87 @@ fn hosted_record_key(id_lower: &str, version: &str) -> String {
     format!("{}{version}.json", hosted_prefix(id_lower))
 }
 
-/// Whether a package is hosted, from its records.
-enum Hosted {
-    /// These versions (lowercase, normalized), in NuGet's order.
-    Yes(Vec<String>),
-    No,
-    /// The listing failed: nothing is decided on a guess.
-    Unknown,
-}
-
-async fn hosted_versions(storage: &crate::storage::Storage, id_lower: &str) -> Hosted {
-    let prefix = hosted_prefix(id_lower);
-    if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
-        return Hosted::No;
+/// What a package's records say of it and of each of its versions, read from one listing of
+/// them. What a version is, is asked of [`hosted::Versions::version`] alone, and the list a
+/// hosted package serves of [`hosted::Versions::listed`]: the records are private to the module,
+/// so no handler decides by them otherwise.
+mod hosted {
+    /// What one version of a package is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Version {
+        /// The package is not hosted: the version is what storage and the upstream hold.
+        Proxied,
+        /// The package is hosted and has a record of the version: it is served, and never asked
+        /// of an upstream.
+        Own,
+        /// The package is hosted and has no record of the version: whatever an upstream served
+        /// under the id before it was imported, it is no version of the package.
+        Foreign,
     }
-    match storage.list(&prefix).await {
-        Ok(keys) => {
-            let mut versions: Vec<String> = keys
-                .iter()
-                .filter_map(|k| k.strip_prefix(&prefix)?.strip_suffix(".json"))
+
+    /// The versions a package has records of (lowercase, normalized), in NuGet's order.
+    pub(super) struct Versions {
+        listed: Vec<String>,
+    }
+
+    impl Versions {
+        /// A package nothing is recorded of.
+        pub(super) fn none() -> Self {
+            Self { listed: Vec::new() }
+        }
+
+        /// The versions `names` record: the keys under the package's prefix, without it, each
+        /// `<version>.json`. A package with a record of a version is hosted.
+        pub(super) fn from_listing<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+            let mut listed: Vec<String> = names
+                .into_iter()
+                .filter_map(|name| name.strip_suffix(".json"))
                 .filter(|v| !v.is_empty() && !v.contains('/'))
                 .map(str::to_string)
                 .collect();
-            if versions.is_empty() {
-                return Hosted::No;
-            }
-            versions.sort_by(|a, b| nuget_version_order(a, b).unwrap_or_else(|| a.cmp(b)));
-            Hosted::Yes(versions)
+            listed.sort_by(|a, b| super::nuget_version_order(a, b).unwrap_or_else(|| a.cmp(b)));
+            Self { listed }
         }
+
+        /// Whether the package is hosted: its versions and registration are built from its
+        /// records, and its id is not asked of an upstream.
+        pub(super) fn hosted(&self) -> bool {
+            !self.listed.is_empty()
+        }
+
+        /// The versions a hosted package serves: those it has records of, and no other.
+        pub(super) fn listed(&self) -> &[String] {
+            &self.listed
+        }
+
+        /// What version `version` (lowercase, normalized) of the package is.
+        pub(super) fn version(&self, version: &str) -> Version {
+            match (self.hosted(), self.listed.iter().any(|v| v == version)) {
+                (false, _) => Version::Proxied,
+                (true, true) => Version::Own,
+                (true, false) => Version::Foreign,
+            }
+        }
+    }
+}
+
+/// The records of package `id_lower`, or `None` when the listing failed: nothing is decided on a
+/// guess.
+async fn hosted_versions(
+    storage: &crate::storage::Storage,
+    id_lower: &str,
+) -> Option<hosted::Versions> {
+    let prefix = hosted_prefix(id_lower);
+    if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
+        return Some(hosted::Versions::none());
+    }
+    match storage.list(&prefix).await {
+        Ok(keys) => Some(hosted::Versions::from_listing(
+            keys.iter().filter_map(|k| k.strip_prefix(&prefix)),
+        )),
         Err(e) => {
             tracing::warn!(registry = "nuget", package = %id_lower, error = %e, "nuget: hosted records not listed");
-            Hosted::Unknown
+            None
         }
     }
 }
@@ -2424,6 +2466,53 @@ fn is_safe_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a package's records say of one of its versions, and the list it serves. A hosted
+    /// package serves exactly the versions it has records of; a key under its prefix that
+    /// records no version makes nothing hosted.
+    #[test]
+    fn a_hosted_package_serves_only_the_versions_it_records() {
+        use super::hosted::{Version, Versions};
+        let rows: [(&[&str], &[&str], &str, Version); 9] = [
+            (&[], &[], "1.0.0", Version::Proxied),
+            (&["1.0.0.json"], &["1.0.0"], "1.0.0", Version::Own),
+            (&["1.0.0.json"], &["1.0.0"], "2.0.0", Version::Foreign),
+            (
+                &[
+                    "10.0.0.json",
+                    "2.0.0-beta.1.json",
+                    "1.0.0.json",
+                    "2.0.0.json",
+                ],
+                &["1.0.0", "2.0.0-beta.1", "2.0.0", "10.0.0"],
+                "2.0.0-beta.1",
+                Version::Own,
+            ),
+            (&["1.0.0.txt"], &[], "1.0.0", Version::Proxied),
+            (&[".json"], &[], "", Version::Proxied),
+            (&["x/1.0.0.json"], &[], "1.0.0", Version::Proxied),
+            (
+                &["x/1.0.0.json", "2.0.0.json"],
+                &["2.0.0"],
+                "1.0.0",
+                Version::Foreign,
+            ),
+            (
+                &["1.0.0.json.tmp", "1.0.0.json"],
+                &["1.0.0"],
+                "1.0.0.json",
+                Version::Foreign,
+            ),
+        ];
+        for (names, listed, version, want) in rows {
+            let versions = Versions::from_listing(names.iter().copied());
+            assert_eq!(versions.listed(), listed, "{names:?}");
+            assert_eq!(versions.hosted(), !listed.is_empty(), "{names:?}");
+            assert_eq!(versions.version(version), want, "{names:?} {version}");
+        }
+        assert!(!Versions::none().hosted());
+        assert_eq!(Versions::none().version("1.0.0"), Version::Proxied);
+    }
 
     /// #385: a slash-escaped upstream registration URL must not survive the
     /// raw-text rewrite — otherwise the client, after unescaping `\/`, is sent

@@ -152,14 +152,10 @@ async fn package_versions(
     let upstreams = state.config.pypi.upstreams();
     // A project imported from the operator's own registry is NORA's: neither its index nor its
     // dates are asked of an upstream, and it lists only its own files.
-    let own_files = match hosted_state(&state.storage, &normalized).await {
-        Hosted::Yes(files) => Some(files),
-        Hosted::No => None,
-        Hosted::Unknown => {
-            return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized))
-        }
+    let Some(records) = own_records(&state.storage, &normalized).await else {
+        return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized));
     };
-    let hosted = own_files.is_some();
+    let hosted = records.hosted();
 
     // #896: for JSON (Renovate) clients, ensure upstream PEP 700 upload-times are cached
     // so the index can surface them. No-op if already cached / internal / no upstream.
@@ -210,7 +206,10 @@ async fn package_versions(
             if !filename.is_empty()
                 && !ends_with_ci(filename, ".sha256")
                 && is_valid_pypi_filename(filename)
-                && own_files.as_ref().is_none_or(|own| own.contains(filename))
+                && match records.file(filename) {
+                    own::File::Proxied | own::File::Own => true,
+                    own::File::Foreign => false,
+                }
             {
                 let sha256 = match markers.get(filename).map(Vec::as_slice) {
                     Some([sha256]) => Some((*sha256).to_string()),
@@ -377,13 +376,13 @@ async fn download_file(
     // A hosted project serves its own files only: a file NORA holds under its name without a
     // record — one an upstream served before the import — is no file of it, and neither is one
     // NORA does not hold; the upstream is not asked.
-    let hosted = match hosted_state(&state.storage, &normalized).await {
-        Hosted::Yes(own) if own.contains(&filename) => true,
-        Hosted::Yes(_) => return StatusCode::NOT_FOUND.into_response(),
-        Hosted::No => false,
-        Hosted::Unknown => {
-            return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized))
-        }
+    let Some(records) = own_records(&state.storage, &normalized).await else {
+        return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized));
+    };
+    let hosted = match records.file(&filename) {
+        own::File::Own => true,
+        own::File::Foreign => return StatusCode::NOT_FOUND.into_response(),
+        own::File::Proxied => false,
     };
 
     // The release date of this file, for min-release-age and to seed the digest-quarantine
@@ -819,12 +818,12 @@ async fn upload(
     // without a record is not one of its files — an upstream served it before the import — and
     // the upload replaces it.
     if state.storage.stat(&file_key).await.is_some() {
-        let replaceable = match hosted_state(&state.storage, &normalized).await {
-            Hosted::Yes(own) => !own.contains(&filename),
-            Hosted::No => false,
-            Hosted::Unknown => {
-                return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized))
-            }
+        let Some(records) = own_records(&state.storage, &normalized).await else {
+            return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized));
+        };
+        let replaceable = match records.file(&filename) {
+            own::File::Foreign => true,
+            own::File::Own | own::File::Proxied => false,
         };
         if !replaceable {
             return (
@@ -1127,7 +1126,9 @@ async fn ensure_pypi_dates_cached(
         &state.curation().curation_engine,
         crate::curation::RegistryType::PyPI,
         normalized,
-    ) || !matches!(hosted_state(&state.storage, normalized).await, Hosted::No)
+    ) || own_records(&state.storage, normalized)
+        .await
+        .is_none_or(|records| records.hosted())
     {
         return serde_json::Map::new();
     }
@@ -1229,41 +1230,90 @@ pub(crate) fn own_file_key(normalized: &str, filename: &str) -> String {
     format!("{OWN_PREFIX}{normalized}/files/{filename}")
 }
 
-/// Whether a project is hosted, from a listing of its records.
-enum Hosted {
-    /// Hosted: these are its own files.
-    Yes(std::collections::HashSet<String>),
-    No,
-    /// The listing failed: nothing is decided on a guess.
-    Unknown,
+/// What a project's records say of it and of each of its files, read from one listing of them.
+/// What a file is, is asked of [`own::Records::file`] alone: the records themselves are private
+/// to the module, so no handler decides by them otherwise.
+mod own {
+    use std::collections::HashSet;
+
+    /// What one file of a project is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum File {
+        /// The project is not hosted: the file is what storage and the upstreams hold.
+        Proxied,
+        /// The project is hosted and the file is one of its own: listed and served, never asked
+        /// of an upstream.
+        Own,
+        /// The project is hosted and the file is not one of its own: what an upstream served
+        /// under the name before the import, or a file NORA does not hold. Neither listed nor
+        /// served, nor asked of an upstream; an upload replaces it.
+        Foreign,
+    }
+
+    /// The records of one project.
+    pub(super) struct Records {
+        hosted: bool,
+        files: HashSet<String>,
+    }
+
+    impl Records {
+        /// A project nothing is recorded of.
+        pub(super) fn none() -> Self {
+            Self {
+                hosted: false,
+                files: HashSet::new(),
+            }
+        }
+
+        /// The records `names` name: the keys under the project's prefix, without it. The marker
+        /// `imported` makes the project hosted, and `files/<filename>` records a file of it.
+        pub(super) fn from_listing<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+            let mut records = Self::none();
+            for name in names {
+                if name == "imported" {
+                    records.hosted = true;
+                } else if let Some(file) = name.strip_prefix("files/") {
+                    records.files.insert(file.to_owned());
+                }
+            }
+            records
+        }
+
+        /// Whether the project is hosted: neither its index nor its dates are asked of an
+        /// upstream.
+        pub(super) fn hosted(&self) -> bool {
+            self.hosted
+        }
+
+        /// What file `filename` of the project is. A hosted project without a record of the file
+        /// — the marker is written first, so a record write that failed or a process that stopped
+        /// leaves none — does not own it.
+        pub(super) fn file(&self, filename: &str) -> File {
+            match (self.hosted, self.files.contains(filename)) {
+                (false, _) => File::Proxied,
+                (true, true) => File::Own,
+                (true, false) => File::Foreign,
+            }
+        }
+    }
 }
 
-async fn hosted_state(storage: &crate::storage::Storage, normalized: &str) -> Hosted {
+/// The records of project `normalized`, or `None` when the listing failed: nothing is decided on
+/// a guess.
+async fn own_records(storage: &crate::storage::Storage, normalized: &str) -> Option<own::Records> {
     let prefix = own_prefix(normalized);
     if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
-        return Hosted::No;
+        return Some(own::Records::none());
     }
-    let records = match storage.list(&prefix).await {
-        Ok(records) => records,
+    match storage.list(&prefix).await {
+        Ok(keys) => Some(own::Records::from_listing(
+            keys.iter().filter_map(|k| k.strip_prefix(&prefix)),
+        )),
         Err(e) => {
             tracing::warn!(registry = "pypi", project = %normalized, error = %e, "pypi: own records not listed");
-            return Hosted::Unknown;
+            None
         }
-    };
-    if !records
-        .iter()
-        .any(|k| k.strip_prefix(&prefix) == Some("imported"))
-    {
-        return Hosted::No;
     }
-    let files = format!("{prefix}files/");
-    Hosted::Yes(
-        records
-            .iter()
-            .filter_map(|k| k.strip_prefix(&files))
-            .map(str::to_string)
-            .collect(),
-    )
 }
 
 /// Make project `normalized` hosted. Written before the first file of it is stored, so from the
@@ -1556,6 +1606,65 @@ fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<In
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// What a project's records say of one of its files. A hosted project owns only the files it
+    /// has a record of: with the marker and no record at all it owns none, so a file an upstream
+    /// served under the name is neither listed nor served. Without the marker nothing is decided
+    /// by the records.
+    #[test]
+    fn a_hosted_project_owns_only_the_files_it_records() {
+        use super::own::{File, Records};
+        let rows: [(&[&str], bool, &str, File); 11] = [
+            (&[], false, "a-1.0.whl", File::Proxied),
+            (&["imported"], true, "a-1.0.whl", File::Foreign),
+            (
+                &["imported", "files/a-1.0.whl"],
+                true,
+                "a-1.0.whl",
+                File::Own,
+            ),
+            (
+                &["imported", "files/a-1.0.whl"],
+                true,
+                "a-2.0.whl",
+                File::Foreign,
+            ),
+            (&["files/a-1.0.whl"], false, "a-1.0.whl", File::Proxied),
+            (&["files/a-1.0.whl"], false, "a-2.0.whl", File::Proxied),
+            (
+                &["importedx", "files/a-1.0.whl"],
+                false,
+                "a-2.0.whl",
+                File::Proxied,
+            ),
+            (
+                &["imported/x", "x/imported"],
+                false,
+                "a-1.0.whl",
+                File::Proxied,
+            ),
+            (
+                &["imported", "files/A-1.0.whl"],
+                true,
+                "a-1.0.whl",
+                File::Foreign,
+            ),
+            (
+                &["imported", "files/a-1.0.whl.sha256"],
+                true,
+                "a-1.0.whl",
+                File::Foreign,
+            ),
+            (&["imported", "a-1.0.whl"], true, "a-1.0.whl", File::Foreign),
+        ];
+        for (names, hosted, file, want) in rows {
+            let records = Records::from_listing(names.iter().copied());
+            assert_eq!(records.hosted(), hosted, "{names:?}");
+            assert_eq!(records.file(file), want, "{names:?} {file}");
+        }
+        assert!(!Records::none().hosted());
+        assert_eq!(Records::none().file("a-1.0.whl"), File::Proxied);
+    }
 
     proptest! {
         #[test]
