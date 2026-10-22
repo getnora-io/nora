@@ -24,6 +24,7 @@ mod storage;
 pub use self::audit_cfg::AuditConfig;
 pub use self::signing_cfg::SigningConfig;
 // Re-exports maintain API surface: `crate::config::OidcRoleRule` etc. used by test code in auth/, circuit_breaker/
+pub(crate) use self::auth::canonical_ip;
 #[allow(unused_imports)]
 pub use self::auth::{
     AudienceCheck, AuthConfig, OidcConfig, OidcProvider, OidcRoleRule, ScopeEnforcement,

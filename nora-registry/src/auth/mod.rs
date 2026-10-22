@@ -68,6 +68,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
+use crate::config::canonical_ip;
 use crate::AppState;
 
 /// Resolve the audit actor for a request-driven event (#985): the authenticated
@@ -255,7 +256,7 @@ pub(crate) fn resolve_client_ip(
     headers: &HeaderMap,
     trusted_proxies: &crate::config::TrustedProxies,
 ) -> IpAddr {
-    let peer = peer.to_canonical();
+    let peer = canonical_ip(peer);
     if !trusted_proxies.contains(peer) {
         if headers.contains_key("x-forwarded-for") || headers.contains_key("x-real-ip") {
             trusted_proxies.warn_untrusted_forwarding(peer);
@@ -270,7 +271,7 @@ pub(crate) fn resolve_client_ip(
     if let Some(xri) = headers.get("x-real-ip") {
         if let Ok(s) = xri.to_str() {
             if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                return ip.to_canonical();
+                return canonical_ip(ip);
             }
         }
     }
@@ -297,7 +298,7 @@ fn forwarded_for_client(
         let Some(ip) = std::str::from_utf8(entry)
             .ok()
             .and_then(|s| s.trim().parse::<IpAddr>().ok())
-            .map(|ip| ip.to_canonical())
+            .map(canonical_ip)
         else {
             break;
         };
@@ -1105,6 +1106,97 @@ mod tests {
         ];
         for (lines, real_ip, trusted, want) in cases {
             assert_eq!(resolve(lines, real_ip, trusted), want, "{lines:?}");
+        }
+    }
+
+    /// The client of a request, as a table over the peer, the forwarding
+    /// headers and `auth.trusted_proxies`: every address is canonical (an
+    /// IPv4-mapped one is its IPv4 address, any other IPv6 one is itself), and
+    /// the headers count only from a trusted peer.
+    #[test]
+    fn the_client_address_is_canonical_wherever_it_comes_from() {
+        for (trusted, peer, header, value, client) in [
+            (
+                "::a00:1/128",
+                "10.0.0.1",
+                "x-forwarded-for",
+                "1.2.3.4",
+                "10.0.0.1",
+            ),
+            (
+                "::a00:1/128",
+                "::a00:1",
+                "x-forwarded-for",
+                "1.2.3.4",
+                "1.2.3.4",
+            ),
+            ("::1/128", "::1", "x-forwarded-for", "1.2.3.4", "1.2.3.4"),
+            (
+                "::1/128",
+                "0.0.0.1",
+                "x-forwarded-for",
+                "1.2.3.4",
+                "0.0.0.1",
+            ),
+            (
+                "10.0.0.0/8",
+                "::ffff:10.0.0.9",
+                "x-forwarded-for",
+                "::ffff:1.2.3.4",
+                "1.2.3.4",
+            ),
+            (
+                "10.0.0.0/8",
+                "::ffff:10.0.0.9",
+                "x-real-ip",
+                "::ffff:5.6.7.8",
+                "5.6.7.8",
+            ),
+            (
+                "10.0.0.0/8",
+                "::ffff:10.0.0.9",
+                "x-forwarded-for",
+                "::a01:203",
+                "::a01:203",
+            ),
+            ("10.0.0.0/8", "::ffff:10.0.0.9", "x-real-ip", "::1", "::1"),
+            (
+                "10.0.0.0/8",
+                "10.0.0.9",
+                "x-forwarded-for",
+                "1.2.3.4, ::ffff:10.0.0.5",
+                "1.2.3.4",
+            ),
+            (
+                "10.0.0.0/8",
+                "10.0.0.9",
+                "x-forwarded-for",
+                "1.2.3.4, ::a00:5",
+                "::a00:5",
+            ),
+            (
+                "10.0.0.0/8",
+                "::a00:9",
+                "x-forwarded-for",
+                "1.2.3.4",
+                "::a00:9",
+            ),
+            (
+                "::ffff:10.0.0.0/104",
+                "10.0.0.9",
+                "x-forwarded-for",
+                "1.2.3.4",
+                "1.2.3.4",
+            ),
+        ] {
+            let proxies = crate::config::TrustedProxies::parse(trusted);
+            let mut headers = HeaderMap::new();
+            headers.insert(header, value.parse().unwrap());
+            assert_eq!(
+                resolve_client_ip(peer.parse().unwrap(), &headers, &proxies),
+                client.parse::<IpAddr>().unwrap(),
+                "{trusted}, peer {peer}, {header}: {value}"
+            );
         }
     }
 

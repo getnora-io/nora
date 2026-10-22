@@ -56,9 +56,7 @@ impl TrustedProxies {
                     tracing::warn!(value = %item, "Cannot parse CIDR, skipping");
                 }
             } else if let Ok(addr) = item.parse::<std::net::IpAddr>() {
-                let addr = addr.to_canonical();
-                let prefix = if addr.is_ipv4() { 32 } else { 128 };
-                entries.push((addr, prefix));
+                entries.push(canonical_network(addr, full_prefix(addr)));
             } else {
                 tracing::warn!(value = %item, "Cannot parse IP address, skipping");
             }
@@ -83,7 +81,7 @@ impl TrustedProxies {
 
     /// Check if an IP address is within the trusted proxy list.
     pub fn contains(&self, ip: std::net::IpAddr) -> bool {
-        let ip = ip.to_canonical();
+        let ip = canonical_ip(ip);
         self.entries.iter().any(|(network, prefix)| {
             match (network, ip) {
                 (std::net::IpAddr::V4(net), std::net::IpAddr::V4(addr)) => {
@@ -168,8 +166,28 @@ impl TrustedProxies {
     }
 }
 
+/// The address a client is known by, whichever way it came: an IPv4-mapped
+/// IPv6 address (`::ffff:a.b.c.d`, how a dual-stack socket sees an IPv4 peer)
+/// is its IPv4 address, and every other address is itself, the IPv4-compatible
+/// form `::a.b.c.d` and the IPv6 loopback included. The peer, the forwarding
+/// headers and `auth.trusted_proxies` all go through here
+/// ([`canonical_network`]).
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
+    canonical_network(ip, full_prefix(ip)).0
+}
+
+/// The prefix of a network of one address.
+fn full_prefix(addr: IpAddr) -> u8 {
+    if addr.is_ipv4() {
+        32
+    } else {
+        128
+    }
+}
+
 /// A network given as an IPv4-mapped IPv6 address that covers only mapped
-/// addresses (prefix 96 or longer) is that IPv4 network.
+/// addresses (prefix 96 or longer) is that IPv4 network; any other network is
+/// itself. The one place an IPv6 address becomes an IPv4 one.
 fn canonical_network(addr: IpAddr, prefix: u8) -> (IpAddr, u8) {
     match addr {
         IpAddr::V6(v6) if prefix >= 96 => match v6.to_ipv4_mapped() {
@@ -600,6 +618,133 @@ impl AuthConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Which networks are IPv4 ones: only the IPv4-mapped form `::ffff:a.b.c.d`
+    /// with a prefix that covers mapped addresses only (96 or longer) is the
+    /// IPv4 network it maps. The IPv4-compatible form `::a.b.c.d`, the IPv6
+    /// loopback and the unspecified address stay the IPv6 networks they name.
+    #[test]
+    fn only_a_mapped_network_is_an_ipv4_one() {
+        for (network, prefix, want, want_prefix) in [
+            ("::ffff:10.0.0.1", 128, "10.0.0.1", 32),
+            ("::ffff:a00:1", 128, "10.0.0.1", 32),
+            ("::ffff:10.1.0.0", 112, "10.1.0.0", 16),
+            ("::ffff:0.0.0.0", 96, "0.0.0.0", 0),
+            ("::ffff:0.0.0.0", 95, "::ffff:0.0.0.0", 95),
+            ("::a00:1", 128, "::a00:1", 128),
+            ("::a00:0", 104, "::a00:0", 104),
+            ("::1", 128, "::1", 128),
+            ("::", 128, "::", 128),
+            ("2001:db8::1", 128, "2001:db8::1", 128),
+            ("10.0.0.1", 32, "10.0.0.1", 32),
+            ("10.0.0.0", 8, "10.0.0.0", 8),
+        ] {
+            let got = canonical_network(network.parse().unwrap(), prefix);
+            assert_eq!(
+                got,
+                (want.parse().unwrap(), want_prefix),
+                "{network}/{prefix}"
+            );
+        }
+    }
+
+    /// The address of one client, as a table: a mapped address is its IPv4
+    /// address, any other is itself.
+    #[test]
+    fn only_a_mapped_address_is_an_ipv4_one() {
+        for (address, want) in [
+            ("::ffff:10.0.0.1", "10.0.0.1"),
+            ("::ffff:0.0.0.1", "0.0.0.1"),
+            ("::a00:1", "::a00:1"),
+            ("::1", "::1"),
+            ("::", "::"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("10.0.0.1", "10.0.0.1"),
+        ] {
+            assert_eq!(
+                canonical_ip(address.parse().unwrap()),
+                want.parse::<IpAddr>().unwrap(),
+                "{address}"
+            );
+        }
+    }
+
+    /// An IPv6 address becomes an IPv4 one only in [`canonical_network`]
+    /// (white list): the peer, the forwarding headers, the limiters and the
+    /// entries take it from there, so no place keys a client by a rule of its
+    /// own. Needles are built at run time so this text does not match.
+    #[test]
+    fn only_canonical_network_turns_an_address_into_ipv4() {
+        let needles = [
+            ["to_canonical", "("].concat(),
+            ["to_ipv4", "("].concat(),
+            ["to_ipv4", "_mapped("].concat(),
+            ["Ipv4Addr::", "from(u32"].concat(),
+        ];
+        for (file, source) in [
+            ("config/auth.rs", include_str!("auth.rs")),
+            ("auth/mod.rs", include_str!("../auth/mod.rs")),
+            (
+                "auth/token_routes.rs",
+                include_str!("../auth/token_routes.rs"),
+            ),
+            ("rate_limit.rs", include_str!("../rate_limit.rs")),
+        ] {
+            let code = source
+                .split(&["#[cfg(test)]", "\nmod tests"].concat())
+                .next()
+                .unwrap();
+            let mut function = "";
+            for line in code.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                if let Some((_, rest)) = line.split_once("fn ") {
+                    function = rest
+                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                        .next()
+                        .unwrap_or("");
+                }
+                for needle in &needles {
+                    assert!(
+                        !line.contains(needle.as_str())
+                            || (file, function) == ("config/auth.rs", "canonical_network"),
+                        "{file}: {function} turns an address into IPv4: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same networks written in `auth.trusted_proxies`, read the way the
+    /// configuration file is: which addresses each one trusts.
+    #[test]
+    fn trusted_proxies_from_the_file_trust_only_their_own_family() {
+        for (setting, address, trusted) in [
+            ("::a00:1/128", "10.0.0.1", false),
+            ("::a00:1/128", "::ffff:10.0.0.1", false),
+            ("::a00:1/128", "::a00:1", true),
+            ("::a00:1", "10.0.0.1", false),
+            ("::1/128", "::1", true),
+            ("::1/128", "0.0.0.1", false),
+            ("::1", "::1", true),
+            ("::1", "0.0.0.1", false),
+            ("::ffff:10.0.0.1/128", "10.0.0.1", true),
+            ("::ffff:10.0.0.1/128", "::ffff:10.0.0.1", true),
+            ("::ffff:10.0.0.1", "10.0.0.1", true),
+            ("::ffff:10.0.0.0/120", "10.0.0.7", true),
+            ("::ffff:10.0.0.0/120", "10.0.1.7", false),
+            ("10.0.0.0/8", "::ffff:10.2.3.4", true),
+            ("10.0.0.0/8", "::a02:304", false),
+            ("2001:db8::/32", "2001:db8::5", true),
+            ("2001:db8::/32", "10.0.0.1", false),
+        ] {
+            let auth: AuthConfig =
+                toml::from_str(&format!("trusted_proxies = {setting:?}")).unwrap();
+            assert_eq!(
+                auth.trusted_proxies.contains(address.parse().unwrap()),
+                trusted,
+                "{setting} trusting {address}"
+            );
+        }
+    }
 
     #[test]
     fn oidc_config_is_active_only_with_enabled_and_a_provider() {
