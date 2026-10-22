@@ -2112,7 +2112,7 @@ mod tests {
         storage.refresh_reachability().await;
         assert!(storage.health_check().await);
 
-        let fifo = crate::test_helpers::hang_health_probe(temp_dir.path());
+        let hung = crate::test_helpers::hang_health_probe(temp_dir.path());
         // CANCEL-SAFETY: the cut refresh leaves its probe blocked on its own thread, which is
         // what the next refresh has to cope with.
         let first =
@@ -2124,9 +2124,8 @@ mod tests {
         assert!(second.await.is_ok(), "the next refresh does not wait on it");
         assert!(!storage.health_check().await, "a disk that does not answer");
 
-        // The disk answers: a reader takes the FIFO, the stuck probe goes on and ends.
-        let reader = tokio::task::spawn_blocking(move || drop(std::fs::File::open(fifo)));
-        reader.await.unwrap();
+        // The disk answers: the stuck probe goes on and ends.
+        hung.answer();
         let mut writable = false;
         for _ in 0..50 {
             storage.refresh_reachability().await;

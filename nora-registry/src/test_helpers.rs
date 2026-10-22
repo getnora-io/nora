@@ -1021,11 +1021,35 @@ impl object_store::ObjectStore for SlowListing {
     }
 }
 
-/// Make the local backend's health-probe file under `base` a FIFO nobody reads: opening it
-/// for writing blocks, as a write does on a disk that stopped answering. Opening the FIFO
-/// for reading lets the probe go on.
+/// A local disk that stopped answering, for the health probe: see [`hang_health_probe`].
 #[cfg(unix)]
-pub fn hang_health_probe(base: &std::path::Path) -> std::path::PathBuf {
+pub struct HungProbe(std::path::PathBuf);
+
+#[cfg(unix)]
+impl HungProbe {
+    /// The disk answers again: every probe blocked on the FIFO goes on and ends.
+    pub fn answer(self) {}
+}
+
+#[cfg(unix)]
+impl Drop for HungProbe {
+    fn drop(&mut self) {
+        // Any reader releases the writers blocked in `open`. Non-blocking, so it does not wait
+        // for a writer when none is left. Also on a failed assertion: a probe still blocked
+        // would keep the runtime from shutting down and hang the test instead of failing it.
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
+            .open(&self.0);
+    }
+}
+
+/// Make the local backend's health-probe file under `base` a FIFO nobody reads: opening it
+/// for writing blocks, as a write does on a disk that stopped answering, until the returned
+/// guard answers or is dropped.
+#[cfg(unix)]
+pub fn hang_health_probe(base: &std::path::Path) -> HungProbe {
     let fifo = base.join(format!(".nora-health-probe.{}", std::process::id()));
     // A running probe holds a regular file under that name for a moment: try again.
     for _ in 0..100 {
@@ -1035,7 +1059,7 @@ pub fn hang_health_probe(base: &std::path::Path) -> std::path::PathBuf {
             .status()
             .unwrap();
         if made.success() {
-            return fifo;
+            return HungProbe(fifo);
         }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }

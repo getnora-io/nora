@@ -3869,7 +3869,7 @@ mod maintenance_storage_tests {
         let ok = ready_becomes(&ctx.app, StatusCode::OK, 10).await;
         assert_eq!(ok, StatusCode::OK, "answering disk");
 
-        let fifo = crate::test_helpers::hang_health_probe(ctx._tempdir.path());
+        let disk = crate::test_helpers::hang_health_probe(ctx._tempdir.path());
         // The probe is cut at the 633 ms tick deadline; the tick after finds it waiting.
         let hung = ready_becomes(&ctx.app, StatusCode::SERVICE_UNAVAILABLE, 20).await;
         assert_eq!(
@@ -3883,8 +3883,7 @@ mod maintenance_storage_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
-        let reader = tokio::task::spawn_blocking(move || drop(std::fs::File::open(fifo)));
-        reader.await.unwrap();
+        disk.answer();
         let ok = ready_becomes(&ctx.app, StatusCode::OK, 30).await;
         assert_eq!(ok, StatusCode::OK, "the disk answers again");
         assert_eq!(ctx.state.tasks.failing(), None);
