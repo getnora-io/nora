@@ -617,4 +617,52 @@ mod tests {
             "enabled with a provider must be active"
         );
     }
+
+    /// A network written in the IPv4-mapped form at prefix 96 or longer is the
+    /// IPv4 network under it, at every such prefix: `::ffff:0.0.0.0/96` is all
+    /// of IPv4, `::ffff:a.b.c.d/128` is the one address. Both forms of every
+    /// address are judged alike.
+    #[test]
+    fn a_mapped_network_is_its_ipv4_network_at_every_prefix() {
+        let addresses: Vec<IpAddr> = [
+            "203.0.113.0",
+            "203.0.113.1",
+            "203.0.113.128",
+            "203.0.113.255",
+            "203.0.112.255",
+            "203.0.114.0",
+            "10.0.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        for prefix in 96..=128u8 {
+            let mapped = TrustedProxies::parse(&format!("::ffff:203.0.113.0/{prefix}"));
+            let ipv4 = TrustedProxies::parse(&format!("203.0.113.0/{}", prefix - 96));
+            for &addr in &addresses {
+                let IpAddr::V4(v4) = addr else { unreachable!() };
+                let as_mapped = IpAddr::V6(v4.to_ipv6_mapped());
+                assert_eq!(
+                    mapped.contains(addr),
+                    ipv4.contains(addr),
+                    "/{prefix}: {addr}"
+                );
+                assert_eq!(
+                    mapped.contains(as_mapped),
+                    ipv4.contains(addr),
+                    "/{prefix}: {as_mapped}"
+                );
+            }
+        }
+        let all_of_ipv4 = TrustedProxies::parse("::ffff:0.0.0.0/96");
+        for addr in &addresses {
+            assert!(all_of_ipv4.contains(*addr), "{addr}");
+        }
+        assert!(!all_of_ipv4.contains("2001:db8::1".parse().unwrap()));
+        let one = TrustedProxies::parse("::ffff:203.0.113.1/128");
+        assert!(one.contains("203.0.113.1".parse().unwrap()));
+        assert!(!one.contains("203.0.113.0".parse().unwrap()));
+    }
 }
