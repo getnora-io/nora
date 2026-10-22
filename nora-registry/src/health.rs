@@ -40,7 +40,8 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<HealthStatus>) {
-    // Read when the probe arrives, before the storage checks below take their time.
+    // Read when the probe arrives. The storage fields below are cached verdicts and counts
+    // the maintenance loop took: a probe does no storage I/O.
     let failing_task = state.tasks.failing();
     let storage_reachable = check_storage_reachable(&state).await;
     let total_size = state.storage.total_size().await;
@@ -155,6 +156,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_returns_200() {
         let ctx = create_test_context();
+        ctx.state.storage.refresh_reachability().await;
         let response = send(&ctx.app, Method::GET, "/health", "").await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
@@ -227,6 +229,7 @@ mod tests {
             .put("test/artifact", b"hello world")
             .await
             .unwrap();
+        ctx.state.storage.refresh_total_size_cache().await;
 
         let response = send(&ctx.app, Method::GET, "/health", "").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -263,6 +266,8 @@ mod tests {
         let mut perms = std::fs::metadata(dir).unwrap().permissions();
         perms.set_mode(0o500);
         std::fs::set_permissions(dir, perms).unwrap();
+        // The next tick's write probe.
+        ctx.state.storage.refresh_reachability().await;
 
         let health = send(&ctx.app, Method::GET, "/health", "").await;
         assert_eq!(health.status(), StatusCode::OK);
@@ -278,9 +283,82 @@ mod tests {
         std::fs::set_permissions(dir, perms).unwrap();
     }
 
+    /// The modification time of the storage directory, which changes when a file is
+    /// created or removed in it.
+    fn dir_mtime(dir: &std::path::Path) -> std::time::SystemTime {
+        std::fs::metadata(dir).unwrap().modified().unwrap()
+    }
+
+    /// Probes on the local backend do no storage I/O: after the maintenance loop's refresh,
+    /// any number of `/health` and `/ready` requests leave the storage directory as it was
+    /// (a write probe creates and removes a file in it, which moves its modification time).
+    #[tokio::test]
+    async fn probes_on_local_storage_touch_no_file() {
+        let ctx = create_test_context();
+        let dir = ctx._tempdir.path();
+        ctx.state.storage.refresh_reachability().await;
+        ctx.state.storage.refresh_total_size_cache().await;
+        // Past the file system's timestamp granularity, so any change would show.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = dir_mtime(dir);
+        let entries = std::fs::read_dir(dir).unwrap().count();
+
+        for _ in 0..10 {
+            let health = send(&ctx.app, Method::GET, "/health", "").await;
+            assert_eq!(health.status(), StatusCode::OK);
+            let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+            assert_eq!(ready.status(), StatusCode::OK);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(dir_mtime(dir), before, "a probe created or removed a file");
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), entries);
+    }
+
+    /// The size on `/health` is the one the size task counted, not a walk of the tree per
+    /// request: bytes written since stay out of it until the next count.
+    #[tokio::test]
+    async fn the_size_on_health_is_the_counted_one() {
+        let ctx = create_test_context();
+        ctx.state.storage.refresh_total_size_cache().await;
+        let dir = ctx._tempdir.path().join("raw");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("late.bin"), [0u8; 1000]).unwrap();
+
+        let size = |json: serde_json::Value| json["storage"]["total_size_bytes"].as_u64().unwrap();
+        for _ in 0..5 {
+            let health = send(&ctx.app, Method::GET, "/health", "").await;
+            let json = serde_json::from_slice(&body_bytes(health).await).unwrap();
+            assert_eq!(size(json), 0, "the size counted before the write");
+        }
+
+        ctx.state.storage.refresh_total_size_cache().await;
+        let health = send(&ctx.app, Method::GET, "/health", "").await;
+        let json = serde_json::from_slice(&body_bytes(health).await).unwrap();
+        assert_eq!(size(json), 1000, "the next count sees the write");
+    }
+
+    /// Until the maintenance loop has looked at the local store, readiness has no verdict
+    /// and gates, as on an object store: `/ready` 503, `/health` 200 and `degraded`.
+    #[tokio::test]
+    async fn readiness_waits_for_the_first_storage_verdict() {
+        let ctx = create_test_context();
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let health = send(&ctx.app, Method::GET, "/health", "").await;
+        assert_eq!(health.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(health).await).unwrap();
+        assert_eq!(json["status"], "degraded");
+
+        ctx.state.storage.refresh_reachability().await;
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn test_ready_returns_200() {
         let ctx = create_test_context();
+        ctx.state.storage.refresh_reachability().await;
         let response = send(&ctx.app, Method::GET, "/ready", "").await;
         assert_eq!(response.status(), StatusCode::OK);
     }

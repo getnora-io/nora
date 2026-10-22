@@ -1021,6 +1021,27 @@ impl object_store::ObjectStore for SlowListing {
     }
 }
 
+/// Make the local backend's health-probe file under `base` a FIFO nobody reads: opening it
+/// for writing blocks, as a write does on a disk that stopped answering. Opening the FIFO
+/// for reading lets the probe go on.
+#[cfg(unix)]
+pub fn hang_health_probe(base: &std::path::Path) -> std::path::PathBuf {
+    let fifo = base.join(format!(".nora-health-probe.{}", std::process::id()));
+    // A running probe holds a regular file under that name for a moment: try again.
+    for _ in 0..100 {
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        if made.success() {
+            return fifo;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("mkfifo {}", fifo.display());
+}
+
 /// A [`Storage`] over a [`SlowListing`] store with `delay` between listed objects.
 pub fn slow_listing_storage(delay: std::time::Duration) -> Storage {
     let store = SlowListing {

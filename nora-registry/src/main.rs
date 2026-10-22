@@ -3401,8 +3401,8 @@ async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceW
     // gauge is counted right after boot): the store's whole size and the per-registry
     // artifact counts and logical bytes from the index (#446). The "total" storage_bytes
     // label is the full physical footprint; per-registry is summed artifact size. Started,
-    // not awaited: on a large bucket the listing takes longer than a tick may run, and
-    // readiness does not depend on it. Skipped while the previous count still runs.
+    // not awaited: on a large bucket or directory tree the count takes longer than a tick
+    // may run, and readiness does not depend on it. Skipped while the previous count still runs.
     if !tick_count.is_multiple_of(2) {
         let storage = state.storage.clone();
         let repo_index = Arc::clone(&state.repo_index);
@@ -3418,7 +3418,8 @@ async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceW
     }
 
     // Every tick, the boot tick included so readiness is known before the first probe:
-    // one cheap request to the store (#869). The tick waits on nothing else.
+    // one cheap request to the store (#869) — the first page of a listing, or a write probe
+    // on the local disk. The tick waits on nothing else.
     state.storage.refresh_reachability().await;
 
     // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
@@ -3805,6 +3806,87 @@ mod maintenance_storage_tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert_eq!(ready, StatusCode::OK, "the store answers again");
+        assert_eq!(ctx.state.tasks.failing(), None);
+    }
+
+    /// Poll `/ready` until it answers `want`, at most `polls` times 100 ms apart, asserting
+    /// `/health` 200 at every poll. Returns the last `/ready` status.
+    async fn ready_becomes(app: &axum::Router, want: StatusCode, polls: usize) -> StatusCode {
+        let mut ready = send(app, Method::GET, "/ready", "").await.status();
+        for _ in 0..polls {
+            if ready == want {
+                break;
+            }
+            let health = send(app, Method::GET, "/health", "").await;
+            assert_eq!(health.status(), StatusCode::OK, "liveness meanwhile");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ready = send(app, Method::GET, "/ready", "").await.status();
+        }
+        ready
+    }
+
+    /// The local store stops taking writes (a read-only remount, a full disk): the next
+    /// tick's write probe sees it, so `/ready` turns 503 within a tick while `/health` stays
+    /// 200; writable again, `/ready` turns 200 under the same loop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritable_local_store_fails_readiness_within_a_tick() {
+        use std::os::unix::fs::PermissionsExt;
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.maintenance_stall_secs = 2
+        });
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 10).await;
+        assert_eq!(ok, StatusCode::OK, "writable store");
+
+        let dir = ctx._tempdir.path();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // A tick is 100 ms here; twenty polls leave room for a loaded test host and stay far
+        // inside the 150 s a verdict takes to expire, so only the tick's probe can turn it.
+        let unwritable = ready_becomes(&ctx.app, StatusCode::SERVICE_UNAVAILABLE, 20).await;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            unwritable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "read-only store"
+        );
+
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 10).await;
+        assert_eq!(ok, StatusCode::OK, "writable again");
+        assert_eq!(ctx.state.tasks.failing(), None);
+    }
+
+    /// The local disk stops answering (the write probe blocks): `/health` stays 200, and
+    /// `/ready` turns 503 once the next tick finds the probe still waiting; when the disk
+    /// answers again `/ready` turns 200, under the same loop.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hung_local_disk_fails_readiness_not_liveness() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.maintenance_stall_secs = 2
+        });
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 10).await;
+        assert_eq!(ok, StatusCode::OK, "answering disk");
+
+        let fifo = crate::test_helpers::hang_health_probe(ctx._tempdir.path());
+        // The probe is cut at the 633 ms tick deadline; the tick after finds it waiting.
+        let hung = ready_becomes(&ctx.app, StatusCode::SERVICE_UNAVAILABLE, 20).await;
+        assert_eq!(
+            hung,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "disk that does not answer"
+        );
+        for _ in 0..30 {
+            let health = send(&ctx.app, Method::GET, "/health", "").await;
+            assert_eq!(health.status(), StatusCode::OK, "liveness on a hung disk");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        let reader = tokio::task::spawn_blocking(move || drop(std::fs::File::open(fifo)));
+        reader.await.unwrap();
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 30).await;
+        assert_eq!(ok, StatusCode::OK, "the disk answers again");
         assert_eq!(ctx.state.tasks.failing(), None);
     }
 

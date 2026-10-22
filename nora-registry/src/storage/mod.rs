@@ -35,6 +35,13 @@ pub(crate) fn is_reserved_signing_key(key: &str) -> bool {
     key.starts_with(SIGNING_KEY_PREFIX)
 }
 
+/// A storage verdict (reachable, writable) older than this is treated as unknown →
+/// unreachable. Five 30 s maintenance ticks: tolerates missed refreshes + jitter without
+/// flapping, but a stalled or dead maintenance loop un-readies the pod within the window
+/// instead of pinning a stale `true` (#872). Shared by every backend whose `health_check`
+/// serves a verdict the maintenance loop took.
+pub(crate) const HEALTH_MAX_STALE_SECS: i64 = 150;
+
 /// File metadata
 #[derive(Debug, Clone)]
 pub struct FileMeta {
@@ -141,7 +148,8 @@ pub trait StorageBackend: Send + Sync {
     /// Total size of all stored artifacts in bytes
     async fn total_size(&self) -> u64;
     fn backend_name(&self) -> &'static str;
-    /// Ask the store whether it answers, with one cheap request, and keep the outcome for
+    /// Ask the store whether it answers, with one cheap request (the object store: the first
+    /// page of its listing; the local disk: a write probe), and keep the outcome for
     /// `health_check`, so a probe never waits on the store. No-op for backends whose
     /// `health_check` asks the store itself.
     async fn refresh_reachability(&self) {}
@@ -615,7 +623,7 @@ impl Storage {
         self.inner.refresh_reachability().await;
     }
 
-    /// Refresh cached total_size. No-op for local storage, computes for S3.
+    /// Recount the size `total_size` serves, walking the whole store.
     pub async fn refresh_total_size_cache(&self) {
         self.inner.refresh_total_size().await;
     }

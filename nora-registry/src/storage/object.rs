@@ -61,12 +61,6 @@ pub struct ObjectStorage {
     last_refresh_unix: std::sync::atomic::AtomicU64,
 }
 
-/// Reachability older than this is treated as unknown → unreachable. Five 30 s maintenance
-/// ticks: tolerates missed refreshes + jitter without flapping, but a stalled or
-/// dead maintenance loop un-readies the pod within the window instead of pinning a stale
-/// `true` (#872).
-const HEALTH_MAX_STALE_SECS: i64 = 150;
-
 impl ObjectStorage {
     /// Create new S3 storage with optional credentials.
     ///
@@ -438,7 +432,7 @@ impl StorageBackend for ObjectStorage {
             && crate::cache_ttl::is_within_ttl(
                 self.last_refresh_unix
                     .load(std::sync::atomic::Ordering::Relaxed),
-                HEALTH_MAX_STALE_SECS,
+                super::HEALTH_MAX_STALE_SECS,
             )
     }
 

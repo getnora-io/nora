@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use axum::body::Bytes;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -400,6 +401,75 @@ pub struct LocalStorage {
     commit_locks: crate::PublishLocks,
     /// This instance's staging directory, see [`Staging`].
     staging: StagingCell,
+    /// Outcome of the last write probe, served by `health_check()`. Starts `false`, so
+    /// readiness gates until the maintenance loop's first tick has probed the disk; a
+    /// probe per health request would put disk I/O, and a disk that hangs, on the probe.
+    cached_reachable: AtomicBool,
+    /// Unix seconds of the last probe (`0` = never). A verdict older than
+    /// `HEALTH_MAX_STALE_SECS` is treated as unreachable, so a maintenance loop that stops
+    /// un-readies the instance instead of pinning a stale `true`.
+    last_refresh_unix: AtomicU64,
+    /// Set while a write probe runs, see `refresh_reachability`.
+    probing: Arc<AtomicBool>,
+    /// Bytes stored, as last counted by `refresh_total_size`.
+    cached_total_size: AtomicU64,
+}
+
+/// Clears the probe-running flag when the probe ends, however it ends.
+struct ProbeDone(Arc<AtomicBool>);
+
+impl Drop for ProbeDone {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Create, write, fsync and remove a probe file under `base`: only a store that takes a
+/// durable write passes. `base.exists()` is not a health signal — a read-only mount or a
+/// full disk where the directory already exists would still pass.
+fn write_probe(base: &Path) -> bool {
+    use std::io::Write as _;
+    if std::fs::create_dir_all(base).is_err() {
+        return false;
+    }
+    // One name per process: a probe file left by a disk that hung is reused by the next
+    // probe, not joined by another.
+    let probe = base.join(format!(".nora-health-probe.{}", std::process::id()));
+    let writable = match std::fs::File::create(&probe) {
+        Ok(mut file) => file.write_all(b"ok").is_ok() && file.sync_all().is_ok(),
+        Err(_) => false,
+    };
+    let _ = std::fs::remove_file(&probe); // best-effort cleanup
+    writable
+}
+
+/// Bytes of the stored artifacts under `path`, walking the whole tree. At the root it
+/// leaves out the pin sidecar, `tmp/` (in-flight streamed uploads — transient staging,
+/// not stored artifacts; counting it makes the storage gauge sawtooth during pushes) and
+/// the staging directory (writes in progress, see `Staging`).
+fn dir_size(path: &Path, is_root: bool) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if is_root && path.file_name().is_some_and(|n| n == PIN_FILE) {
+                    continue;
+                }
+                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            } else if path.is_dir() {
+                if is_root
+                    && path
+                        .file_name()
+                        .is_some_and(|n| n == "tmp" || n == crate::validation::STAGING_DIR)
+                {
+                    continue;
+                }
+                total += dir_size(&path, false);
+            }
+        }
+    }
+    total
 }
 
 impl LocalStorage {
@@ -411,6 +481,10 @@ impl LocalStorage {
             pins,
             commit_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             staging: Arc::new(std::sync::OnceLock::new()),
+            cached_reachable: AtomicBool::new(false),
+            last_refresh_unix: AtomicU64::new(0),
+            probing: Arc::new(AtomicBool::new(false)),
+            cached_total_size: AtomicU64::new(0),
         }
     }
 
@@ -806,67 +880,56 @@ impl StorageBackend for LocalStorage {
     }
 
     async fn health_check(&self) -> bool {
-        // A real write-probe — `base_path.exists()` is not a health signal: a
-        // read-only mount or a full disk where the directory already exists would
-        // still report healthy. Create + write + fsync + remove a unique temp
-        // file; only a genuinely writable backing store passes.
-        if fs::create_dir_all(&self.base_path).await.is_err() {
-            return false;
-        }
-        let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let probe =
-            self.base_path
-                .join(format!(".nora-health-probe.{}.{}", std::process::id(), seq));
-        let writable = match fs::File::create(&probe).await {
-            Ok(mut file) => file.write_all(b"ok").await.is_ok() && file.sync_all().await.is_ok(),
-            Err(_) => false,
-        };
-        let _ = fs::remove_file(&probe).await; // best-effort cleanup
-        writable
+        // The verdict of the last write probe, which the maintenance loop takes once a tick
+        // (`refresh_reachability`): a health request does no disk I/O, so a disk that hangs
+        // cannot hang the probe. It expires like the object store's: a loop that stopped
+        // probing lets the window lapse and un-readies the instance.
+        self.cached_reachable.load(Ordering::Relaxed)
+            && crate::cache_ttl::is_within_ttl(
+                self.last_refresh_unix.load(Ordering::Relaxed),
+                super::HEALTH_MAX_STALE_SECS,
+            )
     }
 
     async fn total_size(&self) -> u64 {
-        let base = self.base_path.clone();
-        tokio::task::spawn_blocking(move || {
-            fn dir_size(path: &std::path::Path, is_root: bool) -> u64 {
-                let mut total = 0u64;
-                if let Ok(entries) = std::fs::read_dir(path) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() {
-                            if is_root && path.file_name().is_some_and(|n| n == PIN_FILE) {
-                                continue;
-                            }
-                            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
-                        } else if path.is_dir() {
-                            // `<root>/tmp/` holds in-flight streamed uploads —
-                            // transient staging, not stored artifacts; counting
-                            // it makes the storage gauge sawtooth during pushes.
-                            if is_root && path.file_name().is_some_and(|n| n == "tmp") {
-                                continue;
-                            }
-                            // Writes in progress, see `Staging`.
-                            if is_root
-                                && path
-                                    .file_name()
-                                    .is_some_and(|n| n == crate::validation::STAGING_DIR)
-                            {
-                                continue;
-                            }
-                            total += dir_size(&path, false);
-                        }
-                    }
-                }
-                total
-            }
-            dir_size(&base, true)
-        })
-        .await
-        .unwrap_or(0)
+        self.cached_total_size.load(Ordering::Relaxed)
     }
 
     fn backend_name(&self) -> &'static str {
         "local"
+    }
+
+    async fn refresh_reachability(&self) {
+        // At most one probe at a time. A probe that has not come back is a disk that does
+        // not answer: record that, rather than queue a second probe (and a second blocked
+        // thread) behind it each tick.
+        let writable = if self.probing.swap(true, Ordering::AcqRel) {
+            false
+        } else {
+            let done = ProbeDone(Arc::clone(&self.probing));
+            let base = self.base_path.clone();
+            // On its own blocking thread, the probe runs to its end even when the tick that
+            // started it is cut at its deadline; only then is the flag cleared.
+            tokio::task::spawn_blocking(move || {
+                let _done = done;
+                write_probe(&base)
+            })
+            .await
+            .unwrap_or(false)
+        };
+        self.cached_reachable.store(writable, Ordering::Relaxed);
+        // Stamp every run, writable or not: `health_check` expires the verdict when the
+        // loop stops.
+        self.last_refresh_unix
+            .store(crate::cache_ttl::now_unix(), Ordering::Relaxed);
+    }
+
+    async fn refresh_total_size(&self) {
+        // The whole tree, as long as it takes; health requests read the count.
+        let base = self.base_path.clone();
+        if let Ok(total) = tokio::task::spawn_blocking(move || dir_size(&base, true)).await {
+            self.cached_total_size.store(total, Ordering::Relaxed);
+        }
     }
 
     async fn prepare(&self) {
@@ -1749,6 +1812,7 @@ mod tests {
         file.flush().await.unwrap();
         assert!(in_flight.path().exists());
 
+        storage.refresh_total_size().await;
         assert_eq!(storage.total_size().await, 3);
         assert_eq!(storage.list("").await.unwrap(), vec!["raw/a".to_string()]);
         let listed: Vec<String> = storage
@@ -1974,7 +2038,37 @@ mod tests {
     async fn test_health_check() {
         let temp_dir = TempDir::new().unwrap();
         let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        assert!(
+            !storage.health_check().await,
+            "no verdict before the first probe"
+        );
+        storage.refresh_reachability().await;
         assert!(storage.health_check().await);
+    }
+
+    /// The verdict of the last probe expires: a maintenance loop that stopped probing
+    /// leaves a verdict older than `HEALTH_MAX_STALE_SECS`, which reads as unreachable;
+    /// the next probe makes it fresh again.
+    #[tokio::test]
+    async fn the_verdict_expires_when_the_loop_stops() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        storage.refresh_reachability().await;
+        assert!(storage.health_check().await);
+
+        let now = crate::cache_ttl::now_unix();
+        let window = super::super::HEALTH_MAX_STALE_SECS as u64;
+        storage
+            .last_refresh_unix
+            .store(now - window + 5, Ordering::Relaxed);
+        assert!(storage.health_check().await, "inside the window");
+        storage
+            .last_refresh_unix
+            .store(now - window - 1, Ordering::Relaxed);
+        assert!(!storage.health_check().await, "past the window");
+
+        storage.refresh_reachability().await;
+        assert!(storage.health_check().await, "fresh again");
     }
 
     #[tokio::test]
@@ -1984,6 +2078,7 @@ mod tests {
         let storage = LocalStorage::new(new_path.to_str().unwrap());
 
         assert!(!new_path.exists());
+        storage.refresh_reachability().await;
         assert!(storage.health_check().await);
         assert!(new_path.exists());
     }
@@ -1998,10 +2093,50 @@ mod tests {
         let file = temp_dir.path().join("not-a-dir");
         std::fs::write(&file, b"x").unwrap();
         let storage = LocalStorage::new(file.join("store").to_str().unwrap());
+        storage.refresh_reachability().await;
         assert!(
             !storage.health_check().await,
             "an unwritable backing store must report unhealthy"
         );
+    }
+
+    /// A probe stuck on the disk is not started a second time: the next refresh does not
+    /// wait, it records the store as unwritable. Once the disk answers, the probe ends and
+    /// the store is writable again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_stuck_on_the_disk_is_not_started_again() {
+        use std::time::Duration;
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        storage.refresh_reachability().await;
+        assert!(storage.health_check().await);
+
+        let fifo = crate::test_helpers::hang_health_probe(temp_dir.path());
+        // CANCEL-SAFETY: the cut refresh leaves its probe blocked on its own thread, which is
+        // what the next refresh has to cope with.
+        let first =
+            tokio::time::timeout(Duration::from_millis(300), storage.refresh_reachability());
+        assert!(first.await.is_err(), "the probe waits on the disk");
+        // CANCEL-SAFETY: only the elapsed outcome is asserted on.
+        let second =
+            tokio::time::timeout(Duration::from_millis(300), storage.refresh_reachability());
+        assert!(second.await.is_ok(), "the next refresh does not wait on it");
+        assert!(!storage.health_check().await, "a disk that does not answer");
+
+        // The disk answers: a reader takes the FIFO, the stuck probe goes on and ends.
+        let reader = tokio::task::spawn_blocking(move || drop(std::fs::File::open(fifo)));
+        reader.await.unwrap();
+        let mut writable = false;
+        for _ in 0..50 {
+            storage.refresh_reachability().await;
+            writable = storage.health_check().await;
+            if writable {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(writable, "writable again once the probe ended");
     }
 
     #[tokio::test]
@@ -2161,6 +2296,7 @@ mod tests {
     async fn test_total_size_empty() {
         let temp_dir = TempDir::new().unwrap();
         let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        storage.refresh_total_size().await;
         assert_eq!(storage.total_size().await, 0);
     }
 
@@ -2172,6 +2308,7 @@ mod tests {
         put(&storage, "a/file1", b"hello").await.unwrap(); // 5 bytes
         put(&storage, "b/file2", b"world!").await.unwrap(); // 6 bytes
 
+        storage.refresh_total_size().await;
         let size = storage.total_size().await;
         assert_eq!(size, 11);
     }
@@ -2183,9 +2320,11 @@ mod tests {
 
         put(&storage, "file1", b"12345").await.unwrap();
         put(&storage, "file2", b"67890").await.unwrap();
+        storage.refresh_total_size().await;
         assert_eq!(storage.total_size().await, 10);
 
         storage.delete("file1").await.unwrap();
+        storage.refresh_total_size().await;
         assert_eq!(storage.total_size().await, 5);
     }
 

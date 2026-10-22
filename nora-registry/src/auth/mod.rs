@@ -1626,6 +1626,8 @@ mod integration_tests {
     #[tokio::test]
     async fn test_auth_public_paths_always_pass() {
         let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        // The storage verdict the maintenance loop's first tick takes.
+        ctx.state.storage.refresh_reachability().await;
         let response = send(&ctx.app, Method::GET, "/health", "").await;
         assert_eq!(response.status(), StatusCode::OK);
         let response = send(&ctx.app, Method::GET, "/ready", "").await;
@@ -4251,7 +4253,9 @@ mod web_surface_gating_tests {
                 "{p} must challenge so browsers prompt"
             );
         }
-        // Probes stay unconditionally open (LB/liveness would break).
+        // Probes stay unconditionally open (LB/liveness would break). The storage
+        // verdict is the one the maintenance loop's first tick takes.
+        ctx.state.storage.refresh_reachability().await;
         for p in ["/health", "/ready"] {
             let resp = send(&ctx.app, Method::GET, p, "").await;
             assert_eq!(resp.status(), StatusCode::OK, "{p}");
