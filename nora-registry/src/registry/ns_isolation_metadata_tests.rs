@@ -1086,6 +1086,17 @@ const INTERNAL_STORED: [(&str, &str); 11] = [
     ),
 ];
 
+/// The bytes stored under an [`INTERNAL_STORED`] key.
+fn internal_stored_body(key: &str) -> Vec<u8> {
+    if key.starts_with("npm/") && key.ends_with(".json") {
+        br#"{"name":"internalpkg","version":"1.0.0"}"#.to_vec()
+    } else if key.ends_with(".json") {
+        br#"{"count":0,"items":[],"versions":["1.0.0"]}"#.to_vec()
+    } else {
+        b"local copy".to_vec()
+    }
+}
+
 #[tokio::test]
 async fn an_internal_package_on_a_store_that_cannot_be_read_is_unavailable_not_absent() {
     use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
@@ -1107,14 +1118,11 @@ async fn an_internal_package_on_a_store_that_cannot_be_read_is_unavailable_not_a
         c.nuget.proxy = Some(uri);
     });
     for (_, key) in INTERNAL_STORED {
-        let body = if key.starts_with("npm/") && key.ends_with(".json") {
-            br#"{"name":"internalpkg","version":"1.0.0"}"#.to_vec()
-        } else if key.ends_with(".json") {
-            br#"{"count":0,"items":[],"versions":["1.0.0"]}"#.to_vec()
-        } else {
-            b"local copy".to_vec()
-        };
-        ctx.state.storage.put(key, &body).await.unwrap();
+        ctx.state
+            .storage
+            .put(key, &internal_stored_body(key))
+            .await
+            .unwrap();
     }
     // The store up: each is served from its local copy.
     for (path, _) in INTERNAL_STORED {
@@ -1256,90 +1264,97 @@ async fn an_internal_package_whose_copy_cannot_be_read_is_unavailable_not_absent
     );
 }
 
-/// The same for the other formats' downloads: an internal package's copy that the store could
-/// not read answers 503, never 403 or 404.
-#[tokio::test]
-async fn an_internal_download_of_every_other_format_on_a_store_that_cannot_be_read_is_503() {
-    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
-    let stored = [
-        (
-            "/gems/gems/internalpkg-1.0.0.gem",
-            "gems/gems/internalpkg-1.0.0.gem",
-        ),
-        (
-            "/gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
-            "gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
-        ),
-        (
-            "/maven2/internalpkg/lib/1.0/lib-1.0.jar",
-            "maven/internalpkg/lib/1.0/lib-1.0.jar",
-        ),
-        (
-            "/maven2/internalpkg/lib/maven-metadata.xml",
-            "maven/internalpkg/lib/maven-metadata.xml",
-        ),
-        (
-            "/pub/packages/internalpkg/versions/1.0.0.tar.gz",
-            "pub/packages/internalpkg/versions/1.0.0.tar.gz",
-        ),
-        (
-            "/ansible/download/internalns-coll-1.0.0.tar.gz",
-            "ansible/download/internalns-coll-1.0.0.tar.gz",
-        ),
-        (
-            "/go/internal.corp/lib/@v/v1.0.0.zip",
-            "go/internal.corp/lib/@v/v1.0.0.zip",
-        ),
-        (
-            "/cargo/api/v1/crates/internalpkg/1.0.0/download",
-            "cargo/internalpkg/1.0.0/internalpkg-1.0.0.crate",
-        ),
-        (
-            "/cpan/authors/id/I/IN/INTERNAL/internalpkg-1.0.tar.gz",
-            "cpan/authors/id/I/IN/INTERNAL/internalpkg-1.0.tar.gz",
-        ),
-        (
-            "/conan/v2/conans/internalpkg/1.0/_/_/latest",
-            "conan/internalpkg/1.0/_/_/latest.json",
-        ),
-        (
-            "/conan/v2/conans/internalpkg/1.0/_/_/revisions",
-            "conan/internalpkg/1.0/_/_/revisions.json",
-        ),
-        (
-            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/files",
-            "conan/internalpkg/1.0/_/_/revisions/abc1/files.json",
-        ),
-        (
-            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/files/conanfile.py",
-            "conan/internalpkg/1.0/_/_/revisions/abc1/files/conanfile.py",
-        ),
-        (
-            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/latest",
-            "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/latest.json",
-        ),
-        (
-            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions",
-            "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions.json",
-        ),
-        (
-            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files",
-            "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files.json",
-        ),
-        (
-            "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files/conaninfo.txt",
-            "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files/conaninfo.txt",
-        ),
-    ];
-    let (storage, outage) = outage_storage();
-    let ctx = create_test_context_with_storage_and_config(storage, |c| {
+/// Each internal download of the other formats, and the key its local copy lives under.
+const INTERNAL_STORED_ELSEWHERE: [(&str, &str); 17] = [
+    (
+        "/gems/gems/internalpkg-1.0.0.gem",
+        "gems/gems/internalpkg-1.0.0.gem",
+    ),
+    (
+        "/gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
+        "gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
+    ),
+    (
+        "/maven2/internalpkg/lib/1.0/lib-1.0.jar",
+        "maven/internalpkg/lib/1.0/lib-1.0.jar",
+    ),
+    (
+        "/maven2/internalpkg/lib/maven-metadata.xml",
+        "maven/internalpkg/lib/maven-metadata.xml",
+    ),
+    (
+        "/pub/packages/internalpkg/versions/1.0.0.tar.gz",
+        "pub/packages/internalpkg/versions/1.0.0.tar.gz",
+    ),
+    (
+        "/ansible/download/internalns-coll-1.0.0.tar.gz",
+        "ansible/download/internalns-coll-1.0.0.tar.gz",
+    ),
+    (
+        "/go/internal.corp/lib/@v/v1.0.0.zip",
+        "go/internal.corp/lib/@v/v1.0.0.zip",
+    ),
+    (
+        "/cargo/api/v1/crates/internalpkg/1.0.0/download",
+        "cargo/internalpkg/1.0.0/internalpkg-1.0.0.crate",
+    ),
+    (
+        "/cpan/authors/id/I/IN/INTERNAL/internalpkg-1.0.tar.gz",
+        "cpan/authors/id/I/IN/INTERNAL/internalpkg-1.0.tar.gz",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/latest",
+        "conan/internalpkg/1.0/_/_/latest.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions",
+        "conan/internalpkg/1.0/_/_/revisions.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/files",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/files.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/files/conanfile.py",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/files/conanfile.py",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/latest",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/latest.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files/conaninfo.txt",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files/conaninfo.txt",
+    ),
+];
+
+/// A context serving [`INTERNAL_STORED_ELSEWHERE`] from `storage`, its formats turned on.
+fn other_formats_context(storage: crate::storage::Storage) -> crate::test_helpers::TestContext {
+    crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
         c.curation.internal_namespaces = vec!["internal*".to_string()];
         c.gems.enabled = true;
         c.pub_dart.enabled = true;
         c.ansible.enabled = true;
         c.cpan.enabled = true;
         c.conan.enabled = true;
-    });
+    })
+}
+
+/// The same for the other formats' downloads: an internal package's copy that the store could
+/// not read answers 503, never 403 or 404.
+#[tokio::test]
+async fn an_internal_download_of_every_other_format_on_a_store_that_cannot_be_read_is_503() {
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let ctx = other_formats_context(storage);
+    let stored = INTERNAL_STORED_ELSEWHERE;
     for (_, key) in stored {
         ctx.state.storage.put(key, b"local copy").await.unwrap();
     }
@@ -1422,12 +1437,10 @@ async fn a_cpan_distribution_internal_by_its_author_path_stays_local() {
     assert_eq!(other.status(), StatusCode::OK);
 }
 
-/// Terraform: every path an internal provider or module is served from — the registry protocol,
-/// its file downloads and the provider network mirror — answers 503 when the store cannot read
-/// the local copy.
-#[tokio::test]
-async fn an_internal_terraform_provider_or_module_on_a_store_that_cannot_be_read_is_503() {
-    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+/// An internal terraform provider and module: each stored key and its bytes, and each path they
+/// are served from with its status with the store up.
+#[allow(clippy::type_complexity)]
+fn internal_terraform() -> (Vec<(String, Vec<u8>)>, [(String, StatusCode); 8]) {
     let zip = "terraform-provider-infra_1.0.0_linux_amd64.zip";
     let stored: Vec<(String, Vec<u8>)> = vec![
         (
@@ -1486,15 +1499,32 @@ async fn an_internal_terraform_provider_or_module_on_a_store_that_cannot_be_read
             StatusCode::OK,
         ),
     ];
-    let (storage, outage) = outage_storage();
-    let ctx = create_test_context_with_storage_and_config(storage, |c| {
+    (stored, paths)
+}
+
+/// A context serving [`internal_terraform`] from `storage`, seeded.
+async fn internal_terraform_context(
+    storage: crate::storage::Storage,
+) -> crate::test_helpers::TestContext {
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
         c.curation.internal_namespaces = vec!["internal*".to_string()];
         c.terraform.enabled = true;
         c.terraform.proxy = Some(BLACKHOLE.to_string());
     });
-    for (key, body) in &stored {
-        ctx.state.storage.put(key, body).await.unwrap();
+    for (key, body) in internal_terraform().0 {
+        ctx.state.storage.put(&key, &body).await.unwrap();
     }
+    ctx
+}
+
+/// Terraform: every path an internal provider or module is served from — the registry protocol,
+/// its file downloads and the provider network mirror — answers 503 when the store cannot read
+/// the local copy.
+#[tokio::test]
+async fn an_internal_terraform_provider_or_module_on_a_store_that_cannot_be_read_is_503() {
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let ctx = internal_terraform_context(storage).await;
+    let (_, paths) = internal_terraform();
     let mut up = Vec::new();
     for (path, expected) in &paths {
         let status = send(&ctx.app, Method::GET, path, "").await.status();
@@ -1559,4 +1589,208 @@ async fn an_internal_mirror_platform_whose_metadata_cannot_be_read_is_503_not_le
     outage.fail_reads_of("/darwin_arm64.json");
     let resp = send(&ctx.app, Method::GET, path, "").await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A local copy that fails its integrity check (changed on disk) is neither served nor taken for
+/// absent: 500, never 403/404 and not the 503 of an outage, and no upstream is asked — in every
+/// format, for each key on its own.
+#[tokio::test]
+async fn an_internal_package_whose_copy_fails_its_integrity_check_is_500_in_every_format() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    use crate::test_helpers::{ReadFault, StorageOutage, TestContext};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Each path answered with its key's copy changed on disk, where the answer is not 500.
+    async fn not_500(
+        ctx: &TestContext,
+        outage: &StorageOutage,
+        stored: &[(&str, &str)],
+    ) -> Vec<String> {
+        let mut wrong = Vec::new();
+        for (path, key) in stored {
+            outage.end();
+            outage.fault_reads_of(key, ReadFault::Tampered);
+            let status = send(&ctx.app, Method::GET, path, "").await.status();
+            if status != StatusCode::INTERNAL_SERVER_ERROR {
+                wrong.push(format!("{path} ({key}) -> {status}"));
+            }
+        }
+        outage.end();
+        wrong
+    }
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(uri.clone());
+        c.pypi.proxy = Some(uri.clone());
+        c.nuget.enabled = true;
+        c.nuget.proxy = Some(uri);
+    });
+    for (_, key) in INTERNAL_STORED {
+        ctx.state
+            .storage
+            .put(key, &internal_stored_body(key))
+            .await
+            .unwrap();
+    }
+    // The project listing names its files from the store's listing and reads no copy of them.
+    let reads_its_copy: Vec<(&str, &str)> = INTERNAL_STORED
+        .into_iter()
+        .filter(|(path, _)| *path != "/simple/internalpkg/")
+        .collect();
+    let mut wrong = not_500(&ctx, &outage, &reads_its_copy).await;
+    let asked = upstream_paths(&upstream).await;
+    assert!(
+        asked.is_empty(),
+        "upstream asked for a tampered copy: {asked:?}"
+    );
+
+    let (storage, outage) = outage_storage();
+    let ctx = other_formats_context(storage);
+    for (_, key) in INTERNAL_STORED_ELSEWHERE {
+        ctx.state.storage.put(key, b"local copy").await.unwrap();
+    }
+    wrong.extend(not_500(&ctx, &outage, &INTERNAL_STORED_ELSEWHERE).await);
+
+    // Terraform: a path reads several keys, so every key is changed at once.
+    let (storage, outage) = outage_storage();
+    let ctx = internal_terraform_context(storage).await;
+    let (stored, paths) = internal_terraform();
+    for (key, _) in &stored {
+        outage.fault_reads_of(key, ReadFault::Tampered);
+    }
+    for (path, _) in &paths {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::INTERNAL_SERVER_ERROR {
+            wrong.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "internal packages whose copy fails its integrity check answered other than 500: {wrong:#?}"
+    );
+}
+
+/// A Go module path with capitals travels encoded (`!c` for `C`); the namespace it belongs to is
+/// read from the decoded path. An internal module spelled with capitals is served from its copy,
+/// refused without one, and unavailable (503) when the copy cannot be read — on every endpoint.
+#[tokio::test]
+async fn an_internal_go_module_with_capitals_is_internal_on_every_path() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, |c| {
+        c.curation.internal_namespaces = vec!["Corp.example/*".to_string()];
+        c.go.proxy = Some(BLACKHOLE.to_string());
+    });
+    let files = [
+        "@v/v1.0.0.zip",
+        "@v/v1.0.0.info",
+        "@v/v1.0.0.mod",
+        "@v/list",
+        "@latest",
+    ];
+    for file in files {
+        ctx.state
+            .storage
+            .put(&format!("go/!corp.example/!lib/{file}"), b"local copy")
+            .await
+            .unwrap();
+    }
+    let mut wrong = Vec::new();
+    for file in files {
+        let path = format!("/go/!corp.example/!lib/{file}");
+        let status = send(&ctx.app, Method::GET, &path, "").await.status();
+        if status != StatusCode::OK {
+            wrong.push(format!("{path} with the store up -> {status}"));
+        }
+        let missing = format!("/go/!corp.example/!other/{file}");
+        let status = send(&ctx.app, Method::GET, &missing, "").await.status();
+        if status != StatusCode::FORBIDDEN {
+            wrong.push(format!("{missing} without a copy -> {status}"));
+        }
+    }
+    outage.fail_reads();
+    for file in files {
+        let path = format!("/go/!corp.example/!lib/{file}");
+        let status = send(&ctx.app, Method::GET, &path, "").await.status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            wrong.push(format!("{path} with reads failing -> {status}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// An internal npm package's packument or version manifest cached from an upstream lives under
+/// its `upstream/` key, or — cached by a release before 1.4.0 — under the legacy
+/// `<path>/metadata.json`. Whichever key holds the copy, a read of it that fails leaves the
+/// package unavailable (503), not absent, and the upstream is not asked.
+#[tokio::test]
+async fn an_internal_npm_document_whose_cached_copy_cannot_be_read_is_503_under_either_key() {
+    use crate::test_helpers::ReadFault;
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    let cases = [
+        (
+            "/npm/internalcache",
+            "npm/internalcache/upstream/packument.json",
+        ),
+        ("/npm/internalcache", "npm/internalcache/metadata.json"),
+        (
+            "/npm/internalcache/1.0.0",
+            "npm/internalcache/upstream/manifests/1.0.0.json",
+        ),
+        (
+            "/npm/internalcache/1.0.0",
+            "npm/internalcache/1.0.0/metadata.json",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (path, key) in cases {
+        for (fault, expected) in [
+            (ReadFault::Network, StatusCode::SERVICE_UNAVAILABLE),
+            (ReadFault::Tampered, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let uri = upstream.uri();
+            let (storage, outage) = outage_storage();
+            let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+                c.curation.internal_namespaces = vec!["internal*".to_string()];
+                c.npm.proxy = Some(uri);
+            });
+            ctx.state
+                .storage
+                .put(
+                    key,
+                    br#"{"name":"internalcache","version":"1.0.0","versions":{},"dist-tags":{}}"#,
+                )
+                .await
+                .unwrap();
+            let status = send(&ctx.app, Method::GET, path, "").await.status();
+            if status != StatusCode::OK {
+                wrong.push(format!("{path} from {key} with the store up -> {status}"));
+            }
+            outage.fault_reads_of(key, fault);
+            let status = send(&ctx.app, Method::GET, path, "").await.status();
+            if status != expected {
+                wrong.push(format!("{path} from {key}, {fault:?} -> {status}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    let asked = upstream_paths(&upstream).await;
+    assert!(asked.is_empty(), "upstream asked: {asked:?}");
 }

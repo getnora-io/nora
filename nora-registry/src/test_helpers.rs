@@ -759,9 +759,13 @@ impl StorageOutage {
         self.0.store(STORE_SIZE_PANICS, Ordering::SeqCst);
     }
 
-    /// Bring the store back: operations waiting on a silent store go on, and every later one
-    /// is answered.
+    /// Bring the store back and clear every fault: operations waiting on a silent store go on,
+    /// and every later one is answered.
     pub fn end(&self) {
+        self.1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.0.store(STORE_UP, Ordering::SeqCst);
     }
 
