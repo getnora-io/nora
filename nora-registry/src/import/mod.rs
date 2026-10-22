@@ -1971,6 +1971,57 @@ mod integration_tests {
         assert_eq!(&body_bytes(own).await[..], b"own 9.9.9");
     }
 
+    /// An imported file has no upstream release: a listing an upstream gave for the project
+    /// before the import, naming a file of the same name, does not date it, so a release-age rule
+    /// does not hold the project's own file as a young upstream release.
+    #[tokio::test]
+    async fn an_upstream_listing_cached_before_the_import_does_not_date_an_imported_file() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.enabled = true;
+            cfg.pypi.proxy = Some(format!("{uri}/simple/"));
+            cfg.server.trust_upstream_dates = true;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("3d".to_string());
+        });
+        let wheel = "corppkg-1.0.0-py3-none-any.whl";
+        let hour_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        ctx.state
+            .storage
+            .put(
+                "pypi/corppkg/dates.json",
+                json!({ wheel: hour_ago }).to_string().as_bytes(),
+            )
+            .await
+            .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::PyPI,
+            "pypi",
+            vec![(
+                format!("corppkg/1.0.0/{wheel}"),
+                zip(&[("corppkg/__init__.py", b"", true)]),
+            )],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/simple/corppkg/{wheel}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+    }
+
     /// An upload to a project nothing imported changes nothing for it: its index is still the
     /// upload merged with the upstream's, and a file it does not hold is still the upstream's.
     #[tokio::test]
