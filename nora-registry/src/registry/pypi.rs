@@ -218,12 +218,18 @@ async fn package_versions(
                         if markers_listed {
                             backfill.push(filename.to_string());
                         }
-                        state
-                            .storage
-                            .get(&format!("{}.sha256", key))
-                            .await
-                            .ok()
-                            .and_then(|d| String::from_utf8(d.to_vec()).ok())
+                        // A file without a sidecar is listed without a digest; one whose
+                        // sidecar the store cannot read is not listed as if it had none.
+                        let sidecar = format!("{}.sha256", key);
+                        match state.storage.get(&sidecar).await {
+                            Ok(d) => String::from_utf8(d.to_vec()).ok(),
+                            Err(crate::storage::StorageError::NotFound) => None,
+                            Err(e) => {
+                                return crate::registry::local_copy_unreadable(
+                                    "pypi", &sidecar, &e,
+                                );
+                            }
+                        }
                     }
                 };
                 local_sizes.insert(filename.to_string(), meta.size);
@@ -3944,6 +3950,51 @@ mod hash_marker_tests {
             &[hash_marker_key("proxied", filename, &digest(content))],
         )
         .await;
+    }
+
+    /// A file whose digest comes from its `.sha256` sidecar (no marker yet) is never listed
+    /// without it because the sidecar could not be read: a client would install it unchecked.
+    /// The project's index answers 503, 500 for a sidecar that fails its integrity check. A file
+    /// that has no sidecar at all is listed without a digest, as before.
+    #[tokio::test]
+    async fn a_digest_the_store_cannot_read_is_not_left_out_of_the_index() {
+        use crate::test_helpers::{outage_storage, ReadFault};
+        let filename = "sidecar-1.0.tar.gz";
+        let sha = digest(b"sdist");
+        for (fault, expected) in [
+            (ReadFault::Network, StatusCode::SERVICE_UNAVAILABLE),
+            (ReadFault::Tampered, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let (storage, outage) = outage_storage();
+            let ctx = create_test_context_with_storage(storage);
+            let key = format!("pypi/sidecar/{filename}");
+            ctx.state.storage.put(&key, b"sdist").await.unwrap();
+            ctx.state
+                .storage
+                .put(&format!("{key}.sha256"), sha.as_bytes())
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put("pypi/sidecar/bare-1.0.tar.gz", b"bare")
+                .await
+                .unwrap();
+            let body = html_index(&ctx, "sidecar").await;
+            assert!(body.contains(&format!("{filename}#sha256={sha}")), "{body}");
+            assert!(body.contains("bare-1.0.tar.gz"), "{body}");
+            outage.fault_reads_of(&format!("{key}.sha256"), fault);
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/simple/sidecar/",
+                vec![("Accept", "text/html")],
+                "",
+            )
+            .await;
+            let status = resp.status();
+            let body = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+            assert_eq!(status, expected, "{fault:?}: {body}");
+        }
     }
 }
 
