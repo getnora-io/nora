@@ -375,6 +375,17 @@ mod mint_tests {
             .collect()
     }
 
+    /// The one `token_mint` entry among `entries`; a mint that logs twice
+    /// or not at all fails here.
+    fn the_one_mint(entries: &[serde_json::Value]) -> &serde_json::Value {
+        let mints: Vec<_> = entries
+            .iter()
+            .filter(|e| e["action"] == "token_mint")
+            .collect();
+        assert_eq!(mints.len(), 1, "one audit entry per mint: {entries:?}");
+        mints[0]
+    }
+
     /// The lifetime of the one token `owner` has.
     fn lifetime_of(ctx: &TestContext, owner: &str) -> u64 {
         let tokens = ctx.state.tokens.as_ref().unwrap().list_tokens(owner);
@@ -461,10 +472,7 @@ mod mint_tests {
         );
         assert_eq!(lifetime_of(&ctx, "svc"), TEN_YEARS);
         let entries = audit_entries(&ctx).await;
-        let mint = entries
-            .iter()
-            .find(|e| e["action"] == "token_mint")
-            .unwrap_or_else(|| panic!("no token_mint entry: {entries:?}"));
+        let mint = the_one_mint(&entries);
         assert_eq!(mint["actor"], "root");
         assert_eq!(mint["artifact"], "svc");
         assert_eq!(mint["registry"], "admin");
@@ -490,10 +498,7 @@ mod mint_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(lifetime_of(&ctx, "alice"), 30 * 86_400);
         let entries = audit_entries(&ctx).await;
-        let mint = entries
-            .iter()
-            .find(|e| e["action"] == "token_mint")
-            .unwrap_or_else(|| panic!("no token_mint entry: {entries:?}"));
+        let mint = the_one_mint(&entries);
         assert_eq!(mint["actor"], "alice");
         assert_eq!(mint["artifact"], "alice");
         assert_eq!(mint["registry"], "ui");
@@ -501,5 +506,100 @@ mod mint_tests {
             mint["detail"],
             format!("role=write ttl_secs={}", 30 * 86_400)
         );
+    }
+
+    /// Each route that mints leaves exactly one `token_mint` entry per token,
+    /// and a mint it refuses leaves none.
+    #[tokio::test]
+    async fn each_mint_is_one_audit_entry_and_a_refused_one_is_none() {
+        let ctx = audited(&[("alice", "alicepw")]);
+        let admin = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("root", 30, None, Role::Admin)
+            .unwrap();
+        let admin = format!("Bearer {admin}");
+        let basic = format!("Basic {}", STANDARD.encode("alice:alicepw"));
+        let ui = |hx: bool, body: &'static str| {
+            let mut headers = vec![
+                ("authorization", basic.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ];
+            if hx {
+                headers.push(("hx-request", "true"));
+            }
+            send_with_headers(
+                &ctx.app,
+                Method::POST,
+                "/api/ui/tokens/create",
+                headers,
+                body.as_bytes().to_vec(),
+            )
+        };
+
+        // Refused on every route: nothing minted, nothing audited.
+        let (status, _) = post_json(
+            &ctx,
+            "/api/v1/admin/tokens",
+            Some(&admin),
+            r#"{"username":"svc","role":"read","ttl_days":0}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = post_json(
+            &ctx,
+            "/api/tokens",
+            None,
+            r#"{"username":"alice","password":"wrong","role":"read"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = post_json(
+            &ctx,
+            "/api/tokens",
+            None,
+            r#"{"username":"alice","password":"alicepw","role":"admin"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let resp = ui(false, "description=ci&role=read&ttl_days=30").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = ui(true, "description=ci&role=admin&ttl_days=30").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            1
+        );
+
+        // One mint on each route.
+        let (status, json) = post_json(
+            &ctx,
+            "/api/v1/admin/tokens",
+            Some(&admin),
+            r#"{"username":"svc","role":"read","ttl_days":30}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let (status, json) = post_json(
+            &ctx,
+            "/api/tokens",
+            None,
+            r#"{"username":"alice","password":"alicepw","ttl_days":30,"role":"read"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let resp = ui(true, "description=ci&role=read&ttl_days=30").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let entries = audit_entries(&ctx).await;
+        let mut routes: Vec<_> = entries
+            .iter()
+            .filter(|e| e["action"] == "token_mint")
+            .map(|e| e["registry"].as_str().unwrap().to_string())
+            .collect();
+        routes.sort();
+        assert_eq!(routes, ["admin", "api", "ui"], "{entries:?}");
     }
 }
