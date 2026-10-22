@@ -2226,6 +2226,91 @@ mod integration_tests {
         assert_eq!(bcrypt_runs(&ctx), 1);
     }
 
+    /// Under every combination of the switches that open routes without credentials
+    /// (`anonymous_read`, `public_web_ui`, `public_metrics`, `docker_anon_pull`), a route
+    /// served without credentials pays no bcrypt for a Basic header it carries, right or
+    /// wrong, whatever the method. The one exception is the Docker API under
+    /// `docker_anon_pull`, whose answer depends on who asks: credentials it is given are
+    /// checked, under the lockout. Which routes are open is what the server answers without
+    /// credentials; a gated one shows the counter counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_switch_makes_a_route_served_without_credentials_run_bcrypt() {
+        let routes = std::sync::Arc::new(every_route_path());
+        let configs = (0..16u8).map(|bits| {
+            let routes = std::sync::Arc::clone(&routes);
+            let config = tokio::spawn(async move {
+                let switches = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0];
+                let [anonymous_read, public_web_ui, public_metrics, docker_anon_pull] = switches;
+                let ctx = create_test_context_with_auth_and_config(&[("admin", "secret")], |c| {
+                    c.auth.anonymous_read = anonymous_read;
+                    c.auth.public_web_ui = public_web_ui;
+                    c.auth.public_metrics = public_metrics;
+                    c.auth.docker_anon_pull = docker_anon_pull;
+                });
+                let mut open = Vec::new();
+                for path in routes.iter() {
+                    if docker_anon_pull && super::is_docker_path(path) {
+                        continue;
+                    }
+                    for method in [
+                        Method::GET,
+                        Method::HEAD,
+                        Method::POST,
+                        Method::PUT,
+                        Method::PATCH,
+                        Method::DELETE,
+                    ] {
+                        let status = send(&ctx.app, method.clone(), path, Vec::new())
+                            .await
+                            .status();
+                        if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+                            open.push((method, path.clone()));
+                        }
+                    }
+                }
+                for always in ["/health", "/ready", "/"] {
+                    assert!(
+                        open.contains(&(Method::GET, always.to_owned())),
+                        "{switches:?}: {always} is served without credentials"
+                    );
+                }
+                for creds in ["admin:wrong", "admin:secret"] {
+                    let header_val = format!("Basic {}", STANDARD.encode(creds));
+                    for (method, path) in &open {
+                        send_with_headers(
+                            &ctx.app,
+                            method.clone(),
+                            path,
+                            vec![("authorization", &header_val)],
+                            Vec::new(),
+                        )
+                        .await;
+                        assert_eq!(
+                            bcrypt_runs(&ctx),
+                            0,
+                            "{switches:?}: {method} {path} ran bcrypt ({creds})"
+                        );
+                    }
+                }
+                let header_val = format!("Basic {}", STANDARD.encode("admin:wrong"));
+                let response = send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    "/npm/-/whoami",
+                    vec![("authorization", &header_val)],
+                    Vec::new(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{switches:?}");
+                assert_eq!(bcrypt_runs(&ctx), 1, "{switches:?}: the counter counts");
+            });
+            config
+        });
+        for config in futures::future::join_all(configs).await {
+            config.unwrap();
+        }
+    }
+
     /// A CI job whose Basic username is an htpasswd user and whose password is an
     /// API token pays bcrypt once, not on every request; it still authenticates as the
     /// token's owner each time.
