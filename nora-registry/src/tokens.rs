@@ -120,6 +120,36 @@ pub struct TokenListEntry {
     pub description: Option<String>,
 }
 
+/// Where a token operation stands, just past one of its steps: a test pauses
+/// it there to play a race against another operation one step at a time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    /// A verify read the revocation count.
+    CountRead,
+    /// A verify read the token file.
+    FileRead,
+    /// The files lock is taken.
+    Locked,
+    /// A rewrite of a token file waits for the files lock.
+    WaitsForLock,
+    /// A revoke removed a token file.
+    Removed,
+    /// A revoke counted itself and purged the cache.
+    Evicted,
+    /// The last_used flush read a token file.
+    FlushRead,
+    /// A token file was rewritten in place.
+    Rewritten,
+}
+
+#[cfg(not(test))]
+fn pause(_step: Step) {}
+
+#[cfg(test)]
+fn pause(step: Step) {
+    tests::interleave::pause(step)
+}
+
 /// Token store for managing API tokens
 #[derive(Clone)]
 pub struct TokenStore {
@@ -287,6 +317,7 @@ impl TokenStore {
             }
             Err(e) => return Err(TokenError::Storage(e.to_string())),
         };
+        pause(Step::FileRead);
 
         let mut info: TokenInfo =
             serde_json::from_str(&content).map_err(|e| TokenError::Storage(e.to_string()))?;
@@ -414,11 +445,12 @@ impl TokenStore {
             let file_path = self.storage_path.join(format!("{}.json", file_prefix));
             // From the read to the rename: a revoke waits, so it removes the
             // rewritten file instead of being undone by it.
-            let _file = self.file_lock.lock().await;
+            let _file = self.lock_files().await;
             let content = match tokio::fs::read_to_string(&file_path).await {
                 Ok(c) => c,
                 Err(_) => continue,
             };
+            pause(Step::FlushRead);
             let mut info: TokenInfo = match serde_json::from_str(&content) {
                 Ok(i) => i,
                 Err(_) => continue,
@@ -435,6 +467,7 @@ impl TokenStore {
                 if tokio::fs::write(&tmp, &json).await.is_ok() {
                     set_file_permissions_600(&tmp);
                     let _ = tokio::fs::rename(&tmp, &file_path).await;
+                    pause(Step::Rewritten);
                 }
             }
         }
@@ -444,7 +477,22 @@ impl TokenStore {
 
     /// The revocation count a verify reads before it reads the token file.
     fn revocations_seen(&self) -> u64 {
-        self.revocations.load(Ordering::SeqCst)
+        let seen = self.revocations.load(Ordering::SeqCst);
+        pause(Step::CountRead);
+        seen
+    }
+
+    /// Take the lock held to rewrite or remove a token file.
+    async fn lock_files(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        let held = match self.file_lock.try_lock() {
+            Ok(held) => held,
+            Err(_) => {
+                pause(Step::WaitsForLock);
+                self.file_lock.lock().await
+            }
+        };
+        pause(Step::Locked);
+        held
     }
 
     /// Cache a verified token, unless a revoke came in since the verify read
@@ -463,6 +511,8 @@ impl TokenStore {
         let mut cache = self.cache.write();
         cache.retain(|key, cached| !revoked(key, cached));
         self.revocations.fetch_add(1, Ordering::SeqCst);
+        drop(cache);
+        pause(Step::Evicted);
     }
 
     /// Remove a token from the in-memory cache (called on revoke).
@@ -486,11 +536,12 @@ impl TokenStore {
             return Err(TokenError::NotFound);
         }
         let file_path = self.storage_path.join(format!("{}.json", hash_prefix));
-        let _file = self.file_lock.lock().await;
+        let _file = self.lock_files().await;
 
         // TOCTOU fix: try remove directly
         match fs::remove_file(&file_path) {
             Ok(()) => {
+                pause(Step::Removed);
                 self.invalidate_cache(hash_prefix);
                 Ok(())
             }
@@ -503,13 +554,14 @@ impl TokenStore {
     /// file, like [`TokenStore::revoke_token`].
     pub async fn revoke_all_for_user(&self, user: &str) -> usize {
         let mut count = 0;
-        let _files = self.file_lock.lock().await;
+        let _files = self.lock_files().await;
 
         if let Ok(entries) = fs::read_dir(&self.storage_path) {
             for entry in entries.flatten() {
                 if let Ok(content) = fs::read_to_string(entry.path()) {
                     if let Ok(info) = serde_json::from_str::<TokenInfo>(&content) {
                         if info.user == user && fs::remove_file(entry.path()).is_ok() {
+                            pause(Step::Removed);
                             count += 1;
                         }
                     }
@@ -603,6 +655,180 @@ pub enum TokenError {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// Plays token operations against each other one step at a time, in every
+    /// order their steps can take. Each operation runs on a thread of its own
+    /// and pauses at every [`Step`] it passes; one operation at a time is let
+    /// on to its next step, so a run is the same whatever the timing. A run
+    /// that would let an operation wait for the files lock held by another
+    /// one lets the holder on instead.
+    pub(super) mod interleave {
+        use super::super::Step;
+        use std::cell::RefCell;
+        use std::sync::{Arc, Condvar, Mutex};
+        use std::time::Duration;
+
+        /// Where every operation of a run stands.
+        #[derive(Default)]
+        struct Turns {
+            /// The step each operation is paused past; `None` while it runs.
+            paused: Vec<Option<Step>>,
+            done: Vec<bool>,
+            /// The operation let on to its next step.
+            running: Option<usize>,
+        }
+
+        #[derive(Default)]
+        struct Run {
+            turns: Mutex<Turns>,
+            changed: Condvar,
+        }
+
+        thread_local! {
+            static OPERATION: RefCell<Option<(Arc<Run>, usize)>> = const { RefCell::new(None) };
+        }
+
+        /// Pause the operation on this thread past `step` until its turn.
+        /// A no-op on a thread outside a run.
+        pub(in crate::tokens) fn pause(step: Step) {
+            let Some((run, me)) = OPERATION.with(|op| op.borrow().clone()) else {
+                return;
+            };
+            let mut turns = run.turns.lock().unwrap();
+            turns.paused[me] = Some(step);
+            turns.running = None;
+            run.changed.notify_all();
+            while turns.running != Some(me) {
+                turns = run.changed.wait(turns).unwrap();
+            }
+            turns.paused[me] = None;
+        }
+
+        /// An operation of a run, on a thread of its own.
+        pub(in crate::tokens) type Operation = Box<dyn FnOnce() + Send>;
+
+        /// Run `operations` to the end, choosing at each turn which one goes
+        /// on with `choose`, among those that can: `can_go(step)` is false for
+        /// one paused at `step` that would block. Answers the steps taken, in
+        /// order, by operation.
+        pub(in crate::tokens) fn run(
+            operations: Vec<Operation>,
+            can_go: &dyn Fn(Step) -> bool,
+            choose: &mut dyn FnMut(&[usize]) -> usize,
+        ) -> Vec<(usize, Option<Step>)> {
+            let run = Arc::new(Run::default());
+            {
+                let mut turns = run.turns.lock().unwrap();
+                turns.paused = vec![None; operations.len()];
+                turns.done = vec![false; operations.len()];
+            }
+            let threads: Vec<_> = operations
+                .into_iter()
+                .enumerate()
+                .map(|(me, operation)| {
+                    let run = run.clone();
+                    std::thread::spawn(move || {
+                        OPERATION.with(|op| *op.borrow_mut() = Some((run.clone(), me)));
+                        // Every operation starts paused, before its first step.
+                        {
+                            let mut turns = run.turns.lock().unwrap();
+                            while turns.running != Some(me) {
+                                turns = run.changed.wait(turns).unwrap();
+                            }
+                        }
+                        let outcome =
+                            std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
+                        let mut turns = run.turns.lock().unwrap();
+                        turns.done[me] = true;
+                        turns.running = None;
+                        run.changed.notify_all();
+                        drop(turns);
+                        if let Err(panic) = outcome {
+                            std::panic::resume_unwind(panic);
+                        }
+                    })
+                })
+                .collect();
+
+            let mut taken = Vec::new();
+            let mut started = vec![false; threads.len()];
+            loop {
+                let mut turns = run.turns.lock().unwrap();
+                let settled = |t: &Turns| {
+                    t.running.is_none()
+                        && (0..t.done.len())
+                            .all(|i| t.done[i] || t.paused[i].is_some() || !started[i])
+                };
+                while !settled(&turns) {
+                    let (next, timeout) = run
+                        .changed
+                        .wait_timeout(turns, Duration::from_secs(30))
+                        .unwrap();
+                    turns = next;
+                    assert!(
+                        !timeout.timed_out() || settled(&turns),
+                        "an operation neither paused nor finished: {taken:?}"
+                    );
+                }
+                let ready: Vec<usize> = (0..turns.done.len())
+                    .filter(|&i| !turns.done[i])
+                    .filter(|&i| turns.paused[i].is_none_or(can_go))
+                    .collect();
+                if ready.is_empty() {
+                    assert!(
+                        turns.done.iter().all(|done| *done),
+                        "no operation can go on: {taken:?}"
+                    );
+                    break;
+                }
+                let next = choose(&ready);
+                taken.push((next, turns.paused[next]));
+                started[next] = true;
+                turns.running = Some(next);
+                run.changed.notify_all();
+            }
+            for thread in threads {
+                if let Err(panic) = thread.join() {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+            taken
+        }
+
+        /// Call `play` once for every order of the turns it can take: `play`
+        /// runs one case, handing [`run`] the chooser it is given. Answers how
+        /// many orders were played.
+        pub(in crate::tokens) fn every_order(
+            mut play: impl FnMut(&mut dyn FnMut(&[usize]) -> usize),
+        ) -> usize {
+            // The choice made at each turn of the order being played, out of
+            // how many.
+            let mut order: Vec<(usize, usize)> = Vec::new();
+            let mut played = 0;
+            loop {
+                let mut turn = 0;
+                let mut taken: Vec<(usize, usize)> = Vec::new();
+                play(&mut |ready| {
+                    let choice = order.get(turn).map_or(0, |&(choice, _)| choice);
+                    assert!(choice < ready.len(), "a run took another way on a replay");
+                    taken.push((choice, ready.len()));
+                    turn += 1;
+                    ready[choice]
+                });
+                played += 1;
+                order = taken;
+                while let Some((choice, of)) = order.pop() {
+                    if choice + 1 < of {
+                        order.push((choice + 1, of));
+                        break;
+                    }
+                }
+                if order.is_empty() {
+                    return played;
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_create_token() {
@@ -1198,6 +1424,140 @@ mod tests {
             let seen = store.revocations_seen();
             store.cache_unless_revoked(seen, sha256_hex(&token), cached());
             assert!(store.verify_token(&token).is_ok(), "{path}: control");
+        }
+    }
+
+    /// A token of `user` written straight into `dir`, hashed at the lowest
+    /// Argon2 cost: a verify checks it like any other, only much sooner, so
+    /// every order of a race can be played.
+    fn cheap_token(dir: &Path, user: &str) -> String {
+        let token = format!("{TOKEN_PREFIX}{}", Uuid::new_v4().simple());
+        let params = argon2::Params::new(8, 1, 1, None).unwrap();
+        let token_hash = Argon2::new(argon2::Algorithm::Argon2id, argon2::Version::V0x13, params)
+            .hash_password(token.as_bytes(), &SaltString::generate(&mut OsRng))
+            .unwrap()
+            .to_string();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let info = TokenInfo {
+            token_hash,
+            user: user.to_string(),
+            created_at: now,
+            expires_at: now + 86_400,
+            last_used: None,
+            description: None,
+            role: Role::Write,
+        };
+        fs::write(
+            token_path(dir, &token),
+            serde_json::to_string_pretty(&info).unwrap(),
+        )
+        .unwrap();
+        token
+    }
+
+    fn token_path(dir: &Path, token: &str) -> PathBuf {
+        dir.join(format!("{}.json", &sha256_hex(token)[..16]))
+    }
+
+    /// `operation` to the end on a runtime of its own thread.
+    fn on_runtime<F: std::future::Future>(operation: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(operation)
+    }
+
+    /// Every way to revoke alice's token: by its prefix, as the API and the UI
+    /// routes do, and with every token of hers.
+    fn revokes() -> [(&'static str, fn(&TokenStore, &str)); 2] {
+        [
+            ("by prefix", |store, token| {
+                on_runtime(store.revoke_token(&sha256_hex(token)[..16])).unwrap()
+            }),
+            ("every token of the user", |store, _| {
+                assert_eq!(on_runtime(store.revoke_all_for_user("alice")), 1)
+            }),
+        ]
+    }
+
+    /// Whether an operation on `store` paused at `step` can go on: not one
+    /// that waits for the files lock while another operation holds it.
+    fn can_go(store: &TokenStore) -> impl Fn(Step) -> bool + '_ {
+        move |step| step != Step::WaitsForLock || store.file_lock.try_lock().is_ok()
+    }
+
+    /// A verify racing a revoke, in every order of their steps and with the
+    /// token cached or not beforehand, leaves the token refused once the
+    /// revoke is done: the verify neither keeps it cached nor caches it again.
+    /// Bob's token, which the revoke leaves alone, is still served.
+    #[test]
+    fn a_verify_racing_a_revoke_in_any_order_leaves_the_token_refused() {
+        for (path, revoke) in revokes() {
+            for cached in [false, true] {
+                let played = interleave::every_order(|choose| {
+                    let dir = TempDir::new().unwrap();
+                    let store = TokenStore::new(dir.path());
+                    let token = cheap_token(dir.path(), "alice");
+                    let kept = cheap_token(dir.path(), "bob");
+                    if cached {
+                        store.verify_token(&token).unwrap();
+                    }
+                    let verify: interleave::Operation = {
+                        let (store, token) = (store.clone(), token.clone());
+                        Box::new(move || drop(store.verify_token(&token)))
+                    };
+                    let revoking: interleave::Operation = {
+                        let (store, token) = (store.clone(), token.clone());
+                        Box::new(move || revoke(&store, &token))
+                    };
+                    let taken = interleave::run(vec![verify, revoking], &can_go(&store), choose);
+                    assert!(
+                        matches!(store.verify_token(&token), Err(TokenError::NotFound)),
+                        "{path}, cached {cached}: the revoked token is served after {taken:?}"
+                    );
+                    assert!(store.verify_token(&kept).is_ok(), "{path}: {taken:?}");
+                });
+                assert!(played > 1, "{path}: {played} orders");
+            }
+        }
+    }
+
+    /// The last_used flush racing a revoke, in every order of their steps,
+    /// leaves the token revoked: the flush does not put the file back, and the
+    /// token is refused by this store and by one that starts afresh.
+    #[test]
+    fn a_rewrite_racing_a_revoke_in_any_order_leaves_the_token_revoked() {
+        for (path, revoke) in revokes() {
+            let played = interleave::every_order(|choose| {
+                let dir = TempDir::new().unwrap();
+                let store = TokenStore::new(dir.path());
+                let token = cheap_token(dir.path(), "alice");
+                // Gives the flush a last_used to write.
+                store.verify_token(&token).unwrap();
+                let flush: interleave::Operation = {
+                    let store = store.clone();
+                    Box::new(move || on_runtime(store.flush_last_used()))
+                };
+                let revoking: interleave::Operation = {
+                    let (store, token) = (store.clone(), token.clone());
+                    Box::new(move || revoke(&store, &token))
+                };
+                let taken = interleave::run(vec![flush, revoking], &can_go(&store), choose);
+                assert!(
+                    !token_path(dir.path(), &token).exists(),
+                    "{path}: the flush put the revoked token back after {taken:?}"
+                );
+                assert!(
+                    matches!(store.verify_token(&token), Err(TokenError::NotFound)),
+                    "{path}: {taken:?}"
+                );
+                assert!(TokenStore::new(dir.path()).verify_token(&token).is_err());
+            });
+            assert!(played > 1, "{path}: {played} orders");
         }
     }
 
