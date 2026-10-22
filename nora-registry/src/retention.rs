@@ -2718,13 +2718,14 @@ mod format_retention_tests {
     }
 
     /// The per-version document of a cached upstream packument, as the proxy
-    /// stores it (tarball URL already rewritten to this registry).
+    /// stores it (tarball URL already rewritten to this registry: the test
+    /// context's public base URL, `http://127.0.0.1:0`).
     fn upstream_version_doc(package: &str, version: &str) -> serde_json::Value {
         serde_json::json!({
             "name": package,
             "version": version,
             "dist": {
-                "tarball": format!("http://localhost:4000/npm/{package}/-/{package}-{version}.tgz"),
+                "tarball": format!("http://127.0.0.1:0/npm/{package}/-/{package}-{version}.tgz"),
                 "shasum": format!("sha1-of-{version}"),
                 "integrity": format!("sha512-of-{version}"),
             }

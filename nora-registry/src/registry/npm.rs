@@ -397,53 +397,199 @@ fn github_packages_tarball(path: &str) -> Option<(&str, &str)> {
     Some((&rest[..scope.len() + 1 + name.len()], version))
 }
 
+/// Why an upstream npm document cannot be served as NORA's after the rewrite.
+#[derive(Debug, PartialEq, Eq)]
+enum Unrewritable {
+    /// It is not JSON: only the byte-level rewrite applies.
+    NotJson,
+    /// A version manifest whose tarball lies outside the upstream: no version NORA serves.
+    OffUpstream,
+}
+
+/// An upstream npm document as NORA serves it.
+struct Placed {
+    body: Vec<u8>,
+    /// Whether a version was left out: its tarball lies outside the upstream.
+    left_out: bool,
+}
+
 /// Rewrite tarball URLs in npm metadata to point to NORA.
 ///
 /// Replaces upstream registry URLs (e.g. `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`)
 /// with NORA URLs (e.g. `http://nora:5000/npm/lodash/-/lodash-4.17.21.tgz`).
 ///
 /// Two-layer approach (#439):
-/// 1. Targeted: parse JSON, rewrite `versions.*.dist.tarball`
+/// 1. Targeted: parse JSON, rewrite `versions.*.dist.tarball` (and a version manifest's own
+///    `dist.tarball`)
 /// 2. Safety net: byte-level replace of upstream URL prefix in serialized output
-fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Result<Vec<u8>, ()> {
+///
+/// A version whose tarball lies anywhere but the upstream, NORA or a relative path is left out
+/// ([`place_tarball`]): npm would download it from there, past NORA. A version manifest whose
+/// tarball does is [`Unrewritable::OffUpstream`].
+fn place_document(
+    data: &[u8],
+    nora_base: &str,
+    upstream_url: &str,
+) -> Result<Placed, Unrewritable> {
     let mut json: serde_json::Value = serde_json::from_slice(data).map_err(|e| {
         tracing::warn!(error = %e, "npm: JSON parse failed in rewrite_tarball_urls");
+        Unrewritable::NotJson
     })?;
 
     let upstream_trimmed = upstream_url.trim_end_matches('/');
     let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+    let package = json
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or_default()
+        .to_string();
 
+    let mut left_out = Vec::new();
     if let Some(versions) = json.get_mut("versions").and_then(|v| v.as_object_mut()) {
-        for (_ver, version_data) in versions.iter_mut() {
-            if let Some(tarball_url) = version_data
-                .get("dist")
-                .and_then(|d| d.get("tarball"))
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-            {
-                let rewritten = upstream_url_forms(upstream_trimmed)
-                    .iter()
-                    .fold(tarball_url, |url, form| {
-                        super::replace_upstream_url_str(&url, form, &nora_npm_base)
-                    });
-                if let Some(dist) = version_data.get_mut("dist") {
-                    dist["tarball"] = serde_json::Value::String(rewritten);
+        versions.retain(|version, version_data| {
+            let Some(tarball_url) = tarball_of(version_data) else {
+                return true;
+            };
+            match place_tarball(tarball_url, &nora_npm_base, upstream_trimmed) {
+                Some(placed) => {
+                    version_data["dist"]["tarball"] = serde_json::Value::String(placed);
+                    true
+                }
+                None => {
+                    warn_left_out(&package, version, tarball_url, &nora_npm_base);
+                    left_out.push(version.clone());
+                    false
                 }
             }
-        }
+        });
+    } else if let Some(tarball_url) = tarball_of(&json) {
+        let Some(placed) = place_tarball(tarball_url, &nora_npm_base, upstream_trimmed) else {
+            let version = json.get("version").and_then(|v| v.as_str());
+            warn_left_out(
+                &package,
+                version.unwrap_or_default(),
+                tarball_url,
+                &nora_npm_base,
+            );
+            return Err(Unrewritable::OffUpstream);
+        };
+        json["dist"]["tarball"] = serde_json::Value::String(placed);
+    }
+    if !left_out.is_empty() {
+        leave_out_of_tags_and_times(&mut json, &left_out);
     }
 
     let output = serde_json::to_vec(&json).map_err(|e| {
         tracing::warn!(error = %e, "npm: JSON serialize failed in rewrite_tarball_urls");
+        Unrewritable::NotJson
     })?;
 
     // Safety net: byte-level replace of any remaining upstream URL prefix (#439).
     // Catches edge cases where targeted rewrite missed (e.g. new npm metadata fields).
-    Ok(replace_upstream_bytes(
-        &output,
-        upstream_trimmed,
-        &nora_npm_base,
-    ))
+    Ok(Placed {
+        body: replace_upstream_bytes(&output, upstream_trimmed, &nora_npm_base),
+        left_out: !left_out.is_empty(),
+    })
+}
+
+/// A version document's `dist.tarball`, if it names one.
+fn tarball_of(version_data: &serde_json::Value) -> Option<&str> {
+    version_data.get("dist")?.get("tarball")?.as_str()
+}
+
+/// Where the tarball link `link` of an upstream document leads once NORA serves it: the
+/// upstream's own link (its URL under either scheme, ending where [`super::upstream_url_ends`]
+/// says) moved under `nora_npm_base`; a link already on NORA, or a relative one, as it is. `None`
+/// for a link anywhere else — another host, a URL that only starts like the upstream's, a
+/// network-path reference — which would send the client past NORA. Where a link leads is what a
+/// URL parser (npm's included) reads, not how it starts: `//host`, `/\host` and ` https://host`
+/// all name `host`.
+fn place_tarball(link: &str, nora_npm_base: &str, upstream: &str) -> Option<String> {
+    let placed = upstream_url_forms(upstream)
+        .iter()
+        .filter(|form| !form.is_empty())
+        .find_map(|form| {
+            link.strip_prefix(form.as_str())
+                .filter(|rest| super::upstream_url_ends(rest.as_bytes()))
+                .map(|rest| format!("{nora_npm_base}{rest}"))
+        })
+        .unwrap_or_else(|| link.to_string());
+    let nora = reqwest::Url::parse(&format!("{nora_npm_base}/")).ok()?;
+    let target = nora.join(&placed).ok()?;
+    let same_server = matches!(target.scheme(), "http" | "https")
+        && target.username().is_empty()
+        && target.password().is_none()
+        && target.host_str() == nora.host_str()
+        && target.port_or_known_default() == nora.port_or_known_default();
+    same_server.then_some(placed)
+}
+
+/// The host a tarball link names, for a log line that must not carry the link itself (it may
+/// hold a token).
+fn link_host(link: &str, nora_npm_base: &str) -> String {
+    reqwest::Url::parse(&format!("{nora_npm_base}/"))
+        .and_then(|nora| nora.join(link))
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "<unparsed>".to_string())
+}
+
+/// The `package@version` pairs already warned about, by hash: one line each in bounded memory. A
+/// pair whose slot another took over is warned about again.
+static LEFT_OUT_WARNED: [std::sync::atomic::AtomicU64; 1024] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+/// Warn, once per package and version, that a version is left out of what NORA serves.
+fn warn_left_out(package: &str, version: &str, link: &str, nora_npm_base: &str) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (package, version).hash(&mut hasher);
+    let hash = hasher.finish();
+    let slot = &LEFT_OUT_WARNED[(hash % LEFT_OUT_WARNED.len() as u64) as usize];
+    if slot.swap(hash, std::sync::atomic::Ordering::Relaxed) != hash {
+        tracing::warn!(
+            registry = "npm",
+            package = %package,
+            version = %version,
+            host = %link_host(link, nora_npm_base),
+            "version left out: its tarball is outside the upstream, npm would fetch it past NORA"
+        );
+    }
+}
+
+/// Drop the versions `left_out` of a packument from `time` and its tags. `latest` on one falls
+/// back to the highest release below it still listed, the version npm picks when no tag names one
+/// (pnpm and yarn need the tag); any other tag on one goes, since no other version is what its
+/// publisher tagged. No tag is left naming a version the packument does not list.
+fn leave_out_of_tags_and_times(json: &mut serde_json::Value, left_out: &[String]) {
+    let listed: Vec<String> = json
+        .get("versions")
+        .and_then(|v| v.as_object())
+        .map(|versions| versions.keys().cloned().collect())
+        .unwrap_or_default();
+    if let Some(time) = json.get_mut("time").and_then(|t| t.as_object_mut()) {
+        time.retain(|version, _| !left_out.contains(version));
+    }
+    if let Some(tags) = json.get_mut("dist-tags").and_then(|t| t.as_object_mut()) {
+        tags.retain(|tag, tagged| {
+            let Some(cut) = tagged.as_str().filter(|v| left_out.iter().any(|c| c == v)) else {
+                return true;
+            };
+            if tag != "latest" {
+                return false;
+            }
+            let below = listed
+                .iter()
+                .filter(|v| !v.contains('-') && semver_key(v) < semver_key(cut));
+            match max_semver(below) {
+                Some(release) => {
+                    *tagged = serde_json::Value::String(release);
+                    true
+                }
+                None => false,
+            }
+        });
+    }
 }
 
 /// Byte-level replace of upstream URL prefix in response body (#439).
@@ -1160,13 +1306,15 @@ async fn cached_copy_trusted(
 ///
 /// `key` is the cache written; `seed_key` holds the copy being revalidated (`key`, or what an
 /// older release cached), from which a missing first-seen ledger starts. `ledger` says whether
-/// the document is a packument, whose versions the ledger records.
+/// the document is a packument, whose versions the ledger records. `conditional` says whether the
+/// cached copy may be kept on a 304: not one holding a link past NORA.
 async fn refetch_metadata(
     state: &AppState,
     path: &str,
     key: &str,
     seed_key: &str,
     ledger: bool,
+    conditional: bool,
 ) -> Option<Vec<u8>> {
     let upstream = state.config.npm.route(path)?;
     let proxy_url = upstream.url;
@@ -1175,7 +1323,7 @@ async fn refetch_metadata(
     // Revalidate with a conditional request when enabled and we have stored
     // validators. Empty validators ⇒ no conditional headers ⇒ always a 200,
     // which is also how the first fetch captures validators for next time (#596).
-    let validators = if state.config.npm.revalidate {
+    let validators = if state.config.npm.revalidate && conditional {
         read_validators(&state.storage, key)
             .await
             .unwrap_or_default()
@@ -1238,17 +1386,8 @@ async fn refetch_metadata(
         }
         // New body — rewrite, cache it, then persist the fresh validators.
         Ok(Revalidation::Modified { body, validators }) => {
-            let nora_base = nora_base_url(state);
-            let rewritten =
-                rewrite_tarball_urls(&body, &nora_base, proxy_url).unwrap_or_else(|()| {
-                    tracing::warn!(
-                        path = %path,
-                        "npm metadata refetch: JSON parse failed, using byte-level URL rewrite"
-                    );
-                    let upstream_trimmed = proxy_url.trim_end_matches('/');
-                    let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-                    replace_upstream_bytes(&body, upstream_trimmed, &nora_npm_base)
-                });
+            // A version manifest whose tarball is now outside the upstream is not cached.
+            let rewritten = rewrite_for_nora(state, &body, proxy_url, path)?;
 
             // Before the cached copy is replaced: it may be the one a ledger starts from.
             if ledger {
@@ -1713,15 +1852,79 @@ async fn published_version_manifest(state: &AppState, name: &str, spec: &str) ->
     }
 }
 
-/// Rewrite an upstream document's tarball URLs to point at NORA.
-fn rewrite_for_nora(state: &AppState, data: &[u8], proxy_url: &str, path: &str) -> Vec<u8> {
+/// Rewrite an upstream document's tarball URLs to point at NORA, leaving out the versions whose
+/// tarball lies outside the upstream. `None` for a version manifest whose tarball does: no version
+/// NORA serves.
+fn rewrite_for_nora(state: &AppState, data: &[u8], proxy_url: &str, path: &str) -> Option<Vec<u8>> {
+    place_for_nora(state, data, proxy_url, path).map(|placed| placed.body)
+}
+
+/// [`rewrite_for_nora`], saying whether a version was left out.
+fn place_for_nora(state: &AppState, data: &[u8], proxy_url: &str, path: &str) -> Option<Placed> {
     let nora_base = nora_base_url(state);
-    rewrite_tarball_urls(data, &nora_base, proxy_url).unwrap_or_else(|()| {
-        tracing::warn!(path = %path, "npm metadata JSON parse failed, using byte-level URL rewrite");
-        let upstream_trimmed = proxy_url.trim_end_matches('/');
-        let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-        replace_upstream_bytes(data, upstream_trimmed, &nora_npm_base)
-    })
+    match place_document(data, &nora_base, proxy_url) {
+        Ok(placed) => Some(placed),
+        Err(Unrewritable::OffUpstream) => None,
+        Err(Unrewritable::NotJson) => {
+            tracing::warn!(path = %path, "npm metadata JSON parse failed, using byte-level URL rewrite");
+            let upstream_trimmed = proxy_url.trim_end_matches('/');
+            let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+            Some(Placed {
+                body: replace_upstream_bytes(data, upstream_trimmed, &nora_npm_base),
+                left_out: false,
+            })
+        }
+    }
+}
+
+/// Whether every tarball link of a cached document is already on NORA, as NORA writes it. Only the
+/// links are read (the rest is skipped unbuilt), so a cached document is placed again
+/// ([`served_copy`]) only when it holds a link of another form (a relative one) or one past NORA,
+/// cached by a release that kept it — or does not read as a packument or manifest at all.
+fn links_on_nora(data: &[u8], nora_base: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Dist {
+        tarball: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Version {
+        dist: Option<Dist>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Document {
+        versions: Option<std::collections::HashMap<String, Version>>,
+        dist: Option<Dist>,
+    }
+    let Ok(doc) = serde_json::from_slice::<Document>(data) else {
+        return false;
+    };
+    let nora = format!("{}/npm/", nora_base.trim_end_matches('/'));
+    let on_nora = |dist: &Option<Dist>| {
+        dist.as_ref()
+            .and_then(|d| d.tarball.as_deref())
+            .is_none_or(|link| link.starts_with(&nora))
+    };
+    on_nora(&doc.dist) && doc.versions.iter().flatten().all(|(_, v)| on_nora(&v.dist))
+}
+
+/// What NORA serves of an upstream document it cached: the document itself when every tarball
+/// link in it is NORA's, else the document placed again, as a fresh one is — the versions whose
+/// tarball lies outside the upstream left out. `None` for a version manifest whose tarball does.
+/// The flag says whether the copy held such a link (cached by a release that kept one).
+fn served_copy(state: &AppState, path: &str, data: Bytes) -> (Option<Bytes>, bool) {
+    if links_on_nora(&data, &nora_base_url(state)) {
+        return (Some(data), false);
+    }
+    let upstream = state
+        .config
+        .npm
+        .route(path)
+        .map(|u| u.url)
+        .unwrap_or_default();
+    match place_for_nora(state, &data, upstream, path) {
+        Some(placed) => (Some(Bytes::from(placed.body)), placed.left_out),
+        None => (None, true),
+    }
 }
 
 /// The document an upstream serves for `path`, for this request only: nothing is cached. Used
@@ -1754,13 +1957,22 @@ async fn uncached_upstream_metadata(
     )
     .await
     {
-        Ok(data) => packument_response(
-            headers,
-            Bytes::from(rewrite_for_nora(state, &data, upstream.url, path)),
-        ),
+        Ok(data) => match rewrite_for_nora(state, &data, upstream.url, path) {
+            Some(rewritten) => packument_response(headers, Bytes::from(rewritten)),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+/// [`packument_response`] for a cached upstream document, as [`served_copy`] has it; 404 for a
+/// version manifest whose tarball lies outside the upstream.
+fn served_packument(state: &AppState, headers: &HeaderMap, path: &str, data: Bytes) -> Response {
+    match served_copy(state, path, data) {
+        (Some(data), _) => packument_response(headers, data),
+        (None, _) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -1800,9 +2012,13 @@ async fn upstream_metadata(
     }
 
     if let Some((data, from_key)) = cached {
-        let fresh = state.storage.stat(&from_key).await.is_some_and(|meta| {
-            crate::cache_ttl::is_within_ttl(meta.modified, state.config.npm.metadata_ttl)
-        });
+        // A copy holding a link past NORA (cached by a release that kept one) is served placed
+        // again, and refetched in full whatever its age: a 304 would keep it as it is.
+        let (served, past_nora) = served_copy(state, path, data);
+        let fresh = !past_nora
+            && state.storage.stat(&from_key).await.is_some_and(|meta| {
+                crate::cache_ttl::is_within_ttl(meta.modified, state.config.npm.metadata_ttl)
+            });
         // #68 namespace isolation: an internal-namespace package is never revalidated upstream.
         if fresh
             || crate::curation::is_internal_namespace(
@@ -1811,11 +2027,14 @@ async fn upstream_metadata(
                 name,
             )
         {
-            return packument_response(headers, data);
+            return match served {
+                Some(data) => packument_response(headers, data),
+                None => StatusCode::NOT_FOUND.into_response(),
+            };
         }
         // Single-flight: a CI fleet stampeding one expired packument revalidates it once (#595).
         let refetch = || async {
-            refetch_metadata(state, path, cache_key, &from_key, packument)
+            refetch_metadata(state, path, cache_key, &from_key, packument, !past_nora)
                 .await
                 .map(Bytes::from)
         };
@@ -1829,10 +2048,13 @@ async fn upstream_metadata(
             refetch().await
         };
         if let Some(refreshed) = refreshed {
-            return packument_response(headers, refreshed);
+            return served_packument(state, headers, path, refreshed);
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
+            let Some(data) = served else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
             let (stale_body, stale_type) = packument_body(headers, data);
             return (
                 StatusCode::OK,
@@ -1881,7 +2103,9 @@ async fn upstream_metadata(
     .await
     {
         Ok(data) => {
-            let rewritten = rewrite_for_nora(state, &data, upstream.url, path);
+            let Some(rewritten) = rewrite_for_nora(state, &data, upstream.url, path) else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
             if packument {
                 record_first_seen(state, cache_key, &rewritten, None).await;
             }
@@ -2732,17 +2956,9 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
         // Rewrite tarball URLs to point at NORA, exactly as the proxy path and
         // refetch_metadata do, so a subsequent client reading the cached
         // packument is not sent back to the upstream.
-        let nora_base = nora_base_url(state);
-        let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or_else(|()| {
-            tracing::warn!(
-                package = %package_name,
-                "npm metadata self-prime: JSON parse failed, using byte-level URL rewrite",
-            );
-            let upstream_trimmed = proxy_url.trim_end_matches('/');
-            let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-            replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
-        });
-        let _ = put_with_origin(&state.storage, &key, &rewritten, &origin_of(proxy_url)).await;
+        if let Some(rewritten) = rewrite_for_nora(state, &data, proxy_url, package_name) {
+            let _ = put_with_origin(&state.storage, &key, &rewritten, &origin_of(proxy_url)).await;
+        }
     }
 }
 
@@ -2903,6 +3119,17 @@ fn with_content_type(
         ],
         data,
     )
+}
+
+/// Rewrite tarball URLs in npm metadata to point to NORA ([`place_document`]): the body alone,
+/// as the tests read it.
+#[cfg(test)]
+fn rewrite_tarball_urls(
+    data: &[u8],
+    nora_base: &str,
+    upstream_url: &str,
+) -> Result<Vec<u8>, Unrewritable> {
+    place_document(data, nora_base, upstream_url).map(|placed| placed.body)
 }
 
 #[cfg(test)]
@@ -5397,7 +5624,7 @@ mod spec_conformance_tests {
         // Call refetch_metadata directly — simulates the race where the handler
         // entered the cache-hit path (body was present at get_verified), TTL
         // expired, but GC deleted the body before refetch_metadata re-reads it.
-        let result = refetch_metadata(&ctx.state, "ghost-pkg", key, key, true).await;
+        let result = refetch_metadata(&ctx.state, "ghost-pkg", key, key, true, true).await;
         assert!(
             result.is_none(),
             "must return None when body is missing on 304"
@@ -5561,7 +5788,7 @@ mod spec_conformance_tests {
                 "1.0.0": {
                     "name": "corgi",
                     "version": "1.0.0",
-                    "dist": { "tarball": "http://example/corgi-1.0.0.tgz" },
+                    "dist": { "tarball": "/npm/corgi/-/corgi-1.0.0.tgz" },
                     "dependencies": { "left-pad": "^1.0.0" },
                     "engines": { "node": ">=18" },
                     "os": ["linux"],
@@ -9586,11 +9813,10 @@ mod rewrite_both_schemes {
             let rewritten = rewrite_tarball_urls(&doc, "http://nora:5000", upstream).unwrap();
             assert_eq!(
                 tarballs(&rewritten),
+                // Another host is not the upstream's to rewrite: its version is left out.
                 vec![
                     "http://nora:5000/npm/pkg/-/pkg-1.0.0.tgz",
                     "http://nora:5000/npm/pkg/-/pkg-1.0.1.tgz",
-                    // Another host is not the upstream's to rewrite.
-                    "http://other.example.com/pkg/-/pkg-1.0.2.tgz",
                 ],
                 "{upstream}"
             );
@@ -9612,8 +9838,8 @@ mod rewrite_both_schemes {
     /// A link is the upstream's only where the upstream URL ends: at a `/`, `?`, `#`, the end of
     /// the JSON string, a `\` (a JSON escape such as `\/`), or the end of the text. A longer host,
     /// a port, credentials before another host, or a longer last path segment name somewhere
-    /// else, under either scheme, and are left as they are — by the targeted rewrite and the
-    /// byte-level one alike.
+    /// else, under either scheme: the byte-level rewrite leaves them as they are, and the targeted
+    /// one leaves out the version whose tarball such a link is.
     #[test]
     fn a_host_or_path_that_only_starts_like_the_upstream_is_not_rewritten() {
         let nora = "http://nora:5000/npm";
@@ -9645,7 +9871,7 @@ mod rewrite_both_schemes {
             for link in links {
                 let doc = packument(&[("1.0.0", link)]);
                 let rewritten = rewrite_tarball_urls(&doc, "http://nora:5000", upstream).unwrap();
-                assert_eq!(tarballs(&rewritten), vec![link.to_string()], "{upstream}");
+                assert!(tarballs(&rewritten).is_empty(), "{upstream}: {link}");
                 let raw = format!("not json {link} {link}");
                 let rewritten = replace_upstream_bytes(raw.as_bytes(), trimmed, nora);
                 assert_eq!(String::from_utf8(rewritten).unwrap(), raw, "{upstream}");
@@ -9702,5 +9928,380 @@ mod rewrite_both_schemes {
                 "http://nora.example/npm/pkg/-/pkg-1.0.1.tgz",
             ]
         );
+    }
+}
+
+/// A version whose tarball an upstream document places outside that upstream (another host, or
+/// a URL that only starts like the upstream's) is no version NORA serves: npm would download it
+/// from there, past NORA. It is left out of the packument — `versions`, `time` and the tags — and
+/// its manifest is not found; a tarball on the upstream under either scheme, on NORA or at a
+/// relative path is served as before. No document NORA serves for an upstream package sends the
+/// client anywhere but NORA, however it was cached.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod off_upstream_versions {
+    use super::rewrite_tarball_urls;
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, send, send_with_headers, LogCapture,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const NORA: &str = "http://nora:5000";
+
+    /// Links outside the upstream `https://registry.example.com/repo` or NORA `http://nora:5000`.
+    const OUTSIDE: &[&str] = &[
+        "https://evil.example/pkg/-/pkg-2.0.0.tgz",
+        "https://registry.example.com.evil.example/repo/pkg/-/pkg-2.0.0.tgz",
+        "https://registry.example.com:8443/repo/pkg/-/pkg-2.0.0.tgz",
+        "https://registry.example.com@evil.example/repo/pkg/-/pkg-2.0.0.tgz",
+        "https://registry.example.com/repo-other/pkg/-/pkg-2.0.0.tgz",
+        "https://registry.example.com/pkg/-/pkg-2.0.0.tgz",
+        "HTTPS://evil.example/pkg/-/pkg-2.0.0.tgz",
+        " https://evil.example/pkg/-/pkg-2.0.0.tgz",
+        "//evil.example/pkg/-/pkg-2.0.0.tgz",
+        "/\\evil.example/pkg/-/pkg-2.0.0.tgz",
+        "\\\\evil.example/pkg/-/pkg-2.0.0.tgz",
+        "ftp://evil.example/pkg-2.0.0.tgz",
+        "http://nora:5000.evil.example/npm/pkg/-/pkg-2.0.0.tgz",
+        "http://nora:5000@evil.example/npm/pkg/-/pkg-2.0.0.tgz",
+        "http://nora:5001/npm/pkg/-/pkg-2.0.0.tgz",
+        // Another host on NORA's own scheme and port.
+        "http://evil.example:5000/npm/pkg/-/pkg-2.0.0.tgz",
+        "//evil.example:5000/npm/pkg/-/pkg-2.0.0.tgz",
+    ];
+
+    fn packument(versions: &[(&str, &str)], tags: serde_json::Value) -> Vec<u8> {
+        let mut docs = serde_json::Map::new();
+        let mut time = serde_json::Map::new();
+        time.insert("created".into(), "2020-01-01T00:00:00.000Z".into());
+        for (version, link) in versions {
+            docs.insert(
+                version.to_string(),
+                serde_json::json!({ "name": "pkg", "version": version, "dist": { "tarball": link } }),
+            );
+            time.insert(version.to_string(), "2020-01-02T00:00:00.000Z".into());
+        }
+        serde_json::to_vec(&serde_json::json!({
+            "name": "pkg", "dist-tags": tags, "versions": docs, "time": time,
+        }))
+        .unwrap()
+    }
+
+    fn served(versions_kept: &[(&str, &str)], last: (&str, &str)) -> Vec<u8> {
+        let mut all = versions_kept.to_vec();
+        all.push(last);
+        packument(
+            &all,
+            serde_json::json!({ "latest": last.0, "next": last.0, "beta": "1.1.0-beta.1" }),
+        )
+    }
+
+    fn keys(doc: &serde_json::Value, field: &str) -> Vec<String> {
+        let mut keys: Vec<String> = doc[field].as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    const KEPT: &[(&str, &str)] = &[
+        (
+            "1.0.0",
+            "https://registry.example.com/repo/pkg/-/pkg-1.0.0.tgz",
+        ),
+        (
+            "1.0.1",
+            "http://registry.example.com/repo/pkg/-/pkg-1.0.1.tgz",
+        ),
+        ("1.0.2", "/npm/pkg/-/pkg-1.0.2.tgz"),
+        ("1.0.3", "http://nora:5000/npm/pkg/-/pkg-1.0.3.tgz"),
+        (
+            "1.1.0-beta.1",
+            "https://registry.example.com/repo/pkg/-/pkg-1.1.0-beta.1.tgz",
+        ),
+    ];
+
+    #[test]
+    fn a_version_whose_tarball_is_outside_the_upstream_is_left_out() {
+        let mut wrong = Vec::new();
+        for link in OUTSIDE {
+            let doc = served(KEPT, ("2.0.0", link));
+            let out =
+                rewrite_tarball_urls(&doc, NORA, "https://registry.example.com/repo/").unwrap();
+            let text = String::from_utf8_lossy(&out).to_string();
+            let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let versions = keys(&doc, "versions");
+            let mut time = keys(&doc, "time");
+            time.retain(|k| k != "created");
+            let expected = ["1.0.0", "1.0.1", "1.0.2", "1.0.3", "1.1.0-beta.1"];
+            if versions != expected || time != expected {
+                wrong.push(format!("{link}: versions {versions:?} time {time:?}"));
+            }
+            // `latest` falls back to the highest release below the one left out; a tag naming
+            // only that version goes; the others stay.
+            let tags = &doc["dist-tags"];
+            if *tags != serde_json::json!({ "latest": "1.0.3", "beta": "1.1.0-beta.1" }) {
+                wrong.push(format!("{link}: tags {tags}"));
+            }
+            if text.contains("evil") || text.contains(":8443") || text.contains("2.0.0") {
+                wrong.push(format!("{link}: {text}"));
+            }
+            // The kept links: the upstream's under either scheme on NORA, the others as they were.
+            let links: Vec<&str> = expected
+                .iter()
+                .map(|v| doc["versions"][v]["dist"]["tarball"].as_str().unwrap())
+                .collect();
+            if links
+                != [
+                    "http://nora:5000/npm/pkg/-/pkg-1.0.0.tgz",
+                    "http://nora:5000/npm/pkg/-/pkg-1.0.1.tgz",
+                    "/npm/pkg/-/pkg-1.0.2.tgz",
+                    "http://nora:5000/npm/pkg/-/pkg-1.0.3.tgz",
+                    "http://nora:5000/npm/pkg/-/pkg-1.1.0-beta.1.tgz",
+                ]
+            {
+                wrong.push(format!("{link}: kept {links:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `latest` on a version left out, with no release below it left: the tag goes.
+    #[test]
+    fn latest_without_a_release_below_it_goes() {
+        let doc = packument(
+            &[
+                ("2.0.0", "https://evil.example/pkg-2.0.0.tgz"),
+                (
+                    "3.0.0",
+                    "https://registry.example.com/repo/pkg/-/pkg-3.0.0.tgz",
+                ),
+                (
+                    "1.0.0-rc.1",
+                    "https://registry.example.com/repo/pkg/-/pkg-1.0.0-rc.1.tgz",
+                ),
+            ],
+            serde_json::json!({ "latest": "2.0.0", "next": "3.0.0" }),
+        );
+        let out = rewrite_tarball_urls(&doc, NORA, "https://registry.example.com/repo").unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["dist-tags"], serde_json::json!({ "next": "3.0.0" }));
+        assert_eq!(keys(&doc, "versions"), ["1.0.0-rc.1", "3.0.0"]);
+    }
+
+    fn upstream_packument(up: &MockServer, last: &str) -> Vec<u8> {
+        let base = up.uri();
+        let link = |v: &str| format!("{base}/pkg/-/pkg-{v}.tgz");
+        packument(
+            &[
+                ("1.0.0", &link("1.0.0")),
+                ("1.1.0", &link("1.1.0")),
+                ("2.0.0", last),
+            ],
+            serde_json::json!({ "latest": "2.0.0" }),
+        )
+    }
+
+    async fn upstream() -> MockServer {
+        let up = MockServer::start().await;
+        let doc = upstream_packument(&up, "https://evil.example/pkg/-/pkg-2.0.0.tgz");
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(doc.clone()))
+            .mount(&up)
+            .await;
+        let manifest = |v: &str, link: String| {
+            serde_json::to_vec(
+                &serde_json::json!({ "name": "pkg", "version": v, "dist": { "tarball": link } }),
+            )
+            .unwrap()
+        };
+        for (spec, version, link) in [
+            (
+                "2.0.0",
+                "2.0.0",
+                "https://evil.example/pkg/-/pkg-2.0.0.tgz".to_string(),
+            ),
+            (
+                "latest",
+                "2.0.0",
+                "https://evil.example/pkg/-/pkg-2.0.0.tgz".to_string(),
+            ),
+            (
+                "1.1.0",
+                "1.1.0",
+                format!("{}/pkg/-/pkg-1.1.0.tgz", up.uri()),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pkg/{spec}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest(version, link)))
+                .mount(&up)
+                .await;
+        }
+        up
+    }
+
+    #[tokio::test]
+    async fn no_served_document_sends_the_client_past_nora() {
+        let up = upstream().await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        let mut wrong = Vec::new();
+        for accept in ["application/json", "application/vnd.npm.install-v1+json"] {
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/npm/pkg",
+                vec![("accept", accept)],
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_bytes(resp).await;
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if keys(&doc, "versions") != ["1.0.0", "1.1.0"]
+                || doc["dist-tags"]["latest"] != "1.1.0"
+                || String::from_utf8_lossy(&body).contains("evil")
+            {
+                wrong.push(format!("{accept}: {}", String::from_utf8_lossy(&body)));
+            }
+        }
+        for spec in ["2.0.0", "latest"] {
+            let resp = send(&ctx.app, Method::GET, &format!("/npm/pkg/{spec}"), "").await;
+            let status = resp.status();
+            let body = body_bytes(resp).await;
+            if status != StatusCode::NOT_FOUND || String::from_utf8_lossy(&body).contains("evil") {
+                wrong.push(format!(
+                    "/npm/pkg/{spec}: {status} {}",
+                    String::from_utf8_lossy(&body)
+                ));
+            }
+        }
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg/1.1.0", "").await;
+        let body = body_bytes(resp).await;
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        if doc["dist"]["tarball"] != "http://nora.example/npm/pkg/-/pkg-1.1.0.tgz" {
+            wrong.push(format!(
+                "/npm/pkg/1.1.0: {}",
+                String::from_utf8_lossy(&body)
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A packument cached with such a link (by a release that kept it) is not served with it.
+    /// It is fetched again in full whatever its age — a 304 would keep it — and, with the
+    /// upstream down, served stale without the version.
+    #[tokio::test]
+    async fn a_cached_link_past_nora_is_not_served() {
+        use crate::registry::{write_validators, Validators};
+        for (case, ttl, up_status) in [
+            ("fresh", 3600, 200),
+            ("expired", 0, 200),
+            ("upstream down", 0, 500),
+        ] {
+            let up = MockServer::start().await;
+            let fresh = upstream_packument(&up, &format!("{}/pkg/-/pkg-2.0.0.tgz", up.uri()));
+            Mock::given(method("GET"))
+                .and(header_exists("if-none-match"))
+                .respond_with(ResponseTemplate::new(304))
+                .mount(&up)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/pkg"))
+                .respond_with(ResponseTemplate::new(up_status).set_body_bytes(fresh))
+                .mount(&up)
+                .await;
+            let uri = up.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.npm.proxy = Some(uri);
+                cfg.npm.metadata_ttl = ttl;
+                cfg.npm.serve_stale = true;
+                cfg.server.public_url = Some("http://nora.example".to_string());
+            });
+            let key = "npm/pkg/upstream/packument.json";
+            let cached = packument(
+                &[
+                    ("1.0.0", "http://nora.example/npm/pkg/-/pkg-1.0.0.tgz"),
+                    ("2.0.0", "https://evil.example/pkg/-/pkg-2.0.0.tgz"),
+                ],
+                serde_json::json!({ "latest": "2.0.0" }),
+            );
+            ctx.state.storage.put(key, &cached).await.unwrap();
+            let validators = Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            };
+            write_validators(&ctx.state.storage, key, &validators).await;
+            let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{case}");
+            let body = body_bytes(resp).await;
+            let text = String::from_utf8_lossy(&body);
+            assert!(!text.contains("evil"), "{case}: {text}");
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let expected: &[&str] = if up_status == 200 {
+                &["1.0.0", "1.1.0", "2.0.0"]
+            } else {
+                &["1.0.0"]
+            };
+            assert_eq!(keys(&doc, "versions"), expected, "{case}");
+            if up_status == 200 {
+                let conditional = up
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.headers.contains_key("if-none-match"))
+                    .count();
+                assert_eq!(conditional, 0, "{case}: the copy was revalidated");
+            }
+        }
+    }
+
+    /// Each version left out is logged once, by package and version and the host only — not
+    /// the link, which may carry a token.
+    #[tokio::test]
+    async fn a_version_left_out_is_warned_about_once() {
+        let up = MockServer::start().await;
+        let doc = packument(
+            &[
+                ("1.0.0", &format!("{}/warned/-/warned-1.0.0.tgz", up.uri())),
+                (
+                    "2.0.0",
+                    "https://evil.example/secret-token/warned-2.0.0.tgz",
+                ),
+            ],
+            serde_json::json!({ "latest": "2.0.0" }),
+        );
+        let doc = String::from_utf8(doc)
+            .unwrap()
+            .replace("\"pkg\"", "\"warned\"");
+        Mock::given(method("GET"))
+            .and(path("/warned"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(doc))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.npm.metadata_ttl = 0;
+        });
+        let (log, _guard) = LogCapture::start();
+        for _ in 0..3 {
+            let resp = send(&ctx.app, Method::GET, "/npm/warned", "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let text = log.text();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("warned") && l.contains("2.0.0"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].contains("evil.example"), "{text}");
+        assert!(!text.contains("secret-token"), "{text}");
     }
 }
