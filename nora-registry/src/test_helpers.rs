@@ -1203,20 +1203,12 @@ pub async fn background_writes_done(storage: &Storage, holders: usize) {
         .expect("a background task still holds the store after 30 s");
 }
 
-/// What a SIGHUP does to `ctx`: an engine built by the reload's own builder from the
-/// configuration changed by `customize` replaces the running one, while the state keeps the
-/// configuration NORA started with.
+/// What a SIGHUP does to `ctx`: the reload installs what it builds from the configuration
+/// changed by `customize`, while the state keeps the configuration NORA started with.
 pub fn reload_curation(ctx: &TestContext, customize: impl FnOnce(&mut Config)) {
     let mut config = (*ctx.state.config).clone();
     customize(&mut config);
-    let curation_engine =
-        crate::build_curation_engine(&config).expect("the reloaded curation builds");
-    ctx.state
-        .reloadable
-        .store(Arc::new(crate::ReloadableConfig {
-            curation_engine,
-            bypass_token: config.curation.bypass_token,
-        }));
+    crate::reload_curation(&ctx.state, config).expect("the reloaded curation builds");
 }
 
 /// Quarantine every proxied artifact for 7 days, curation on.

@@ -3326,7 +3326,9 @@ async fn run_server(mut config: Config, storage: Storage) {
                 loop {
                     sighup.recv().await;
                     info!("SIGHUP received — reloading curation policy");
-                    match reload_curation(&reload_state) {
+                    let reloaded = Config::try_load()
+                        .and_then(|config| reload_curation(&reload_state, config));
+                    match reloaded {
                         Ok(()) => info!("Curation policy reloaded successfully"),
                         Err(e) => {
                             error!(error = %e, "Curation policy reload failed, keeping previous config")
@@ -4484,25 +4486,32 @@ async fn shutdown_signal() {
     }
 }
 
-/// Reload curation policy from disk (triggered by SIGHUP).
+/// Reload curation policy from `config`, the config.toml a SIGHUP re-read.
 ///
-/// Re-reads config.toml, rebuilds the CurationEngine with new filters,
-/// and atomically swaps the old config via ArcSwap.
-/// Storage, auth, port, and other settings are NOT reloaded — only curation.
-fn reload_curation(state: &AppState) -> Result<(), String> {
-    let config = Config::try_load()?;
-
+/// Rebuilds the CurationEngine with new filters and atomically swaps the old
+/// one, with the bypass token, via ArcSwap.
+/// Storage, auth, port, and other settings are NOT reloaded — only curation, and
+/// of it not the digest quarantine: a changed key the reload does not apply is
+/// named in a warning, it waits for a restart (`CurationConfig::unreloaded_changes`).
+fn reload_curation(state: &AppState, config: Config) -> Result<(), String> {
     // Fail-closed: `build_curation_engine` returns Err in enforce mode if any
     // filter no longer parses, so a broken allowlist surfaces here and the
     // `?` short-circuits BEFORE the `store` below — the previous (working)
     // engine is kept and never swapped for an allow-all one (#586).
     let engine = build_curation_engine(&config)?;
+    let unreloaded = state.config.curation.unreloaded_changes(&config.curation);
 
     state.reloadable.store(Arc::new(ReloadableConfig {
         curation_engine: engine,
         bypass_token: config.curation.bypass_token,
     }));
 
+    if !unreloaded.is_empty() {
+        warn!(
+            keys = ?unreloaded,
+            "Changed curation keys are not applied by a reload; they apply after a restart"
+        );
+    }
     Ok(())
 }
 
@@ -4897,6 +4906,127 @@ mod curation_reload_tests {
             assert!(err.contains("curation.npm.min_release_age"), "{err}");
             assert!(err.contains("3x"), "{err}");
         }
+    }
+
+    /// The line a reload logs about keys it leaves for a restart, if it logs one.
+    fn restart_warning(log: &str) -> Option<&str> {
+        log.lines()
+            .find(|line| line.contains("WARN") && line.contains("restart"))
+    }
+
+    /// A reload does not apply the quarantine: the handlers read it from the
+    /// configuration NORA started with. A SIGHUP that changes it says so, naming
+    /// each changed key, the global ones and a registry's own, and only those.
+    #[tokio::test]
+    async fn a_reload_that_changes_the_quarantine_warns_it_waits_for_a_restart() {
+        use crate::digest_quarantine::QuarantineMode;
+        let ctx = crate::test_helpers::create_test_context_with_config(
+            crate::test_helpers::quarantine_7d,
+        );
+        let (log, _capture) = crate::test_helpers::LogCapture::start();
+        let mut config = (*ctx.state.config).clone();
+        config.curation.quarantine_ttl = Some("14d".to_string());
+        config.curation.npm.quarantine = Some(QuarantineMode::Observe);
+        config.curation.pub_dart.quarantine_ttl = Some("1d".to_string());
+        super::reload_curation(&ctx.state, config).unwrap();
+
+        let text = log.text();
+        let warning = restart_warning(&text)
+            .unwrap_or_else(|| panic!("no restart warning after a quarantine change:\n{text}"));
+        for key in [
+            "curation.quarantine_ttl",
+            "curation.npm.quarantine",
+            "curation.pub.quarantine_ttl",
+        ] {
+            assert!(warning.contains(&format!("\"{key}\"")), "{key}: {warning}");
+        }
+        for unchanged in ["curation.quarantine", "curation.npm.quarantine_ttl"] {
+            assert!(
+                !warning.contains(&format!("\"{unchanged}\"")),
+                "{unchanged} did not change: {warning}"
+            );
+        }
+    }
+
+    /// `min_release_age`, global or a registry's own, is in the engine a reload
+    /// builds: a SIGHUP that changes only it applies it and warns of no restart.
+    #[tokio::test]
+    async fn a_reload_that_changes_only_the_release_age_warns_of_no_restart() {
+        let ctx = crate::test_helpers::create_test_context_with_config(
+            crate::test_helpers::quarantine_7d,
+        );
+        let npm = crate::curation::RegistryType::Npm;
+        assert!(!ctx.state.curation().curation_engine.reads_release_date(npm));
+        let (log, _capture) = crate::test_helpers::LogCapture::start();
+        let mut config = (*ctx.state.config).clone();
+        config.curation.min_release_age = Some("3d".to_string());
+        config.curation.npm.min_release_age = Some("1d".to_string());
+        super::reload_curation(&ctx.state, config).unwrap();
+
+        let text = log.text();
+        assert_eq!(restart_warning(&text), None, "{text}");
+        assert!(
+            ctx.state.curation().curation_engine.reads_release_date(npm),
+            "the reload did not install the release-age rule"
+        );
+    }
+
+    /// Every registry's own quarantine keys are compared, by the name of their
+    /// `[curation.<registry>]` section; a registry without one has none.
+    #[test]
+    fn every_registry_quarantine_key_is_compared() {
+        use crate::curation::RegistryType;
+        let running = CurationConfig::default();
+        for &rt in RegistryType::all() {
+            let mut loaded = CurationConfig::default();
+            let Some(section) = loaded.registry_override_mut(rt) else {
+                assert_eq!(running.unreloaded_changes(&loaded), Vec::<String>::new());
+                continue;
+            };
+            section.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+            section.quarantine_ttl = Some("2d".to_string());
+            section.min_release_age = Some("2d".to_string());
+            assert_eq!(
+                running.unreloaded_changes(&loaded),
+                [
+                    format!("curation.{rt}.quarantine"),
+                    format!("curation.{rt}.quarantine_ttl")
+                ],
+                "{rt}"
+            );
+        }
+    }
+
+    /// Each global quarantine key is named on its own, and a change a reload
+    /// applies — the engine's keys and the bypass token — names nothing.
+    #[test]
+    fn the_global_quarantine_keys_are_compared_and_the_reloaded_ones_are_not() {
+        use crate::digest_quarantine::QuarantineMode;
+        let running = CurationConfig::default();
+        let loaded = CurationConfig {
+            quarantine: Some(QuarantineMode::Observe),
+            ..Default::default()
+        };
+        assert_eq!(running.unreloaded_changes(&loaded), ["curation.quarantine"]);
+        let loaded = CurationConfig {
+            quarantine_ttl: Some("1d".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            running.unreloaded_changes(&loaded),
+            ["curation.quarantine_ttl"]
+        );
+        let loaded = CurationConfig {
+            mode: CurationMode::Enforce,
+            allowlist_path: Some("allow.json".to_string()),
+            blocklist_path: Some("block.json".to_string()),
+            bypass_token: Some("bypass".into()),
+            require_integrity: true,
+            internal_namespaces: vec!["corp/*".to_string()],
+            min_release_age: Some("1d".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(running.unreloaded_changes(&loaded), Vec::<String>::new());
     }
 }
 
