@@ -2056,48 +2056,55 @@ enum AttachmentRefused {
     Base64(#[from] base64::DecodeError),
 }
 
-/// The tarballs a publish stores: each attachment decoded, under its tarball key. Every attachment
-/// must be the tarball (`<name>-<version>.tgz`, the name with or without its scope) of a version
-/// the same payload publishes; anything else — another version's tarball, a key beside one,
-/// another package's — refuses the whole publish before anything is stored, so a publish cannot
-/// replace bytes clients installed or the pin they are checked against.
+/// The file name a publish's attachment `filename` is stored under: the tarball
+/// (`<name>-<version>.tgz`, the name with or without its scope) of one of the `versions` the
+/// payload publishes. Anything else — another version's tarball, a key beside one, a path,
+/// another scope's or another package's tarball — is refused.
+fn tarball_of_this_publish<'a>(
+    package_name: &str,
+    filename: &'a str,
+    versions: &serde_json::Map<String, serde_json::Value>,
+) -> Result<&'a str, AttachmentRefused> {
+    // A scoped package's attachment may carry its scope (`@scope/name-1.0.0.tgz`); without it
+    // the name must be flat, with no path separator to traverse with.
+    let (scope, short_name) = match package_name.split_once('/') {
+        Some((scope, name)) => (Some(scope), name),
+        None => (None, package_name),
+    };
+    let normalized_name = scope
+        .and_then(|scope| filename.strip_prefix(scope)?.strip_prefix('/'))
+        .unwrap_or(filename);
+    if !is_valid_attachment_name(normalized_name) {
+        return Err(AttachmentRefused::InvalidName);
+    }
+    if !versions
+        .keys()
+        .any(|version| normalized_name == format!("{short_name}-{version}.tgz"))
+    {
+        return Err(AttachmentRefused::NotThisPublish(
+            normalized_name.to_string(),
+        ));
+    }
+    Ok(normalized_name)
+}
+
+/// The tarballs a publish stores: each attachment decoded, under its tarball key. Every attachment,
+/// with bytes or without, must be [`tarball_of_this_publish`]; one that is not refuses the whole
+/// publish before anything is stored, so a publish cannot replace bytes clients installed or the
+/// pin they are checked against.
 fn publish_tarballs(
     package_name: &str,
     attachments: &serde_json::Map<String, serde_json::Value>,
     versions: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<Vec<(String, Vec<u8>)>, AttachmentRefused> {
-    let short_name = package_name.rsplit('/').next().unwrap_or(package_name);
     let mut tarballs = Vec::with_capacity(attachments.len());
     for (filename, attachment) in attachments {
-        // Scoped packages (e.g. @scope/name) may have attachment filenames
-        // like "@scope/name-1.0.0.tgz". Strip the scope prefix since it is
-        // already captured in the package name — the filename part must be a
-        // flat name without path separators to prevent path traversal.
-        let normalized_name = match package_name.find('/') {
-            Some(scope_end) => filename
-                .strip_prefix(&package_name[..=scope_end])
-                .unwrap_or(filename),
-            None => filename,
-        };
-        if !is_valid_attachment_name(normalized_name) {
-            return Err(AttachmentRefused::InvalidName);
-        }
-        let of_this_publish = versions
-            .keys()
-            .any(|version| normalized_name == format!("{short_name}-{version}.tgz"));
-        if !of_this_publish {
-            return Err(AttachmentRefused::NotThisPublish(
-                normalized_name.to_string(),
-            ));
-        }
+        let tarball = tarball_of_this_publish(package_name, filename, versions)?;
         let Some(data) = attachment.get("data").and_then(|d| d.as_str()) else {
             continue;
         };
         let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
-        tarballs.push((
-            format!("npm/{package_name}/tarballs/{normalized_name}"),
-            bytes,
-        ));
+        tarballs.push((format!("npm/{package_name}/tarballs/{tarball}"), bytes));
     }
     Ok(tarballs)
 }
