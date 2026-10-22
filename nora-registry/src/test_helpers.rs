@@ -700,6 +700,7 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 pub struct StorageOutage(
     Arc<std::sync::atomic::AtomicU8>,
     Arc<std::sync::Mutex<Vec<(String, ReadFault)>>>,
+    Arc<std::sync::Mutex<Vec<String>>>,
 );
 
 /// How the read of a key fails.
@@ -766,7 +767,31 @@ impl StorageOutage {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
+        self.2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         self.0.store(STORE_UP, Ordering::SeqCst);
+    }
+
+    /// Fail the listings of `prefix` exactly with a network error; other listings and every
+    /// read answer.
+    pub fn fail_listings_of(&self, prefix: &str) {
+        self.2
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(prefix.to_string());
+    }
+
+    /// Whether a listing of `prefix` fails now.
+    fn listing_fails(&self, prefix: &str) -> bool {
+        self.mode() == STORE_DOWN
+            || self
+                .2
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .any(|failing| failing == prefix)
     }
 
     fn mode(&self) -> u8 {
@@ -806,7 +831,7 @@ pub struct OutageBackend {
 
 /// An in-memory [`Storage`] to seed while it is up, and its outage switch.
 pub fn outage_storage() -> (Storage, StorageOutage) {
-    let outage = StorageOutage(Arc::default(), Arc::default());
+    let outage = StorageOutage(Arc::default(), Arc::default(), Arc::default());
     let backend = OutageBackend {
         inner: crate::storage::ObjectStorage::in_memory(),
         outage: outage.clone(),
@@ -874,7 +899,9 @@ impl crate::storage::StorageBackend for OutageBackend {
 
     async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
         self.outage.wait_answer().await;
-        self.check()?;
+        if self.outage.listing_fails(prefix) {
+            return Err(network_error());
+        }
         self.inner.list(prefix).await
     }
 
@@ -889,7 +916,9 @@ impl crate::storage::StorageBackend for OutageBackend {
         prefix: &str,
     ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
         self.outage.wait_answer().await;
-        self.check()?;
+        if self.outage.listing_fails(prefix) {
+            return Err(network_error());
+        }
         self.inner.list_with_meta(prefix).await
     }
 

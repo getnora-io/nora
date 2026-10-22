@@ -9274,6 +9274,36 @@ mod published_names_stay_local {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// A listing of a published package's tags that fails is not taken for no tags: the
+    /// packument rebuilt without a stored one answers 503 rather than a `latest` derived from
+    /// the versions.
+    #[tokio::test]
+    async fn a_published_package_whose_tags_cannot_be_listed_is_unavailable() {
+        let (storage, outage) = outage_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |_| {});
+        publish(&ctx, "pkg", "1.0.0").await;
+        publish(&ctx, "pkg", "1.0.1").await;
+        ctx.state
+            .storage
+            .put("npm/pkg/dist-tags/latest", b"1.0.0")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .delete("npm/pkg/metadata.json")
+            .await
+            .unwrap();
+        outage.fail_listings_of("npm/pkg/dist-tags/");
+        for path in ["/npm/pkg", "/npm/-/package/pkg/dist-tags"] {
+            let status = send(&ctx.app, Method::GET, path, "").await.status();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+        outage.end();
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+        let doc: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(doc["dist-tags"]["latest"], "1.0.0");
+    }
+
     /// A published version whose document the store cannot read is unavailable, not absent and
     /// not left out: its manifest (by version or by tag), the packument rebuilt without a stored
     /// one and the tags answer 503 for a store that cannot be asked and 500 for a copy that fails
