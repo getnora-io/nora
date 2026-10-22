@@ -371,6 +371,45 @@ mod tests {
         task.abort();
     }
 
+    /// Restart backoff: each restart waits out the backoff, doubled after each panic up to
+    /// its cap, so a task that panics at every start is not restarted in a hot loop.
+    #[tokio::test(start_paused = true)]
+    async fn restarts_wait_out_a_doubling_backoff() {
+        let tasks = Arc::new(Supervisor::with(
+            Vec::new(),
+            Timing {
+                backoff_min: Duration::from_secs(1),
+                backoff_max: Duration::from_secs(4),
+                stable_run: Duration::from_secs(1000),
+                crash_loop: 1000,
+            },
+        ));
+        let origin = tokio::time::Instant::now();
+        let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = Arc::clone(&starts);
+        let task = tasks.spawn("test_backoff", move || {
+            let mut starts = s.lock().unwrap();
+            starts.push(origin.elapsed());
+            // Past twenty runs, a restart without a pause would spin and stop the paused
+            // clock: the run then waits, so the test fails on the gaps instead of hanging.
+            let spinning = starts.len() > 20;
+            async move {
+                if spinning {
+                    std::future::pending::<()>().await;
+                }
+                panic!("a bug in every run")
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(20_500)).await;
+        task.abort();
+        let starts = starts.lock().unwrap();
+        let gaps: Vec<u128> = starts
+            .windows(2)
+            .map(|w| (w[1] - w[0]).as_millis())
+            .collect();
+        assert_eq!(gaps, [1000, 2000, 4000, 4000, 4000, 4000], "{starts:?}");
+    }
+
     /// Restart, crash loop: a task that keeps panicking soon after each start fails
     /// liveness by name, and clears it once a run lasts.
     #[tokio::test]
