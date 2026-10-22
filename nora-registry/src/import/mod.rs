@@ -2230,6 +2230,109 @@ mod integration_tests {
         );
     }
 
+    /// What an upstream served under the very key an import writes is replaced by the source's
+    /// verified package: the import stores its .nuspec and record, and the package is served as
+    /// NORA's own without asking the upstream.
+    #[tokio::test]
+    async fn a_nupkg_an_upstream_cached_under_its_key_is_imported_over_it() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+        });
+        let one = nupkg("Corp.Lib", "1.0");
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/corp.lib/1.0.0/corp.lib.1.0.0.nupkg",
+                b"what an upstream served",
+            )
+            .await
+            .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib/Corp.Lib.1.0.nupkg".into(), one.clone())],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        let flat = "/nuget/v3/flatcontainer/corp.lib";
+        let package = send(
+            &ctx.app,
+            Method::GET,
+            &format!("{flat}/1.0.0/corp.lib.1.0.0.nupkg"),
+            "",
+        )
+        .await;
+        assert_eq!(package.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(package).await[..], &one[..]);
+        let nuspec = send(
+            &ctx.app,
+            Method::GET,
+            &format!("{flat}/1.0.0/corp.lib.nuspec"),
+            "",
+        )
+        .await;
+        assert_eq!(nuspec.status(), StatusCode::OK);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+    }
+
+    /// A project the import made hosted whose file record was never written (the record write
+    /// failed, or the process stopped between the marker and the record) lists no file: a file
+    /// an upstream served under the name is not one of its files, and the upstream is not asked.
+    #[tokio::test]
+    async fn a_hosted_project_without_file_records_lists_no_cached_file() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.enabled = true;
+            cfg.pypi.proxy = Some(format!("{uri}/simple/"));
+        });
+        let cached = "corppkg-9.9.9-py3-none-any.whl";
+        ctx.state
+            .storage
+            .put(
+                &format!("pypi/corppkg/{cached}"),
+                b"what an upstream served",
+            )
+            .await
+            .unwrap();
+        crate::registry::pypi_claim_imported_project(&ctx.state.storage, "corppkg")
+            .await
+            .unwrap();
+        let index = send(&ctx.app, Method::GET, "/simple/corppkg/", "").await;
+        let status = index.status();
+        let html = String::from_utf8(body_bytes(index).await.to_vec()).unwrap();
+        assert!(!html.contains(cached), "{status}: {html}");
+        let file = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/simple/corppkg/{cached}"),
+            "",
+        )
+        .await;
+        assert_eq!(file.status(), StatusCode::NOT_FOUND);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+    }
+
     /// A .nupkg is imported only when it is a package of the id and version its key names: one
     /// whose .nuspec names another id or version, or that is no zip with a .nuspec, leaves
     /// nothing behind.
