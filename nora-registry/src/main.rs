@@ -3813,9 +3813,11 @@ mod maintenance_storage_tests {
     /// `/health` 200 at every poll. Returns the last `/ready` status.
     ///
     /// The local-store tests below run a 6 s stall window: its 1.97 s tick deadline stays
-    /// above what an fsync takes on a busy test host, so only a probe that really does not
-    /// come back is cut. A tick is 100 ms; the poll budgets cover the deadline and stay far
+    /// above what an fsync usually takes on a busy test host, so only a probe that really does
+    /// not come back is cut. A tick is 100 ms; the poll budgets cover the deadline and stay far
     /// inside the 150 s a verdict takes to expire, so only a tick's probe can turn `/ready`.
+    /// Turning 200 waits for an fsync, which a loaded host can stretch past the deadline: those
+    /// budgets are the longer ones, and a passing poll ends them early.
     async fn ready_becomes(app: &axum::Router, want: StatusCode, polls: usize) -> StatusCode {
         let mut ready = send(app, Method::GET, "/ready", "").await.status();
         for _ in 0..polls {
@@ -3841,7 +3843,7 @@ mod maintenance_storage_tests {
             c.server.maintenance_stall_secs = 6
         });
         super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
-        let ok = ready_becomes(&ctx.app, StatusCode::OK, 50).await;
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 150).await;
         assert_eq!(ok, StatusCode::OK, "writable store");
 
         let dir = ctx._tempdir.path();
@@ -3854,7 +3856,7 @@ mod maintenance_storage_tests {
             "read-only store"
         );
 
-        let ok = ready_becomes(&ctx.app, StatusCode::OK, 50).await;
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 150).await;
         assert_eq!(ok, StatusCode::OK, "writable again");
         assert_eq!(ctx.state.tasks.failing(), None);
     }
@@ -3896,7 +3898,7 @@ mod maintenance_storage_tests {
             c.server.maintenance_stall_secs = 6
         });
         super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
-        let ok = ready_becomes(&ctx.app, StatusCode::OK, 50).await;
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 150).await;
         assert_eq!(ok, StatusCode::OK, "answering disk");
 
         let disk = crate::test_helpers::hang_health_probe(ctx._tempdir.path());
@@ -3914,7 +3916,7 @@ mod maintenance_storage_tests {
         }
 
         disk.answer();
-        let ok = ready_becomes(&ctx.app, StatusCode::OK, 50).await;
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 150).await;
         assert_eq!(ok, StatusCode::OK, "the disk answers again");
         assert_eq!(ctx.state.tasks.failing(), None);
     }
