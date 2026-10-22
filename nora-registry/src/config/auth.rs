@@ -144,6 +144,12 @@ impl TrustedProxies {
         );
     }
 
+    /// Whether forwarding headers from an untrusted peer have been warned about.
+    #[cfg(test)]
+    pub(crate) fn warned_untrusted_forwarding(&self) -> bool {
+        self.untrusted_forwarding_warned.load(Ordering::Relaxed)
+    }
+
     /// The entries as the comma-separated list the setting is written in.
     fn listed(&self) -> String {
         let parts: Vec<String> = self

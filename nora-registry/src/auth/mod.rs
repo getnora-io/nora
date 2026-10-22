@@ -4716,7 +4716,12 @@ mod client_address_tests {
                 .with_ansi(false)
                 .with_writer(sink.clone()),
         );
-        tracing::subscriber::with_default(subscriber, run);
+        tracing::subscriber::with_default(subscriber, || {
+            // Another test's thread may have cached the callsites as
+            // uninteresting while no subscriber was installed; recount them.
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        });
         let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
         out.lines()
             .filter(|l| l.contains("WARN"))
@@ -4754,8 +4759,10 @@ mod client_address_tests {
     }
 
     /// Each forwarding header NORA reads is ignored from a peer outside
-    /// `trusted_proxies`, sent alone or with the other, and NORA says so once
-    /// per setting, never with the header's content.
+    /// `trusted_proxies`, sent alone or with the other, and the setting
+    /// records that it warned. Read from the setting, not from a log capture,
+    /// which other tests' threads can race; the warning's text is held by
+    /// `forwarding_from_an_untrusted_peer_is_warned_about_once`.
     #[test]
     fn every_forwarding_header_from_an_untrusted_peer_is_warned_about() {
         let sent: [(&[&str], Option<&str>); 3] = [
@@ -4765,20 +4772,25 @@ mod client_address_tests {
         ];
         for (xff, real_ip) in sent {
             let trusted = TrustedProxies::parse("10.9.9.9");
-            let warnings = warnings_of(|| {
-                for _ in 0..2 {
-                    let ip = resolve("127.0.0.1", xff, real_ip, &trusted);
-                    assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
-                }
-            });
-            assert_eq!(
-                warnings.len(),
-                1,
-                "xff {xff:?} real_ip {real_ip:?}: {warnings:#?}"
+            let ip = resolve("127.0.0.1", xff, real_ip, &trusted);
+            assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+            assert!(
+                trusted.warned_untrusted_forwarding(),
+                "xff {xff:?} real_ip {real_ip:?} ignored without a warning"
             );
-            assert!(warnings[0].contains("127.0.0.1"), "{}", warnings[0]);
-            assert!(!warnings[0].contains("203.0.113.10"), "{}", warnings[0]);
         }
+        // Controls: nothing to ignore, nothing to warn about.
+        let untrusted = TrustedProxies::parse("10.9.9.9");
+        let _ = resolve("127.0.0.1", &[], None, &untrusted);
+        assert!(!untrusted.warned_untrusted_forwarding());
+        let loopback = TrustedProxies::default_loopback();
+        let _ = resolve(
+            "127.0.0.1",
+            &["203.0.113.10"],
+            Some("203.0.113.10"),
+            &loopback,
+        );
+        assert!(!loopback.warned_untrusted_forwarding());
     }
 
     /// Send a request from `peer` (the TCP address the server sees).
@@ -4893,6 +4905,16 @@ mod client_address_tests {
             )
             .await;
         }
+        assert!(
+            ctx.state
+                .auth_failures
+                .check_blocked(&"127.0.0.1".parse().unwrap(), "alice")
+                .is_some(),
+            "wrong passwords did not lock the address out"
+        );
+        // Lengthen the lockout past the Argon2 check of the Bearer token
+        // below, which can outlast a lockout of a second or two under load.
+        lock_out_alice(&ctx.state.auth_failures, "127.0.0.1");
         let good = basic("alice", "alicepw");
         assert_eq!(
             send_from(
