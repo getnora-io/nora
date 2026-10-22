@@ -1078,6 +1078,17 @@ impl Config {
             }
         }
 
+        let keep_alive = self.server.keep_alive_timeout;
+        if (1..=server::PROXY_IDLE_SECS).contains(&keep_alive) {
+            warnings.push(format!(
+                "server.keep_alive_timeout is {keep_alive} s, not above the {} s a reverse proxy \
+                 such as traefik keeps an idle connection to NORA: the proxy may send a request \
+                 into a connection NORA is closing and answer 502. Set it above {} (default 120)",
+                server::PROXY_IDLE_SECS,
+                server::PROXY_IDLE_SECS
+            ));
+        }
+
         if self.server.maintenance_stall_secs < server::MIN_MAINTENANCE_STALL_SECS {
             errors.push(format!(
                 "server.maintenance_stall_secs must be at least {} (three maintenance ticks), got {}",
@@ -3556,6 +3567,31 @@ proxies = [
             let (_, errors) = config.validate();
             assert_eq!(errors, vec![format!("server.{key} must not be 0")]);
         }
+    }
+
+    /// An idle keep-alive not above the 90 s traefik keeps an idle backend connection is
+    /// warned about, not refused: the proxy may send a request into a connection NORA is
+    /// closing and answer 502. Above it, the default included, nothing is said.
+    #[test]
+    fn a_keep_alive_not_above_the_proxy_idle_timeout_is_warned_about() {
+        let _lock = env_lock();
+        let warned = |secs: u64| {
+            let mut config = Config::default();
+            config.server.keep_alive_timeout = secs;
+            let (warnings, errors) = config.validate();
+            assert!(errors.is_empty(), "{secs}: {errors:?}");
+            warnings
+                .iter()
+                .filter(|w| w.contains("server.keep_alive_timeout"))
+                .count()
+        };
+        for secs in [1, 5, 30, 89, 90] {
+            assert_eq!(warned(secs), 1, "{secs} s");
+        }
+        for secs in [91, 120, 3600] {
+            assert_eq!(warned(secs), 0, "{secs} s");
+        }
+        assert_eq!(warned(Config::default().server.keep_alive_timeout), 0);
     }
 
     /// Below three maintenance ticks one failing tick would fail liveness.

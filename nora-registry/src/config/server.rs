@@ -67,6 +67,10 @@ pub struct ServerConfig {
     pub maintenance_stall_secs: u64,
 }
 
+/// Seconds traefik, by default, keeps an idle connection to a backend. A `keep_alive_timeout`
+/// not above it lets NORA close an idle connection the proxy is about to reuse.
+pub const PROXY_IDLE_SECS: u64 = 90;
+
 /// The smallest `maintenance_stall_secs`: three maintenance ticks.
 pub const MIN_MAINTENANCE_STALL_SECS: u64 = 90;
 
