@@ -3177,9 +3177,7 @@ mod release_date_read {
     use crate::config::{Config, CurationMode};
     use crate::digest_quarantine::QuarantineMode;
     use crate::registry_type::RegistryType;
-    use crate::test_helpers::{
-        create_test_context_with_config, reload_curation, try_reload_curation,
-    };
+    use crate::test_helpers::{create_test_context_with_config, reload_curation, reload_file};
 
     /// Apply `set` to every registry.
     fn each_section(c: &mut Config, set: fn(&mut Config, RegistryType)) {
@@ -3335,7 +3333,12 @@ mod release_date_read {
             {
                 continue;
             }
-            let reloaded = try_reload_curation(&ctx, move |c| rule(c, target));
+            let (_dir, file) = reload_file(&ctx, move |c| rule(c, target));
+            let reloaded = {
+                let _lock = crate::test_env::env_lock();
+                let held = crate::HeldQuarantine::of(&ctx.state.config.curation);
+                crate::reload_curation(&ctx.state.reloadable, &held, Some(file))
+            };
             assert_eq!(
                 reloaded.is_err(),
                 refused.contains(&target),

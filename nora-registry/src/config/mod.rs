@@ -1608,14 +1608,10 @@ impl Config {
         env::var("NORA_CONFIG_PATH").ok()
     }
 
-    /// Non-panicking config reload for SIGHUP handler.
-    /// Returns Err on invalid file/TOML/validation instead of panicking.
-    pub fn try_load() -> Result<Self, String> {
-        Self::try_load_from(Self::path_from_env())
-    }
-
-    /// [`Config::try_load`] of the file at `path` (see [`Config::path_from_env`]), passed in so a
-    /// test reloads a file of its own without setting process-wide state.
+    /// Non-panicking config reload for SIGHUP handler, of the file at `path` (see
+    /// [`Config::path_from_env`]), passed in so a test reloads a file of its own without
+    /// setting process-wide state. Returns Err on invalid file/TOML/validation instead of
+    /// panicking.
     pub fn try_load_from(path: Option<String>) -> Result<Self, String> {
         let file = match path {
             Some(path) => {
@@ -3308,9 +3304,9 @@ proxies = [
         let path = dir.path().join("oidc.toml").to_string_lossy().into_owned();
         std::fs::write(&path, oidc_config_with("")).unwrap();
         std::env::set_var("NORA_CONFIG_PATH", &path);
-        let refused = Config::try_load();
+        let refused = Config::try_load_from(Config::path_from_env());
         std::fs::write(&path, oidc_config_with("any_audience = true")).unwrap();
-        let opted_out = Config::try_load();
+        let opted_out = Config::try_load_from(Config::path_from_env());
         std::env::remove_var("NORA_CONFIG_PATH");
         let err = refused.expect_err("a reload without an audience must be refused");
         assert!(err.contains("\"gh\"") && err.contains("audience"), "{err}");
@@ -3369,9 +3365,9 @@ proxies = [
         std::fs::write(&typo, "[curation]\nmdoe = \"enforce\"\n").unwrap();
         std::env::set_var("NORA_CONFIG_PATH", &typo);
         std::env::set_var("NORA_CONFIG_STRICT", "true");
-        let strict = Config::try_load();
+        let strict = Config::try_load_from(Config::path_from_env());
         std::env::remove_var("NORA_CONFIG_STRICT");
-        let lenient = Config::try_load();
+        let lenient = Config::try_load_from(Config::path_from_env());
         std::env::remove_var("NORA_CONFIG_PATH");
         let err = strict.expect_err("strict reload must refuse unknown keys");
         assert!(err.contains("curation.mdoe"), "{err}");
@@ -4870,9 +4866,9 @@ proxies = [
         std::fs::write(&path, "[curation.docker]\nmin_release_age = \"3d\"\n").unwrap();
         std::env::set_var("NORA_CONFIG_PATH", &path);
         std::env::set_var("NORA_REGISTRIES_ENABLE", "raw");
-        let off = Config::try_load();
+        let off = Config::try_load_from(Config::path_from_env());
         std::env::set_var("NORA_REGISTRIES_ENABLE", "docker");
-        let on = Config::try_load();
+        let on = Config::try_load_from(Config::path_from_env());
         std::env::remove_var("NORA_REGISTRIES_ENABLE");
         std::env::remove_var("NORA_CONFIG_PATH");
         assert!(off.is_ok(), "docker is not mounted: {:?}", off.err());

@@ -1299,15 +1299,20 @@ pub async fn background_writes_done(storage: &Storage, holders: usize) {
 /// to a file, and the server's own reload reads that file and installs the engine it describes.
 /// The state keeps the configuration NORA started with, as it does in the server.
 pub fn reload_curation(ctx: &TestContext, customize: impl FnOnce(&mut Config)) {
-    try_reload_curation(ctx, customize).expect("the reloaded curation builds");
+    let (_dir, file) = reload_file(ctx, customize);
+    // The reload applies the env overrides, so no other test may change them meanwhile.
+    let _lock = crate::test_env::env_lock();
+    let held = crate::HeldQuarantine::of(&ctx.state.config.curation);
+    crate::reload_curation(&ctx.state.reloadable, &held, Some(file))
+        .expect("the reloaded curation builds");
 }
 
-/// [`reload_curation`], with the server's verdict on the file: `Err` when it refuses it and
-/// keeps the running engine.
-pub fn try_reload_curation(
+/// The file a SIGHUP on `ctx` would read: the configuration NORA started with, changed by
+/// `customize`. It lives as long as the returned directory.
+pub fn reload_file(
     ctx: &TestContext,
     customize: impl FnOnce(&mut Config),
-) -> Result<(), String> {
+) -> (tempfile::TempDir, String) {
     let mut config = (*ctx.state.config).clone();
     customize(&mut config);
     // The test server listens on no port; a file the server loads names one, and the reload
@@ -1320,14 +1325,8 @@ pub fn try_reload_curation(
         toml::to_string(&config).expect("the configuration serializes"),
     )
     .unwrap();
-    // The reload applies the env overrides, so no other test may change them meanwhile.
-    let _lock = crate::test_env::env_lock();
-    let held = crate::HeldQuarantine::of(&ctx.state.config.curation);
-    crate::reload_curation(
-        &ctx.state.reloadable,
-        &held,
-        Some(path.to_string_lossy().into_owned()),
-    )
+    let file = path.to_string_lossy().into_owned();
+    (dir, file)
 }
 
 /// Quarantine every proxied artifact for 7 days, curation on.
