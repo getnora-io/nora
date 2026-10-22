@@ -2,15 +2,12 @@
 //! packaged systemd units do not restart into (`RestartPreventExitStatus=78`): a curation file
 //! NORA refuses in enforce mode stops the service instead of putting it into a restart loop.
 
-use std::io::Read;
-use std::net::{TcpListener, TcpStream};
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+mod common;
 
 enum Outcome {
     /// The process exited: its code (`None` when a signal ended it) and what it wrote to stderr.
     Exited(Option<i32>, String),
-    /// The process accepted a connection on its port, and was stopped by the test.
+    /// The process logged that it bound its port, and was stopped by the test.
     Serving,
 }
 
@@ -34,50 +31,12 @@ fn serve_with_blocklist(registry: &str, mode: &str) -> Outcome {
 /// `nora serve` with the settings in `envs`.
 fn serve(envs: &[(&str, &str)]) -> Outcome {
     let dir = tempfile::tempdir().unwrap();
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_nora"));
-    command
-        .arg("serve")
-        .current_dir(dir.path())
-        .env_remove("NORA_CONFIG_PATH")
-        .env("NORA_HOST", "127.0.0.1")
-        .env("NORA_PORT", port.to_string())
-        .env("NORA_STORAGE_PATH", dir.path().join("data"));
-    for (key, value) in envs {
-        command.env(key, value);
-    }
-    let mut child = command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            let mut stderr = String::new();
-            child
-                .stderr
-                .take()
-                .unwrap()
-                .read_to_string(&mut stderr)
-                .unwrap();
-            return Outcome::Exited(status.code(), stderr);
-        }
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            child.kill().unwrap();
-            child.wait().unwrap();
-            return Outcome::Serving;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "nora serve neither stopped nor served"
-        );
-        std::thread::sleep(Duration::from_millis(50));
+    let data = dir.path().join("data");
+    let mut envs = envs.to_vec();
+    envs.push(("NORA_STORAGE_PATH", data.to_str().unwrap()));
+    match common::start(dir.path(), &envs) {
+        common::Started::Serving(_) => Outcome::Serving,
+        common::Started::Exited(code, stderr) => Outcome::Exited(code, stderr),
     }
 }
 
@@ -201,4 +160,42 @@ fn valid_curation_durations_start() {
         Outcome::Serving => {}
         Outcome::Exited(code, stderr) => panic!("exited with {code:?}: {stderr}"),
     }
+}
+
+/// A port that answers is not NORA serving: with the port held by another listener, a start
+/// that refuses its configuration is seen to exit with EX_CONFIG, and one that would serve is
+/// seen to fail to bind — neither is taken for serving because something accepted the
+/// connection.
+#[test]
+fn a_port_another_process_holds_is_not_taken_for_nora_serving() {
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = held.local_addr().unwrap().port();
+    let dir = tempfile::tempdir().unwrap();
+    let blocklist = dir.path().join("blocklist.json");
+    std::fs::write(
+        &blocklist,
+        r#"{"version": 1, "rules": [{"registry": "pyip", "name": "six", "version": "*", "reason": "r"}]}"#,
+    )
+    .unwrap();
+    let data = dir.path().join("data");
+    let data = data.to_str().unwrap();
+    for (mode, refused) in [("enforce", true), ("audit", false)] {
+        let envs = [
+            ("NORA_CURATION_MODE", mode),
+            ("NORA_CURATION_BLOCKLIST_PATH", blocklist.to_str().unwrap()),
+            ("NORA_STORAGE_PATH", data),
+        ];
+        match common::start_on(dir.path(), &envs, port) {
+            common::Started::Exited(code, stderr) if refused => {
+                assert_eq!(code, Some(78), "{mode}: {stderr}")
+            }
+            common::Started::Exited(_, stderr) => {
+                assert!(stderr.contains("Failed to bind"), "{mode}: {stderr}")
+            }
+            common::Started::Serving(_) => {
+                panic!("{mode}: a port held by another listener was taken for nora serving")
+            }
+        }
+    }
+    drop(held);
 }
