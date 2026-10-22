@@ -424,6 +424,9 @@ impl Drop for ProbeDone {
     }
 }
 
+/// Name prefix of the write probe's file, in the storage root.
+const HEALTH_PROBE_PREFIX: &str = ".nora-health-probe.";
+
 /// Create, write, fsync and remove a probe file under `base`: only a store that takes a
 /// durable write passes. `base.exists()` is not a health signal — a read-only mount or a
 /// full disk where the directory already exists would still pass.
@@ -437,7 +440,11 @@ fn write_probe(base: &Path) -> bool {
     // A new file every time: writing into a file that already exists passes on a read-only
     // directory, and can pass on a full disk.
     let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let probe = base.join(format!(".nora-health-probe.{}.{}", std::process::id(), seq));
+    let probe = base.join(format!(
+        "{HEALTH_PROBE_PREFIX}{}.{}",
+        std::process::id(),
+        seq
+    ));
     let writable = match std::fs::File::create_new(&probe) {
         Ok(mut file) => file.write_all(b"ok").is_ok() && file.sync_all().is_ok(),
         Err(_) => false,
@@ -447,7 +454,7 @@ fn write_probe(base: &Path) -> bool {
 }
 
 /// Bytes of the stored artifacts under `path`, walking the whole tree. At the root it
-/// leaves out the pin sidecar, `tmp/` (in-flight streamed uploads — transient staging,
+/// leaves out the pin sidecar, a write probe in flight (the count runs beside it), `tmp/` (in-flight streamed uploads — transient staging,
 /// not stored artifacts; counting it makes the storage gauge sawtooth during pushes) and
 /// the staging directory (writes in progress, see `Staging`).
 fn dir_size(path: &Path, is_root: bool) -> u64 {
@@ -456,7 +463,11 @@ fn dir_size(path: &Path, is_root: bool) -> u64 {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_file() {
-                if is_root && path.file_name().is_some_and(|n| n == PIN_FILE) {
+                if is_root
+                    && path.file_name().is_some_and(|n| {
+                        n == PIN_FILE || n.to_string_lossy().starts_with(HEALTH_PROBE_PREFIX)
+                    })
+                {
                     continue;
                 }
                 total += entry.metadata().map(|m| m.len()).unwrap_or(0);
@@ -2315,6 +2326,18 @@ mod tests {
             data.iter().all(|&b| b == first),
             "final state must be a uniform object"
         );
+    }
+
+    /// A write probe in flight is not stored data: the size count, which runs beside it,
+    /// leaves its file out.
+    #[tokio::test]
+    async fn the_size_leaves_out_a_probe_in_flight() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        put(&storage, "raw/a", b"abc").await.unwrap();
+        std::fs::write(temp_dir.path().join(".nora-health-probe.1.2"), b"ok").unwrap();
+        storage.refresh_total_size().await;
+        assert_eq!(storage.total_size().await, 3);
     }
 
     #[tokio::test]
