@@ -327,3 +327,28 @@ impl Future for HeadSleep {
 }
 
 impl hyper::rt::Sleep for HeadSleep {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each limit the server runs with comes from its own key of `[server]`: the bridge
+    /// `run_server` uses, given values no two keys share.
+    #[test]
+    fn the_limits_come_from_their_own_keys() {
+        let server = crate::config::ServerConfig {
+            header_read_timeout: 7,
+            keep_alive_timeout: 123,
+            max_connections: 9,
+            ..crate::config::ServerConfig::default()
+        };
+        let limits = ConnLimits::from_config(&server);
+        assert_eq!(limits.header_read_timeout, Duration::from_secs(7));
+        assert_eq!(limits.keep_alive_timeout, Duration::from_secs(123));
+        assert_eq!(limits.max_connections, 9);
+        let defaults = ConnLimits::from_config(&crate::config::ServerConfig::default());
+        assert_eq!(defaults.header_read_timeout, Duration::from_secs(30));
+        assert_eq!(defaults.keep_alive_timeout, Duration::from_secs(120));
+        assert_eq!(defaults.max_connections, 4096);
+    }
+}
