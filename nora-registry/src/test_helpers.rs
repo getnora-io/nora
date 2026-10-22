@@ -694,13 +694,24 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
 // ── Storage outage ──────────────────────────────────────────────────────────
 
-/// The switch of an [`outage_storage`]: up, down, silent, failing object reads only, or
-/// failing the reads of some keys.
+/// The switch of an [`outage_storage`]: up, down, silent, failing object reads only, or failing
+/// the reads of some keys, each with its own [`ReadFault`].
 #[derive(Clone)]
 pub struct StorageOutage(
     Arc<std::sync::atomic::AtomicU8>,
-    Arc<std::sync::OnceLock<String>>,
+    Arc<std::sync::Mutex<Vec<(String, ReadFault)>>>,
 );
+
+/// How the read of a key fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadFault {
+    /// The store cannot be asked: a network error.
+    Network,
+    /// The store answers with bytes that are not the ones written (changed on disk), under the
+    /// pin of the bytes written, so the read fails its integrity check as a tampered copy does.
+    /// Applies to the buffered read the integrity gate checks; streamed reads are left alone.
+    Tampered,
+}
 
 const STORE_UP: u8 = 0;
 const STORE_DOWN: u8 = 1;
@@ -721,9 +732,18 @@ impl StorageOutage {
         self.0.store(STORE_READS_FAIL, Ordering::SeqCst);
     }
 
-    /// Fail the reads of the keys ending with `suffix` only (set once).
+    /// Fail the reads of the keys ending with `suffix` with a network error; other keys read.
     pub fn fail_reads_of(&self, suffix: &str) {
-        let _ = self.1.set(suffix.to_string());
+        self.fault_reads_of(suffix, ReadFault::Network);
+    }
+
+    /// Fail the reads of the keys ending with `suffix` with `fault`; other keys read. Faults
+    /// add up: each key fails with the first fault whose suffix it ends with.
+    pub fn fault_reads_of(&self, suffix: &str, fault: ReadFault) {
+        self.1
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((suffix.to_string(), fault));
         self.0.store(STORE_READS_OF_FAIL, Ordering::SeqCst);
     }
 
@@ -755,6 +775,21 @@ impl StorageOutage {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
     }
+
+    /// The fault an object read of `key` meets now, if any.
+    fn read_fault(&self, key: &str) -> Option<ReadFault> {
+        match self.mode() {
+            STORE_UP => None,
+            STORE_READS_OF_FAIL => self
+                .1
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .iter()
+                .find(|(suffix, _)| key.ends_with(suffix.as_str()))
+                .map(|(_, fault)| *fault),
+            _ => Some(ReadFault::Network),
+        }
+    }
 }
 
 /// An in-memory object store that can be taken down. While down, every read, listing and write
@@ -775,35 +810,25 @@ pub fn outage_storage() -> (Storage, StorageOutage) {
     (Storage::from_backend(Arc::new(backend)), outage)
 }
 
+fn network_error() -> crate::storage::StorageError {
+    crate::storage::StorageError::Network("connection refused".into())
+}
+
 impl OutageBackend {
     /// For a listing, `stat`, `pin` or a write: fails while the store is down.
     fn check(&self) -> crate::storage::Result<()> {
         match self.outage.mode() {
-            STORE_DOWN => Err(crate::storage::StorageError::Network(
-                "connection refused".into(),
-            )),
+            STORE_DOWN => Err(network_error()),
             _ => Ok(()),
         }
     }
 
-    /// For an object read of `key`: fails while the store is down, failing reads, or failing
-    /// the reads of keys like this one.
+    /// For a streamed read of `key`: fails with a network error while the store is down,
+    /// failing reads, or failing the reads of keys like this one with one.
     fn check_read(&self, key: &str) -> crate::storage::Result<()> {
-        let fails = match self.outage.mode() {
-            STORE_UP => false,
-            STORE_READS_OF_FAIL => self
-                .outage
-                .1
-                .get()
-                .is_some_and(|s| key.ends_with(s.as_str())),
-            _ => true,
-        };
-        if fails {
-            Err(crate::storage::StorageError::Network(
-                "connection refused".into(),
-            ))
-        } else {
-            Ok(())
+        match self.outage.read_fault(key) {
+            Some(ReadFault::Network) => Err(network_error()),
+            Some(ReadFault::Tampered) | None => Ok(()),
         }
     }
 }
@@ -819,7 +844,16 @@ impl crate::storage::StorageBackend for OutageBackend {
     async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
         self.outage.wait_answer().await;
         self.check_read(key)?;
-        self.inner.get(key).await
+        let (data, pin) = self.inner.get(key).await?;
+        if self.outage.read_fault(key) != Some(ReadFault::Tampered) {
+            return Ok((data, pin));
+        }
+        // The pin of the bytes written, whether or not the inner store keeps one.
+        use sha2::Digest;
+        let pin = pin.unwrap_or_else(|| hex::encode(sha2::Sha256::digest(&data)));
+        let mut changed = data.to_vec();
+        changed.extend_from_slice(b" changed on disk");
+        Ok((changed.into(), Some(pin)))
     }
 
     async fn pin(&self, key: &str) -> Option<String> {

@@ -1367,7 +1367,13 @@ async fn serve_dist_tags(
     name: &str,
 ) -> Response {
     let own = match published_state(&state.storage, name).await {
-        Published::Yes(_) => assemble_packument(&state.storage, name).await,
+        // Tags derived from the versions (`latest` when no pointer names it) need them all.
+        Published::Yes(published) => match assemble_packument(&state.storage, name).await {
+            Some(bytes) if listed_versions(&bytes).as_ref() != Some(&published) => {
+                return published_versions_unreadable(state, name, &published, &bytes).await;
+            }
+            assembled => assembled,
+        },
         Published::Unknown => {
             let key = published_packument_key(name);
             match state.storage.get(&key).await {
@@ -1639,15 +1645,7 @@ async fn published_packument_response(
         // read would rebuild it again: the package is unavailable until it is repaired, and says
         // which versions keep it so.
         Ok(bytes) if listed_versions(&bytes).as_ref() != Some(published) => {
-            let assembled = listed_versions(&bytes).unwrap_or_default();
-            let unreadable: Vec<&String> = published.difference(&assembled).collect();
-            tracing::error!(
-                registry = "npm",
-                package = %name,
-                versions = ?unreadable,
-                "published versions cannot be read; packument not served"
-            );
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+            published_versions_unreadable(state, name, published, &bytes).await
         }
         Ok(bytes) => {
             PACKUMENT_REBUILT_TOTAL.with_label_values(&["npm"]).inc();
@@ -1665,22 +1663,55 @@ async fn published_packument_response(
     }
 }
 
+/// The answer for a published package whose assembled packument `bytes` left out some of its
+/// `published` versions: their documents could not be read. Each is read again and its failure
+/// says why — 500 for a copy that fails its integrity check, else 503. The package is
+/// unavailable until it is repaired, never served without the versions.
+async fn published_versions_unreadable(
+    state: &AppState,
+    name: &str,
+    published: &std::collections::BTreeSet<String>,
+    bytes: &[u8],
+) -> Response {
+    let assembled = listed_versions(bytes).unwrap_or_default();
+    let unreadable: Vec<&String> = published.difference(&assembled).collect();
+    tracing::error!(
+        registry = "npm",
+        package = %name,
+        versions = ?unreadable,
+        "published versions cannot be read; packument not served"
+    );
+    let mut failure = None;
+    for version in unreadable {
+        let key = format!("npm/{name}/versions/{version}.json");
+        match state.storage.get(&key).await {
+            Err(e @ crate::storage::StorageError::IntegrityViolation) => {
+                return crate::registry::local_copy_unreadable("npm", &key, &e);
+            }
+            Err(e) => failure = failure.or(Some((key, e))),
+            Ok(_) => {}
+        }
+    }
+    match failure {
+        Some((key, e)) => crate::registry::local_copy_unreadable("npm", &key, &e),
+        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 /// The manifest of one version of a published package, by version or by dist-tag, from its
-/// own keys; 404 when neither names a published version. No upstream is asked.
+/// own keys; 404 when neither names a published version. No upstream is asked. A tag or a
+/// document the store cannot read is unavailable (503, 500 for a copy that fails its integrity
+/// check), not absent.
 async fn published_version_manifest(state: &AppState, name: &str, spec: &str) -> Response {
-    let version = match state
-        .storage
-        .get(&format!("npm/{name}/dist-tags/{spec}"))
-        .await
-    {
+    use crate::storage::StorageError;
+    let tag_key = format!("npm/{name}/dist-tags/{spec}");
+    let version = match state.storage.get(&tag_key).await {
         Ok(tagged) => String::from_utf8_lossy(&tagged).trim().to_string(),
-        Err(_) => spec.to_string(),
+        Err(StorageError::NotFound | StorageError::Validation(_)) => spec.to_string(),
+        Err(e) => return crate::registry::local_copy_unreadable("npm", &tag_key, &e),
     };
-    match state
-        .storage
-        .get(&format!("npm/{name}/versions/{version}.json"))
-        .await
-    {
+    let key = format!("npm/{name}/versions/{version}.json");
+    match state.storage.get(&key).await {
         Ok(doc) => (
             StatusCode::OK,
             [(
@@ -1690,7 +1721,10 @@ async fn published_version_manifest(state: &AppState, name: &str, spec: &str) ->
             doc,
         )
             .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(StorageError::NotFound | StorageError::Validation(_)) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(e) => crate::registry::local_copy_unreadable("npm", &key, &e),
     }
 }
 
@@ -8989,6 +9023,77 @@ mod published_names_stay_local {
             .iter()
             .map(|r| r.url.path().to_string())
             .collect()
+    }
+
+    /// A published version whose document the store cannot read is unavailable, not absent and
+    /// not left out: its manifest (by version or by tag), the packument rebuilt without a stored
+    /// one and the tags answer 503 for a store that cannot be asked and 500 for a copy that fails
+    /// its integrity check — never 404 or a document without the version — and the upstream is
+    /// not asked. Another version still reads.
+    #[tokio::test]
+    async fn a_published_version_whose_document_cannot_be_read_is_unavailable_not_absent() {
+        use crate::test_helpers::ReadFault;
+        let mut wrong = Vec::new();
+        for (fault, expected) in [
+            (ReadFault::Network, StatusCode::SERVICE_UNAVAILABLE),
+            (ReadFault::Tampered, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            for (unreadable, paths) in [
+                (
+                    "npm/pkg/versions/1.0.0.json",
+                    &["/npm/pkg/1.0.0", "/npm/pkg", "/npm/-/package/pkg/dist-tags"][..],
+                ),
+                ("npm/pkg/dist-tags/latest", &["/npm/pkg/latest"][..]),
+            ] {
+                let upstream = recording_upstream().await;
+                let uri = upstream.uri();
+                let (storage, outage) = outage_storage();
+                let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+                    c.npm.proxy = Some(uri);
+                });
+                publish(&ctx, "pkg", "1.0.0").await;
+                publish(&ctx, "pkg", "1.0.1").await;
+                // The tag a client's publish sets.
+                ctx.state
+                    .storage
+                    .put("npm/pkg/dist-tags/latest", b"1.0.1")
+                    .await
+                    .unwrap();
+                // No stored packument: it is rebuilt from the published keys.
+                ctx.state
+                    .storage
+                    .delete("npm/pkg/metadata.json")
+                    .await
+                    .unwrap();
+                for path in paths {
+                    let status = send(&ctx.app, Method::GET, path, "").await.status();
+                    if status != StatusCode::OK {
+                        wrong.push(format!("{path} with the store up -> {status}"));
+                    }
+                }
+                // Rebuilt and stored again where the reads above read the packument.
+                let _ = ctx.state.storage.delete("npm/pkg/metadata.json").await;
+                outage.fault_reads_of(unreadable, fault);
+                for path in paths {
+                    let status = send(&ctx.app, Method::GET, path, "").await.status();
+                    if status != expected {
+                        wrong.push(format!("{path}, {unreadable} {fault:?} -> {status}"));
+                    }
+                }
+                let other = send(&ctx.app, Method::GET, "/npm/pkg/1.0.1", "").await;
+                if other.status() != StatusCode::OK {
+                    wrong.push(format!(
+                        "/npm/pkg/1.0.1, {unreadable} {fault:?} -> {}",
+                        other.status()
+                    ));
+                }
+                let asked = asked(&upstream).await;
+                if !asked.is_empty() {
+                    wrong.push(format!("upstream asked, {unreadable} {fault:?}: {asked:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[tokio::test]
