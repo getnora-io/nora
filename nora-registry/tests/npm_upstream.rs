@@ -150,6 +150,12 @@ fn the_credential_in_the_upstream_url_is_not_written_down() {
     ]);
     let status = status_of(server.port, "/npm/pkg/-/pkg-1.0.0.tgz");
     assert!(status.contains(" 200 "), "{status}");
+    let seen = registry.seen.lock().unwrap().clone();
+    assert!(
+        seen.iter()
+            .any(|line| line.starts_with("GET /pkg/-/pkg-1.0.0.tgz ")),
+        "the tarball did not come from the upstream: {seen:?}"
+    );
     let ledger = server.dir.path().join("data").join("quarantine.jsonl");
     let deadline = Instant::now() + Duration::from_secs(10);
     let written = loop {
