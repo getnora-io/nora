@@ -992,6 +992,98 @@ impl crate::storage::StorageBackend for OutageBackend {
     }
 }
 
+// ── A size count that never ends ────────────────────────────────────────────
+
+/// How often a [`long_count_storage`] was asked what.
+#[derive(Default)]
+pub struct LongCount {
+    /// Readiness requests made.
+    pub probes: std::sync::atomic::AtomicU64,
+    /// Size counts started.
+    pub counting: std::sync::atomic::AtomicU64,
+    /// The most size counts running at once.
+    pub most_counting: std::sync::atomic::AtomicU64,
+}
+
+/// A store whose size count never ends (a bucket too large to list in the test's time)
+/// and whose first readiness request panics (a bug that shows once); nothing is stored.
+struct LongCountBackend(Arc<LongCount>);
+
+/// A [`Storage`] whose size count never ends and whose first readiness request panics,
+/// and what it was asked.
+pub fn long_count_storage() -> (Storage, Arc<LongCount>) {
+    let counts = Arc::new(LongCount::default());
+    let backend = LongCountBackend(Arc::clone(&counts));
+    (Storage::from_backend(Arc::new(backend)), counts)
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for LongCountBackend {
+    async fn put(&self, _k: &str, _d: &[u8], _sha256: &str) -> crate::storage::Result<()> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+    async fn get(&self, _k: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+    async fn pin(&self, _k: &str) -> Option<String> {
+        None
+    }
+    async fn delete(&self, _k: &str) -> crate::storage::Result<()> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+    async fn list(&self, _prefix: &str) -> crate::storage::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn stat(&self, _k: &str) -> Option<crate::storage::FileMeta> {
+        None
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+    async fn total_size(&self) -> u64 {
+        0
+    }
+    fn backend_name(&self) -> &'static str {
+        "long-count-test"
+    }
+    async fn refresh_reachability(&self) {
+        if self.0.probes.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("a bug in the first readiness request");
+        }
+    }
+    async fn refresh_total_size(&self) {
+        let now = self.0.counting.fetch_add(1, Ordering::SeqCst) + 1;
+        self.0.most_counting.fetch_max(now, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+    }
+    async fn put_from_path(
+        &self,
+        _k: &str,
+        _src: &std::path::Path,
+        _sha256: Option<&str>,
+    ) -> crate::storage::Result<()> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+    async fn copy(
+        &self,
+        _src: &str,
+        _dst: &str,
+        _sha256: Option<&str>,
+    ) -> crate::storage::Result<()> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+    async fn get_reader(
+        &self,
+        _k: &str,
+    ) -> crate::storage::Result<(
+        u64,
+        Option<String>,
+        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    )> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+}
+
 // ── A large bucket ──────────────────────────────────────────────────────────
 
 /// An in-memory object store whose listing answers its first object at once and each later

@@ -4362,7 +4362,7 @@ mod maintenance_loop_tests {
     async fn a_cut_tick_is_counted() {
         let period = super::MAINTENANCE_PERIOD;
         let silence = Duration::from_secs(90);
-        let cuts = || crate::metrics::MAINTENANCE_TIMEOUTS_TOTAL.get();
+        let cuts = || super::metrics::MAINTENANCE_TIMEOUTS_TOTAL.get();
         let before = cuts();
         let heartbeat = Arc::new(Heartbeat::new(silence));
         let task = tokio::spawn(run_maintenance(period, heartbeat, |n| async move {
@@ -4554,7 +4554,7 @@ mod maintenance_storage_tests {
     //! large, and a tick cut at its deadline.
     use crate::test_helpers::{
         body_bytes, create_test_context_with_auth, create_test_context_with_storage_and_config,
-        outage_storage, send, slow_listing_storage,
+        long_count_storage, outage_storage, send, slow_listing_storage,
     };
     use axum::http::{Method, StatusCode};
     use std::sync::atomic::Ordering;
@@ -4633,96 +4633,11 @@ mod maintenance_storage_tests {
         assert_eq!(ready, StatusCode::OK, "readiness is not the size count");
     }
 
-    /// How often a [`LongCountStore`] was asked what.
-    #[derive(Default)]
-    struct LongCount {
-        probes: std::sync::atomic::AtomicU64,
-        counting: std::sync::atomic::AtomicU64,
-        most_counting: std::sync::atomic::AtomicU64,
-    }
-
-    /// A store whose size count never ends (a bucket too large to list in the test's time)
-    /// and whose first readiness request panics (a bug that shows once); nothing is stored.
-    struct LongCountStore(std::sync::Arc<LongCount>);
-
-    #[async_trait::async_trait]
-    impl crate::storage::StorageBackend for LongCountStore {
-        async fn put(&self, _k: &str, _d: &[u8], _sha256: &str) -> crate::storage::Result<()> {
-            Err(crate::storage::StorageError::NotFound)
-        }
-        async fn get(
-            &self,
-            _k: &str,
-        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
-            Err(crate::storage::StorageError::NotFound)
-        }
-        async fn pin(&self, _k: &str) -> Option<String> {
-            None
-        }
-        async fn delete(&self, _k: &str) -> crate::storage::Result<()> {
-            Err(crate::storage::StorageError::NotFound)
-        }
-        async fn list(&self, _prefix: &str) -> crate::storage::Result<Vec<String>> {
-            Ok(Vec::new())
-        }
-        async fn stat(&self, _k: &str) -> Option<crate::storage::FileMeta> {
-            None
-        }
-        async fn health_check(&self) -> bool {
-            true
-        }
-        async fn total_size(&self) -> u64 {
-            0
-        }
-        fn backend_name(&self) -> &'static str {
-            "long-count-test"
-        }
-        async fn refresh_reachability(&self) {
-            if self.0.probes.fetch_add(1, Ordering::SeqCst) == 0 {
-                panic!("a bug in the first readiness request");
-            }
-        }
-        async fn refresh_total_size(&self) {
-            let now = self.0.counting.fetch_add(1, Ordering::SeqCst) + 1;
-            self.0.most_counting.fetch_max(now, Ordering::SeqCst);
-            std::future::pending::<()>().await;
-        }
-        async fn put_from_path(
-            &self,
-            _k: &str,
-            _src: &std::path::Path,
-            _sha256: Option<&str>,
-        ) -> crate::storage::Result<()> {
-            Err(crate::storage::StorageError::NotFound)
-        }
-        async fn copy(
-            &self,
-            _src: &str,
-            _dst: &str,
-            _sha256: Option<&str>,
-        ) -> crate::storage::Result<()> {
-            Err(crate::storage::StorageError::NotFound)
-        }
-        async fn get_reader(
-            &self,
-            _k: &str,
-        ) -> crate::storage::Result<(
-            u64,
-            Option<String>,
-            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
-        )> {
-            Err(crate::storage::StorageError::NotFound)
-        }
-    }
-
     /// A tick panics once while the size count it started still runs: the loop is restarted,
     /// and the restarted loop does not start a second count beside the first.
     #[tokio::test]
     async fn a_restarted_loop_does_not_start_a_second_size_count() {
-        let counts = std::sync::Arc::new(LongCount::default());
-        let storage = crate::storage::Storage::from_backend(std::sync::Arc::new(LongCountStore(
-            std::sync::Arc::clone(&counts),
-        )));
+        let (storage, counts) = long_count_storage();
         let ctx = create_test_context_with_storage_and_config(storage, |_| {});
         super::spawn_maintenance(&ctx.state, Duration::from_millis(50));
         // The server's restart backoff is 1 s; the restarted loop's first tick is an odd one,
