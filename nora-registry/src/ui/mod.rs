@@ -1027,20 +1027,6 @@ fn decide_ui_token_mint(
     Ok(requested_role)
 }
 
-/// The lifetime in seconds of a token asked for `requested_days` days, capped
-/// by an optional ceiling in seconds — an OIDC caller's provider
-/// `max_token_lifetime_secs` (#1094). A ceiling shorter than a day is kept to
-/// the second: the token never outlives what the caller's own credential may.
-/// `None` (Basic/opaque callers, which carry no ceiling) leaves the
-/// lifetime unchanged.
-fn cap_ttl_secs(requested_days: u64, ceiling_secs: Option<u64>) -> u64 {
-    let requested = requested_days.saturating_mul(86_400);
-    match ceiling_secs {
-        Some(ceiling) => requested.min(ceiling),
-        None => requested,
-    }
-}
-
 async fn tokens_create(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedUser>,
@@ -1095,11 +1081,11 @@ async fn tokens_create(
         }
     };
 
-    let ttl_secs = cap_ttl_secs(
+    let ttl_secs = crate::auth::mint_ttl_secs(
         form.ttl_days
             .unwrap_or(90)
             .clamp(1, crate::tokens::MAX_TOKEN_TTL_DAYS),
-        caller_mint_ceiling.map(|Extension(c)| c.0),
+        caller_mint_ceiling.map(|Extension(c)| c),
     );
     // Nothing left of the caller's credential: fail closed, mint nothing.
     if ttl_secs == 0 {
@@ -1350,26 +1336,5 @@ mod base_path_tests {
         assert!(UiMintRefusal::ScopedCannotMintUnrestricted
             .message()
             .contains("scoped"));
-    }
-
-    /// #1094: an OIDC caller's provider lifetime ceiling caps the minted token;
-    /// a caller with no ceiling (Basic/opaque) is unchanged.
-    #[test]
-    fn cap_ttl_secs_respects_the_ceiling() {
-        const DAY: u64 = 86_400;
-        // No ceiling: the requested (already clamped) lifetime is unchanged.
-        assert_eq!(cap_ttl_secs(3650, None), 3650 * DAY);
-        assert_eq!(cap_ttl_secs(1, None), DAY);
-        // A whole-day ceiling caps a longer request…
-        assert_eq!(cap_ttl_secs(3650, Some(7 * DAY)), 7 * DAY);
-        // …but leaves a shorter request alone.
-        assert_eq!(cap_ttl_secs(3, Some(7 * DAY)), 3 * DAY);
-        // Exactly one day.
-        assert_eq!(cap_ttl_secs(3650, Some(DAY)), DAY);
-        // A sub-day ceiling is kept to the second, not rounded up to a day.
-        assert_eq!(cap_ttl_secs(3650, Some(900)), 900);
-        assert_eq!(cap_ttl_secs(3650, Some(0)), 0);
-        // A lifetime too long to count in seconds still caps.
-        assert_eq!(cap_ttl_secs(u64::MAX, Some(900)), 900);
     }
 }

@@ -33,11 +33,28 @@ pub struct AuthenticatedRole(pub crate::tokens::Role);
 /// provider's `max_token_lifetime_secs` and what is left of the JWT until its
 /// `exp`, so a minted token never outlives the JWT that minted it (0 once the
 /// JWT has expired, inside the validator's leeway). Absent for Basic and opaque
-/// (`nra_`) callers, which carry no such ceiling. A UI mint reads it to cap the
-/// new token so a short-lived federated identity cannot bootstrap a long-lived
-/// static one (#1094).
+/// (`nra_`) callers, which carry no such ceiling. Every mint route an OIDC
+/// identity reaches (the UI and the admin route) reads it to cap the new token
+/// so a short-lived federated identity cannot bootstrap a long-lived static one
+/// (#1094).
 #[derive(Clone, Copy, Debug)]
 pub struct MintLifetimeCeiling(pub u64);
+
+/// The lifetime in seconds of a token asked for `requested_days` days by a
+/// caller whose credential imposes `ceiling` — an OIDC caller's provider
+/// `max_token_lifetime_secs` and what is left of its JWT (#1094). A ceiling
+/// shorter than a day is kept to the second: the token never outlives what the
+/// caller's own credential may. `None` (Basic/opaque callers, which carry no
+/// ceiling) leaves the lifetime unchanged. 0 once nothing is left of the
+/// credential: the route mints nothing. Every route that mints for an
+/// authenticated caller (the UI and the admin route) takes its lifetime here.
+pub(crate) fn mint_ttl_secs(requested_days: u64, ceiling: Option<MintLifetimeCeiling>) -> u64 {
+    let requested = requested_days.saturating_mul(crate::tokens::SECS_PER_DAY);
+    match ceiling {
+        Some(MintLifetimeCeiling(ceiling)) => requested.min(ceiling),
+        None => requested,
+    }
+}
 
 use axum::{
     body::Body,
@@ -876,6 +893,28 @@ fn unauthorized_response(message: &str, realm: &str) -> Response {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #1094: an OIDC caller's lifetime ceiling caps the minted token; a
+    /// caller with no ceiling (Basic/opaque) is unchanged.
+    #[test]
+    fn mint_ttl_secs_respects_the_ceiling() {
+        const DAY: u64 = 86_400;
+        let ceiling = |secs| Some(MintLifetimeCeiling(secs));
+        // No ceiling: the requested (already clamped) lifetime is unchanged.
+        assert_eq!(mint_ttl_secs(3650, None), 3650 * DAY);
+        assert_eq!(mint_ttl_secs(1, None), DAY);
+        // A whole-day ceiling caps a longer request…
+        assert_eq!(mint_ttl_secs(3650, ceiling(7 * DAY)), 7 * DAY);
+        // …but leaves a shorter request alone.
+        assert_eq!(mint_ttl_secs(3, ceiling(7 * DAY)), 3 * DAY);
+        // Exactly one day.
+        assert_eq!(mint_ttl_secs(3650, ceiling(DAY)), DAY);
+        // A sub-day ceiling is kept to the second, not rounded up to a day.
+        assert_eq!(mint_ttl_secs(3650, ceiling(900)), 900);
+        assert_eq!(mint_ttl_secs(3650, ceiling(0)), 0);
+        // A lifetime too long to count in seconds still caps.
+        assert_eq!(mint_ttl_secs(u64::MAX, ceiling(900)), 900);
+    }
 
     #[test]
     fn audit_actor_resolves_user_or_anonymous() {
@@ -3468,6 +3507,65 @@ Jd74nq6dNCjpWG4drIsyhqX+
         assert!(
             (590..=600).contains(&lifetime),
             "an OIDC-minted token outlived the JWT that minted it: {lifetime}s (JWT 600s, ceiling 900s)"
+        );
+    }
+
+    /// The admin route holds an OIDC admin to the same lifetime as the UI: a
+    /// token it mints lives no longer than what is left of the JWT (600s here,
+    /// under the 900s ceiling) whatever it asks for, and a JWT accepted only
+    /// inside the leeway mints nothing.
+    #[tokio::test]
+    async fn an_oidc_admin_mint_on_the_admin_route_never_outlives_the_jwt() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let mint = |ctx: &TestContext, jwt: String| {
+            let app = ctx.app.clone();
+            async move {
+                send_with_headers(
+                    &app,
+                    Method::POST,
+                    "/api/v1/admin/tokens",
+                    vec![
+                        ("authorization", &format!("Bearer {jwt}")),
+                        ("content-type", "application/json"),
+                    ],
+                    br#"{"username":"svc","role":"read","ttl_days":3650}"#.to_vec(),
+                )
+                .await
+                .status()
+            }
+        };
+        let subject = "repo:myorg/admin-free:ref:refs/heads/main";
+        let now = now_secs();
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let jwt = make_jwt(&mock_server.uri(), subject, "nora", now, now + 600);
+        assert_eq!(mint(&ctx, jwt).await, StatusCode::OK);
+        let entries = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
+        assert_eq!(entries.len(), 1, "exactly one token minted");
+        let lifetime = entries[0].expires_at - entries[0].created_at;
+        assert!(
+            (590..=600).contains(&lifetime),
+            "an OIDC admin minted a {lifetime}s token on the admin route (JWT 600s, ceiling 900s)"
+        );
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let expired = make_jwt(&mock_server.uri(), subject, "nora", now - 630, now - 30);
+        assert_eq!(mint(&ctx, expired).await, StatusCode::FORBIDDEN);
+        assert!(
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .is_empty(),
+            "an expired JWT minted a token on the admin route"
         );
     }
 
