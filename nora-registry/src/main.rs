@@ -777,8 +777,30 @@ mod panic_strategy_tests {
         }
     }
 
-    /// The `/__fi/` panic routes are in no shipped build: the feature is not a default, no
-    /// other feature pulls it in, and no build file names it.
+    /// The features `name` turns on through the manifest's `[features]`, itself included;
+    /// `dep:` and `crate/feature` entries are kept as they are written.
+    fn feature_closure(features: &toml::Table, name: &str) -> std::collections::BTreeSet<String> {
+        let mut on = std::collections::BTreeSet::new();
+        let mut next = vec![name.to_owned()];
+        while let Some(feature) = next.pop() {
+            if !on.insert(feature.clone()) {
+                continue;
+            }
+            if let Some(enables) = features.get(&feature).and_then(|f| f.as_array()) {
+                next.extend(enables.iter().filter_map(|f| f.as_str()).map(str::to_owned));
+            }
+        }
+        on
+    }
+
+    /// Lines of the build inputs that may pass `--all-features`: cargo-deny's check, which
+    /// builds nothing.
+    const ALL_FEATURES_ALLOWED: &[(&str, &str)] =
+        &[(".github/workflows/ci.yml", "arguments: --all-features")];
+
+    /// The `/__fi/` panic routes are in no shipped build: neither the default features nor any
+    /// other feature turn it on, however indirectly; no build file names it, and none builds
+    /// with `--all-features`.
     #[test]
     fn no_shipped_build_enables_fault_injection() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
@@ -786,19 +808,113 @@ mod panic_strategy_tests {
         let doc: toml::Table = std::fs::read_to_string(&manifest).unwrap().parse().unwrap();
         let features = doc["features"].as_table().unwrap();
         assert!(features.contains_key("fault-injection"));
-        for (name, enables) in features {
-            let enables = enables.as_array().unwrap();
+        assert!(features.contains_key("default"));
+        for name in features.keys().filter(|name| *name != "fault-injection") {
+            let on = feature_closure(features, name);
             assert!(
-                !enables
-                    .iter()
-                    .any(|f| f.as_str() == Some("fault-injection")),
-                "feature {name} enables fault-injection"
+                !on.iter().any(|f| f.contains("fault-injection")),
+                "feature {name} turns on {on:?}"
             );
         }
         for file in build_inputs(root).into_iter().filter(|f| *f != manifest) {
             let text = std::fs::read_to_string(&file).unwrap();
             assert!(!text.contains("fault-injection"), "{}", file.display());
+            let relative = file
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            for line in text.lines().filter(|line| line.contains("--all-features")) {
+                assert!(
+                    ALL_FEATURES_ALLOWED.contains(&(relative.as_str(), line.trim())),
+                    "{relative}: {line}"
+                );
+            }
         }
+    }
+
+    /// `--all-features` is found in each build file it can appear in, the release Dockerfile
+    /// first; the allowed line is the one cargo-deny runs.
+    #[test]
+    fn the_build_files_read_include_the_dockerfile_and_ci() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let inputs = build_inputs(root);
+        for (file, line) in ALL_FEATURES_ALLOWED {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(text.lines().any(|l| l.trim() == *line), "{file}: {line}");
+            assert!(inputs.contains(&root.join(file)), "{file}");
+        }
+        assert!(inputs.contains(&root.join("Dockerfile")));
+        assert!(inputs.contains(&root.join(".github/workflows/release.yml")));
+    }
+
+    /// The code before the first string literal of a source line, without whitespace.
+    fn code_of(line: &str) -> String {
+        line.split('"')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    /// The fault-injection module is compiled only under its own feature: the one place it is
+    /// declared carries exactly `#[cfg(feature = "fault-injection")]`, no `#[path]` or
+    /// `include!` brings its file in under another name, and every `cfg` naming the feature is
+    /// that one or its `not(…)`, never an `any(…)` that another feature, the default
+    /// `mimalloc` say, would satisfy. Anything else that uses the module then fails to compile
+    /// in the default build.
+    #[test]
+    fn fault_injection_is_compiled_only_under_its_own_feature() {
+        const OWN: &str = r#"#[cfg(feature="fault-injection")]"#;
+        const NOT_OWN: &str = r#"#[cfg(not(feature="fault-injection"))]"#;
+        fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut declared = 0;
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            for (at, line) in lines.iter().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let compact: String = line.chars().filter(|c| !c.is_whitespace()).collect();
+                let code = code_of(line);
+                let place = format!("{}:{}", file.display(), at + 1);
+                if code.contains("cfg") && compact.contains("fault-injection") {
+                    assert!(compact == OWN || compact == NOT_OWN, "{place}: {line}");
+                }
+                if (code.contains("#[path") || code.contains("include!"))
+                    && compact.contains("fault_injection")
+                {
+                    panic!("{place}: {line}");
+                }
+                if code.contains("modfault_injection") {
+                    declared += 1;
+                    let gate: String = lines[..at]
+                        .last()
+                        .unwrap_or(&"")
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect();
+                    assert_eq!(gate, OWN, "{place}: {line}");
+                }
+            }
+        }
+        assert_eq!(declared, 1, "the module is declared once");
     }
 
     #[test]
