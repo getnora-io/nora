@@ -14,6 +14,7 @@
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -82,7 +83,8 @@ pub struct DigestEntry {
     pub digest: String,
     /// Unix timestamp (seconds) when first seen by NORA.
     pub first_seen: i64,
-    /// Upstream that provided the content (e.g. "registry-1.docker.io").
+    /// Upstream that provided the content (e.g. "registry-1.docker.io"), any userinfo in its
+    /// URL masked as in the log ([`crate::log_redact::url_for_record`]).
     pub upstream: String,
 }
 
@@ -154,7 +156,14 @@ impl DigestStore {
                             continue;
                         }
                         match serde_json::from_str::<DigestEntry>(&line) {
-                            Ok(entry) => {
+                            Ok(mut entry) => {
+                                // A line written before the credential was masked loses it in
+                                // the rewrite below.
+                                if let Cow::Owned(named) =
+                                    crate::log_redact::url_for_record(&entry.upstream)
+                                {
+                                    entry.upstream = named;
+                                }
                                 if entry.first_seen >= cutoff {
                                     let key = format!("{}:{}", entry.registry, entry.digest);
                                     entries.entry(key).or_insert(entry);
@@ -239,7 +248,7 @@ impl DigestStore {
             registry: registry.to_string(),
             digest: digest.to_string(),
             first_seen: first_seen.unwrap_or_else(|| Utc::now().timestamp()),
-            upstream: upstream.to_string(),
+            upstream: crate::log_redact::url_for_record(upstream).into_owned(),
         };
 
         entries.insert(key, entry.clone());
@@ -657,6 +666,62 @@ mod tests {
         assert_eq!(entry1.first_seen, entry2.first_seen);
         assert_eq!(entry1.upstream, entry2.upstream);
         assert_eq!(store.len(), 1);
+    }
+
+    /// An upstream configured with a credential is written down without it, in memory and in
+    /// the ledger file; the rest of its URL is kept.
+    #[tokio::test]
+    async fn the_ledger_names_an_upstream_without_its_credential() {
+        let tmp = TempDir::new().unwrap();
+        let store = DigestStore::empty(tmp.path().to_str().unwrap());
+        let entry = store.record(
+            "npm",
+            "sha256:abc",
+            "https://ci-user:s3cret@npm.example/pkg/-/pkg-1.0.0.tgz?x=1",
+            None,
+        );
+        let named = "https://***@npm.example/pkg/-/pkg-1.0.0.tgz?x=1";
+        assert_eq!(entry.upstream, named);
+        let ledger = tmp.path().join("quarantine.jsonl");
+        let mut written = String::new();
+        for _ in 0..100 {
+            written = std::fs::read_to_string(&ledger).unwrap_or_default();
+            if !written.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(written.contains(named), "{written}");
+        assert!(
+            !written.contains("s3cret") && !written.contains("ci-user"),
+            "{written}"
+        );
+        let reloaded = DigestStore::load(tmp.path().to_str().unwrap());
+        assert_eq!(reloaded.len(), 1);
+    }
+
+    /// A ledger written before the credential was masked loses it on the next start: loading
+    /// rewrites the file.
+    #[test]
+    fn a_credential_already_in_the_ledger_is_masked_on_load() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = tmp.path().join("quarantine.jsonl");
+        let line = serde_json::json!({
+            "registry": "npm", "digest": "sha256:abc", "first_seen": Utc::now().timestamp(),
+            "upstream": "https://ci-user:s3cret@npm.example/pkg/-/pkg-1.0.0.tgz",
+        });
+        std::fs::write(&ledger, format!("{line}\n")).unwrap();
+        let store = DigestStore::load(tmp.path().to_str().unwrap());
+        assert_eq!(store.len(), 1);
+        let written = std::fs::read_to_string(&ledger).unwrap();
+        assert!(
+            written.contains("https://***@npm.example/pkg/-/pkg-1.0.0.tgz"),
+            "{written}"
+        );
+        assert!(
+            !written.contains("s3cret") && !written.contains("ci-user"),
+            "{written}"
+        );
     }
 
     #[tokio::test]

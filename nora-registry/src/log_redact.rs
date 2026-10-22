@@ -52,6 +52,18 @@ pub(crate) fn redact_userinfo(text: &[u8]) -> Cow<'_, [u8]> {
     }
 }
 
+/// A URL as NORA writes it down outside the log — a journal record — in the form every log
+/// line has it: userinfo replaced by [`MASK`], the rest kept. The query is kept too, as in the
+/// log: a credential belongs in userinfo or a header, and a query is part of what names the
+/// file.
+pub(crate) fn url_for_record(url: &str) -> Cow<'_, str> {
+    match redact_userinfo(url.as_bytes()) {
+        Cow::Borrowed(_) => Cow::Borrowed(url),
+        // Only ASCII between ASCII delimiters is replaced, so the text stays UTF-8.
+        Cow::Owned(bytes) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+    }
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
