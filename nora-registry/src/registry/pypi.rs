@@ -151,16 +151,15 @@ async fn package_versions(
     );
     let upstreams = state.config.pypi.upstreams();
     // A project imported from the operator's own registry is NORA's: neither its index nor its
-    // dates are asked of an upstream. Read only when an upstream would otherwise be asked.
-    let hosted = !is_internal
-        && !upstreams.is_empty()
-        && match hosted_state(&state.storage, &normalized).await {
-            Hosted::Yes => true,
-            Hosted::No => false,
-            Hosted::Unknown => {
-                return crate::registry::storage_unavailable("pypi", &hosted_key(&normalized))
-            }
-        };
+    // dates are asked of an upstream, and it lists only its own files.
+    let own_files = match hosted_state(&state.storage, &normalized).await {
+        Hosted::Yes(files) => Some(files),
+        Hosted::No => None,
+        Hosted::Unknown => {
+            return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized))
+        }
+    };
+    let hosted = own_files.is_some();
 
     // #896: for JSON (Renovate) clients, ensure upstream PEP 700 upload-times are cached
     // so the index can surface them. No-op if already cached / internal / no upstream.
@@ -211,6 +210,7 @@ async fn package_versions(
             if !filename.is_empty()
                 && !ends_with_ci(filename, ".sha256")
                 && is_valid_pypi_filename(filename)
+                && own_files.as_ref().is_none_or(|own| own.contains(filename))
             {
                 let sha256 = match markers.get(filename).map(Vec::as_slice) {
                     Some([sha256]) => Some((*sha256).to_string()),
@@ -368,10 +368,26 @@ async fn download_file(
 
     let key = storage_key(&normalized, &filename);
 
+    // A hosted project serves its own files only: a file NORA holds under its name without a
+    // record — one an upstream served before the import — is no file of it, and neither is one
+    // NORA does not hold; the upstream is not asked.
+    let hosted = match hosted_state(&state.storage, &normalized).await {
+        Hosted::Yes(own) if own.contains(&filename) => true,
+        Hosted::Yes(_) => return StatusCode::NOT_FOUND.into_response(),
+        Hosted::No => false,
+        Hosted::Unknown => {
+            return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized))
+        }
+    };
+
     // The release date of this file, for min-release-age and to seed the digest-quarantine
     // first-seen clock so a provably-old release is not held as "new to this mirror"
-    // (#748/#750). Obtained here whatever index the client read.
-    let publish_date = pypi_publish_date(&state, &normalized, &filename, &key).await;
+    // (#748/#750). Obtained here whatever index the client read. An own file of a hosted project
+    // has no upstream release, and an upstream's listing cached before the import does not date it.
+    let publish_date = match hosted {
+        true => None,
+        false => pypi_publish_date(&state, &normalized, &filename, &key).await,
+    };
 
     // #733 serve-local: an internal-namespace package is operator-owned — skip curation
     // and serve any local copy below; the upstream branch is blocked separately (never proxy).
@@ -522,19 +538,13 @@ async fn download_file(
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
-    // A file of a hosted project that NORA does not hold is no file of it: the upstream is not
-    // asked, so what it has under the name is neither served nor cached beside the hosted files.
-    match hosted_state(&state.storage, &normalized).await {
-        Hosted::Yes => {
-            if let Some(e) = &read_failure {
-                return crate::registry::local_copy_unreadable("pypi", &key, e);
-            }
-            return StatusCode::NOT_FOUND.into_response();
+    // An own file of a hosted project that NORA cannot read is unavailable, not absent; one it
+    // no longer holds is not asked of the upstream either.
+    if hosted {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("pypi", &key, e);
         }
-        Hosted::Unknown => {
-            return crate::registry::storage_unavailable("pypi", &hosted_key(&normalized))
-        }
-        Hosted::No => {}
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     // Try each configured upstream in order; the first whose index lists the file
@@ -799,13 +809,30 @@ async fn upload(
     let lock = state.publish_lock(&file_key);
     let _guard = lock.lock().await;
 
-    // Check immutability (same filename = already exists)
+    // Check immutability (same filename = already exists). In a hosted project a file NORA holds
+    // without a record is not one of its files — an upstream served it before the import — and
+    // the upload replaces it.
     if state.storage.stat(&file_key).await.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            format!("File {} already exists", filename),
-        )
-            .into_response();
+        let replaceable = match hosted_state(&state.storage, &normalized).await {
+            Hosted::Yes(own) => !own.contains(&filename),
+            Hosted::No => false,
+            Hosted::Unknown => {
+                return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized))
+            }
+        };
+        if !replaceable {
+            return (
+                StatusCode::CONFLICT,
+                format!("File {} already exists", filename),
+            )
+                .into_response();
+        }
+    }
+
+    // The record first: in a hosted project a file is listed only once it is recorded.
+    if let Err(e) = record_own_file(&state.storage, &normalized, &filename).await {
+        tracing::warn!(key = %file_key, error = %e, "pypi: failed to record an uploaded file");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     // Store file
@@ -1179,54 +1206,87 @@ pub(crate) fn storage_key(normalized: &str, filename: &str) -> String {
     format!("pypi/{normalized}/{filename}")
 }
 
-/// Storage prefix of the records of hosted files: `pypi-hosted/<project>/<filename>`.
+/// Storage prefix of what NORA records of the projects it owns: `pypi-own/<project>/`.
 ///
-/// A project with a record is NORA's own: `nora import` writes one for each file of the project
-/// it brings in from the operator's own registry, and from then on neither the project's index,
-/// its dates nor a file of it is asked of an upstream. The records live outside `pypi/`, so the
-/// listings of `pypi/` that retention, the web UI and the simple index read never take one for a
+/// - `pypi-own/<project>/files/<filename>` — a file of the project that is NORA's own: an upload
+///   or an import writes it with the file.
+/// - `pypi-own/<project>/imported` — the project is hosted: `nora import` writes it when it
+///   brings in a file of the project from the operator's own registry. From then on neither the
+///   project's index, its dates nor a file of it is asked of an upstream, and only its own files
+///   are listed and served: a file an upstream served under the name before the import is not.
+///
+/// One listing of the prefix answers both. The records live outside `pypi/`, so the listings of
+/// `pypi/` that retention, the web UI and the simple index read never take one for a
 /// distribution file.
-pub(crate) const HOSTED_PREFIX: &str = "pypi-hosted/";
+pub(crate) const OWN_PREFIX: &str = "pypi-own/";
 
 /// The prefix of project `normalized`'s records.
-pub(crate) fn hosted_key(normalized: &str) -> String {
-    format!("{HOSTED_PREFIX}{normalized}/")
+fn own_prefix(normalized: &str) -> String {
+    format!("{OWN_PREFIX}{normalized}/")
+}
+
+/// The record that file `filename` of project `normalized` is NORA's own.
+pub(crate) fn own_file_key(normalized: &str, filename: &str) -> String {
+    format!("{OWN_PREFIX}{normalized}/files/{filename}")
 }
 
 /// Whether a project is hosted, from a listing of its records.
 enum Hosted {
-    Yes,
+    /// Hosted: these are its own files.
+    Yes(std::collections::HashSet<String>),
     No,
     /// The listing failed: nothing is decided on a guess.
     Unknown,
 }
 
 async fn hosted_state(storage: &crate::storage::Storage, normalized: &str) -> Hosted {
-    let prefix = hosted_key(normalized);
+    let prefix = own_prefix(normalized);
     if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
         return Hosted::No;
     }
-    match storage.list(&prefix).await {
-        Ok(records) if records.is_empty() => Hosted::No,
-        Ok(_) => Hosted::Yes,
+    let records = match storage.list(&prefix).await {
+        Ok(records) => records,
         Err(e) => {
-            tracing::warn!(registry = "pypi", project = %normalized, error = %e, "pypi: hosted records not listed");
-            Hosted::Unknown
+            tracing::warn!(registry = "pypi", project = %normalized, error = %e, "pypi: own records not listed");
+            return Hosted::Unknown;
         }
+    };
+    if !records
+        .iter()
+        .any(|k| k.strip_prefix(&prefix) == Some("imported"))
+    {
+        return Hosted::No;
     }
+    let files = format!("{prefix}files/");
+    Hosted::Yes(
+        records
+            .iter()
+            .filter_map(|k| k.strip_prefix(&files))
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
-/// Record file `filename` of project `normalized` as hosted. Written before the file is stored,
-/// so from the moment an import stores anything of the project its name is no longer asked of
-/// an upstream.
-pub(crate) async fn claim_hosted_file(
+/// Make project `normalized` hosted. Written before the first file of it is stored, so from the
+/// moment an import stores anything of the project its name is no longer asked of an upstream.
+pub(crate) async fn claim_imported_project(
+    storage: &crate::storage::Storage,
+    normalized: &str,
+) -> crate::storage::Result<()> {
+    storage
+        .put(&format!("{}imported", own_prefix(normalized)), b"")
+        .await
+}
+
+/// Record file `filename` of project `normalized` as NORA's own. Written before the file is
+/// stored: a hosted project lists a file only once it is recorded, and a record of a file that
+/// is not there lists nothing.
+pub(crate) async fn record_own_file(
     storage: &crate::storage::Storage,
     normalized: &str,
     filename: &str,
 ) -> crate::storage::Result<()> {
-    storage
-        .put(&format!("{}{filename}", hosted_key(normalized)), b"")
-        .await
+    storage.put(&own_file_key(normalized, filename), b"").await
 }
 
 /// Record the SHA-256 of a distribution file stored at `storage_key(project, filename)`, as an

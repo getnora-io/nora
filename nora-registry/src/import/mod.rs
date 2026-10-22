@@ -124,7 +124,10 @@ pub enum ImportCommand {
     /// own from then on. Its index, registration and files are served from what the import
     /// stored, and no upstream is asked for its name — a version NORA does not hold is not found.
     /// Only distribution files (.whl, .tar.gz, .zip, .egg) and .nupkg files are imported; a
-    /// .nupkg must hold one .nuspec naming the id and version of its file name.
+    /// .nupkg must hold one .nuspec naming the id and version of its file name. An imported PyPI
+    /// project lists and serves only the files imported or uploaded to it: a file NORA held under
+    /// its name before — cached from an upstream, or uploaded by 1.4.1 or older — is not, until it
+    /// is uploaded again.
     ///
     /// Upgrading from 1.4.1 or older: those releases skipped every PyPI and NuGet file yet marked
     /// the repository finished. Run the import again: a PyPI or NuGet repository finished by them
@@ -1359,6 +1362,7 @@ mod integration_tests {
             "1.4.1",
             "PyPI or NuGet repository finished by them is walked again",
             "with nothing to delete first",
+            "until it is uploaded again",
         ] {
             assert!(help.contains(needle), "{needle} missing from:\n{help}");
         }
@@ -1790,6 +1794,227 @@ mod integration_tests {
         assert_eq!(
             asked(&upstream).await,
             vec!["/simple/requests/".to_string()]
+        );
+    }
+
+    /// `twine upload` of `filename` (project `name`, `version`) to NORA.
+    async fn twine_upload(
+        app: &axum::Router,
+        name: &str,
+        version: &str,
+        filename: &str,
+        content: &[u8],
+    ) -> axum::http::StatusCode {
+        const BOUNDARY: &str = "twine-boundary";
+        let mut body = Vec::new();
+        for (field, value) in [
+            (":action", "file_upload"),
+            ("name", name),
+            ("version", version),
+        ] {
+            body.extend_from_slice(
+                format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{field}\"\r\n\r\n{value}\r\n")
+                    .as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"content\"; filename=\"{filename}\"\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(content);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+        let content_type = format!("multipart/form-data; boundary={BOUNDARY}");
+        crate::test_helpers::send_with_headers(
+            app,
+            axum::http::Method::POST,
+            "/simple/",
+            vec![("content-type", content_type.as_str())],
+            body,
+        )
+        .await
+        .status()
+    }
+
+    /// The PEP 503 index NORA serves for `project`.
+    async fn simple_index(app: &axum::Router, project: &str) -> String {
+        let resp = crate::test_helpers::send(
+            app,
+            axum::http::Method::GET,
+            &format!("/simple/{project}/"),
+            "",
+        )
+        .await;
+        String::from_utf8(crate::test_helpers::body_bytes(resp).await.to_vec()).unwrap()
+    }
+
+    /// An imported project's files are the ones imported or uploaded to it. A file an upstream
+    /// served under its name before the import — cached under the project — is neither listed
+    /// nor served; a file uploaded before the import, or after it, is.
+    #[tokio::test]
+    async fn an_imported_project_lists_and_serves_only_its_own_files() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.enabled = true;
+            cfg.pypi.proxy = Some(format!("{uri}/simple/"));
+        });
+        // Before the import: a file uploaded to NORA, and one an upstream served and NORA cached.
+        assert_eq!(
+            twine_upload(
+                &ctx.app,
+                "corppkg",
+                "0.9.0",
+                "corppkg-0.9.0.tar.gz",
+                b"uploaded"
+            )
+            .await,
+            StatusCode::OK
+        );
+        let cached = "pypi/corppkg/corppkg-9.9.9-py3-none-any.whl";
+        ctx.state.storage.put(cached, b"squatted").await.unwrap();
+        let squatted_sha = hex::encode(Sha256::digest(b"squatted"));
+        ctx.state
+            .storage
+            .put(&format!("{cached}.sha256"), squatted_sha.as_bytes())
+            .await
+            .unwrap();
+
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::PyPI,
+            "pypi",
+            vec![(
+                "corppkg/1.0.0/corppkg-1.0.0-py3-none-any.whl".into(),
+                zip(&[("corppkg/__init__.py", b"", true)]),
+            )],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        // After it: a file uploaded to the imported project.
+        assert_eq!(
+            twine_upload(
+                &ctx.app,
+                "corppkg",
+                "1.0.1",
+                "corppkg-1.0.1.tar.gz",
+                b"uploaded"
+            )
+            .await,
+            StatusCode::OK
+        );
+
+        let html = simple_index(&ctx.app, "corppkg").await;
+        for own in [
+            "corppkg-0.9.0.tar.gz",
+            "corppkg-1.0.0-py3-none-any.whl",
+            "corppkg-1.0.1.tar.gz",
+        ] {
+            assert!(html.contains(own), "{own} missing from {html}");
+        }
+        assert!(!html.contains("9.9.9"), "{html}");
+        let json = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/simple/corppkg/",
+            vec![("accept", "application/vnd.pypi.simple.v1+json")],
+            "",
+        )
+        .await;
+        let json = String::from_utf8(body_bytes(json).await.to_vec()).unwrap();
+        assert!(!json.contains("9.9.9"), "{json}");
+        let squatted = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/corppkg/corppkg-9.9.9-py3-none-any.whl",
+            "",
+        )
+        .await;
+        assert_eq!(squatted.status(), StatusCode::NOT_FOUND);
+        let uploaded = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/corppkg/corppkg-1.0.1.tar.gz",
+            "",
+        )
+        .await;
+        assert_eq!(uploaded.status(), StatusCode::OK);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+
+        // A file of the imported project's name that NORA holds but does not own can be uploaded:
+        // the upload replaces it, and it is the project's from then on.
+        assert_eq!(
+            twine_upload(
+                &ctx.app,
+                "corppkg",
+                "9.9.9",
+                "corppkg-9.9.9-py3-none-any.whl",
+                b"own 9.9.9"
+            )
+            .await,
+            StatusCode::OK
+        );
+        let own = send(
+            &ctx.app,
+            Method::GET,
+            "/simple/corppkg/corppkg-9.9.9-py3-none-any.whl",
+            "",
+        )
+        .await;
+        assert_eq!(own.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(own).await[..], b"own 9.9.9");
+    }
+
+    /// An upload to a project nothing imported changes nothing for it: its index is still the
+    /// upload merged with the upstream's, and a file it does not hold is still the upstream's.
+    #[tokio::test]
+    async fn an_upload_to_a_project_nothing_imported_still_merges_with_the_upstream() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::path("/simple/otherpkg/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"<a href="/files/otherpkg-9.9.9-py3-none-any.whl">otherpkg-9.9.9-py3-none-any.whl</a>"#,
+            ))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.pypi.enabled = true;
+            cfg.pypi.proxy = Some(format!("{uri}/simple/"));
+        });
+        assert_eq!(
+            twine_upload(
+                &ctx.app,
+                "otherpkg",
+                "1.0.0",
+                "otherpkg-1.0.0.tar.gz",
+                b"mine"
+            )
+            .await,
+            StatusCode::OK
+        );
+        let html = simple_index(&ctx.app, "otherpkg").await;
+        assert!(html.contains("otherpkg-1.0.0.tar.gz"), "{html}");
+        assert!(html.contains("otherpkg-9.9.9-py3-none-any.whl"), "{html}");
+        send(
+            &ctx.app,
+            Method::GET,
+            "/simple/otherpkg/otherpkg-9.9.9-py3-none-any.whl",
+            "",
+        )
+        .await;
+        let asked = asked(&upstream).await;
+        assert!(
+            asked.contains(&"/files/otherpkg-9.9.9-py3-none-any.whl".to_string()),
+            "{asked:?}"
         );
     }
 

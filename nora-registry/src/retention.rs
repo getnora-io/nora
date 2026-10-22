@@ -691,6 +691,20 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
         }
     }
 
+    // Records that a file is NORA's own live outside `pypi/` too:
+    // `pypi-own/<project>/files/<filename>`. A retired file takes its record with it, so a
+    // file stored later under the same name is not taken for the project's own.
+    let own_root = crate::registry::PYPI_OWN_PREFIX;
+    let own_records: std::collections::HashSet<String> = storage
+        .list(own_root)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::error!("Failed to list {} keys: {}", own_root, e);
+            Vec::new()
+        })
+        .into_iter()
+        .collect();
+
     let mut result = Vec::new();
     for (pkg, file_keys) in &packages {
         let mut entries = Vec::new();
@@ -704,6 +718,10 @@ async fn collect_pypi_versions(storage: &Storage) -> Vec<(String, Vec<VersionEnt
             }
             if let Some(file_markers) = markers.get(format!("{pkg}/{filename}").as_str()) {
                 keys.extend(file_markers.iter().cloned());
+            }
+            let own = crate::registry::pypi_own_file_key(pkg, filename);
+            if own_records.contains(&own) {
+                keys.push(own);
             }
             entries.push(VersionEntry {
                 name: filename.to_string(),
@@ -2464,6 +2482,10 @@ mod format_retention_tests {
                 .put(&format!("{marker_root}markpkg/{file}/{sha}"), b"")
                 .await
                 .unwrap();
+            storage
+                .put(&crate::registry::pypi_own_file_key("markpkg", file), b"")
+                .await
+                .unwrap();
         }
 
         let rules = vec![rule("pypi", None, Some(2), None)];
@@ -2497,12 +2519,28 @@ mod format_retention_tests {
             2,
             "one marker per surviving file: {markers:?}"
         );
-        for file in kept {
+        for file in &kept {
             assert!(
                 markers.iter().any(|m| m.contains(&format!("/{file}/"))),
                 "surviving {file} keeps its marker: {markers:?}"
             );
         }
+        // So does the record that a file is NORA's own: a file stored later under a retired
+        // name is not taken for one.
+        let mut own = storage
+            .list(&format!(
+                "{}markpkg/files/",
+                crate::registry::PYPI_OWN_PREFIX
+            ))
+            .await
+            .unwrap();
+        own.sort();
+        let mut expected: Vec<String> = kept
+            .iter()
+            .map(|file| crate::registry::pypi_own_file_key("markpkg", file))
+            .collect();
+        expected.sort();
+        assert_eq!(own, expected);
     }
 
     /// #961: retention deleted the tarball and left the packument advertising

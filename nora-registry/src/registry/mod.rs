@@ -55,8 +55,9 @@ pub(crate) use nuget::{
 pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;
 pub(crate) use pypi::{
-    claim_hosted_file as pypi_claim_hosted_file, record_stored_file as pypi_record_stored_file,
-    storage_key as pypi_storage_key,
+    claim_imported_project as pypi_claim_imported_project, own_file_key as pypi_own_file_key,
+    record_own_file as pypi_record_own_file, record_stored_file as pypi_record_stored_file,
+    storage_key as pypi_storage_key, OWN_PREFIX as PYPI_OWN_PREFIX,
 };
 // Retention retires a PyPI file's hash markers together with the file.
 pub(crate) use pypi::HASH_MARKER_PREFIX as PYPI_HASH_MARKER_PREFIX;
