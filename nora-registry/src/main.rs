@@ -3811,6 +3811,11 @@ mod maintenance_storage_tests {
 
     /// Poll `/ready` until it answers `want`, at most `polls` times 100 ms apart, asserting
     /// `/health` 200 at every poll. Returns the last `/ready` status.
+    ///
+    /// The local-store tests below run a 6 s stall window: its 1.97 s tick deadline stays
+    /// above what an fsync takes on a busy test host, so only a probe that really does not
+    /// come back is cut. A tick is 100 ms; the poll budgets cover the deadline and stay far
+    /// inside the 150 s a verdict takes to expire, so only a tick's probe can turn `/ready`.
     async fn ready_becomes(app: &axum::Router, want: StatusCode, polls: usize) -> StatusCode {
         let mut ready = send(app, Method::GET, "/ready", "").await.status();
         for _ in 0..polls {
@@ -3833,17 +3838,15 @@ mod maintenance_storage_tests {
     async fn an_unwritable_local_store_fails_readiness_within_a_tick() {
         use std::os::unix::fs::PermissionsExt;
         let ctx = crate::test_helpers::create_test_context_with_config(|c| {
-            c.server.maintenance_stall_secs = 2
+            c.server.maintenance_stall_secs = 6
         });
         super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
-        let ok = ready_becomes(&ctx.app, StatusCode::OK, 10).await;
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 50).await;
         assert_eq!(ok, StatusCode::OK, "writable store");
 
         let dir = ctx._tempdir.path();
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-        // A tick is 100 ms here; twenty polls leave room for a loaded test host and stay far
-        // inside the 150 s a verdict takes to expire, so only the tick's probe can turn it.
-        let unwritable = ready_becomes(&ctx.app, StatusCode::SERVICE_UNAVAILABLE, 20).await;
+        let unwritable = ready_becomes(&ctx.app, StatusCode::SERVICE_UNAVAILABLE, 50).await;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(
             unwritable,
@@ -3851,40 +3854,67 @@ mod maintenance_storage_tests {
             "read-only store"
         );
 
-        let ok = ready_becomes(&ctx.app, StatusCode::OK, 10).await;
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 50).await;
         assert_eq!(ok, StatusCode::OK, "writable again");
         assert_eq!(ctx.state.tasks.failing(), None);
     }
 
-    /// The local disk stops answering (the write probe blocks): `/health` stays 200, and
-    /// `/ready` turns 503 once the next tick finds the probe still waiting; when the disk
-    /// answers again `/ready` turns 200, under the same loop.
+    /// Each tick, whatever its number, probes the store: the tick right after the local
+    /// store turns read-only answers `/ready` 503, the next one after it is writable again
+    /// answers 200.
     #[cfg(unix)]
+    #[tokio::test]
+    async fn every_tick_sees_a_local_store_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let ctx = crate::test_helpers::create_test_context();
+        let work = super::MaintenanceWork::new();
+        let dir = ctx._tempdir.path();
+        let ready = || async { send(&ctx.app, Method::GET, "/ready", "").await.status() };
+
+        super::maintenance_tick(&ctx.state, 2, &work).await;
+        assert_eq!(ready().await, StatusCode::OK);
+        for (tick, mode, want) in [
+            (3, 0o500, StatusCode::SERVICE_UNAVAILABLE),
+            (4, 0o700, StatusCode::OK),
+            (5, 0o500, StatusCode::SERVICE_UNAVAILABLE),
+            (6, 0o700, StatusCode::OK),
+        ] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            super::maintenance_tick(&ctx.state, tick, &work).await;
+            let got = ready().await;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(got, want, "after tick {tick}");
+        }
+    }
+
+    /// The local disk stops answering (the write probe blocks): `/ready` turns 503 once the
+    /// tick after the cut one finds the probe still waiting, and `/health` stays 200 past the
+    /// whole stall window; when the disk answers again `/ready` turns 200, under the same loop.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_hung_local_disk_fails_readiness_not_liveness() {
         let ctx = crate::test_helpers::create_test_context_with_config(|c| {
-            c.server.maintenance_stall_secs = 2
+            c.server.maintenance_stall_secs = 6
         });
         super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
-        let ok = ready_becomes(&ctx.app, StatusCode::OK, 10).await;
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 50).await;
         assert_eq!(ok, StatusCode::OK, "answering disk");
 
         let disk = crate::test_helpers::hang_health_probe(ctx._tempdir.path());
-        // The probe is cut at the 633 ms tick deadline; the tick after finds it waiting.
-        let hung = ready_becomes(&ctx.app, StatusCode::SERVICE_UNAVAILABLE, 20).await;
+        // The probe is cut at the 1.97 s tick deadline; the tick after finds it waiting.
+        let hung = ready_becomes(&ctx.app, StatusCode::SERVICE_UNAVAILABLE, 50).await;
         assert_eq!(
             hung,
             StatusCode::SERVICE_UNAVAILABLE,
             "disk that does not answer"
         );
-        for _ in 0..30 {
+        for _ in 0..65 {
             let health = send(&ctx.app, Method::GET, "/health", "").await;
             assert_eq!(health.status(), StatusCode::OK, "liveness on a hung disk");
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
 
         disk.answer();
-        let ok = ready_becomes(&ctx.app, StatusCode::OK, 30).await;
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 50).await;
         assert_eq!(ok, StatusCode::OK, "the disk answers again");
         assert_eq!(ctx.state.tasks.failing(), None);
     }

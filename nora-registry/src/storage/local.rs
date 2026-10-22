@@ -429,13 +429,16 @@ impl Drop for ProbeDone {
 /// full disk where the directory already exists would still pass.
 fn write_probe(base: &Path) -> bool {
     use std::io::Write as _;
+    #[cfg(test)]
+    crate::test_helpers::wait_while_disk_hangs(base);
     if std::fs::create_dir_all(base).is_err() {
         return false;
     }
-    // One name per process: a probe file left by a disk that hung is reused by the next
-    // probe, not joined by another.
-    let probe = base.join(format!(".nora-health-probe.{}", std::process::id()));
-    let writable = match std::fs::File::create(&probe) {
+    // A new file every time: writing into a file that already exists passes on a read-only
+    // directory, and can pass on a full disk.
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let probe = base.join(format!(".nora-health-probe.{}.{}", std::process::id(), seq));
+    let writable = match std::fs::File::create_new(&probe) {
         Ok(mut file) => file.write_all(b"ok").is_ok() && file.sync_all().is_ok(),
         Err(_) => false,
     };
@@ -2103,7 +2106,6 @@ mod tests {
     /// A probe stuck on the disk is not started a second time: the next refresh does not
     /// wait, it records the store as unwritable. Once the disk answers, the probe ends and
     /// the store is writable again.
-    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_probe_stuck_on_the_disk_is_not_started_again() {
         use std::time::Duration;
@@ -2136,6 +2138,30 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(writable, "writable again once the probe ended");
+    }
+
+    /// The probe must create its file: in a directory that takes no new entries, probe files
+    /// already there (left by a probe cut while the directory turned read-only) and writable
+    /// do not make it pass.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_files_left_behind_do_not_pass_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        let pid = std::process::id();
+        let next = TMP_COUNTER.load(Ordering::Relaxed);
+        let mut names = vec![format!(".nora-health-probe.{pid}")];
+        names.extend((next..next + 1024).map(|seq| format!(".nora-health-probe.{pid}.{seq}")));
+        for name in &names {
+            std::fs::write(temp_dir.path().join(name), b"").unwrap();
+        }
+        let dir = temp_dir.path();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        storage.refresh_reachability().await;
+        let writable = storage.health_check().await;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!writable, "a read-only directory");
     }
 
     #[tokio::test]

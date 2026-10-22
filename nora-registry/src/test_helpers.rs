@@ -1021,49 +1021,46 @@ impl object_store::ObjectStore for SlowListing {
     }
 }
 
+/// Storage directories whose disk "does not answer": the local backend's write probe under
+/// one of them waits until it is released. See [`hang_health_probe`].
+static HUNG_DISKS: std::sync::LazyLock<(
+    parking_lot::Mutex<Vec<std::path::PathBuf>>,
+    parking_lot::Condvar,
+)> = std::sync::LazyLock::new(Default::default);
+
+/// Called by the local backend's write probe: wait while `base` is held by
+/// [`hang_health_probe`], as a write does on a disk that stopped answering.
+pub fn wait_while_disk_hangs(base: &std::path::Path) {
+    let (hung, released) = &*HUNG_DISKS;
+    let mut hung = hung.lock();
+    while hung.iter().any(|dir| dir == base) {
+        released.wait(&mut hung);
+    }
+}
+
 /// A local disk that stopped answering, for the health probe: see [`hang_health_probe`].
-#[cfg(unix)]
 pub struct HungProbe(std::path::PathBuf);
 
-#[cfg(unix)]
 impl HungProbe {
-    /// The disk answers again: every probe blocked on the FIFO goes on and ends.
+    /// The disk answers again: every probe waiting on it goes on and ends.
     pub fn answer(self) {}
 }
 
-#[cfg(unix)]
 impl Drop for HungProbe {
     fn drop(&mut self) {
-        // Any reader releases the writers blocked in `open`. Non-blocking, so it does not wait
-        // for a writer when none is left. Also on a failed assertion: a probe still blocked
-        // would keep the runtime from shutting down and hang the test instead of failing it.
-        use std::os::unix::fs::OpenOptionsExt;
-        let _ = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(rustix::fs::OFlags::NONBLOCK.bits() as i32)
-            .open(&self.0);
+        // Also on a failed assertion: a probe still waiting would keep the runtime from
+        // shutting down and hang the test instead of failing it.
+        let (hung, released) = &*HUNG_DISKS;
+        hung.lock().retain(|dir| dir != &self.0);
+        released.notify_all();
     }
 }
 
-/// Make the local backend's health-probe file under `base` a FIFO nobody reads: opening it
-/// for writing blocks, as a write does on a disk that stopped answering, until the returned
-/// guard answers or is dropped.
-#[cfg(unix)]
+/// Make the local backend's write probe under `base` wait, as on a disk that stopped
+/// answering, until the returned guard answers or is dropped.
 pub fn hang_health_probe(base: &std::path::Path) -> HungProbe {
-    let fifo = base.join(format!(".nora-health-probe.{}", std::process::id()));
-    // A running probe holds a regular file under that name for a moment: try again.
-    for _ in 0..100 {
-        let made = std::process::Command::new("mkfifo")
-            .arg(&fifo)
-            .stderr(std::process::Stdio::null())
-            .status()
-            .unwrap();
-        if made.success() {
-            return HungProbe(fifo);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    panic!("mkfifo {}", fifo.display());
+    HUNG_DISKS.0.lock().push(base.to_path_buf());
+    HungProbe(base.to_path_buf())
 }
 
 /// A [`Storage`] over a [`SlowListing`] store with `delay` between listed objects.
