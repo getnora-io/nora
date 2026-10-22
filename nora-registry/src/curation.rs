@@ -114,6 +114,12 @@ pub trait ProxyFilter: Send + Sync {
 
     /// Evaluate a request and return a decision.
     fn evaluate(&self, request: &FilterRequest) -> Decision;
+
+    /// Whether this filter's decision for `registry` turns on a download's release date
+    /// ([`FilterRequest::publish_date`]).
+    fn reads_release_date(&self, _registry: RegistryType) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -174,6 +180,18 @@ impl CurationEngine {
     /// Whether curation is active (not off).
     pub fn is_active(&self) -> bool {
         self.config.mode != CurationMode::Off
+    }
+
+    /// Whether a download's release date decides anything for `registry`: curation is on and a
+    /// filter of the chain reads the date — a release-age rule, global or the registry's own. A
+    /// reload installs a new engine with its own rules, so a format asks this, not the
+    /// configuration NORA started with.
+    pub fn reads_release_date(&self, registry: RegistryType) -> bool {
+        self.is_active()
+            && self
+                .filters
+                .iter()
+                .any(|filter| filter.reads_release_date(registry))
     }
 
     /// Whether curation reads a download's name: it is on (audit logs what it would refuse),
@@ -1965,6 +1983,11 @@ impl MinReleaseAgeFilter {
         }
     }
 
+    /// The threshold `(seconds, value)` `registry` is held to: its own, else the global one.
+    fn threshold(&self, registry: RegistryType) -> Option<&(i64, String)> {
+        self.overrides.get(&registry).or(self.default.as_ref())
+    }
+
     /// The thresholds for a log line: `"7d (npm: 3d)"`, or `"npm: 3d"` without a
     /// global value.
     pub fn summary(&self) -> String {
@@ -2008,11 +2031,7 @@ impl ProxyFilter for MinReleaseAgeFilter {
     fn evaluate(&self, request: &FilterRequest) -> Decision {
         // Resolve the threshold for this registry first: a per-registry override
         // takes precedence over the global default.
-        let Some((threshold, label)) = self
-            .overrides
-            .get(&request.registry)
-            .or(self.default.as_ref())
-        else {
+        let Some((threshold, label)) = self.threshold(request.registry) else {
             // Neither a value of its own nor a global one: not filtered by age.
             return Decision::Skip;
         };
@@ -2050,6 +2069,11 @@ impl ProxyFilter for MinReleaseAgeFilter {
         } else {
             Decision::Skip
         }
+    }
+
+    /// A registry held to a threshold has its downloads judged by their release date.
+    fn reads_release_date(&self, registry: RegistryType) -> bool {
+        self.threshold(registry).is_some()
     }
 }
 
@@ -4598,6 +4622,58 @@ mod min_release_age_tests {
     }
 
     // ── MinReleaseAgeFilter tests ───────────────────────────────────────
+
+    /// The chain reads a download's release date for a registry held to a release-age rule —
+    /// the global one or its own — while curation is on; no other filter reads it.
+    #[test]
+    fn the_chain_reads_a_release_date_where_a_release_age_rule_applies() {
+        /// A filter that refuses everything without looking at a date.
+        struct Refuse;
+        impl ProxyFilter for Refuse {
+            fn name(&self) -> &'static str {
+                "refuse"
+            }
+            fn evaluate(&self, _request: &FilterRequest) -> Decision {
+                Decision::Block {
+                    rule: "refuse".to_string(),
+                    reason: "test".to_string(),
+                }
+            }
+        }
+        let hour = || (3600, "1h".to_string());
+        for &rt in RegistryType::all() {
+            let other = *RegistryType::all().iter().find(|&&o| o != rt).unwrap();
+            // (mode, global rule, registries with a rule of their own) -> the date is read for rt
+            let rows = [
+                (CurationMode::Enforce, true, vec![], true),
+                (CurationMode::Audit, true, vec![], true),
+                (CurationMode::Enforce, false, vec![rt], true),
+                (CurationMode::Audit, false, vec![rt], true),
+                (CurationMode::Enforce, true, vec![other], true),
+                (CurationMode::Enforce, false, vec![other], false),
+                (CurationMode::Enforce, false, vec![], false),
+                (CurationMode::Off, true, vec![rt], false),
+            ];
+            for (mode, global, own, want) in rows {
+                let mut engine = CurationEngine::new(CurationConfig {
+                    mode: mode.clone(),
+                    ..CurationConfig::default()
+                });
+                engine.add_filter(Box::new(Refuse));
+                if global || !own.is_empty() {
+                    engine.add_filter(Box::new(MinReleaseAgeFilter {
+                        default: global.then(hour),
+                        overrides: own.iter().map(|&r| (r, hour())).collect(),
+                    }));
+                }
+                assert_eq!(
+                    engine.reads_release_date(rt),
+                    want,
+                    "{rt}: {mode:?}, global rule {global}, own rules {own:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_min_release_age_young_package_blocked() {

@@ -219,6 +219,34 @@ impl CurationConfig {
         }
     }
 
+    /// Test-only: [`Self::registry_override`] to change, for tests that set a section of every
+    /// registry in turn.
+    #[cfg(test)]
+    pub(crate) fn registry_override_mut(
+        &mut self,
+        rt: RegistryType,
+    ) -> Option<&mut RegistryCurationOverride> {
+        match rt {
+            RegistryType::Docker => Some(&mut self.docker),
+            RegistryType::Maven => Some(&mut self.maven),
+            RegistryType::Npm => Some(&mut self.npm),
+            RegistryType::Cargo => Some(&mut self.cargo),
+            RegistryType::PyPI => Some(&mut self.pypi),
+            RegistryType::Go => Some(&mut self.go),
+            RegistryType::Raw => None,
+            RegistryType::Gems => Some(&mut self.gems),
+            RegistryType::Terraform => Some(&mut self.terraform),
+            RegistryType::Ansible => Some(&mut self.ansible),
+            RegistryType::Nuget => Some(&mut self.nuget),
+            RegistryType::PubDart => Some(&mut self.pub_dart),
+            RegistryType::Conan => Some(&mut self.conan),
+            RegistryType::Rpm => Some(&mut self.rpm),
+            RegistryType::Deb => Some(&mut self.deb),
+            RegistryType::Cpan => Some(&mut self.cpan),
+            RegistryType::HuggingFace => None,
+        }
+    }
+
     /// Apply environment variable overrides for curation config.
     pub(super) fn apply_env_overrides(&mut self) -> Result<(), String> {
         if let Ok(val) = env::var("NORA_CURATION_MODE") {

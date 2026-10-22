@@ -316,6 +316,17 @@ pub(crate) fn cached_read<T>(
     }
 }
 
+/// Whether anything reads the release date of a proxied download of `rt`: the running curation's
+/// release-age rule (global or `rt`'s own), or the quarantine of `rt` when upstream dates are
+/// trusted — only a trusted date seeds its first-seen. A format asks an upstream for a date only
+/// when this holds.
+pub(crate) fn release_date_read(state: &AppState, rt: crate::registry_type::RegistryType) -> bool {
+    state.curation().curation_engine.reads_release_date(rt)
+        || (state.config.server.trust_upstream_dates
+            && state.config.quarantine_mode_for(rt)
+                != crate::digest_quarantine::QuarantineMode::Off)
+}
+
 /// 503 for a package served only from local copies (one in an internal namespace) whose copy the
 /// store could not be asked about. The package is unavailable, not absent: a 403 or a 404 here
 /// sends a client with several feeds to look for the name in the next one.
@@ -3121,6 +3132,178 @@ mod upstream_failure_matrix {
 /// and rules are looked up by that label, so a handler passing another registry's would
 /// apply another registry's settings (#1098). In the code of `registry/<format>.rs`
 /// (before its test module) the only `RegistryType::` variant is its own.
+#[cfg(test)]
+mod release_date_read {
+    use crate::config::{Config, CurationMode};
+    use crate::digest_quarantine::QuarantineMode;
+    use crate::registry_type::RegistryType;
+    use crate::test_helpers::{create_test_context_with_config, reload_curation};
+
+    /// Apply `set` to every registry.
+    fn each_section(c: &mut Config, set: fn(&mut Config, RegistryType)) {
+        for &rt in RegistryType::all() {
+            set(c, rt);
+        }
+    }
+
+    /// A release-age rule of `rt`'s own, when it has a section.
+    fn rule(c: &mut Config, rt: RegistryType) {
+        if let Some(own) = c.curation.registry_override_mut(rt) {
+            own.min_release_age = Some("1h".to_string());
+        }
+    }
+
+    /// A quarantine of `rt`'s own, when it has a section.
+    fn quarantine(c: &mut Config, rt: RegistryType) {
+        if let Some(own) = c.curation.registry_override_mut(rt) {
+            own.quarantine = Some(QuarantineMode::Enforce);
+        }
+    }
+
+    /// Whether a download's release date is read, for every registry: by a release-age rule
+    /// while curation is on — one a reload brought in too — or, with trusted dates only, by the
+    /// quarantine the registry is held to.
+    #[tokio::test]
+    async fn a_date_is_read_by_a_running_release_age_rule_or_a_trusting_quarantine() {
+        type Setup = fn(&mut Config);
+        // (row, trusted dates, the configuration NORA starts with, what a reload changes) ->
+        // read for a registry with a section of its own / for one without (Raw, Hugging Face)
+        let rows: [(&str, bool, Setup, Option<Setup>, bool, bool); 11] = [
+            ("nothing", true, |_| {}, None, false, false),
+            (
+                "global rule",
+                false,
+                |c| c.curation.min_release_age = Some("1h".into()),
+                None,
+                true,
+                true,
+            ),
+            (
+                "own rule",
+                false,
+                |c| each_section(c, rule),
+                None,
+                true,
+                false,
+            ),
+            (
+                "own rule, curation off",
+                false,
+                |c| {
+                    c.curation.mode = CurationMode::Off;
+                    each_section(c, rule);
+                },
+                None,
+                false,
+                false,
+            ),
+            (
+                "own rule by reload",
+                false,
+                |_| {},
+                Some(|c| each_section(c, rule)),
+                true,
+                false,
+            ),
+            (
+                "global rule by reload",
+                false,
+                |_| {},
+                Some(|c| c.curation.min_release_age = Some("1h".into())),
+                true,
+                true,
+            ),
+            (
+                "trusted, global quarantine",
+                true,
+                |c| c.curation.quarantine = Some(QuarantineMode::Observe),
+                None,
+                true,
+                false,
+            ),
+            (
+                "trusted, own quarantine",
+                true,
+                |c| each_section(c, quarantine),
+                None,
+                true,
+                false,
+            ),
+            (
+                "trusted, own quarantine off",
+                true,
+                |c| {
+                    c.curation.quarantine = Some(QuarantineMode::Enforce);
+                    each_section(c, |c, rt| {
+                        if let Some(own) = c.curation.registry_override_mut(rt) {
+                            own.quarantine = Some(QuarantineMode::Off);
+                        }
+                    });
+                },
+                None,
+                false,
+                false,
+            ),
+            (
+                "untrusted, global quarantine",
+                false,
+                |c| c.curation.quarantine = Some(QuarantineMode::Enforce),
+                None,
+                false,
+                false,
+            ),
+            (
+                "untrusted, own quarantine",
+                false,
+                |c| each_section(c, quarantine),
+                None,
+                false,
+                false,
+            ),
+        ];
+        for (row, trust, start, reload) in rows.iter().map(|r| (r.0, r.1, r.2, r.3)) {
+            let ctx = create_test_context_with_config(move |c| {
+                c.server.trust_upstream_dates = trust;
+                c.curation.mode = CurationMode::Enforce;
+                start(c);
+            });
+            if let Some(change) = reload {
+                reload_curation(&ctx, change);
+            }
+            let (_, _, _, _, with_section, without_section) =
+                *rows.iter().find(|r| r.0 == row).unwrap();
+            for &rt in RegistryType::all() {
+                let want = match ctx.state.config.curation.registry_override(rt) {
+                    Some(_) => with_section,
+                    None => without_section,
+                };
+                assert_eq!(
+                    super::release_date_read(&ctx.state, rt),
+                    want,
+                    "{rt}: {row}"
+                );
+            }
+        }
+    }
+
+    /// Another registry's rule or quarantine reads no date of the registries that ask for one.
+    #[tokio::test]
+    async fn another_registry_s_policy_reads_no_date() {
+        for target in [RegistryType::Nuget, RegistryType::PyPI] {
+            let ctx = create_test_context_with_config(move |c| {
+                c.server.trust_upstream_dates = true;
+                c.curation.mode = CurationMode::Enforce;
+                each_section(c, rule);
+                each_section(c, quarantine);
+                let own = c.curation.registry_override_mut(target).unwrap();
+                own.min_release_age = None;
+                own.quarantine = None;
+            });
+            assert!(!super::release_date_read(&ctx.state, target), "{target}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod curation_label_whitelist {
     use crate::registry_type::RegistryType;

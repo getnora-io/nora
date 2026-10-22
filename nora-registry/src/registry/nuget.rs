@@ -980,7 +980,7 @@ async fn flatcontainer_download(
         // package has no upstream date, and no cached registration of an upstream dates it.
         if !hosted {
             let ask_upstream = state.config.server.trust_upstream_dates
-                && nuget_date_read(&state)
+                && crate::registry::release_date_read(&state, RegistryType::Nuget)
                 && state.storage.stat(&storage_key).await.is_none();
             publish_date = nuget_publish_date(&state, &id_lower, ver, ask_upstream).await;
         }
@@ -1468,21 +1468,6 @@ async fn nuget_publish_date(
         }
         Registered::Absent => None,
     }
-}
-
-/// Whether anything reads a NuGet download's date: a release-age rule (curation on and
-/// `min_release_age` set globally or for NuGet) or the quarantine.
-fn nuget_date_read(state: &AppState) -> bool {
-    let curation = &state.config.curation;
-    let release_age = state.curation().curation_engine.is_active()
-        && (curation.min_release_age.is_some() || curation.nuget.min_release_age.is_some());
-    let quarantine = curation
-        .nuget
-        .quarantine
-        .as_ref()
-        .or(curation.quarantine.as_ref())
-        .is_some_and(|mode| !matches!(mode, crate::digest_quarantine::QuarantineMode::Off));
-    release_age || quarantine
 }
 
 /// `version`'s date on the upstream registration page `lower`..`upper`: `None` when the page
@@ -4031,7 +4016,8 @@ mod nuget_version_curation {
 mod nuget_release_dates {
     use crate::digest_quarantine::QuarantineMode;
     use crate::test_helpers::{
-        create_test_context_with_config, put_written_days_ago, send, upstream_paths, TestContext,
+        create_test_context_with_config, put_written_days_ago, reload_curation, send,
+        upstream_paths, TestContext,
     };
     use axum::http::{Method, StatusCode};
     use wiremock::matchers::{method, path, path_regex};
@@ -4535,6 +4521,45 @@ mod nuget_release_dates {
         });
         assert_eq!(download(&ctx, "4.0.0").await, StatusCode::OK);
         assert_eq!(registration_requests(&up).await, 0);
+    }
+
+    /// A release-age rule a reload brings in asks the upstream for the date from then on: the
+    /// engine the reload installs is what curation decides with, not the configuration NORA
+    /// started with — the global rule and NuGet's own alike.
+    #[tokio::test]
+    async fn a_release_age_rule_a_reload_brings_in_asks_the_upstream_for_the_date() {
+        let rules: [(&str, fn(&mut crate::config::Config)); 2] = [
+            ("global", |cfg| {
+                cfg.curation.min_release_age = Some("1h".to_string());
+            }),
+            ("NuGet's own", |cfg| {
+                cfg.curation.nuget.min_release_age = Some("1h".to_string());
+            }),
+        ];
+        for (rule, add) in rules {
+            let up = upstream().await;
+            serve_registration(
+                &up,
+                REGISTRATION,
+                registration(vec![inline_page(
+                    "1.0.0",
+                    "2.0.0",
+                    vec![
+                        leaf("1.0.0", "2019-01-01T00:00:00Z"),
+                        leaf("2.0.0", &minutes_ago(10)),
+                    ],
+                )]),
+            )
+            .await;
+            let ctx = context(&up, true, |_| {});
+            reload_curation(&ctx, add);
+            assert_eq!(
+                download(&ctx, "2.0.0").await,
+                StatusCode::FORBIDDEN,
+                "{rule}: published 10 minutes ago, younger than 1h"
+            );
+            assert_eq!(download(&ctx, "1.0.0").await, StatusCode::OK, "{rule}");
+        }
     }
 
     /// A quarantine switched off reads no date, and neither does a release-age rule while

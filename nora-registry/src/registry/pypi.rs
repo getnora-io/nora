@@ -1066,14 +1066,6 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
 /// With untrusted dates a missing listing is fetched on a cold miss only: that request goes
 /// upstream anyway, while a cache hit (a hosted package above all) must not start asking an
 /// upstream on every download.
-/// Whether a release-age rule reads a PyPI download's date: curation is on and
-/// `min_release_age` is set globally or for PyPI.
-fn release_age_applies(state: &AppState) -> bool {
-    let curation = &state.config.curation;
-    state.curation().curation_engine.is_active()
-        && (curation.min_release_age.is_some() || curation.pypi.min_release_age.is_some())
-}
-
 async fn pypi_publish_date(
     state: &AppState,
     normalized: &str,
@@ -1088,7 +1080,8 @@ async fn pypi_publish_date(
         // Without trusted dates the listing is asked for only when a release-age rule reads
         // the date: otherwise nothing uses it, and the download asks the upstream nothing more.
         Err(_)
-            if release_age_applies(state) && state.storage.stat(artifact_key).await.is_none() =>
+            if crate::registry::release_date_read(state, RegistryType::PyPI)
+                && state.storage.stat(artifact_key).await.is_none() =>
         {
             ensure_pypi_dates_cached(state, normalized).await
         }
@@ -4405,7 +4398,9 @@ mod release_age_without_the_json_index {
     use super::PEP691_JSON;
     use crate::digest_quarantine::QuarantineMode;
     use crate::test_helpers::TestContext;
-    use crate::test_helpers::{create_test_context_with_config, send, send_with_headers};
+    use crate::test_helpers::{
+        create_test_context_with_config, reload_curation, send, send_with_headers,
+    };
     use axum::http::{Method, StatusCode};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4573,6 +4568,43 @@ mod release_age_without_the_json_index {
             let before = json_listings(&up).await;
             let _ = send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "").await;
             assert_eq!(json_listings(&up).await - before, want, "{name}");
+        }
+    }
+
+    /// A release-age rule a reload brings in reads the dates from then on: the engine the reload
+    /// installs decides, not the configuration NORA started with — the global rule and PyPI's own
+    /// alike.
+    #[tokio::test]
+    async fn a_release_age_rule_a_reload_brings_in_asks_for_the_dates() {
+        type Setup = fn(&mut crate::config::Config);
+        let rules: [(&str, Setup); 2] = [
+            ("global", min_age),
+            ("PyPI's own", |cfg| {
+                cfg.curation.pypi.min_release_age = Some("3d".to_string());
+            }),
+        ];
+        for (rule, add) in rules {
+            let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
+            let ctx = context(&up, false, |_| {});
+            reload_curation(&ctx, add);
+            let index = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/simple/foo/",
+                vec![("Accept", PIP_HTML)],
+                "",
+            )
+            .await;
+            assert_eq!(index.status(), StatusCode::OK);
+            let before = json_listings(&up).await;
+            assert_eq!(
+                send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "")
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN,
+                "{rule}: a file NORA first saw just now is younger than 3d on its own clock"
+            );
+            assert_eq!(json_listings(&up).await - before, 1, "{rule}");
         }
     }
 

@@ -736,7 +736,10 @@ impl Config {
     /// `Raw` has no curation override and no quarantine-enforcing path → always
     /// `Off` (counting it would be a phantom control: `any_quarantine_active`
     /// true while nothing enforces).
-    fn quarantine_mode_for(&self, rt: RegistryType) -> crate::digest_quarantine::QuarantineMode {
+    pub(crate) fn quarantine_mode_for(
+        &self,
+        rt: RegistryType,
+    ) -> crate::digest_quarantine::QuarantineMode {
         use crate::digest_quarantine::QuarantineMode;
         let global = self.curation.quarantine.as_ref();
         let per = match rt {
