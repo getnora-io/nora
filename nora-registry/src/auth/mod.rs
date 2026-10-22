@@ -2104,26 +2104,126 @@ mod integration_tests {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// A probe or another open path never pays bcrypt for the Basic header it
-    /// carries, right or wrong; only the gated paths check htpasswd credentials.
+    /// Every route path the server registers, its parameters filled in: read from the
+    /// `.route("…")` calls of the sources, so a route added later is in it as well.
+    fn every_route_path() -> Vec<String> {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut paths = std::collections::BTreeSet::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (at, _) in text.match_indices(".route(") {
+                let rest = text[at + ".route(".len()..].trim_start();
+                let Some(rest) = rest.strip_prefix('"') else {
+                    continue;
+                };
+                let template = &rest[..rest.find('"').unwrap()];
+                let mut path = String::new();
+                for segment in template.split('/').skip(1) {
+                    path.push('/');
+                    path.push_str(match segment {
+                        s if s.starts_with("{*") => "a/b",
+                        s if s.starts_with('{') => "x",
+                        s => s,
+                    });
+                }
+                paths.insert(if path.is_empty() { "/".into() } else { path });
+            }
+        }
+        paths.into_iter().collect()
+    }
+
+    /// No route served without credentials pays bcrypt for a Basic header it carries,
+    /// right or wrong: the probes, `/`, the public `/metrics`, the web surface and the
+    /// registry reads under `anonymous_read`, every method. Which routes are open is what
+    /// the server answers without credentials, not a list kept here; only the gated ones
+    /// check htpasswd credentials.
     #[tokio::test]
     async fn an_open_path_never_runs_bcrypt() {
-        let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        let ctx = create_test_context_with_anonymous_read_and_config(&[("admin", "secret")], |c| {
+            c.auth.public_metrics = true
+        });
+        let routes = every_route_path();
+        assert!(routes.len() > 100, "{} routes read", routes.len());
+        let methods = [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ];
+        let mut open = Vec::new();
+        for path in &routes {
+            for method in &methods {
+                let status = send(&ctx.app, method.clone(), path, Vec::new())
+                    .await
+                    .status();
+                if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+                    open.push((method.clone(), path.as_str()));
+                }
+            }
+        }
+        for served in [
+            "/",
+            "/health",
+            "/ready",
+            "/metrics",
+            "/ui/",
+            "/api/ui/dashboard",
+            "/api-docs/openapi.json",
+            "/raw/a/b",
+        ] {
+            assert!(
+                open.contains(&(Method::GET, served)),
+                "{served} is served without credentials"
+            );
+        }
+        assert_eq!(bcrypt_runs(&ctx), 0);
         for creds in ["admin:wrong", "admin:secret"] {
-            for path in ["/health", "/ready", "/"] {
-                let header_val = format!("Basic {}", STANDARD.encode(creds));
+            let header_val = format!("Basic {}", STANDARD.encode(creds));
+            for (method, path) in &open {
                 let response = send_with_headers(
                     &ctx.app,
-                    Method::GET,
+                    method.clone(),
                     path,
                     vec![("authorization", &header_val)],
                     Vec::new(),
                 )
                 .await;
-                assert_ne!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+                assert_ne!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {path}"
+                );
             }
+            assert_eq!(bcrypt_runs(&ctx), 0, "an open path ran bcrypt ({creds})");
         }
-        assert_eq!(bcrypt_runs(&ctx), 0, "an open path ran bcrypt");
+        // The counter counts: a gated path checks the same header.
+        let header_val = format!("Basic {}", STANDARD.encode("admin:wrong"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/-/whoami",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(bcrypt_runs(&ctx), 1);
     }
 
     /// A CI job whose Basic username is an htpasswd user and whose password is an
