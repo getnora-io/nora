@@ -1154,6 +1154,53 @@ mod tests {
         );
     }
 
+    /// Every revoke path keeps a racing verify out of the cache, by prefix and
+    /// by user alike. The race is played step by step instead of by timing: a
+    /// verify reads the revocation count, the revoke lands while it checks the
+    /// file, then the verify offers its result to the cache. The revoked token
+    /// is refused afterwards, and a token the revoke left alone is still served.
+    #[test]
+    fn a_verify_racing_any_revoke_leaves_nothing_cached() {
+        type Revoke = fn(&TokenStore, &str) -> usize;
+        let paths: [(&str, Revoke); 2] = [
+            ("revoke_token", |store, token| {
+                let prefix = &sha256_hex(token)[..16];
+                futures::executor::block_on(store.revoke_token(prefix)).unwrap();
+                1
+            }),
+            ("revoke_all_for_user", |store, _| {
+                futures::executor::block_on(store.revoke_all_for_user("alice"))
+            }),
+        ];
+        for (path, revoke) in paths {
+            let temp_dir = TempDir::new().unwrap();
+            let store = TokenStore::new(temp_dir.path());
+            let token = store.create_token("alice", 30, None, Role::Write).unwrap();
+            let kept = store.create_token("bob", 30, None, Role::Read).unwrap();
+            let cached = || CachedToken {
+                user: "alice".to_string(),
+                role: Role::Write,
+                expires_at: u64::MAX,
+                cached_at: Instant::now(),
+            };
+
+            let seen = store.revocations_seen();
+            assert_eq!(revoke(&store, &token), 1, "{path}");
+            store.cache_unless_revoked(seen, sha256_hex(&token), cached());
+
+            assert!(
+                matches!(store.verify_token(&token), Err(TokenError::NotFound)),
+                "{path}: a verify racing the revoke cached the revoked token"
+            );
+            assert!(store.verify_token(&kept).is_ok(), "{path}");
+
+            // Control: with no revoke in between, the verify's result is cached.
+            let seen = store.revocations_seen();
+            store.cache_unless_revoked(seen, sha256_hex(&token), cached());
+            assert!(store.verify_token(&token).is_ok(), "{path}: control");
+        }
+    }
+
     /// The legacy-hash migration rewrites the token file on a verify; a revoke
     /// landing between its read and its write must stay in force: the
     /// migration must not put the file back.
