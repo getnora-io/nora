@@ -3394,16 +3394,15 @@ const MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(3
 
 /// The supervisor of the server's long-lived tasks, and the maintenance loop's heartbeat it
 /// reads: stalled after `server.maintenance_stall_secs` without a completed tick.
-/// The server and the test router both build them here.
+/// The server and the test router both get them here: the process's one
+/// ([`supervise::of_process`]).
 pub(crate) fn supervision(
     server: &config::ServerConfig,
 ) -> (Arc<supervise::Supervisor>, Arc<supervise::Heartbeat>) {
     let stall = std::time::Duration::from_secs(server.maintenance_stall_secs);
     #[cfg(feature = "fault-injection")]
     let stall = fault_injection::maintenance_max_silence().unwrap_or(stall);
-    let heartbeat = Arc::new(supervise::Heartbeat::new(stall));
-    let tasks = supervise::Supervisor::new(vec![("maintenance", Arc::clone(&heartbeat))]);
-    (Arc::new(tasks), heartbeat)
+    supervise::of_process(stall)
 }
 
 /// Background task: flush token last_used + periodic maintenance every `period`.
@@ -3411,8 +3410,9 @@ pub(crate) fn supervision(
 /// /health when the loop stops starting ticks or every tick panics.
 fn spawn_maintenance(state: &AppState, period: std::time::Duration) {
     let maintenance_state = state.clone();
-    // Outlives a restart of the loop, so a run still going is not joined by a second.
-    let work = Arc::new(MaintenanceWork::new());
+    // The supervisor's detached work: a run still going after a restart of the loop is not
+    // joined by a second.
+    let work = Arc::new(MaintenanceWork::new(&state.tasks));
     state.tasks.spawn("maintenance", move || {
         let state = maintenance_state.clone();
         let work = Arc::clone(&work);
@@ -3434,10 +3434,10 @@ struct MaintenanceWork {
 }
 
 impl MaintenanceWork {
-    fn new() -> Self {
+    fn new(tasks: &supervise::Supervisor) -> Self {
         Self {
-            token_flush: supervise::Detached::new("token_flush"),
-            storage_size: supervise::Detached::new("storage_size"),
+            token_flush: tasks.detached("token_flush"),
+            storage_size: tasks.detached("storage_size"),
         }
     }
 }
@@ -4094,6 +4094,7 @@ mod maintenance_storage_tests {
         outage_storage, send, slow_listing_storage,
     };
     use axum::http::{Method, StatusCode};
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
 
     /// A large bucket: the first page of its listing answers at once, the whole listing
@@ -4167,6 +4168,112 @@ mod maintenance_storage_tests {
         assert_eq!(ctx.state.tasks.failing(), None);
         let ready = send(&ctx.app, Method::GET, "/ready", "").await.status();
         assert_eq!(ready, StatusCode::OK, "readiness is not the size count");
+    }
+
+    /// How often a [`LongCountStore`] was asked what.
+    #[derive(Default)]
+    struct LongCount {
+        probes: std::sync::atomic::AtomicU64,
+        counting: std::sync::atomic::AtomicU64,
+        most_counting: std::sync::atomic::AtomicU64,
+    }
+
+    /// A store whose size count never ends (a bucket too large to list in the test's time)
+    /// and whose first readiness request panics (a bug that shows once); nothing is stored.
+    struct LongCountStore(std::sync::Arc<LongCount>);
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for LongCountStore {
+        async fn put(&self, _k: &str, _d: &[u8], _sha256: &str) -> crate::storage::Result<()> {
+            Err(crate::storage::StorageError::NotFound)
+        }
+        async fn get(
+            &self,
+            _k: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            Err(crate::storage::StorageError::NotFound)
+        }
+        async fn pin(&self, _k: &str) -> Option<String> {
+            None
+        }
+        async fn delete(&self, _k: &str) -> crate::storage::Result<()> {
+            Err(crate::storage::StorageError::NotFound)
+        }
+        async fn list(&self, _prefix: &str) -> crate::storage::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn stat(&self, _k: &str) -> Option<crate::storage::FileMeta> {
+            None
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            0
+        }
+        fn backend_name(&self) -> &'static str {
+            "long-count-test"
+        }
+        async fn refresh_reachability(&self) {
+            if self.0.probes.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("a bug in the first readiness request");
+            }
+        }
+        async fn refresh_total_size(&self) {
+            let now = self.0.counting.fetch_add(1, Ordering::SeqCst) + 1;
+            self.0.most_counting.fetch_max(now, Ordering::SeqCst);
+            std::future::pending::<()>().await;
+        }
+        async fn put_from_path(
+            &self,
+            _k: &str,
+            _src: &std::path::Path,
+            _sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            Err(crate::storage::StorageError::NotFound)
+        }
+        async fn copy(
+            &self,
+            _src: &str,
+            _dst: &str,
+            _sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            Err(crate::storage::StorageError::NotFound)
+        }
+        async fn get_reader(
+            &self,
+            _k: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            Err(crate::storage::StorageError::NotFound)
+        }
+    }
+
+    /// A tick panics once while the size count it started still runs: the loop is restarted,
+    /// and the restarted loop does not start a second count beside the first.
+    #[tokio::test]
+    async fn a_restarted_loop_does_not_start_a_second_size_count() {
+        let counts = std::sync::Arc::new(LongCount::default());
+        let storage = crate::storage::Storage::from_backend(std::sync::Arc::new(LongCountStore(
+            std::sync::Arc::clone(&counts),
+        )));
+        let ctx = create_test_context_with_storage_and_config(storage, |_| {});
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(50));
+        // The server's restart backoff is 1 s; the restarted loop's first tick is an odd one,
+        // which starts a count.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            counts.probes.load(Ordering::SeqCst) >= 3,
+            "the loop runs again after the panicking tick"
+        );
+        assert_eq!(
+            counts.most_counting.load(Ordering::SeqCst),
+            1,
+            "a second count ran beside the first after the restart"
+        );
     }
 
     /// A store that accepted the connection and went silent: `/health` stays 200 for
@@ -4266,7 +4373,7 @@ mod maintenance_storage_tests {
     async fn every_tick_sees_a_local_store_change() {
         use std::os::unix::fs::PermissionsExt;
         let ctx = crate::test_helpers::create_test_context();
-        let work = super::MaintenanceWork::new();
+        let work = super::MaintenanceWork::new(&ctx.state.tasks);
         let dir = ctx._tempdir.path();
         let ready = || async { send(&ctx.app, Method::GET, "/ready", "").await.status() };
 
@@ -4330,7 +4437,7 @@ mod maintenance_storage_tests {
         tokens.verify_token(&token).unwrap();
 
         // Polled once and dropped, wherever it was: the flush has taken the pending timestamps.
-        let work = super::MaintenanceWork::new();
+        let work = super::MaintenanceWork::new(&ctx.state.tasks);
         let _ = futures::FutureExt::now_or_never(super::maintenance_tick(&ctx.state, 2, &work));
 
         let mut last_used = None;

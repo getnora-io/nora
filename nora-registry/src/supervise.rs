@@ -20,6 +20,11 @@
 //! loop that starts no new tick, or whose ticks keep panicking, fails `/health` too; a tick
 //! waiting on a store that does not answer does not (that is `/ready`'s business).
 //! `/health` asks [`Supervisor::failing`] and nothing else.
+//!
+//! So that a task started under some other supervisor cannot go unseen, a shipped build has
+//! one: [`of_process`] is the only way to one outside tests, and every call gets the same.
+//! The work a task starts and does not wait for ([`Detached`]) comes from it too, one per
+//! name, so a run still going is never joined by a second, however often the task restarts.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -136,21 +141,87 @@ pub struct Supervisor {
     heartbeats: Vec<(&'static str, Arc<Heartbeat>)>,
     /// Tasks in a crash loop right now.
     crash_looping: ArcSwap<Vec<&'static str>>,
+    /// Whether a run of the detached work of each name is going.
+    detached: ArcSwap<Vec<(&'static str, Arc<AtomicBool>)>>,
     timing: Timing,
 }
 
-impl Supervisor {
-    /// A supervisor reading `heartbeats`, with the default timing.
-    pub fn new(heartbeats: Vec<(&'static str, Arc<Heartbeat>)>) -> Self {
-        Self::with(heartbeats, Timing::default())
+/// The supervisor of the process, and the maintenance loop's heartbeat it reads, stalled after
+/// `max_silence` without a beat. The first call builds them; every later one gets the same,
+/// whatever it asks, so code that starts a task cannot hold a supervisor `/health` does not
+/// read. In tests each call builds its own: a test process runs many servers.
+pub fn of_process(max_silence: Duration) -> (Arc<Supervisor>, Arc<Heartbeat>) {
+    #[cfg(test)]
+    return maintained(max_silence);
+    #[cfg(not(test))]
+    {
+        static PROCESS: std::sync::OnceLock<(Arc<Supervisor>, Arc<Heartbeat>)> =
+            std::sync::OnceLock::new();
+        once(&PROCESS, max_silence)
     }
+}
 
-    /// A supervisor with its timing spelled out (tests).
-    pub fn with(heartbeats: Vec<(&'static str, Arc<Heartbeat>)>, timing: Timing) -> Self {
+/// What `cell` holds, built by [`maintained`] if it holds nothing yet.
+fn once(
+    cell: &std::sync::OnceLock<(Arc<Supervisor>, Arc<Heartbeat>)>,
+    max_silence: Duration,
+) -> (Arc<Supervisor>, Arc<Heartbeat>) {
+    let (tasks, heartbeat) = cell.get_or_init(|| maintained(max_silence));
+    (Arc::clone(tasks), Arc::clone(heartbeat))
+}
+
+/// A supervisor with the default timing reading the maintenance loop's heartbeat.
+fn maintained(max_silence: Duration) -> (Arc<Supervisor>, Arc<Heartbeat>) {
+    let heartbeat = Arc::new(Heartbeat::new(max_silence));
+    let tasks = Supervisor::build(
+        vec![("maintenance", Arc::clone(&heartbeat))],
+        Timing::default(),
+    );
+    (Arc::new(tasks), heartbeat)
+}
+
+impl Supervisor {
+    fn build(heartbeats: Vec<(&'static str, Arc<Heartbeat>)>, timing: Timing) -> Self {
         Self {
             heartbeats,
             crash_looping: ArcSwap::default(),
+            detached: ArcSwap::default(),
             timing,
+        }
+    }
+
+    /// A supervisor of its own reading `heartbeats`, with the default timing (tests).
+    #[cfg(test)]
+    pub fn new(heartbeats: Vec<(&'static str, Arc<Heartbeat>)>) -> Self {
+        Self::build(heartbeats, Timing::default())
+    }
+
+    /// A supervisor of its own with its timing spelled out (tests).
+    #[cfg(test)]
+    pub fn with(heartbeats: Vec<(&'static str, Arc<Heartbeat>)>, timing: Timing) -> Self {
+        Self::build(heartbeats, timing)
+    }
+
+    /// The detached work reported as the task `name`: every call for one name shares its
+    /// runs, so one starts only while none of that name is going.
+    pub fn detached(&self, name: &'static str) -> Detached {
+        let of = |runs: &[(&'static str, Arc<AtomicBool>)]| {
+            runs.iter()
+                .find(|(run, _)| *run == name)
+                .map(|(_, running)| Arc::clone(running))
+        };
+        if of(&self.detached.load()).is_none() {
+            self.detached.rcu(|runs| {
+                let mut runs = Vec::clone(runs);
+                if of(&runs).is_none() {
+                    runs.push((name, Arc::new(AtomicBool::new(false))));
+                }
+                runs
+            });
+        }
+        Detached {
+            name,
+            running: of(&self.detached.load()).unwrap_or_default(),
         }
     }
 
@@ -242,7 +313,7 @@ impl Supervisor {
 
 /// Work a periodic task starts and does not wait for, such as counting the store's size:
 /// it runs in a task of its own, at most one run at a time, so a slow run is never joined by
-/// a second. A panic in a run is reported under `name` (log and counter) and ends only that
+/// a second. Only [`Supervisor::detached`] makes one, and every one of a name shares its runs. A panic in a run is reported under `name` (log and counter) and ends only that
 /// run; the next start runs again.
 pub struct Detached {
     name: &'static str,
@@ -259,14 +330,6 @@ impl Drop for Finished {
 }
 
 impl Detached {
-    /// Detached work reported as the task `name`.
-    pub fn new(name: &'static str) -> Self {
-        Self {
-            name,
-            running: Arc::new(AtomicBool::new(false)),
-        }
-    }
-
     /// Start `work` unless the previous run is still going. Returns the run's handle, or
     /// `None` when nothing was started; dropping the handle does not stop the run.
     pub fn start<F>(&self, work: F) -> Option<tokio::task::JoinHandle<()>>
@@ -329,6 +392,48 @@ mod tests {
     use std::sync::atomic::AtomicI32;
 
     const TICK: Duration = Duration::from_millis(10);
+
+    /// The supervisor a shipped build has is built once: every later call, the server's
+    /// own or any other, gets the same one, and the heartbeat it reads.
+    #[test]
+    fn a_process_has_one_supervisor() {
+        let cell = std::sync::OnceLock::new();
+        let (tasks, heartbeat) = once(&cell, Duration::from_secs(300));
+        let (again, beats) = once(&cell, Duration::from_secs(90));
+        assert!(Arc::ptr_eq(&tasks, &again));
+        assert!(Arc::ptr_eq(&heartbeat, &beats));
+        assert_eq!(beats.max_silence(), Duration::from_secs(300));
+        assert!(tasks
+            .heartbeats
+            .iter()
+            .any(|(name, beat)| *name == "maintenance" && Arc::ptr_eq(beat, &heartbeat)));
+    }
+
+    /// Detached work of one name asked for twice, as a restarted task asks for it again, is
+    /// one: a second run does not start beside a run still going. Another name runs apart.
+    #[tokio::test]
+    async fn detached_work_of_one_name_runs_one_at_a_time_however_often_it_is_asked_for() {
+        let tasks = supervisor();
+        let first = tasks.detached("size");
+        let again = tasks.detached("size");
+        let other = tasks.detached("flush");
+        let (done, finish) = tokio::sync::oneshot::channel::<()>();
+        let run = first.start(async move {
+            let _ = finish.await;
+        });
+        assert!(run.is_some());
+        assert!(
+            again.start(async {}).is_none(),
+            "a second run beside the first"
+        );
+        assert!(other.start(async {}).is_some(), "another name runs apart");
+        done.send(()).unwrap();
+        run.unwrap().await.unwrap();
+        assert!(
+            again.start(async {}).is_some(),
+            "the next run once the first ended"
+        );
+    }
 
     fn timing() -> Timing {
         Timing {
@@ -467,7 +572,7 @@ mod tests {
     /// next start after it ends runs.
     #[tokio::test]
     async fn detached_work_runs_one_at_a_time() {
-        let work = Detached::new("test_detached_one");
+        let work = supervisor().detached("test_detached_one");
         let (release, wait) = tokio::sync::oneshot::channel::<()>();
         let first = work
             .start(async move {
@@ -490,7 +595,7 @@ mod tests {
     /// keep the next start from running.
     #[tokio::test]
     async fn a_detached_run_that_panics_is_reported_and_the_next_runs() {
-        let work = Detached::new("test_detached_panic");
+        let work = supervisor().detached("test_detached_panic");
         let run = work
             .start(async {
                 tokio::time::sleep(TICK).await;
