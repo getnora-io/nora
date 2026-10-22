@@ -62,10 +62,14 @@ async fn handle(
         }
     };
 
+    // The module path as written in go.mod (`!a` decoded to `A`): curation and the internal
+    // namespaces match this one spelling, on every branch below.
+    let module_path =
+        decode_module_path(&module_encoded).unwrap_or_else(|_| module_encoded.clone());
+
     // Parse curation coords for .zip downloads (used in both pre-download and integrity checks)
     let go_curation = if ends_with_ci(&file, ".zip") {
-        let module_name =
-            decode_module_path(&module_encoded).unwrap_or_else(|_| module_encoded.clone());
+        let module_name = module_path.clone();
         let version = file
             .strip_prefix("@v/")
             .and_then(|f| f.strip_suffix(".zip"))
@@ -234,8 +238,6 @@ async fn handle(
     // An internal-namespace module whose copy the store could not read is unavailable, not
     // absent — with or without an upstream.
     if let Some(e) = &read_failure {
-        let module_path =
-            decode_module_path(&module_encoded).unwrap_or_else(|_| module_encoded.clone());
         if crate::curation::is_internal_namespace(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Go,
@@ -260,8 +262,6 @@ async fn handle(
     // a fresh copy; here, serve any stale cached copy rather than re-proxying, and
     // block only when nothing is cached — never proxy. (The .zip artifact path also
     // runs check_download.)
-    let module_path =
-        decode_module_path(&module_encoded).unwrap_or_else(|_| module_encoded.clone());
     if crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Go,
