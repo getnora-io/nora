@@ -2413,12 +2413,22 @@ mod proxy_off_means_off {
         Seeded,
     }
 
+    /// Every option that has a format ask an upstream for more than the request itself: trusted
+    /// dates, and a release-age rule and the quarantine that read them — both only observing, so
+    /// the answer stays the stored copy or 404.
+    fn read_dates(c: &mut Config) {
+        c.server.trust_upstream_dates = true;
+        c.curation.mode = crate::config::CurationMode::Audit;
+        c.curation.min_release_age = Some("1h".to_string());
+        c.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+    }
+
     /// Every route of a format with its upstream switched off, over an empty store and over one
     /// holding stale copies and the upstream addresses an earlier configuration stored: no request
     /// leaves NORA, whatever host a handler meant to ask (the client goes through a recording proxy
-    /// without idle connections, so each request is seen), and the answer is the stored copy (200)
-    /// or 404. The control, per address: with the public default upstream on and nothing stored,
-    /// every address not marked local reaches the upstream.
+    /// without idle connections, so each request is seen) — a date for a release included — and
+    /// the answer is the stored copy (200) or 404. The control, per address: with the public
+    /// default upstream on and nothing stored, every address not marked local reaches the upstream.
     async fn no_egress(
         format: &str,
         uris: &[(&str, Reach)],
@@ -2429,8 +2439,10 @@ mod proxy_off_means_off {
         for mode in [Mode::Off, Mode::Blank, Mode::On] {
             let upstream_on = mode == Mode::On;
             let recorder = EgressRecorder::start().await;
-            let ctx =
-                create_test_context_with_egress_proxy(&recorder.url, move |c| configure(c, mode));
+            let ctx = create_test_context_with_egress_proxy(&recorder.url, move |c| {
+                configure(c, mode);
+                read_dates(c);
+            });
             for seeded in [false, true] {
                 if seeded {
                     for (key, body) in seeds {
