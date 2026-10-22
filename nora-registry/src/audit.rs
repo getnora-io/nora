@@ -162,7 +162,7 @@ impl AuditLog {
 
         let writer_mode = mode.clone();
         // Without its writer the audit log would take entries and record none, so a panic
-        // there ends the process (supervise.rs, `OnPanic::Exit`).
+        // there ends the process with `EXIT_TASK_PANICKED` (`supervise::blocking`).
         let handle = tokio::task::spawn_blocking(move || {
             let exit = crate::supervise::process_exit();
             crate::supervise::blocking("audit", &exit, move || {
