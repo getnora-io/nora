@@ -32,6 +32,20 @@ pub enum Compat {
     Unsupported,
 }
 
+/// The layout `nora import` writes, recorded in the marker of every repository it finishes.
+/// Layout 1 — releases up to 1.4.1, whose markers record none — skipped every PyPI and NuGet
+/// file; layout 2 imports them.
+pub const LAYOUT: u32 = 2;
+
+/// The first layout that imported the files of a repository of format `rt`. A repository
+/// finished under an earlier layout had its files skipped, not imported, and is walked again.
+pub fn imported_since(rt: RegistryType) -> u32 {
+    match rt {
+        RegistryType::PyPI | RegistryType::Nuget => 2,
+        _ => 1,
+    }
+}
+
 /// Normalize a source-reported format string (Artifactory `maven`, Nexus
 /// `maven2`/`raw`/`yum`, ...) to a NORA [`RegistryType`], reusing NORA's shared
 /// alias table (`registry_type::from_str_opt`). `None` = NORA hosts no such

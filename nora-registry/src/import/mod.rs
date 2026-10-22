@@ -126,14 +126,16 @@ pub enum ImportCommand {
     /// Only distribution files (.whl, .tar.gz, .zip, .egg) and .nupkg files are imported; a
     /// .nupkg must hold one .nuspec naming the id and version of its file name.
     ///
-    /// Upgrading from 1.4.1 or older: an npm repository those releases imported holds tarballs
-    /// without version documents, and NORA does not serve them as published packages; a PyPI or
-    /// NuGet repository they imported holds nothing, every file of it skipped. A re-run skips a
-    /// repository it finished, so first delete that repository's `<repo>__<hash>.done` and
-    /// `<repo>__<hash>.progress` from the source's directory under `<storage path>/.nora-import/`,
-    /// then run the import again: on local storage it writes the missing npm documents beside the
-    /// tarballs already stored; on S3 it transfers the tarballs again; PyPI and NuGet files are
-    /// transferred.
+    /// Upgrading from 1.4.1 or older: those releases skipped every PyPI and NuGet file yet marked
+    /// the repository finished. Run the import again: a PyPI or NuGet repository finished by them
+    /// is walked again and its files are imported, with nothing to delete first.
+    ///
+    /// An npm repository they imported holds tarballs without version documents, and NORA does
+    /// not serve them as published packages. A re-run skips an npm repository it finished, so
+    /// first delete that repository's `<repo>__<hash>.done` and `<repo>__<hash>.progress` from the
+    /// source's directory under `<storage path>/.nora-import/`, then run the import again: on
+    /// local storage it writes the missing documents beside the tarballs already stored; on S3 it
+    /// transfers the tarballs again.
     Run(RunArgs),
 }
 
@@ -354,31 +356,76 @@ async fn run_import(
     };
 
     let repos = filter_repos(source.list_repositories().await?, &args.repos);
+    let run = RunContext {
+        source: source.as_ref(),
+        host: &host,
+        storage,
+        curation: &curation,
+        temp_dir: &temp_dir,
+        resume: &resume,
+        opts,
+        concurrency: args.concurrency,
+        on_s3,
+    };
+    let result = import_repos(&run, &repos).await;
+
+    // Permission proposal (Artifactory only; inert — review R3).
+    if args.with_permissions {
+        emit_permissions_proposal(&args, client, auth, &host, &state_root).await?;
+    }
+
+    report_result(&result, args.dry_run, args.json);
+    Ok(())
+}
+
+/// What every repository of one run is imported with.
+struct RunContext<'a> {
+    source: &'a dyn SourceRegistry,
+    host: &'a str,
+    storage: &'a crate::storage::Storage,
+    curation: &'a crate::curation::CurationEngine,
+    temp_dir: &'a std::path::Path,
+    resume: &'a resume::ResumeStore,
+    opts: transfer::TransferOpts<'a>,
+    concurrency: usize,
+    on_s3: bool,
+}
+
+/// Import `repos` one after another, skipping a repository an earlier run finished.
+async fn import_repos(run: &RunContext<'_>, repos: &[RepoRef]) -> ImportResult {
     let mut result = ImportResult::default();
-    for repo in &repos {
-        if resume.is_repo_done(&repo.name) {
-            tracing::info!(repo = %repo.name, "skipping repo (.done marker)");
-            continue;
-        }
+    for repo in repos {
         let Some(rt) = layout::normalize_format(&repo.format) else {
             tracing::info!(repo = %repo.name, format = %repo.format, "skipping repo (unsupported source format)");
             continue;
         };
+        // A repository finished under a layout that skipped its format was not imported: it is
+        // walked again, and the journal skips what was committed.
+        match run.resume.done_layout(&repo.name).await {
+            Some(done) if done >= layout::imported_since(rt) => {
+                tracing::info!(repo = %repo.name, "skipping repo (.done marker)");
+                continue;
+            }
+            Some(done) => {
+                tracing::info!(repo = %repo.name, layout = done, "walking repo again: it was finished under a layout that skipped its format");
+            }
+            None => {}
+        }
         // Per-repo isolation: a repo that fails to even start (e.g. journal open
         // error) is logged and counted, never aborting the remaining repos of a
         // multi-day migration (review: single-error-aborts-job).
         match import_repo(
-            source.as_ref(),
+            run.source,
             repo,
             rt,
-            &host,
-            storage,
-            &curation,
-            &temp_dir,
-            &resume,
-            opts,
-            args.concurrency,
-            on_s3,
+            run.host,
+            run.storage,
+            run.curation,
+            run.temp_dir,
+            run.resume,
+            run.opts,
+            run.concurrency,
+            run.on_s3,
         )
         .await
         {
@@ -389,14 +436,7 @@ async fn run_import(
             }
         }
     }
-
-    // Permission proposal (Artifactory only; inert — review R3).
-    if args.with_permissions {
-        emit_permissions_proposal(&args, client, auth, &host, &state_root).await?;
-    }
-
-    report_result(&result, args.dry_run, args.json);
-    Ok(())
+    result
 }
 
 /// Import a single repo with bounded concurrency and strict resume ordering.
@@ -545,7 +585,7 @@ async fn import_repo(
     // journal line must be retried on the next run. A marker-write failure is
     // logged but not fatal (the repo simply re-scans next run).
     if !opts.dry_run && result.failed == 0 && journal_ok {
-        if let Err(e) = resume.mark_repo_done(&repo.name).await {
+        if let Err(e) = resume.mark_repo_done(&repo.name, layout::LAYOUT).await {
             tracing::error!(repo = %repo.name, error = %e, "failed to write .done marker (repo will re-scan next run)");
         }
     }
@@ -830,7 +870,7 @@ mod integration_tests {
             Some(sha.as_str())
         );
         // Repo marked done; rerun is idempotent (resume skip, no re-download).
-        assert!(h.resume.is_repo_done("libs-release-local"));
+        assert!(h.resume.done_layout("libs-release-local").await.is_some());
         let res2 = import_repo(
             source.as_ref(),
             &repos[0],
@@ -893,7 +933,7 @@ mod integration_tests {
             h.storage.stat(MAVEN_KEY).await.is_none(),
             "nothing committed on mismatch"
         );
-        assert!(!h.resume.is_repo_done("libs-release-local"));
+        assert!(h.resume.done_layout("libs-release-local").await.is_none());
     }
 
     #[tokio::test]
@@ -937,7 +977,7 @@ mod integration_tests {
             "dry-run commits nothing"
         );
         assert!(
-            !h.resume.is_repo_done("libs-release-local"),
+            h.resume.done_layout("libs-release-local").await.is_none(),
             "dry-run sets no marker"
         );
     }
@@ -1317,7 +1357,8 @@ mod integration_tests {
             "<repo>__<hash>.done",
             "<repo>__<hash>.progress",
             "1.4.1",
-            "PyPI or NuGet repository",
+            "PyPI or NuGet repository finished by them is walked again",
+            "with nothing to delete first",
         ] {
             assert!(help.contains(needle), "{needle} missing from:\n{help}");
         }
@@ -2016,6 +2057,126 @@ mod integration_tests {
         assert_eq!(asked(&upstream).await, Vec::<String>::new());
     }
 
+    /// A source of several repositories, each of its own format.
+    struct ReposSource {
+        repos: Vec<(RepoRef, Vec<(String, Vec<u8>)>)>,
+    }
+
+    #[async_trait]
+    impl SourceRegistry for ReposSource {
+        async fn list_repositories(&self) -> Result<Vec<RepoRef>> {
+            Ok(self.repos.iter().map(|(repo, _)| repo.clone()).collect())
+        }
+        fn artifacts<'a>(&'a self, repo: &'a str) -> BoxStream<'a, Result<ArtifactRef>> {
+            use futures::StreamExt;
+            let arts = self
+                .repos
+                .iter()
+                .filter(|(r, _)| r.name == repo)
+                .flat_map(|(_, arts)| arts)
+                .map(|(path, body)| {
+                    Ok(ArtifactRef {
+                        repo: repo.to_string(),
+                        path: path.clone(),
+                        name: path.rsplit('/').next().unwrap_or(path).to_string(),
+                        size: Some(body.len() as u64),
+                        sha256: Some(hex::encode(Sha256::digest(body))),
+                        sha1: None,
+                    })
+                })
+                .collect::<Vec<_>>();
+            futures::stream::iter(arts).boxed()
+        }
+        async fn download_stream(
+            &self,
+            artifact: &ArtifactRef,
+        ) -> Result<BoxStream<'static, Result<Bytes>>> {
+            use futures::StreamExt;
+            let body = self
+                .repos
+                .iter()
+                .filter(|(r, _)| r.name == artifact.repo)
+                .flat_map(|(_, arts)| arts)
+                .find(|(path, _)| *path == artifact.path)
+                .map(|(_, body)| body.clone())
+                .unwrap_or_default();
+            Ok(futures::stream::once(async move { Ok(Bytes::from(body)) }).boxed())
+        }
+    }
+
+    /// An import by 1.4.1 or older skipped every PyPI and NuGet file and still marked their
+    /// repositories finished. The next run imports them without the operator touching the
+    /// markers, and the run after it transfers nothing; a finished npm repository stays finished.
+    #[tokio::test]
+    async fn a_pypi_or_nuget_repository_an_earlier_release_marked_finished_is_imported() {
+        let h = harness("upgrade").await;
+        let repo = |name: &str, format: &str| RepoRef {
+            name: name.into(),
+            format: format.into(),
+        };
+        let wheel = zip(&[("corppkg/__init__.py", b"", true)]);
+        let source = ReposSource {
+            repos: vec![
+                (
+                    repo("npm-local", "npm"),
+                    vec![(
+                        "corppkg/-/corppkg-1.0.0.tgz".into(),
+                        npm_tgz(&json!({ "name": "corppkg", "version": "1.0.0" })),
+                    )],
+                ),
+                (
+                    repo("pypi-local", "pypi"),
+                    vec![("corppkg/1.0.0/corppkg-1.0.0-py3-none-any.whl".into(), wheel)],
+                ),
+                (
+                    repo("nuget-local", "nuget"),
+                    vec![(
+                        "Corp.Lib/Corp.Lib.1.0.0.nupkg".into(),
+                        nupkg("Corp.Lib", "1.0.0"),
+                    )],
+                ),
+            ],
+        };
+        for name in ["npm-local", "pypi-local", "nuget-local"] {
+            h.resume.mark_repo_done_as_1_4_1(name).await;
+        }
+        let run = RunContext {
+            source: &source,
+            host: "host",
+            storage: &h.storage,
+            curation: &h.curation,
+            temp_dir: &h.temp_dir,
+            resume: &h.resume,
+            opts: opts(false),
+            concurrency: 4,
+            on_s3: false,
+        };
+        let repos = source.list_repositories().await.unwrap();
+
+        let first = import_repos(&run, &repos).await;
+        assert_eq!((first.imported, first.failed), (2, 0), "{first:?}");
+        assert!(h
+            .storage
+            .stat("pypi/corppkg/corppkg-1.0.0-py3-none-any.whl")
+            .await
+            .is_some());
+        assert!(h
+            .storage
+            .stat("nuget/flatcontainer/corp.lib/1.0.0/corp.lib.1.0.0.nupkg")
+            .await
+            .is_some());
+        // The npm repository's marker is kept: its tarball is not transferred.
+        assert_eq!(h.storage.list("npm/").await.unwrap(), Vec::<String>::new());
+
+        let mut stored = h.storage.list("").await.unwrap();
+        stored.sort();
+        let again = import_repos(&run, &repos).await;
+        assert_eq!((again.total, again.imported), (0, 0), "{again:?}");
+        let mut after = h.storage.list("").await.unwrap();
+        after.sort();
+        assert_eq!(stored, after);
+    }
+
     /// A second run over a finished import transfers nothing and leaves the store as it was.
     #[tokio::test]
     async fn a_pypi_and_nuget_import_runs_again_without_a_change() {
@@ -2090,7 +2251,7 @@ mod integration_tests {
         assert_eq!(res.imported, 2);
         assert_eq!(res.failed, 0);
         assert!(h.storage.stat("maven/com/a/1.0/a-1.0.jar").await.is_some());
-        assert!(h.resume.is_repo_done("r"));
+        assert!(h.resume.done_layout("r").await.is_some());
         let res2 = run_repo(&src, crate::registry_type::RegistryType::Maven, &h, false).await;
         assert_eq!(res2.imported, 0);
         assert!(res2.skipped >= 2);
@@ -2105,7 +2266,7 @@ mod integration_tests {
         };
         let res = run_repo(&src, crate::registry_type::RegistryType::Maven, &h, false).await;
         assert!(res.failed >= 1);
-        assert!(!h.resume.is_repo_done("r"));
+        assert!(h.resume.done_layout("r").await.is_none());
     }
 
     #[tokio::test]
@@ -2142,7 +2303,7 @@ mod integration_tests {
         let res = run_repo(&src, crate::registry_type::RegistryType::Maven, &h, true).await;
         assert_eq!(res.imported, 1);
         assert!(h.storage.stat("maven/com/a/1.0/a.jar").await.is_none());
-        assert!(!h.resume.is_repo_done("r"));
+        assert!(h.resume.done_layout("r").await.is_none());
     }
 
     #[tokio::test]
