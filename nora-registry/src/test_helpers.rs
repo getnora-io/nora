@@ -1021,20 +1021,15 @@ impl object_store::ObjectStore for SlowListing {
     }
 }
 
-/// Storage directories whose disk "does not answer": the local backend's write probe under
-/// one of them waits until it is released. See [`hang_health_probe`].
-static HUNG_DISKS: std::sync::LazyLock<(
-    parking_lot::Mutex<Vec<std::path::PathBuf>>,
-    parking_lot::Condvar,
-)> = std::sync::LazyLock::new(Default::default);
+/// While this file is in a storage directory, its disk "does not answer": the local
+/// backend's write probe under it waits. See [`hang_health_probe`].
+const DISK_HANGS: &str = ".nora-test-disk-hangs";
 
-/// Called by the local backend's write probe: wait while `base` is held by
-/// [`hang_health_probe`], as a write does on a disk that stopped answering.
+/// Called by the local backend's write probe: wait while `base` holds the
+/// [`hang_health_probe`] marker, as a write does on a disk that stopped answering.
 pub fn wait_while_disk_hangs(base: &std::path::Path) {
-    let (hung, released) = &*HUNG_DISKS;
-    let mut hung = hung.lock();
-    while hung.iter().any(|dir| dir == base) {
-        released.wait(&mut hung);
+    while base.join(DISK_HANGS).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -1050,17 +1045,16 @@ impl Drop for HungProbe {
     fn drop(&mut self) {
         // Also on a failed assertion: a probe still waiting would keep the runtime from
         // shutting down and hang the test instead of failing it.
-        let (hung, released) = &*HUNG_DISKS;
-        hung.lock().retain(|dir| dir != &self.0);
-        released.notify_all();
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
 /// Make the local backend's write probe under `base` wait, as on a disk that stopped
 /// answering, until the returned guard answers or is dropped.
 pub fn hang_health_probe(base: &std::path::Path) -> HungProbe {
-    HUNG_DISKS.0.lock().push(base.to_path_buf());
-    HungProbe(base.to_path_buf())
+    let marker = base.join(DISK_HANGS);
+    std::fs::write(&marker, b"").unwrap();
+    HungProbe(marker)
 }
 
 /// A [`Storage`] over a [`SlowListing`] store with `delay` between listed objects.
