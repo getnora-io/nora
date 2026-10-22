@@ -1442,27 +1442,21 @@ async fn nuget_publish_date(
             }
         }
     }
-    if !trust || !ask_upstream || !is_valid_package_id(id) {
+    if !trust || !ask_upstream {
         return None;
     }
-    let upstream = upstream_url(state)?;
-    let base = format!(
-        "{}/v3/registration5-gz-semver2/{}",
-        upstream.trim_end_matches('/'),
-        id
-    );
     // The page the cached index named first; when that one does not list the version, the
     // upstream index — its pages may have moved since — and the page it names.
     if let Some((lower, upper)) = &page {
-        if let Some(published) = upstream_page_date(state, &base, lower, upper, version).await {
+        if let Some(published) = upstream_page_date(state, id, lower, upper, version).await {
             return published;
         }
     }
-    let doc = nuget_registration_fetch(state, &format!("{base}/index.json")).await?;
+    let doc = nuget_registration_fetch(state, id, RegistrationDoc::Index).await?;
     match registered(&doc, version) {
         Registered::Listed(published) => published,
         Registered::OnPage { lower, upper } => {
-            upstream_page_date(state, &base, &lower, &upper, version)
+            upstream_page_date(state, id, &lower, &upper, version)
                 .await
                 .flatten()
         }
@@ -1474,27 +1468,58 @@ async fn nuget_publish_date(
 /// does not list it or could not be read, `Some(None)` when it lists it undated.
 async fn upstream_page_date(
     state: &AppState,
-    base: &str,
+    id: &str,
     lower: &str,
     upper: &str,
     version: &str,
 ) -> Option<Option<i64>> {
-    if !is_valid_version(lower) || !is_valid_version(upper) {
-        return None;
-    }
-    let doc = nuget_registration_fetch(state, &format!("{base}/page/{lower}/{upper}.json")).await?;
+    let doc = nuget_registration_fetch(state, id, RegistrationDoc::Page { lower, upper }).await?;
     match registered(&doc, version) {
         Registered::Listed(published) => Some(published),
         _ => None,
     }
 }
 
-/// One upstream registration document, read for a date only: it is not cached, so the
-/// registration endpoints' TTL and validators stay theirs.
-async fn nuget_registration_fetch(state: &AppState, url: &str) -> Option<Vec<u8>> {
+/// A registration document of a package NORA reads a date from: the index, or the page with
+/// these bounds. A document is named by what it is, never by a URL — not one a response gave.
+#[derive(Debug, Clone, Copy)]
+enum RegistrationDoc<'a> {
+    Index,
+    Page { lower: &'a str, upper: &'a str },
+}
+
+/// Where `doc` of `id` is on `upstream`: the registration path of the configured upstream,
+/// with a package id and versions as its only segments. `None` for anything else, so no
+/// segment can lead the request off that path or that host.
+fn registration_url(upstream: &str, id: &str, doc: RegistrationDoc) -> Option<String> {
+    if !is_valid_package_id(id) {
+        return None;
+    }
+    let base = format!(
+        "{}/v3/registration5-gz-semver2/{}",
+        upstream.trim_end_matches('/'),
+        id
+    );
+    match doc {
+        RegistrationDoc::Index => Some(format!("{base}/index.json")),
+        RegistrationDoc::Page { lower, upper } => (is_valid_version(lower)
+            && is_valid_version(upper))
+        .then(|| format!("{base}/page/{lower}/{upper}.json")),
+    }
+}
+
+/// `doc` of `id` from the configured upstream, read for a date only: it is not cached, so the
+/// registration endpoints' TTL and validators stay theirs. Nothing is asked when the upstream
+/// is switched off.
+async fn nuget_registration_fetch(
+    state: &AppState,
+    id: &str,
+    doc: RegistrationDoc<'_>,
+) -> Option<Vec<u8>> {
+    let url = registration_url(&upstream_url(state)?, id, doc)?;
     proxy_fetch(
         &state.http_client,
-        url,
+        &url,
         Duration::from_secs(state.config.nuget.metadata_proxy_timeout),
         expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
@@ -4710,8 +4735,8 @@ mod nuget_release_dates {
                 "1.0.10",
                 vec![
                     leaf("1.0.10", Y2019),
-                    leaf("1.0.1-beta", Y2023),
                     leaf("1.0.1", MID2024),
+                    leaf("1.0.1-beta", Y2023),
                     leaf("1.0.0", Y2024),
                 ],
             ),
@@ -4867,6 +4892,54 @@ mod nuget_release_dates {
                 0,
                 "{prefix}: the host of the page's @id was asked"
             );
+        }
+    }
+
+    /// The URL a registration document is asked at is built from the configured upstream
+    /// alone, with a package id and versions as its only segments: a segment that would leave
+    /// the registration path or the host — a slash, `..`, a query, a scheme — names no URL.
+    #[test]
+    fn a_registration_document_is_asked_of_the_configured_upstream_only() {
+        use super::{registration_url, RegistrationDoc};
+        const UP: &str = "https://feed.internal";
+        let page = |lower, upper| RegistrationDoc::Page { lower, upper };
+        let base = "https://feed.internal/v3/registration5-gz-semver2/repro.pkg";
+        for (upstream, id, doc, want) in [
+            (
+                UP,
+                ID,
+                RegistrationDoc::Index,
+                Some(format!("{base}/index.json")),
+            ),
+            (
+                "https://feed.internal/",
+                ID,
+                RegistrationDoc::Index,
+                Some(format!("{base}/index.json")),
+            ),
+            (
+                UP,
+                ID,
+                page("1.0.0", "2.0.0-rc.1+b"),
+                Some(format!("{base}/page/1.0.0/2.0.0-rc.1+b.json")),
+            ),
+            (UP, "a/b", RegistrationDoc::Index, None),
+            (UP, "..", RegistrationDoc::Index, None),
+            (UP, "x?y", RegistrationDoc::Index, None),
+            (UP, "", RegistrationDoc::Index, None),
+            (UP, ID, page("1.0.0", "https://elsewhere.example/x"), None),
+            (UP, ID, page("../../x", "2.0.0"), None),
+            (UP, ID, page("1.0.0", "2.0.0?at=elsewhere"), None),
+            (UP, ID, page("1.0.0", "2.0.0#x"), None),
+            (UP, ID, page("1.0.0", "2.0.0\\x"), None),
+            (UP, ID, page("", "2.0.0"), None),
+            (UP, ID, page("1.0.0", "@elsewhere.example"), None),
+        ] {
+            let url = registration_url(upstream, id, doc);
+            assert_eq!(url, want, "{upstream} {id} {doc:?}");
+            if let Some(url) = url {
+                assert!(url.starts_with("https://feed.internal/v3/registration5-gz-semver2/"));
+            }
         }
     }
 
