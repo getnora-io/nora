@@ -15,7 +15,10 @@
 //! A client may also speak HTTP/2 from its first byte (prior knowledge, as before: axum's
 //! server took both). The first bytes are read here, under the header timeout, until they
 //! show the HTTP/2 preface or not; an HTTP/2 connection is served with keep-alive pings, so
-//! a peer that stops answering them is closed.
+//! a peer that stops answering them is closed. A peer that answers them is held to the same
+//! limits as an HTTP/1 client by [`Streams`]: its first stream must open within
+//! `header_read_timeout` from the accept, and with no stream open the connection is idle and
+//! closed after `keep_alive_timeout`.
 
 use std::future::Future;
 use std::io;
@@ -79,11 +82,27 @@ pub(crate) async fn serve_connection(
         replayed: 0,
         clock: Arc::clone(&clock),
     });
+    let streams = Arc::new(Streams::default());
+    let open = Arc::clone(&streams);
+    let accepted = clock.accepted;
     let service = hyper::service::service_fn(move |mut request: hyper::Request<Incoming>| {
+        use futures::FutureExt;
         use tower::ServiceExt;
         // What `into_make_service_with_connect_info` gave handlers: the peer address.
         request.extensions_mut().insert(ConnectInfo(remote));
-        app.clone().oneshot(request.map(axum::body::Body::new))
+        let stream = StreamOpen::new(&open, accepted);
+        app.clone()
+            .oneshot(request.map(axum::body::Body::new))
+            .map(|response| {
+                response.map(|response| {
+                    response.map(|body| {
+                        axum::body::Body::new(InStream {
+                            body,
+                            _stream: stream,
+                        })
+                    })
+                })
+            })
     });
     if is_h2 {
         let mut builder =
@@ -92,29 +111,41 @@ pub(crate) async fn serve_connection(
             .timer(hyper_util::rt::TokioTimer::new())
             .keep_alive_interval(limits.keep_alive_timeout)
             .keep_alive_timeout(limits.header_read_timeout);
-        drive(builder.serve_connection(io, service), stop, remote).await;
+        let idle = streams.idle(accepted, limits);
+        drive(builder.serve_connection(io, service), stop, idle, remote).await;
     } else {
         let mut builder = hyper::server::conn::http1::Builder::new();
         builder
             .timer(HeadTimer { clock, limits })
             .header_read_timeout(limits.header_read_timeout)
             .keep_alive(true);
-        drive(builder.serve_connection(io, service), stop, remote).await;
+        // HTTP/1 keeps its limits in `HeadTimer`.
+        let idle = std::future::pending();
+        drive(builder.serve_connection(io, service), stop, idle, remote).await;
     }
 }
 
-/// Run `connection` to its end, shutting it down gracefully once `stop` turns true.
-async fn drive<C>(connection: C, mut stop: tokio::sync::watch::Receiver<bool>, remote: SocketAddr)
-where
+/// Run `connection` to its end, shutting it down gracefully once `stop` turns true or the
+/// connection has been `idle` too long.
+async fn drive<C>(
+    connection: C,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+    idle: impl Future<Output = ()>,
+    remote: SocketAddr,
+) where
     C: hyper_util::server::graceful::GracefulConnection,
     C::Error: std::fmt::Display,
 {
     tokio::pin!(connection);
     // CANCEL-SAFETY: the connection future stays pinned here and is polled to its end in
-    // both arms; `stopped` holds nothing.
+    // every arm; `stopped` and `idle` hold nothing the connection needs.
     let served = tokio::select! {
         served = connection.as_mut() => served,
         () = stopped(&mut stop) => {
+            connection.as_mut().graceful_shutdown();
+            connection.await
+        }
+        () = idle => {
             connection.as_mut().graceful_shutdown();
             connection.await
         }
@@ -128,6 +159,121 @@ where
 /// dropped here, so it is not held across the shutdown that follows.
 async fn stopped(stop: &mut tokio::sync::watch::Receiver<bool>) {
     let _ = stop.wait_for(|stop| *stop).await;
+}
+
+/// The streams of a connection: how many are open, and when the last one ended. A stream is
+/// open from the request's head until its response is sent or the stream is reset.
+struct Streams {
+    open: AtomicU64,
+    /// Milliseconds from the accept to the end of the last stream; `u64::MAX` before one ends.
+    last_end_ms: AtomicU64,
+    /// Woken when a stream opens or ends.
+    changed: tokio::sync::Notify,
+}
+
+impl Default for Streams {
+    fn default() -> Self {
+        Self {
+            open: AtomicU64::new(0),
+            last_end_ms: AtomicU64::new(u64::MAX),
+            changed: tokio::sync::Notify::new(),
+        }
+    }
+}
+
+impl Streams {
+    /// Resolves once the connection has had no stream open for too long: before its first
+    /// stream, `header_read_timeout` from the accept; after one, `keep_alive_timeout` from
+    /// the end of the last.
+    async fn idle(self: Arc<Self>, accepted: tokio::time::Instant, limits: ConnLimits) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            // Registered before the state is read, so a change after the read wakes it.
+            changed.as_mut().enable();
+            if self.open.load(Ordering::Acquire) > 0 {
+                changed.await;
+                continue;
+            }
+            let deadline =
+                idle_deadline(accepted, self.last_end_ms.load(Ordering::Acquire), limits);
+            if tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            // CANCEL-SAFETY: both arms only wake the loop, which reads the state again.
+            tokio::select! {
+                () = tokio::time::sleep_until(deadline) => {}
+                () = changed => {}
+            }
+        }
+    }
+}
+
+/// When a connection with no stream open is idle too long: `header_read_timeout` from the
+/// accept if no stream has ended yet (`u64::MAX`), else `keep_alive_timeout` from the end of
+/// the last one, `last_end_ms` after the accept.
+fn idle_deadline(
+    accepted: tokio::time::Instant,
+    last_end_ms: u64,
+    limits: ConnLimits,
+) -> tokio::time::Instant {
+    match last_end_ms {
+        u64::MAX => accepted + limits.header_read_timeout,
+        ms => accepted + Duration::from_millis(ms) + limits.keep_alive_timeout,
+    }
+}
+
+/// One open stream of a connection's [`Streams`]; ends it when dropped.
+struct StreamOpen {
+    streams: Arc<Streams>,
+    accepted: tokio::time::Instant,
+}
+
+impl StreamOpen {
+    fn new(streams: &Arc<Streams>, accepted: tokio::time::Instant) -> Self {
+        streams.open.fetch_add(1, Ordering::AcqRel);
+        streams.changed.notify_waiters();
+        Self {
+            streams: Arc::clone(streams),
+            accepted,
+        }
+    }
+}
+
+impl Drop for StreamOpen {
+    fn drop(&mut self) {
+        let ms = u64::try_from(self.accepted.elapsed().as_millis()).unwrap_or(u64::MAX - 1);
+        self.streams.last_end_ms.store(ms, Ordering::Release);
+        self.streams.open.fetch_sub(1, Ordering::AcqRel);
+        self.streams.changed.notify_waiters();
+    }
+}
+
+/// A response body that holds its stream open until hyper is done with it: sent to its end,
+/// or dropped with a reset stream.
+struct InStream {
+    body: axum::body::Body,
+    _stream: StreamOpen,
+}
+
+impl hyper::body::Body for InStream {
+    type Data = axum::body::Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.body).poll_frame(cx)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.body.size_hint()
+    }
 }
 
 /// The connection preface of HTTP/2 (RFC 9113 §3.4).
@@ -350,5 +496,66 @@ mod tests {
         assert_eq!(defaults.header_read_timeout, Duration::from_secs(30));
         assert_eq!(defaults.keep_alive_timeout, Duration::from_secs(120));
         assert_eq!(defaults.max_connections, 4096);
+    }
+
+    fn limits() -> ConnLimits {
+        ConnLimits {
+            header_read_timeout: Duration::from_secs(7),
+            keep_alive_timeout: Duration::from_secs(120),
+            max_connections: 1,
+        }
+    }
+
+    /// With no stream open, a connection is idle too long at the header timeout from the
+    /// accept until a stream has ended, and at the keep-alive timeout from the end of the
+    /// last stream after.
+    #[test]
+    fn the_idle_deadline_is_the_header_timeout_first_and_the_keep_alive_after() {
+        let accepted = tokio::time::Instant::now();
+        for (last_end_ms, deadline) in [
+            (u64::MAX, Duration::from_secs(7)),
+            (0, Duration::from_secs(120)),
+            (5_000, Duration::from_secs(125)),
+        ] {
+            assert_eq!(
+                idle_deadline(accepted, last_end_ms, limits()) - accepted,
+                deadline,
+                "{last_end_ms}"
+            );
+        }
+        assert_eq!(Streams::default().last_end_ms.into_inner(), u64::MAX);
+    }
+
+    /// A stream open holds the connection however long it runs; once the last one ends, the
+    /// keep-alive timeout runs from its end.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_is_idle_only_with_no_stream_open() {
+        let streams = Arc::new(Streams::default());
+        let accepted = tokio::time::Instant::now();
+        let idle = tokio::spawn(Arc::clone(&streams).idle(accepted, limits()));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let first = StreamOpen::new(&streams, accepted);
+        let second = StreamOpen::new(&streams, accepted);
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        drop(first);
+        tokio::time::sleep(Duration::from_secs(200)).await;
+        assert!(!idle.is_finished(), "idle with a stream open");
+        drop(second);
+        tokio::time::sleep(Duration::from_secs(119)).await;
+        assert!(!idle.is_finished(), "closed before the keep-alive timeout");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(idle.is_finished(), "kept past the keep-alive timeout");
+    }
+
+    /// Before its first stream a connection is kept the header timeout from the accept.
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_without_a_stream_is_idle_at_the_header_timeout() {
+        let streams = Arc::new(Streams::default());
+        let accepted = tokio::time::Instant::now();
+        let idle = tokio::spawn(streams.idle(accepted, limits()));
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!idle.is_finished());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(idle.is_finished());
     }
 }

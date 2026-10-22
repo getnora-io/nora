@@ -1576,6 +1576,91 @@ mod connection_limit_tests {
         );
     }
 
+    /// The HTTP/2 preface and an empty SETTINGS frame.
+    const H2_START: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00";
+
+    /// A HEADERS frame on stream 1 ending its stream: `GET http://x/`, HPACK-coded from the
+    /// static table.
+    const H2_GET: &[u8] = b"\x00\x00\x06\x01\x05\x00\x00\x00\x01\x82\x86\x84\x41\x01x";
+
+    /// Play an HTTP/2 client that is alive: acknowledge each SETTINGS, answer each PING.
+    /// Returns how long after `from` the server closed the connection, if it did within
+    /// `limit`, and when the response to stream 1 ended, if it came.
+    async fn h2_alive_until_closed(
+        stream: &mut TcpStream,
+        from: Instant,
+        limit: Duration,
+    ) -> (Option<Duration>, Option<Instant>) {
+        let mut answered = None;
+        loop {
+            let left = limit.saturating_sub(from.elapsed());
+            let mut head = [0u8; 9];
+            // CANCEL-SAFETY: a read on the test's own socket; on timeout the test ends.
+            match tokio::time::timeout(left, stream.read_exact(&mut head)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => return (Some(from.elapsed()), answered),
+                Err(_) => return (None, answered),
+            }
+            let length = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+            let mut payload = vec![0u8; length];
+            if stream.read_exact(&mut payload).await.is_err() {
+                return (Some(from.elapsed()), answered);
+            }
+            let (kind, flags, id) = (head[3], head[4], &head[5..9]);
+            let reply: Option<Vec<u8>> = match kind {
+                0x4 if flags & 1 == 0 => Some(b"\x00\x00\x00\x04\x01\x00\x00\x00\x00".to_vec()),
+                0x6 if flags & 1 == 0 => {
+                    Some([&b"\x00\x00\x08\x06\x01\x00\x00\x00\x00"[..], &payload].concat())
+                }
+                0x0 | 0x1 if flags & 1 == 1 && id == [0, 0, 0, 1] => {
+                    answered = Some(Instant::now());
+                    None
+                }
+                _ => None,
+            };
+            if let Some(reply) = reply {
+                if stream.write_all(&reply).await.is_err() {
+                    return (Some(from.elapsed()), answered);
+                }
+            }
+        }
+    }
+
+    /// An HTTP/2 client that answers every ping but opens no stream is closed as an HTTP/1
+    /// one that sends no head: at the header timeout from the accept. It does not hold a
+    /// connection, and a place under `max_connections`, for as long as it answers.
+    #[tokio::test]
+    async fn an_http2_client_that_opens_no_stream_is_closed_at_the_header_timeout() {
+        let server = start(16).await;
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        let connected = Instant::now();
+        client.write_all(H2_START).await.unwrap();
+        let (closed, _) = h2_alive_until_closed(&mut client, connected, IDLE * 4).await;
+        assert!(
+            closed.is_some_and(|d| d < HEAD * 4),
+            "an HTTP/2 client with no stream was kept: {closed:?}"
+        );
+    }
+
+    /// After its last stream an HTTP/2 connection is idle as a keep-alive one: kept at least
+    /// the keep-alive timeout (past the header timeout), and closed once that has passed,
+    /// although the client answers every ping.
+    #[tokio::test]
+    async fn an_idle_http2_connection_is_closed_at_the_keep_alive_timeout() {
+        let server = start(16).await;
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        let connected = Instant::now();
+        client.write_all(H2_START).await.unwrap();
+        client.write_all(H2_GET).await.unwrap();
+        let (closed, answered) = h2_alive_until_closed(&mut client, connected, IDLE * 4).await;
+        let answered = answered.expect("the request on stream 1 is answered");
+        let closed = closed.map(|at| connected + at - answered);
+        assert!(
+            closed.is_some_and(|d| d >= IDLE - HEAD && d < IDLE + HEAD * 4),
+            "idle after its stream for {closed:?}, keep-alive {IDLE:?}"
+        );
+    }
+
     /// Handlers (the lockout, token routes) still see the client's address.
     #[tokio::test]
     async fn a_request_carries_the_peer_address() {
