@@ -141,7 +141,12 @@ pub trait StorageBackend: Send + Sync {
     /// Total size of all stored artifacts in bytes
     async fn total_size(&self) -> u64;
     fn backend_name(&self) -> &'static str;
-    /// Refresh any cached size data. No-op for backends without caching.
+    /// Ask the store whether it answers, with one cheap request, and keep the outcome for
+    /// `health_check`, so a probe never waits on the store. No-op for backends whose
+    /// `health_check` asks the store itself.
+    async fn refresh_reachability(&self) {}
+    /// Refresh any cached size data. No-op for backends without caching. It may take as
+    /// long as listing the whole store, and does not say whether the store answers.
     async fn refresh_total_size(&self) {}
     /// Housekeeping at server start, before serving. The local backend opens this
     /// instance's staging directory and removes what dead instances left there; a
@@ -603,6 +608,11 @@ impl Storage {
         }
         self.inner.put(key, &data, &expected).await?;
         Ok(RepinOutcome::Updated { old, new: expected })
+    }
+
+    /// See [`StorageBackend::refresh_reachability`].
+    pub async fn refresh_reachability(&self) {
+        self.inner.refresh_reachability().await;
     }
 
     /// Refresh cached total_size. No-op for local storage, computes for S3.

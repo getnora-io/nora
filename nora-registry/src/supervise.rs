@@ -23,7 +23,7 @@
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -218,6 +218,54 @@ impl Supervisor {
     }
 }
 
+/// Work a periodic task starts and does not wait for, such as counting the store's size:
+/// it runs in a task of its own, at most one run at a time, so a slow run is never joined by
+/// a second. A panic in a run is reported under `name` (log and counter) and ends only that
+/// run; the next start runs again.
+pub struct Detached {
+    name: &'static str,
+    running: Arc<AtomicBool>,
+}
+
+/// Marks a [`Detached`] run finished however it ends, a panic included.
+struct Finished(Arc<AtomicBool>);
+
+impl Drop for Finished {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+impl Detached {
+    /// Detached work reported as the task `name`.
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            running: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Start `work` unless the previous run is still going. Returns the run's handle, or
+    /// `None` when nothing was started; dropping the handle does not stop the run.
+    pub fn start<F>(&self, work: F) -> Option<tokio::task::JoinHandle<()>>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        if self.running.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        let finished = Finished(Arc::clone(&self.running));
+        let name = self.name;
+        let run = tokio::spawn(async move {
+            let _finished = finished;
+            if let Err(panic) = AssertUnwindSafe(work).catch_unwind().await {
+                report_panic(name, &panic);
+            }
+        });
+        Some(run)
+    }
+}
+
 /// Run `work` on the current (blocking) thread as the task `name`, ending the process if it panics:
 /// for a task that lives on a blocking thread, such as the audit writer.
 pub fn blocking<F: FnOnce()>(name: &'static str, exit: &ExitHook, work: F) {
@@ -344,6 +392,53 @@ mod tests {
             .unwrap();
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(panics("test_return"), 0);
+    }
+
+    /// Detached work runs one at a time: while a run is going no second one starts, and the
+    /// next start after it ends runs.
+    #[tokio::test]
+    async fn detached_work_runs_one_at_a_time() {
+        let work = Detached::new("test_detached_one");
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let first = work
+            .start(async move {
+                let _ = wait.await;
+            })
+            .unwrap();
+        assert!(
+            work.start(async {}).is_none(),
+            "a second run while one goes"
+        );
+        release.send(()).unwrap();
+        first.await.unwrap();
+        let next = work
+            .start(async {})
+            .expect("the next start after the run ended");
+        next.await.unwrap();
+    }
+
+    /// A detached run that panics late is logged and counted under its name, and does not
+    /// keep the next start from running.
+    #[tokio::test]
+    async fn a_detached_run_that_panics_is_reported_and_the_next_runs() {
+        let work = Detached::new("test_detached_panic");
+        let run = work
+            .start(async {
+                tokio::time::sleep(TICK).await;
+                panic!("a bug that shows after a while");
+            })
+            .unwrap();
+        run.await.expect("the panic is caught in the run");
+        assert_eq!(panics("test_detached_panic"), 1);
+        let ran = Arc::new(AtomicU64::new(0));
+        let r = Arc::clone(&ran);
+        work.start(async move {
+            r.fetch_add(1, Ordering::SeqCst);
+        })
+        .expect("the next start after a panic")
+        .await
+        .unwrap();
+        assert_eq!(ran.load(Ordering::SeqCst), 1);
     }
 
     /// A stalled heartbeat names its task.

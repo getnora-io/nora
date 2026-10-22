@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use axum::body::Bytes;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
@@ -54,14 +54,15 @@ pub struct ObjectStorage {
     /// unhealthy exactly when it is busiest (#869).
     cached_reachable: std::sync::atomic::AtomicBool,
     /// Unix seconds of the last background refresh (`0` = never refreshed). Paired with
-    /// `cached_reachable`, which is only ever written by the 60s maintenance loop: if that
+    /// `cached_reachable`, which is only ever written by the maintenance loop (one cheap
+    /// request every 30 s tick, `refresh_reachability`): if that
     /// task stalls or dies, the stale flag would otherwise pin readiness forever. A refresh
     /// older than `HEALTH_MAX_STALE_SECS` is treated as unreachable (#872).
     last_refresh_unix: std::sync::atomic::AtomicU64,
 }
 
-/// Reachability older than this is treated as unknown → unreachable. 2.5× the 60s background
-/// refresh cadence: tolerates one missed refresh + jitter without flapping, but a stalled or
+/// Reachability older than this is treated as unknown → unreachable. Five 30 s maintenance
+/// ticks: tolerates missed refreshes + jitter without flapping, but a stalled or
 /// dead maintenance loop un-readies the pod within the window instead of pinning a stale
 /// `true` (#872).
 const HEALTH_MAX_STALE_SECS: i64 = 150;
@@ -176,6 +177,20 @@ impl ObjectStorage {
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(true),
+            last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Over a store a test supplies (one that answers slowly, say), on the same code path as
+    /// S3/GCS. Reachability is unknown until the first refresh, as on a real store.
+    #[cfg(test)]
+    pub(crate) fn over(store: Box<dyn ObjectStore>) -> Self {
+        Self {
+            store,
+            name: "s3",
+            cached_total_size: std::sync::atomic::AtomicU64::new(0),
+            size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
+            cached_reachable: std::sync::atomic::AtomicBool::new(false),
             last_refresh_unix: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -416,7 +431,7 @@ impl StorageBackend for ObjectStorage {
         // Cached outcome of the last background refresh (#869) — probes must never hit the
         // store. False until the boot refresh succeeds, so readiness still gates a
         // misconfigured store at rollout. Self-expiring (#872): the flag is only written by
-        // the 60s maintenance loop, so a stalled or dead loop lets the staleness window lapse
+        // the maintenance loop, so a stalled or dead loop lets the staleness window lapse
         // and un-readies the pod rather than pinning a stale `true` forever.
         self.cached_reachable
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -436,17 +451,29 @@ impl StorageBackend for ObjectStorage {
         self.name
     }
 
-    async fn refresh_total_size(&self) {
-        let result: std::result::Result<Vec<_>, _> = self.store.list(None).try_collect().await;
-
+    async fn refresh_reachability(&self) {
+        // One request whatever the bucket holds: the first page of its listing (the listing
+        // is fetched page by page, and only the first is asked for). An empty bucket answers
+        // with an empty page, which is an answer.
+        let reachable = self
+            .store
+            .list(None)
+            .next()
+            .await
+            .is_none_or(|first| first.is_ok());
         self.cached_reachable
-            .store(result.is_ok(), std::sync::atomic::Ordering::Relaxed);
+            .store(reachable, std::sync::atomic::Ordering::Relaxed);
         // Stamp every run (success or failure): this marks the maintenance loop as alive so
         // `health_check` can expire the cached verdict if the loop stops (#872).
         self.last_refresh_unix.store(
             crate::cache_ttl::now_unix(),
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    async fn refresh_total_size(&self) {
+        // The whole listing, as long as it takes; readiness does not wait for it.
+        let result: std::result::Result<Vec<_>, _> = self.store.list(None).try_collect().await;
         if let Ok(objects) = result {
             let total: u64 = objects.iter().map(|m| m.size).sum();
             self.cached_total_size
@@ -644,8 +671,53 @@ mod tests {
     async fn test_health_check_cached_not_live() {
         let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
         assert!(!storage.health_check().await);
-        storage.refresh_total_size().await;
+        storage.refresh_reachability().await;
         assert!(!storage.health_check().await);
+    }
+
+    /// Reachability costs one request however large the bucket: against a store whose
+    /// every listing page says there is another, `refresh_reachability` asks for the first
+    /// page only, and that answer makes the store reachable.
+    #[tokio::test]
+    async fn reachability_is_one_request_on_a_bucket_of_many_pages() {
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(ENDLESS_LIST_XML, "application/xml"),
+            )
+            .mount(&server)
+            .await;
+        let storage = ObjectStorage::new(
+            &server.uri(),
+            "test-bucket",
+            "us-east-1",
+            Some("access"),
+            Some("secret"),
+            false,
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            storage.refresh_reachability(),
+        )
+        .await
+        .expect("one page, not the whole listing");
+        assert!(storage.health_check().await);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// Counting the size does not decide reachability: a whole listing that fails leaves the
+    /// verdict of the last reachability request as it was.
+    #[tokio::test]
+    async fn a_failed_size_count_leaves_reachability_alone() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
+        storage.cached_reachable.store(true, Relaxed);
+        storage
+            .last_refresh_unix
+            .store(crate::cache_ttl::now_unix(), Relaxed);
+        storage.refresh_total_size().await;
+        assert!(storage.health_check().await);
     }
 
     /// Cached reachability self-expires (#872): a `true` verdict whose last refresh is older
@@ -761,10 +833,14 @@ mod tests {
         assert_eq!(storage.backend_name(), "gcs");
     }
 
-    /// Empty ListObjectsV2 body so `refresh_total_size`'s `list(None)` succeeds against the mock.
+    /// A ListObjectsV2 page that always says another follows: a bucket too large to list.
+    const ENDLESS_LIST_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>test-bucket</Name><KeyCount>1</KeyCount><MaxKeys>1</MaxKeys><IsTruncated>true</IsTruncated><NextContinuationToken>more</NextContinuationToken><Contents><Key>a</Key><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>"x"</ETag><Size>1</Size></Contents></ListBucketResult>"#;
+
+    /// Empty ListObjectsV2 body so the reachability request's `list(None)` succeeds against
+    /// the mock.
     const EMPTY_LIST_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?><ListBucketResult><Name>test-bucket</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>"#;
 
-    /// Run one `refresh_total_size` (a ListObjectsV2) against a mock server and return the
+    /// Run one `refresh_reachability` (a ListObjectsV2) against a mock server and return the
     /// request path the client actually used. Also covers the cached-reachability true
     /// path (#869): a successful refresh flips `health_check()` to true.
     async fn observed_list_path(virtual_hosted: bool) -> String {
@@ -785,7 +861,7 @@ mod tests {
             virtual_hosted,
         );
         assert!(!storage.health_check().await);
-        storage.refresh_total_size().await;
+        storage.refresh_reachability().await;
         assert!(storage.health_check().await);
         let requests = server.received_requests().await.unwrap();
         requests[0].url.path().to_string()

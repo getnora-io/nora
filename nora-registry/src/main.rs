@@ -3293,13 +3293,35 @@ pub(crate) fn supervision(
 /// /health when the loop stops starting ticks or every tick panics.
 fn spawn_maintenance(state: &AppState, period: std::time::Duration) {
     let maintenance_state = state.clone();
+    // Outlives a restart of the loop, so a run still going is not joined by a second.
+    let work = Arc::new(MaintenanceWork::new());
     state.tasks.spawn("maintenance", move || {
         let state = maintenance_state.clone();
+        let work = Arc::clone(&work);
         run_maintenance(period, Arc::clone(&state.maintenance), move |tick_count| {
             let state = state.clone();
-            async move { maintenance_tick(&state, tick_count).await }
+            let work = Arc::clone(&work);
+            async move { maintenance_tick(&state, tick_count, &work).await }
         })
     });
+}
+
+/// The work a maintenance tick starts and does not wait for: each runs apart from the tick,
+/// one run at a time, and reports its own panics (`nora_task_panics_total{task}`).
+struct MaintenanceWork {
+    /// Token `last_used` to disk; its file rewrites must not be cut halfway.
+    token_flush: supervise::Detached,
+    /// The store's size and the per-registry gauges: a whole listing, as long as it takes.
+    storage_size: supervise::Detached,
+}
+
+impl MaintenanceWork {
+    fn new() -> Self {
+        Self {
+            token_flush: supervise::Detached::new("token_flush"),
+            storage_size: supervise::Detached::new("storage_size"),
+        }
+    }
 }
 
 /// How long a maintenance tick may run before it is cut, for a loop ticking every `period`
@@ -3308,8 +3330,8 @@ fn spawn_maintenance(state: &AppState, period: std::time::Duration) {
 /// just inside its deadline and the restarted loop's first tick cut at it, with one more
 /// deadline to spare for the restart backoff (1 s after a single panic) and scheduling. So a
 /// store that never answers, or one panic, keeps `/health` 200. With the default 300 s window
-/// that is 90 s; with the smallest, 90 s, it is 20 s. A storage listing that needs longer
-/// (a very large bucket) needs a larger `maintenance_stall_secs`.
+/// that is 90 s; with the smallest, 90 s, it is 20 s. The tick waits on one cheap storage
+/// request only, so its deadline does not depend on how much the store holds.
 fn tick_deadline(
     period: std::time::Duration,
     max_silence: std::time::Duration,
@@ -3323,7 +3345,8 @@ fn tick_deadline(
 /// and counted, and the next starts on schedule: waiting on a store is not a dead loop, and
 /// `/ready` reports the store. A panicking tick ends the loop, which its supervisor restarts.
 /// The beats stop when ticks keep panicking or one holds its thread so that it cannot be cut,
-/// since the work they stand for (token flush, readiness refresh) is no longer done.
+/// since the work they stand for (readiness refresh, starting the token flush and the size
+/// count) is no longer done.
 async fn run_maintenance<F, Fut>(
     period: std::time::Duration,
     heartbeat: Arc<supervise::Heartbeat>,
@@ -3339,11 +3362,11 @@ async fn run_maintenance<F, Fut>(
     loop {
         interval.tick().await;
         tick_count += 1;
-        // CANCEL-SAFETY: a tick cut here is dropped at whatever await it was in. Every part
-        // of it can stop at any await: storage refreshes and index rebuilds keep what they
-        // read in locals and publish it only at the end, the token flush runs in a task of
-        // its own (`flush_last_used_detached`), session and lock expiry do not await, and
-        // the temp-file sweep is a detached blocking task.
+        // CANCEL-SAFETY: a tick cut here is dropped at whatever await it was in, which is
+        // the reachability request: it publishes its verdict only once it has one. The token
+        // flush and the size count run in tasks of their own (`MaintenanceWork`) that the
+        // cut does not stop, session and lock expiry do not await, and the temp-file sweep is
+        // a detached blocking task.
         if tokio::time::timeout(deadline, tick(tick_count))
             .await
             .is_err()
@@ -3359,43 +3382,44 @@ async fn run_maintenance<F, Fut>(
     }
 }
 
-/// One tick of the maintenance loop: flush token `last_used`, expire upload sessions and
-/// failure-tracker entries; every second tick refresh the storage gauges, every tenth
-/// evict unused publish locks and stale temp files.
-async fn maintenance_tick(state: &AppState, tick_count: u64) {
+/// One tick of the maintenance loop: start the token `last_used` flush, expire upload
+/// sessions and failure-tracker entries, and ask the store whether it answers; every second
+/// tick start the count of the store's size and gauges, every tenth evict unused publish
+/// locks and stale temp files.
+async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceWork) {
     #[cfg(feature = "fault-injection")]
     fault_injection::maintenance_fault().await;
     if let Some(ref token_store) = state.tokens {
-        token_store.flush_last_used_detached().await;
+        let token_store = token_store.clone();
+        work.token_flush
+            .start(async move { token_store.flush_last_used().await });
     }
     registry::docker::cleanup_expired_sessions(&state.upload_sessions);
     state.auth_failures.cleanup();
 
-    // Every 60s (odd ticks — the interval's first tick fires immediately, so the
-    // boot pass runs right away: object-store reachability (#869) and the storage
-    // gauge are populated before the first readiness probe, not 30s in).
+    // Every 60s (odd ticks — the interval's first tick fires immediately, so the storage
+    // gauge is counted right after boot): the store's whole size and the per-registry
+    // artifact counts and logical bytes from the index (#446). The "total" storage_bytes
+    // label is the full physical footprint; per-registry is summed artifact size. Started,
+    // not awaited: on a large bucket the listing takes longer than a tick may run, and
+    // readiness does not depend on it. Skipped while the previous count still runs.
     if !tick_count.is_multiple_of(2) {
-        state.storage.refresh_total_size_cache().await;
-        metrics::STORAGE_BYTES
-            .with_label_values(&["total"])
-            .set(state.storage.total_size().await as i64);
-        // Per-registry artifact counts + logical bytes from the index, plus
-        // process uptime (#446). The "total" storage_bytes label above is the
-        // full physical footprint; per-registry is summed artifact size.
-        // A panic in an index builder must not end this loop: it also flushes
-        // tokens and expires upload sessions.
-        let gauges = std::panic::AssertUnwindSafe(refresh_artifact_gauges(
-            &state.repo_index,
-            &state.storage,
-            &state.enabled_registries,
-        ))
-        .catch_unwind()
-        .await;
-        if let Err(panic) = gauges {
-            supervise::report_panic("maintenance", &panic);
-        }
+        let storage = state.storage.clone();
+        let repo_index = Arc::clone(&state.repo_index);
+        let enabled = Arc::clone(&state.enabled_registries);
+        work.storage_size.start(async move {
+            storage.refresh_total_size_cache().await;
+            metrics::STORAGE_BYTES
+                .with_label_values(&["total"])
+                .set(storage.total_size().await as i64);
+            refresh_artifact_gauges(&repo_index, &storage, &enabled).await;
+        });
         metrics::UPTIME_SECONDS.set(state.start_time.elapsed().as_secs() as i64);
     }
+
+    // Every tick, the boot tick included so readiness is known before the first probe:
+    // one cheap request to the store (#869). The tick waits on nothing else.
+    state.storage.refresh_reachability().await;
 
     // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
     // + clean up stale proxy and upload temp files (#580)
@@ -3665,13 +3689,87 @@ mod maintenance_loop_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod maintenance_storage_tests {
-    //! The server's own maintenance loop and tick when a tick is cut at its deadline.
+    //! The server's own maintenance loop and tick over a store that is slow, silent or
+    //! large, and a tick cut at its deadline.
     use crate::test_helpers::{
-        create_test_context_with_auth, create_test_context_with_storage_and_config, outage_storage,
-        send,
+        body_bytes, create_test_context_with_auth, create_test_context_with_storage_and_config,
+        outage_storage, send, slow_listing_storage,
     };
     use axum::http::{Method, StatusCode};
     use std::time::Duration;
+
+    /// A large bucket: the first page of its listing answers at once, the whole listing
+    /// (1.6 s) takes longer than a tick may run (633 ms with a 2 s window). Readiness comes
+    /// from that first page, so `/ready` turns 200 and stays 200; the size, counted from the
+    /// whole listing apart from the tick, shows once that listing ends.
+    #[tokio::test]
+    async fn a_large_bucket_is_ready_and_its_size_follows() {
+        let storage = slow_listing_storage(Duration::from_millis(400));
+        for i in 0..5 {
+            storage
+                .put(&format!("raw/big/{i}.bin"), &[0u8; 100])
+                .await
+                .unwrap();
+        }
+        let ctx = create_test_context_with_storage_and_config(storage, |c| {
+            c.server.maintenance_stall_secs = 2
+        });
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
+
+        let mut ready = StatusCode::SERVICE_UNAVAILABLE;
+        for _ in 0..10 {
+            ready = send(&ctx.app, Method::GET, "/ready", "").await.status();
+            if ready == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(ready, StatusCode::OK, "ready from the first page");
+
+        let mut size = 0;
+        for _ in 0..40 {
+            let ready = send(&ctx.app, Method::GET, "/ready", "").await.status();
+            assert_eq!(
+                ready,
+                StatusCode::OK,
+                "readiness does not wait for the listing"
+            );
+            let health = send(&ctx.app, Method::GET, "/health", "").await;
+            assert_eq!(health.status(), StatusCode::OK);
+            let json: serde_json::Value =
+                serde_json::from_slice(&body_bytes(health).await).unwrap();
+            size = json["storage"]["total_size_bytes"].as_u64().unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(size >= 500, "the size of the whole listing: {size}");
+    }
+
+    /// Counting the store's size panics, late, every time: the panic is logged and counted
+    /// under `storage_size`, the next count starts again, and the loop and readiness go on.
+    #[tokio::test]
+    async fn a_panic_counting_the_size_is_reported_and_the_loop_goes_on() {
+        let panics = || {
+            super::metrics::TASK_PANICS_TOTAL
+                .with_label_values(&["storage_size"])
+                .get()
+        };
+        let before = panics();
+        let (storage, outage) = outage_storage();
+        outage.panic_counting_size();
+        let ctx = create_test_context_with_storage_and_config(storage, |c| {
+            c.server.maintenance_stall_secs = 2
+        });
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            panics() - before >= 2,
+            "each panic counted, and the count starts again after one"
+        );
+        assert_eq!(ctx.state.tasks.failing(), None);
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await.status();
+        assert_eq!(ready, StatusCode::OK, "readiness is not the size count");
+    }
 
     /// A store that accepted the connection and went silent: `/health` stays 200 for
     /// twice the stall window, `/ready` is 503; once the store answers again `/ready`
@@ -3710,7 +3808,7 @@ mod maintenance_storage_tests {
         assert_eq!(ctx.state.tasks.failing(), None);
     }
 
-    /// A tick cut while it flushes token `last_used` (its deadline can fall at any await)
+    /// A tick cut while the token `last_used` flush runs (its deadline can fall at any await)
     /// does not cut the flush: the timestamps it took still land on disk.
     #[tokio::test]
     async fn a_cut_tick_finishes_its_token_flush() {
@@ -3721,9 +3819,9 @@ mod maintenance_storage_tests {
             .unwrap();
         tokens.verify_token(&token).unwrap();
 
-        // Polled once and dropped: the flush has taken the pending timestamps.
-        let cut = futures::FutureExt::now_or_never(super::maintenance_tick(&ctx.state, 2));
-        assert!(cut.is_none(), "the tick is cut mid-flush");
+        // Polled once and dropped, wherever it was: the flush has taken the pending timestamps.
+        let work = super::MaintenanceWork::new();
+        let _ = futures::FutureExt::now_or_never(super::maintenance_tick(&ctx.state, 2, &work));
 
         let mut last_used = None;
         for _ in 0..50 {

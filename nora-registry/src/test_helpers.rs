@@ -642,6 +642,10 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         self.inner.backend_name()
     }
 
+    async fn refresh_reachability(&self) {
+        self.inner.refresh_reachability().await
+    }
+
     async fn refresh_total_size(&self) {
         self.inner.refresh_total_size().await
     }
@@ -703,6 +707,7 @@ const STORE_DOWN: u8 = 1;
 const STORE_READS_FAIL: u8 = 2;
 const STORE_READS_OF_FAIL: u8 = 3;
 const STORE_SILENT: u8 = 4;
+const STORE_SIZE_PANICS: u8 = 5;
 
 impl StorageOutage {
     /// Take the store down: every read, listing and write fails from now on.
@@ -726,6 +731,12 @@ impl StorageOutage {
     /// connection and never answers, until [`Self::end`].
     pub fn silence(&self) {
         self.0.store(STORE_SILENT, Ordering::SeqCst);
+    }
+
+    /// Make every count of the store's size panic after a while (a bug that shows late);
+    /// everything else answers.
+    pub fn panic_counting_size(&self) {
+        self.0.store(STORE_SIZE_PANICS, Ordering::SeqCst);
     }
 
     /// Bring the store back: operations waiting on a silent store go on, and every later one
@@ -853,8 +864,19 @@ impl crate::storage::StorageBackend for OutageBackend {
     }
 
     /// A store that is down refreshes nothing: its cached reachability goes stale.
+    async fn refresh_reachability(&self) {
+        self.outage.wait_answer().await;
+        if self.check().is_ok() {
+            self.inner.refresh_reachability().await;
+        }
+    }
+
     async fn refresh_total_size(&self) {
         self.outage.wait_answer().await;
+        if self.outage.mode() == STORE_SIZE_PANICS {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            panic!("a bug in counting the store's size");
+        }
         if self.check().is_ok() {
             self.inner.refresh_total_size().await;
         }
@@ -908,6 +930,106 @@ impl crate::storage::StorageBackend for OutageBackend {
         self.check_read(key)?;
         self.inner.get_range(key, start, end).await
     }
+}
+
+// ── A large bucket ──────────────────────────────────────────────────────────
+
+/// An in-memory object store whose listing answers its first object at once and each later
+/// one after `delay`, as a large bucket listed page by page over a slow link: one page is
+/// quick, the whole listing is not. Everything else is the in-memory store as is.
+#[derive(Debug)]
+pub struct SlowListing {
+    inner: object_store::memory::InMemory,
+    delay: std::time::Duration,
+}
+
+impl std::fmt::Display for SlowListing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlowListing")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for SlowListing {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        use futures::StreamExt;
+        let delay = self.delay;
+        self.inner
+            .list(prefix)
+            .enumerate()
+            .then(move |(n, item)| async move {
+                if n > 0 {
+                    tokio::time::sleep(delay).await;
+                }
+                item
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A [`Storage`] over a [`SlowListing`] store with `delay` between listed objects.
+pub fn slow_listing_storage(delay: std::time::Duration) -> Storage {
+    let store = SlowListing {
+        inner: object_store::memory::InMemory::new(),
+        delay,
+    };
+    Storage::from_backend(Arc::new(crate::storage::ObjectStorage::over(Box::new(
+        store,
+    ))))
 }
 
 // ── Per-registry artifact counts, each read from its real source ────────────

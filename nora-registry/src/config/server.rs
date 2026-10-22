@@ -57,8 +57,8 @@ pub struct ServerConfig {
     /// until one closes. Keep it below the process's open-file limit. Default 4096.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
-    /// Seconds without a finished maintenance tick (token flush, upload-session expiry,
-    /// storage refresh; one every 30 s) after which `/health` answers 503, so an
+    /// Seconds without a finished maintenance tick (upload-session expiry, storage
+    /// reachability; one every 30 s) after which `/health` answers 503, so an
     /// orchestrator restarts the process. A tick is cut, and counts as finished, after a third
     /// of what this leaves past one tick (90 s for the default), so one waiting on a store
     /// that does not answer fails `/ready`, not liveness. Default 300; at least 90, three
