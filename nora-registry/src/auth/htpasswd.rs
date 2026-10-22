@@ -16,6 +16,10 @@ const ACCEPTED_CAPACITY: usize = 4096;
 /// Refused pairs remembered at most; past it that memory starts over, the accepted pairs kept.
 const REFUSED_CAPACITY: usize = 4096;
 
+/// Locks a check of a pair takes first, the one its key picks: requests checking one pair at
+/// the same time queue on it, and each after the first finds the first one's verdict.
+const PAIR_LOCKS: usize = 64;
+
 /// Htpasswd-based authentication.
 ///
 /// bcrypt is slow on purpose, so it never runs on an async worker: checks run on the
@@ -40,9 +44,29 @@ pub struct HtpasswdAuth {
     /// bcrypt checks running at once at most: half the cores, so a flood of logins leaves
     /// the rest of the CPU to the requests.
     checks: Semaphore,
+    /// [`PAIR_LOCKS`] locks, taken before a permit of `checks`.
+    pairs: [tokio::sync::Mutex<()>; PAIR_LOCKS],
     /// bcrypt verifications run, for tests that prove a path runs none.
     #[cfg(test)]
     pub(crate) bcrypt_runs: std::sync::atomic::AtomicUsize,
+}
+
+/// Where a check of a pair stands once its lock is taken.
+enum Begun<'a> {
+    /// A request that held the lock before left the verdict.
+    Remembered(bool),
+    /// Nobody has checked the pair: this request does.
+    Unchecked(Unchecked<'a>),
+    /// No permit can be had: the process is shutting down.
+    Closed,
+}
+
+/// A pair nobody has checked, its lock and a permit held: what [`HtpasswdAuth::bcrypt`] runs
+/// under, and made only by [`HtpasswdAuth::begin`], after it read the remembered verdicts.
+struct Unchecked<'a> {
+    key: [u8; 32],
+    _pair: tokio::sync::MutexGuard<'a, ()>,
+    _permit: tokio::sync::SemaphorePermit<'a>,
 }
 
 /// How many accepted and refused pairs [`HtpasswdAuth`] remembers.
@@ -98,6 +122,7 @@ impl HtpasswdAuth {
                 },
                 key: rand::random(),
                 checks: Semaphore::new((cores / 2).max(1)),
+                pairs: std::array::from_fn(|_| tokio::sync::Mutex::new(())),
                 #[cfg(test)]
                 bcrypt_runs: Default::default(),
             })
@@ -114,22 +139,42 @@ impl HtpasswdAuth {
         if let Some(verdict) = self.remembered(&key) {
             return verdict;
         }
-        let Ok(_permit) = self.checks.acquire().await else {
-            return false;
-        };
-        // Another request may have checked the same pair while this one waited.
-        if let Some(verdict) = self.remembered(&key) {
-            return verdict;
+        match self.begin(key).await {
+            Begun::Remembered(verdict) => verdict,
+            Begun::Unchecked(unchecked) => self.bcrypt(unchecked, hash, password).await,
+            Begun::Closed => false,
         }
+    }
+
+    /// Take the lock of the pair `key`, then a permit to check: unless a request that held
+    /// the lock before this one left the verdict, which is then this one's too.
+    async fn begin(&self, key: [u8; 32]) -> Begun<'_> {
+        let pair = self.pairs[usize::from(key[0]) % PAIR_LOCKS].lock().await;
+        if let Some(verdict) = self.remembered(&key) {
+            return Begun::Remembered(verdict);
+        }
+        match self.checks.acquire().await {
+            Ok(permit) => Begun::Unchecked(Unchecked {
+                key,
+                _pair: pair,
+                _permit: permit,
+            }),
+            Err(_) => Begun::Closed,
+        }
+    }
+
+    /// Check `password` against `hash` with bcrypt, on the blocking pool, and remember the
+    /// verdict before the pair's lock is let go.
+    async fn bcrypt(&self, unchecked: Unchecked<'_>, hash: &str, password: &str) -> bool {
         #[cfg(test)]
         self.bcrypt_runs
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let (hash, password) = (hash.clone(), Zeroizing::new(password.to_owned()));
+        let (hash, password) = (hash.to_owned(), Zeroizing::new(password.to_owned()));
         match tokio::task::spawn_blocking(move || bcrypt::verify(password.as_str(), &hash)).await {
             Ok(checked) => {
                 // A hash bcrypt cannot read matches nothing, now or later.
                 let verdict = checked.unwrap_or(false);
-                self.remember(key, verdict);
+                self.remember(unchecked.key, verdict);
                 verdict
             }
             // The check panicked: refuse, and check again next time.
@@ -486,6 +531,27 @@ mod tests {
             None,
             "past the capacity it starts over"
         );
+    }
+
+    /// Requests that check one pair at the same time, on a process that has not checked it
+    /// yet, pay bcrypt once between them, on as many threads as the checks may use: the rest
+    /// get that check's verdict. The same for a refused pair.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn one_pair_checked_by_many_at_once_pays_bcrypt_once() {
+        let file = create_test_htpasswd(&[("alice", "pw")]);
+        let auth = std::sync::Arc::new(HtpasswdAuth::from_file(file.path()).unwrap());
+        for (password, verdict) in [("pw", true), ("wrong", false)] {
+            let before = runs(&auth);
+            let checks = (0..16).map(|_| {
+                let auth = std::sync::Arc::clone(&auth);
+                let check = tokio::spawn(async move { auth.verify("alice", password).await });
+                check
+            });
+            for checked in futures::future::join_all(checks).await {
+                assert_eq!(checked.unwrap(), verdict, "{password}");
+            }
+            assert_eq!(runs(&auth) - before, 1, "{password}: bcrypt more than once");
+        }
     }
 
     /// One username and password make one key; moving bytes across the boundary between
