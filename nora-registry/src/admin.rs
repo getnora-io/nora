@@ -177,12 +177,6 @@ fn default_admin_token_role() -> String {
     "read".to_string()
 }
 
-#[derive(Serialize)]
-struct AdminCreateTokenResponse {
-    token: String,
-    expires_in_days: u64,
-}
-
 /// Mint an API token of any role — including `admin` — WITHOUT the
 /// `auth.admin_users` self-service check.
 ///
@@ -262,11 +256,7 @@ async fn admin_create_token(
                 &minted.role,
                 minted.ttl_secs,
             ));
-            Json(AdminCreateTokenResponse {
-                token: minted.token,
-                expires_in_days: minted.ttl_secs / crate::tokens::SECS_PER_DAY,
-            })
-            .into_response()
+            Json(crate::auth::MintedTokenResponse::from(minted)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

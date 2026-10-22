@@ -16,7 +16,7 @@ mod token_routes;
 pub use htpasswd::HtpasswdAuth;
 pub use namespace::{enforce_namespace_scope, NamespaceAuthority};
 pub use oidc::OidcValidator;
-pub use token_routes::{token_routes, TokenListItem, TokenListResponse};
+pub use token_routes::{token_routes, MintedTokenResponse, TokenListItem, TokenListResponse};
 
 /// Authenticated username carried in request extensions after successful auth.
 #[derive(Clone, Debug)]
@@ -3669,6 +3669,73 @@ Jd74nq6dNCjpWG4drIsyhqX+
                 .is_empty(),
             "an expired JWT minted a token on the admin route"
         );
+    }
+
+    /// The admin route answers the lifetime it granted in seconds: an OIDC admin
+    /// whose JWT has 600 s left asks for 30 days and is told what the token store
+    /// holds, which `expires_in_days` (kept as it was) rounds down to 0; an admin
+    /// holding an opaque token, with no JWT to outlive, is told the 30 days.
+    #[tokio::test]
+    async fn the_admin_route_answers_the_lifetime_granted_in_seconds() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let mint = |ctx: &TestContext, bearer: String| {
+            let app = ctx.app.clone();
+            async move {
+                let response = send_with_headers(
+                    &app,
+                    Method::POST,
+                    "/api/v1/admin/tokens",
+                    vec![
+                        ("authorization", &bearer),
+                        ("content-type", "application/json"),
+                    ],
+                    br#"{"username":"svc","role":"read","ttl_days":30}"#.to_vec(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                serde_json::from_slice::<serde_json::Value>(&body_bytes(response).await).unwrap()
+            }
+        };
+        let stored = |ctx: &TestContext| {
+            let entries = ctx.state.tokens.as_ref().unwrap().list_tokens("svc");
+            assert_eq!(entries.len(), 1, "exactly one token minted for svc");
+            entries[0].expires_at - entries[0].created_at
+        };
+        let now = now_secs();
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/admin-free:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+        let json = mint(&ctx, format!("Bearer {jwt}")).await;
+        let secs = json["expires_in_secs"].as_u64().expect("expires_in_secs");
+        assert!(secs <= 600, "the answer outlives the JWT: {json}");
+        assert_eq!(secs, stored(&ctx), "the answer is not what the store holds");
+        assert_eq!(json["expires_in_days"], 0, "{json}");
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let admin = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("root", 30, None, crate::tokens::Role::Admin)
+            .unwrap();
+        let json = mint(&ctx, format!("Bearer {admin}")).await;
+        assert_eq!(json["expires_in_secs"], 30 * 86_400, "{json}");
+        assert_eq!(stored(&ctx), 30 * 86_400);
+        assert_eq!(json["expires_in_days"], 30, "{json}");
     }
 
     /// A JWT the validator still accepts inside its leeway, though its `exp`

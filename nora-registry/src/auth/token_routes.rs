@@ -15,7 +15,7 @@ use std::net::SocketAddr;
 use utoipa::ToSchema;
 
 use crate::audit::AuditEntry;
-use crate::tokens::{ttl_secs_for_days, Role, SECS_PER_DAY};
+use crate::tokens::{ttl_secs_for_days, MintedToken, Role, SECS_PER_DAY};
 use crate::AppState;
 
 use super::resolve_client_ip;
@@ -39,10 +39,28 @@ fn default_ttl() -> u64 {
     30
 }
 
-#[derive(Serialize)]
-pub struct CreateTokenResponse {
+/// What a route that mints a token answers: the token and the lifetime granted,
+/// which a cap — the longest lifetime a token may have, or what is left of the
+/// credential an OIDC caller mints with — may have made shorter than asked.
+#[derive(Serialize, ToSchema)]
+#[schema(as = TokenResponse)]
+pub struct MintedTokenResponse {
+    /// Generated API token (starts with nra_)
     pub token: String,
+    /// Whole days the token lives, rounded down: 0 for a token living less than a day
     pub expires_in_days: u64,
+    /// Seconds the token lives
+    pub expires_in_secs: u64,
+}
+
+impl From<MintedToken> for MintedTokenResponse {
+    fn from(minted: MintedToken) -> Self {
+        Self {
+            token: minted.token,
+            expires_in_days: minted.ttl_secs / SECS_PER_DAY,
+            expires_in_secs: minted.ttl_secs,
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -151,11 +169,7 @@ async fn create_token(
                 &minted.role,
                 minted.ttl_secs,
             ));
-            Json(CreateTokenResponse {
-                token: minted.token,
-                expires_in_days: minted.ttl_secs / SECS_PER_DAY,
-            })
-            .into_response()
+            Json(MintedTokenResponse::from(minted)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
@@ -336,13 +350,21 @@ mod tests {
 
     #[test]
     fn test_create_token_response_serialization() {
-        let resp = CreateTokenResponse {
+        let resp = MintedTokenResponse::from(MintedToken {
             token: "nora_abc123".to_string(),
-            expires_in_days: 30,
-        };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("nora_abc123"));
-        assert!(json.contains("30"));
+            owner: "ci".to_string(),
+            role: Role::Read,
+            ttl_secs: 30 * SECS_PER_DAY + 600,
+        });
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "token": "nora_abc123",
+                "expires_in_days": 30,
+                "expires_in_secs": 30 * SECS_PER_DAY + 600,
+            })
+        );
     }
 }
 
@@ -446,6 +468,26 @@ mod mint_tests {
                 "a token id in the audit log"
             );
         }
+    }
+
+    /// The password route answers the lifetime granted in seconds as well, the
+    /// same field the admin route answers it in.
+    #[tokio::test]
+    async fn api_tokens_answers_the_lifetime_granted_in_seconds() {
+        let ctx = create_test_context_with_auth_and_config(&[("alice", "alicepw")], |cfg| {
+            cfg.auth.admin_users = vec!["alice".to_string()];
+        });
+        let (status, json) = post_json(
+            &ctx,
+            "/api/tokens",
+            None,
+            r#"{"username":"alice","password":"alicepw","ttl_days":30,"role":"admin"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["expires_in_secs"], 30 * 86_400, "{json}");
+        assert_eq!(json["expires_in_days"], 30, "{json}");
+        assert_eq!(lifetime_of(&ctx, "alice"), 30 * 86_400);
     }
 
     #[tokio::test]
