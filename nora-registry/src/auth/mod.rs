@@ -1170,6 +1170,40 @@ mod tests {
         assert!(tracker.check_blocked(&ip2, "alice").is_none());
     }
 
+    /// The lockout counts by the whole username: a name sharing a prefix or
+    /// a suffix with a locked-out one, differing in case or in one trailing
+    /// byte of a long name, is another account and is not held.
+    #[test]
+    fn the_lockout_keys_the_whole_username() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let long = "ci-deploy-production-runner-01";
+        for (locked, others) in [
+            (
+                "alice",
+                &["alicia", "ali", "alice2", "Alice", "alice ", "", "xalice"][..],
+            ),
+            (
+                long,
+                &[
+                    "ci-deploy-production-runner-02",
+                    "ci-deploy-production-runner-0",
+                ][..],
+            ),
+        ] {
+            let tracker = AuthFailureTracker::new(5, 900);
+            for _ in 0..5 {
+                tracker.record_failure(ip, locked);
+            }
+            assert!(tracker.check_blocked(&ip, locked).is_some(), "{locked}");
+            for other in others {
+                assert!(
+                    tracker.check_blocked(&ip, other).is_none(),
+                    "locking out {locked:?} held {other:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_auth_failure_tracker_cleanup() {
         let tracker = AuthFailureTracker::new(3, 1); // 1 sec max lockout
@@ -4621,6 +4655,34 @@ mod client_address_tests {
         assert!(quiet.is_empty(), "{quiet:#?}");
     }
 
+    /// Each forwarding header NORA reads is ignored from a peer outside
+    /// `trusted_proxies`, sent alone or with the other, and NORA says so once
+    /// per setting, never with the header's content.
+    #[test]
+    fn every_forwarding_header_from_an_untrusted_peer_is_warned_about() {
+        let sent: [(&[&str], Option<&str>); 3] = [
+            (&["203.0.113.10"], None),
+            (&[], Some("203.0.113.10")),
+            (&["203.0.113.10"], Some("203.0.113.10")),
+        ];
+        for (xff, real_ip) in sent {
+            let trusted = TrustedProxies::parse("10.9.9.9");
+            let warnings = warnings_of(|| {
+                for _ in 0..2 {
+                    let ip = resolve("127.0.0.1", xff, real_ip, &trusted);
+                    assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+                }
+            });
+            assert_eq!(
+                warnings.len(),
+                1,
+                "xff {xff:?} real_ip {real_ip:?}: {warnings:#?}"
+            );
+            assert!(warnings[0].contains("127.0.0.1"), "{}", warnings[0]);
+            assert!(!warnings[0].contains("203.0.113.10"), "{}", warnings[0]);
+        }
+    }
+
     /// Send a request from `peer` (the TCP address the server sees).
     async fn send_from(
         app: &axum::Router,
@@ -4981,5 +5043,208 @@ mod client_address_tests {
             StatusCode::OK,
             "a valid token as the Basic password is refused while locked out"
         );
+    }
+
+    /// The routes that take a username and password in their JSON body, and
+    /// the status each answers once the password is accepted (the revoke names
+    /// a token alice does not have).
+    const TOKEN_ROUTES: [(&str, StatusCode); 3] = [
+        ("/api/tokens", StatusCode::OK),
+        ("/api/tokens/list", StatusCode::OK),
+        ("/api/tokens/revoke", StatusCode::NOT_FOUND),
+    ];
+
+    /// POST a token-route body for `alice` with `password` from `peer`.
+    async fn token_route_from(
+        app: &axum::Router,
+        peer: &str,
+        uri: &str,
+        password: &str,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        let body = format!(
+            r#"{{"username":"alice","password":"{password}","hash_prefix":"0123456789abcdef"}}"#
+        );
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let mut request = builder.body(Body::from(body)).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 4000)));
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    /// Lock alice out at `ip` for half a minute (ten failures), so no test
+    /// step races the end of the lockout.
+    fn lock_out_alice(tracker: &super::AuthFailureTracker, ip: &str) {
+        for _ in 0..10 {
+            tracker.record_failure(ip.parse().unwrap(), "alice");
+        }
+    }
+
+    /// Every token route keeps the lockout as the middleware does: it counts
+    /// a wrong password, a login clears the count, and a locked-out username
+    /// gets no password checked, however the lockout was earned. Another
+    /// address is not held.
+    #[tokio::test]
+    async fn every_token_route_keeps_the_lockout() {
+        let client = "203.0.113.5";
+        let ip: IpAddr = client.parse().unwrap();
+        for (uri, served) in TOKEN_ROUTES {
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            let tracker = &ctx.state.auth_failures;
+
+            // The wrong password that reaches the threshold is counted here.
+            for _ in 0..4 {
+                tracker.record_failure(ip, "alice");
+            }
+            assert_eq!(
+                token_route_from(&ctx.app, client, uri, "wrong", &[]).await,
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+            assert!(
+                tracker.check_blocked(&ip, "alice").is_some(),
+                "{uri} does not count a wrong password"
+            );
+
+            // A login clears the account's count.
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            let tracker = &ctx.state.auth_failures;
+            for _ in 0..4 {
+                tracker.record_failure(ip, "alice");
+            }
+            assert_eq!(
+                token_route_from(&ctx.app, client, uri, "alicepw", &[]).await,
+                served,
+                "{uri}"
+            );
+            tracker.record_failure(ip, "alice");
+            assert!(
+                tracker.check_blocked(&ip, "alice").is_none(),
+                "{uri}: a login did not clear the failures"
+            );
+
+            // Locked out: the right password is refused, the address is
+            // named in no way the client chooses, another address is served.
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            lock_out_alice(&ctx.state.auth_failures, client);
+            assert_eq!(
+                token_route_from(&ctx.app, client, uri, "alicepw", &[]).await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{uri} checks the password of a locked-out username"
+            );
+            assert_eq!(
+                token_route_from(
+                    &ctx.app,
+                    client,
+                    uri,
+                    "alicepw",
+                    &[
+                        ("x-forwarded-for", "198.51.100.7"),
+                        ("x-real-ip", "198.51.100.7")
+                    ]
+                )
+                .await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{uri}: forwarding headers from an untrusted peer escape the lockout"
+            );
+            assert_eq!(
+                token_route_from(&ctx.app, "192.0.2.77", uri, "alicepw", &[]).await,
+                served,
+                "{uri}: another address is held"
+            );
+        }
+    }
+
+    /// A lockout earned on one token route holds on every other, and on the
+    /// middleware's Basic login: it is one count per account, whichever route
+    /// the guesses came by.
+    #[tokio::test]
+    async fn a_lockout_earned_on_one_token_route_holds_on_every_route() {
+        let client = "203.0.113.5";
+        for (earned_on, _) in TOKEN_ROUTES {
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            for _ in 0..4 {
+                ctx.state
+                    .auth_failures
+                    .record_failure(client.parse().unwrap(), "alice");
+            }
+            assert_eq!(
+                token_route_from(&ctx.app, client, earned_on, "wrong", &[]).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert!(
+                ctx.state
+                    .auth_failures
+                    .check_blocked(&client.parse().unwrap(), "alice")
+                    .is_some(),
+                "{earned_on} does not count a wrong password"
+            );
+            // Lengthen the lockout so no step below races its end.
+            lock_out_alice(&ctx.state.auth_failures, client);
+            for (uri, _) in TOKEN_ROUTES {
+                assert_eq!(
+                    token_route_from(&ctx.app, client, uri, "alicepw", &[]).await,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "locked out on {earned_on}, served on {uri}"
+                );
+            }
+            let auth = basic("alice", "alicepw");
+            assert_eq!(
+                send_from(
+                    &ctx.app,
+                    client,
+                    Method::GET,
+                    "/v2/",
+                    &[("authorization", &auth)]
+                )
+                .await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "locked out on {earned_on}, served by the middleware"
+            );
+        }
+    }
+
+    /// The token routes key a client by its canonical address, as the
+    /// middleware does: `::ffff:a.b.c.d` from a dual-stack socket is the
+    /// client `a.b.c.d`, for the failures it adds and the lockout it meets.
+    #[tokio::test]
+    async fn the_token_routes_key_a_v4_mapped_peer_as_its_ipv4_address() {
+        for (uri, _) in TOKEN_ROUTES {
+            // Locked out as 203.0.113.5, refused as ::ffff:203.0.113.5.
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            lock_out_alice(&ctx.state.auth_failures, "203.0.113.5");
+            assert_eq!(
+                token_route_from(&ctx.app, "::ffff:203.0.113.5", uri, "alicepw", &[]).await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{uri}: the mapped peer is another client"
+            );
+
+            // A wrong password from ::ffff:198.51.100.9 counts for 198.51.100.9.
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            let ip: IpAddr = "198.51.100.9".parse().unwrap();
+            for _ in 0..4 {
+                ctx.state.auth_failures.record_failure(ip, "alice");
+            }
+            assert_eq!(
+                token_route_from(&ctx.app, "::ffff:198.51.100.9", uri, "wrong", &[]).await,
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+            assert!(
+                ctx.state
+                    .auth_failures
+                    .check_blocked(&ip, "alice")
+                    .is_some(),
+                "{uri}: a failure from the mapped peer is counted elsewhere"
+            );
+        }
     }
 }
