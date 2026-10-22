@@ -395,6 +395,9 @@ pub struct AppState {
     /// The same client, except that it never follows a redirect: for a format whose answer
     /// depends on what each hop said (hf: the commit rides on the Hub's redirect).
     pub http_client_no_redirect: reqwest::Client,
+    /// The same client, except that it follows a redirect only on the origin of the URL asked
+    /// (npm tarballs: a private package's name goes to no other host).
+    pub http_client_same_origin: reqwest::Client,
     /// Canonical repo ids the Hugging Face upstream named, for curation of aliases (#579).
     pub hf_canonical_ids: Arc<registry::hf::CanonicalIds>,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
@@ -597,6 +600,34 @@ fn build_http_client(
 /// tests run against the very client the server uses.
 pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
     build_http_client(tls, None, false, reqwest::redirect::Policy::none())
+}
+
+/// The client that follows a redirect only on the origin (scheme, host and port) of the URL
+/// asked, up to reqwest's default ten hops, for a format whose upstream names a private package
+/// in the path: a hop to another origin is handed back unfollowed, so that name and the request
+/// go to no host NORA was not given. Built by [`build_http_client`], here for the test context
+/// too.
+pub(crate) fn build_same_origin_client(tls: &TlsConfig) -> reqwest::Client {
+    build_http_client(tls, None, false, same_origin_redirects())
+}
+
+pub(crate) fn same_origin_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        // The first of the previous URLs is the one asked.
+        let on_origin = attempt.previous().first().is_some_and(|asked| {
+            let next = attempt.url();
+            asked.scheme() == next.scheme()
+                && asked.host_str() == next.host_str()
+                && asked.port_or_known_default() == next.port_or_known_default()
+        });
+        if !on_origin {
+            attempt.stop()
+        } else if attempt.previous().len() > 10 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
 }
 
 /// Build the `/health` probe URL from the configured listen host. Wildcard
@@ -3332,6 +3363,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         reqwest::redirect::Policy::default(),
     );
     let http_client_no_redirect = build_no_redirect_client(&config.tls);
+    let http_client_same_origin = build_same_origin_client(&config.tls);
     log_outbound_proxy();
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)
@@ -3500,6 +3532,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
         http_client_no_redirect,
+        http_client_same_origin,
         hf_canonical_ids: Arc::default(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),

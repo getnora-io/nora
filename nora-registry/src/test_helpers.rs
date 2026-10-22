@@ -354,7 +354,7 @@ fn build_context_full(
     } else {
         None
     };
-    let (http_client, http_client_no_redirect) = match egress_proxy {
+    let (http_client, http_client_no_redirect, http_client_same_origin) = match egress_proxy {
         Some(url) => {
             let proxy = || reqwest::Proxy::all(url).expect("egress proxy url");
             (
@@ -370,11 +370,18 @@ fn build_context_full(
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .expect("egress client"),
+                reqwest::Client::builder()
+                    .proxy(proxy())
+                    .pool_max_idle_per_host(0)
+                    .redirect(crate::same_origin_redirects())
+                    .build()
+                    .expect("egress client"),
             )
         }
         None => (
             reqwest::Client::new(),
             crate::build_no_redirect_client(&config.tls),
+            crate::build_same_origin_client(&config.tls),
         ),
     };
     let (tasks, maintenance) = crate::supervision(&config.server);
@@ -393,6 +400,7 @@ fn build_context_full(
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
         http_client_no_redirect,
+        http_client_same_origin,
         hf_canonical_ids: Arc::default(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),

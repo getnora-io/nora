@@ -3649,6 +3649,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             repo_index: Arc::new(crate::repo_index::RepoIndex::new()),
             http_client: reqwest::Client::new(),
             http_client_no_redirect: reqwest::Client::new(),
+            http_client_same_origin: reqwest::Client::new(),
             hf_canonical_ids: Arc::default(),
             upload_sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             publish_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),

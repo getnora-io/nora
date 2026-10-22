@@ -457,6 +457,31 @@ where
                     return result;
                 }
                 let status = response.status().as_u16();
+                if response.status().is_redirection() {
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry_str, "3xx"])
+                        .observe(elapsed);
+                    // A redirect the client did not follow (one off the upstream's origin, see
+                    // `build_same_origin_client`) is the upstream's answer, not its failure: it
+                    // is not asked again, and the breaker sees it alive. Only the host it pointed
+                    // to is logged; the path names the package.
+                    let to = response
+                        .headers()
+                        .get(header::LOCATION)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| reqwest::Url::parse(url).ok()?.join(v).ok())
+                        .and_then(|v| v.host_str().map(str::to_string))
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        registry = registry_str,
+                        url,
+                        status,
+                        to,
+                        "upstream redirected off its origin, not followed"
+                    );
+                    cb.record_alive(&cb_key, probe);
+                    return Err(ProxyError::Upstream(status));
+                }
                 if (400..500).contains(&status) {
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "4xx"])

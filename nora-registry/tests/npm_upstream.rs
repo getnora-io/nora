@@ -1,8 +1,8 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-//! What `nora serve` writes down of an npm upstream's URL, where the handler tests build their
-//! own context.
+//! What `nora serve` does with an npm upstream, where the handler tests build their own
+//! context: the client it fetches tarballs with, and what it writes down of the upstream's URL.
 //! No test here reaches the network: upstreams are local servers on threads of the test.
 
 use std::io::{Read, Write};
@@ -128,6 +128,58 @@ fn upstream(answer: impl Fn(&str) -> String + Send + 'static) -> Upstream {
 }
 
 const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+#[test]
+fn the_served_npm_client_does_not_follow_a_redirect_to_another_origin() {
+    let foreign = upstream(|_| {
+        "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nELSEWHERE".to_string()
+    });
+    let to = foreign.port;
+    let registry = upstream(move |line| {
+        if line.starts_with("GET /pkg/-/pkg-1.0.0.tgz ") {
+            format!(
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{to}/files/pkg-1.0.0.tgz\r\n\
+                 Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        } else {
+            NOT_FOUND.to_string()
+        }
+    });
+    let server = serve(&[(
+        "NORA_NPM_PROXY",
+        &format!("http://nora-user:s3cret-pass@127.0.0.1:{}", registry.port),
+    )]);
+    let status = status_of(server.port, "/npm/pkg/-/pkg-1.0.0.tgz");
+    assert!(status.contains(" 502 "), "{status}");
+    // The refusal is logged with the upstream's URL, its credential masked.
+    let log = std::fs::read_to_string(server.dir.path().join("nora.log")).unwrap();
+    assert!(
+        log.contains(&format!("***@127.0.0.1:{}", registry.port)),
+        "the log does not name the upstream: {log}"
+    );
+    assert!(
+        !log.contains("s3cret-pass") && !log.contains("nora-user"),
+        "{log}"
+    );
+    // Of where it pointed, only the host: the path names the package.
+    assert!(log.contains(r#""to":"127.0.0.1""#), "{log}");
+    assert!(!log.contains("/files/pkg-1.0.0.tgz"), "{log}");
+    assert!(
+        registry
+            .seen
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("/pkg/-/pkg-1.0.0.tgz")),
+        "the registry was not asked: {:?}",
+        registry.seen.lock().unwrap()
+    );
+    assert!(
+        foreign.seen.lock().unwrap().is_empty(),
+        "{:?}",
+        foreign.seen.lock().unwrap()
+    );
+}
 
 /// The quarantine ledger and the server's log name the upstream a tarball came from without
 /// the credential in its URL.

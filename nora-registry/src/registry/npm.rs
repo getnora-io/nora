@@ -1196,8 +1196,10 @@ async fn fetch_upstream_tarball(
 ) -> (String, Result<Vec<u8>, ProxyError>) {
     // A link is asked with the upstream's userinfo, and named without it.
     let fetch = |asked: String, named: String| async move {
+        // A redirect off the upstream's origin is not followed (502): the package is private
+        // to the upstream as far as NORA knows.
         let fetched = proxy_fetch(
-            &state.http_client,
+            &state.http_client_same_origin,
             &asked,
             Duration::from_secs(state.config.npm.proxy_timeout),
             auth,
@@ -11401,5 +11403,271 @@ mod upstream_origin_tarballs {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+}
+
+/// An upstream may answer a tarball with a redirect. One on its own origin is followed; one to
+/// any other origin is not: the package's name goes to no host NORA was not given, and no bytes
+/// from it are cached under that name. The download fails as on an upstream failure.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tarball_redirects {
+    use crate::config::{NpmConfig, NpmProxyEntry};
+    use crate::secrets::ProtectedString;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{any, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TARBALL: &str = "/pkg/-/pkg-1.0.0.tgz";
+
+    /// 200 to anything, so only its request log tells.
+    async fn open_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ELSEWHERE".to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A registry at the root of its origin with `pkg` 1.0.0, whose tarball path answers what
+    /// `answer` makes of the registry.
+    async fn registry(answer: impl FnOnce(&MockServer) -> ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        let doc = serde_json::json!({
+            "name": "pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0": {
+                "name": "pkg", "version": "1.0.0",
+                "dist": { "tarball": format!("{}{TARBALL}", server.uri()) },
+            } },
+            "time": { "1.0.0": "2020-01-02T00:00:00.000Z" },
+        });
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(doc.to_string()))
+            .mount(&server)
+            .await;
+        let answer = answer(&server);
+        Mock::given(method("GET"))
+            .and(path(TARBALL))
+            .respond_with(answer)
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn redirect(to: &str) -> ResponseTemplate {
+        ResponseTemplate::new(302).insert_header("location", to)
+    }
+
+    fn port_of(server: &MockServer) -> u16 {
+        reqwest::Url::parse(&server.uri()).unwrap().port().unwrap()
+    }
+
+    /// The upstream's circuit breaker is on, at its default threshold.
+    fn context(public: &str, private: &str) -> TestContext {
+        let mut npm: NpmConfig = toml::from_str(&format!(
+            r#"proxies = ["{public}", {{ url = "{private}", scopes = ["@vendor"], auth_bearer_env = "NORA_NPM_VENDOR_TOKEN" }}]"#
+        ))
+        .unwrap();
+        if let NpmProxyEntry::Full(p) = &mut npm.proxies[1] {
+            p.auth_bearer = Some(ProtectedString::from("vendor-tok"));
+        }
+        let proxies = npm.proxies;
+        create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.server.public_url = Some("http://nora.example".to_string());
+            cfg.circuit_breaker.enabled = true;
+        })
+    }
+
+    async fn get(ctx: &TestContext, uri: &str) -> (StatusCode, Vec<u8>) {
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        let status = resp.status();
+        (status, body_bytes(resp).await.to_vec())
+    }
+
+    async fn asked(server: &MockServer) -> Vec<String> {
+        let requests = server.received_requests().await.unwrap();
+        requests.iter().map(|r| r.url.path().to_string()).collect()
+    }
+
+    async fn tarball_asks(server: &MockServer) -> usize {
+        asked(server).await.iter().filter(|p| *p == TARBALL).count()
+    }
+
+    /// Tarballs and their digests NORA keeps.
+    async fn cached_tarballs(ctx: &TestContext) -> Vec<String> {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let keys = ctx.state.storage.list("npm/").await.unwrap();
+        keys.into_iter().filter(|k| k.contains(".tgz")).collect()
+    }
+
+    /// Refused on every download, more of them than the breaker's threshold: a redirect is the
+    /// upstream's answer, not its failure, so it is neither asked again nor cut off.
+    #[tokio::test]
+    async fn a_redirect_to_another_origin_is_not_followed() {
+        let foreign = open_server().await;
+        let to = format!("{}/files/pkg-1.0.0.tgz", foreign.uri());
+        let upstream = registry(|_| redirect(&to)).await;
+        let private = open_server().await;
+        let ctx = context(&upstream.uri(), &private.uri());
+        let downloads = crate::config::CircuitBreakerConfig::default().failure_threshold + 1;
+        for _ in 0..downloads {
+            let (status, body) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "{}",
+                String::from_utf8_lossy(&body)
+            );
+        }
+        assert!(
+            asked(&foreign).await.is_empty(),
+            "{:?}",
+            asked(&foreign).await
+        );
+        assert!(
+            cached_tarballs(&ctx).await.is_empty(),
+            "{:?}",
+            cached_tarballs(&ctx).await
+        );
+        assert_eq!(tarball_asks(&upstream).await, downloads as usize);
+    }
+
+    /// Another host, port or scheme is another origin, each alone: the redirect is answered
+    /// 502 after one ask, whatever is at its target.
+    #[tokio::test]
+    async fn another_host_port_or_scheme_is_another_origin() {
+        let foreign = open_server().await;
+        let foreign_port = port_of(&foreign);
+        for case in ["host", "port", "scheme"] {
+            let target = |own: u16| match case {
+                "host" => format!("http://localhost:{own}/pkg/-/pkg-1.0.0.tgz"),
+                "port" => format!("http://127.0.0.1:{foreign_port}/pkg/-/pkg-1.0.0.tgz"),
+                _ => format!("https://127.0.0.1:{own}/pkg/-/pkg-1.0.0.tgz"),
+            };
+            let upstream = registry(|server| redirect(&target(port_of(server)))).await;
+            let ctx = context(&upstream.uri(), &open_server().await.uri());
+            let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{case}");
+            assert_eq!(tarball_asks(&upstream).await, 1, "{case}");
+            assert!(cached_tarballs(&ctx).await.is_empty(), "{case}");
+        }
+        assert!(
+            asked(&foreign).await.is_empty(),
+            "{:?}",
+            asked(&foreign).await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_on_the_same_origin_is_followed() {
+        for to in [
+            "/files/pkg-1.0.0.tgz".to_string(),
+            "http://127.0.0.1:{port}/files/pkg-1.0.0.tgz".to_string(),
+        ] {
+            let upstream =
+                registry(|server| redirect(&to.replace("{port}", &port_of(server).to_string())))
+                    .await;
+            Mock::given(method("GET"))
+                .and(path("/files/pkg-1.0.0.tgz"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UPSTREAM-TGZ".to_vec()))
+                .mount(&upstream)
+                .await;
+            let ctx = context(&upstream.uri(), &open_server().await.uri());
+            let (status, body) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+            assert_eq!(
+                (status, body.as_slice()),
+                (StatusCode::OK, b"UPSTREAM-TGZ".as_slice()),
+                "{to}"
+            );
+            assert!(!cached_tarballs(&ctx).await.is_empty(), "{to}");
+        }
+    }
+
+    /// A walk that starts on the origin and only later leaves it stops where it leaves.
+    #[tokio::test]
+    async fn a_walk_that_leaves_the_origin_later_stops_there() {
+        let foreign = open_server().await;
+        let upstream = registry(|_| redirect("/hop/pkg-1.0.0.tgz")).await;
+        Mock::given(method("GET"))
+            .and(path("/hop/pkg-1.0.0.tgz"))
+            .respond_with(redirect(&format!("{}/files/pkg-1.0.0.tgz", foreign.uri())))
+            .mount(&upstream)
+            .await;
+        let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            asked(&foreign).await.is_empty(),
+            "{:?}",
+            asked(&foreign).await
+        );
+        assert!(cached_tarballs(&ctx).await.is_empty());
+    }
+
+    /// A walk on the origin is cut off after ten hops, as reqwest cuts off any other.
+    #[tokio::test]
+    async fn a_walk_on_the_origin_ends() {
+        let upstream = registry(|_| redirect(TARBALL)).await;
+        let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let (status, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz"),
+        )
+        .await
+        .expect("a redirect loop never ends");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(tarball_asks(&upstream).await <= 2 * 11);
+    }
+
+    /// GitLab forwards a tarball its packument does not list to the public registry (302,
+    /// measured on 19.5): the private name is not taken there, with or without the token.
+    #[tokio::test]
+    async fn a_private_upstream_forwarding_to_the_public_registry_is_not_followed() {
+        let public = open_server().await;
+        let gitlab = MockServer::start().await;
+        let doc = serde_json::json!({
+            "name": "@vendor/pkg",
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0": {
+                "name": "@vendor/pkg", "version": "1.0.0",
+                "dist": { "tarball": format!(
+                    "{}/api/v4/projects/7/packages/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz",
+                    gitlab.uri()
+                ) },
+            } },
+            "time": { "1.0.0": "2020-01-02T00:00:00.000Z" },
+        });
+        Mock::given(method("GET"))
+            .and(path("/api/v4/packages/npm/@vendor/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(doc.to_string()))
+            .mount(&gitlab)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/packages/npm/@vendor/pkg/-/@vendor/pkg-9.9.9.tgz",
+            ))
+            .respond_with(redirect(&format!(
+                "{}/@vendor/pkg/-/@vendor/pkg-9.9.9.tgz",
+                public.uri()
+            )))
+            .mount(&gitlab)
+            .await;
+        let ctx = context(
+            &public.uri(),
+            &format!("{}/api/v4/packages/npm", gitlab.uri()),
+        );
+        let (status, _) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-9.9.9.tgz").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            asked(&public).await.is_empty(),
+            "{:?}",
+            asked(&public).await
+        );
+        assert!(cached_tarballs(&ctx).await.is_empty());
     }
 }
