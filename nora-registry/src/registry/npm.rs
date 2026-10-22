@@ -1356,10 +1356,11 @@ async fn serve_dist_tags(
     let own = match published_state(&state.storage, name).await {
         // Tags derived from the versions (`latest` when no pointer names it) need them all.
         Published::Yes(published) => match assemble_packument(&state.storage, name).await {
-            Some(bytes) if listed_versions(&bytes).as_ref() != Some(&published) => {
+            Ok(bytes) if listed_versions(&bytes).as_ref() != Some(&published) => {
                 return published_versions_unreadable(state, name, &published, &bytes).await;
             }
-            assembled => assembled,
+            Ok(bytes) => Some(bytes),
+            Err(unassembled) => return unassembled.response(name),
         },
         Published::Unknown => {
             let key = published_packument_key(name);
@@ -1627,7 +1628,7 @@ async fn published_packument_response(
             return packument_response(headers, data);
         }
     }
-    match assemble_packument(&state.storage, name).await.ok_or(()) {
+    match assemble_packument(&state.storage, name).await {
         // A version whose document cannot be read would silently leave the packument, and every
         // read would rebuild it again: the package is unavailable until it is repaired, and says
         // which versions keep it so.
@@ -1643,10 +1644,7 @@ async fn published_packument_response(
             state.metrics.record_cache_hit("npm");
             packument_response(headers, Bytes::from(bytes))
         }
-        Err(()) => {
-            tracing::warn!(registry = "npm", package = %name, "published packument cannot be assembled");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
-        }
+        Err(unassembled) => unassembled.response(name),
     }
 }
 
@@ -2396,25 +2394,57 @@ pub(crate) async fn regenerate_packument(
     storage: &crate::storage::Storage,
     package_name: &str,
 ) -> Result<(), ()> {
-    let bytes = assemble_packument(storage, package_name).await.ok_or(())?;
+    let bytes = assemble_packument(storage, package_name)
+        .await
+        .map_err(|_| ())?;
     store_assembled_packument(storage, package_name, &bytes)
         .await
         .map_err(|_| ())
 }
 
+/// Why a published package's packument could not be assembled.
+enum Unassembled {
+    /// The store could not read this key (or list this prefix).
+    Unreadable(String, crate::storage::StorageError),
+    /// The package fields are not a JSON object.
+    Malformed,
+}
+
+impl Unassembled {
+    /// The answer for a read that needed the packument: 503, 500 for a copy that fails its
+    /// integrity check.
+    fn response(&self, name: &str) -> Response {
+        match self {
+            Unassembled::Unreadable(key, e) => {
+                crate::registry::local_copy_unreadable("npm", key, e)
+            }
+            Unassembled::Malformed => {
+                tracing::warn!(registry = "npm", package = %name, "published packument cannot be assembled");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+        }
+    }
+}
+
 /// The packument of a published package, assembled from its published keys (`versions/`,
-/// `dist-tags/`, `pkg.json`).
+/// `dist-tags/`, `pkg.json`). A key the store cannot read fails it: a document without a tag or
+/// the package fields would be served, or stored, as complete.
 async fn assemble_packument(
     storage: &crate::storage::Storage,
     package_name: &str,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, Unassembled> {
+    let unreadable = |(key, e)| Unassembled::Unreadable(key, e);
     // versions map, keyed by the filename (version) without the .json suffix. Read
     // concurrently: on an object store every version is a round-trip, and this path now
     // runs on a read (#956), so a package with thousands of versions used to pay them
-    // one after another. An unreadable or unparsable key is skipped, as before.
+    // one after another. An unparsable document is skipped; the reader that compares the
+    // versions with the published ones refuses the packument.
     let versions_prefix = format!("npm/{}/versions/", package_name);
     let mut versions = serde_json::Map::new();
-    for (key, data) in super::read_keyed_blobs(storage, &versions_prefix).await {
+    for (key, data) in super::read_keyed_blobs(storage, &versions_prefix)
+        .await
+        .map_err(unreadable)?
+    {
         let Ok(vd) = serde_json::from_slice::<serde_json::Value>(&data) else {
             continue;
         };
@@ -2426,7 +2456,10 @@ async fn assemble_packument(
     // dist-tags from the pointer keys (+ derive `latest` if publish left it unset).
     let dt_prefix = format!("npm/{}/dist-tags/", package_name);
     let mut dist_tags = serde_json::Map::new();
-    for (key, data) in super::read_keyed_blobs(storage, &dt_prefix).await {
+    for (key, data) in super::read_keyed_blobs(storage, &dt_prefix)
+        .await
+        .map_err(unreadable)?
+    {
         if let (Some(tag), Ok(ver)) = (key.rsplit('/').next(), String::from_utf8(data.to_vec())) {
             dist_tags.insert(tag.to_string(), serde_json::Value::String(ver));
         }
@@ -2438,11 +2471,13 @@ async fn assemble_packument(
     }
 
     // Package-level fields + the assembled maps -> the packument.
-    let mut packument = match storage.get(&format!("npm/{}/pkg.json", package_name)).await {
+    let pkg_key = format!("npm/{}/pkg.json", package_name);
+    let mut packument = match storage.get(&pkg_key).await {
         Ok(d) => serde_json::from_slice(&d).unwrap_or_else(|_| serde_json::json!({})),
-        Err(_) => serde_json::json!({}),
+        Err(crate::storage::StorageError::NotFound) => serde_json::json!({}),
+        Err(e) => return Err(Unassembled::Unreadable(pkg_key, e)),
     };
-    let obj = packument.as_object_mut()?;
+    let obj = packument.as_object_mut().ok_or(Unassembled::Malformed)?;
     obj.insert(
         "name".to_string(),
         serde_json::Value::String(package_name.to_string()),
@@ -2453,7 +2488,7 @@ async fn assemble_packument(
     );
     obj.insert("versions".to_string(), serde_json::Value::Object(versions));
 
-    serde_json::to_vec(&packument).ok()
+    serde_json::to_vec(&packument).map_err(|_| Unassembled::Malformed)
 }
 
 /// Why retention could not bring a packument back in line with storage.
@@ -9149,6 +9184,94 @@ mod published_names_stay_local {
             .iter()
             .map(|r| r.url.path().to_string())
             .collect()
+    }
+
+    /// A published package's tag or package fields the store cannot read are not left out: the
+    /// packument rebuilt without a stored one and the tags answer 503 (500 for a copy that fails
+    /// its integrity check) rather than a document without them — a `latest` derived from the
+    /// versions names another version than the one tagged — and a publish stores no packument
+    /// without them, so the tag is there once the store reads again.
+    #[tokio::test]
+    async fn a_published_tag_that_cannot_be_read_is_unavailable_not_left_out() {
+        use crate::test_helpers::ReadFault;
+        async fn latest(ctx: &TestContext) -> (StatusCode, serde_json::Value) {
+            let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+            let status = resp.status();
+            let doc: serde_json::Value =
+                serde_json::from_slice(&body_bytes(resp).await).unwrap_or_default();
+            (status, doc["dist-tags"]["latest"].clone())
+        }
+        let mut wrong = Vec::new();
+        for (fault, expected) in [
+            (ReadFault::Network, StatusCode::SERVICE_UNAVAILABLE),
+            (ReadFault::Tampered, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            for unreadable in ["npm/pkg/dist-tags/latest", "npm/pkg/pkg.json"] {
+                let upstream = recording_upstream().await;
+                let uri = upstream.uri();
+                let (storage, outage) = outage_storage();
+                let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+                    c.npm.proxy = Some(uri);
+                });
+                publish(&ctx, "pkg", "1.0.0").await;
+                publish(&ctx, "pkg", "1.0.1").await;
+                // The older version is the one tagged.
+                ctx.state
+                    .storage
+                    .put("npm/pkg/dist-tags/latest", b"1.0.0")
+                    .await
+                    .unwrap();
+                ctx.state
+                    .storage
+                    .delete("npm/pkg/metadata.json")
+                    .await
+                    .unwrap();
+                let (status, tagged) = latest(&ctx).await;
+                if (status, tagged.as_str()) != (StatusCode::OK, Some("1.0.0")) {
+                    wrong.push(format!("with the store up: {status} latest {tagged}"));
+                }
+                ctx.state
+                    .storage
+                    .delete("npm/pkg/metadata.json")
+                    .await
+                    .unwrap();
+                outage.fault_reads_of(unreadable, fault);
+                for path in ["/npm/pkg", "/npm/-/package/pkg/dist-tags"] {
+                    let status = send(&ctx.app, Method::GET, path, "").await.status();
+                    if status != expected {
+                        wrong.push(format!("{path}, {unreadable} {fault:?} -> {status}"));
+                    }
+                }
+                // A publish while the tag cannot be read.
+                let payload = serde_json::json!({
+                    "name": "pkg",
+                    "versions": { "1.0.2": { "name": "pkg", "version": "1.0.2", "dist": {} } },
+                    "_attachments": { "pkg-1.0.2.tgz": {
+                        "data": base64::engine::general_purpose::STANDARD.encode(b"published"),
+                    } },
+                });
+                let published = send(
+                    &ctx.app,
+                    Method::PUT,
+                    "/npm/pkg",
+                    Body::from(serde_json::to_vec(&payload).unwrap()),
+                )
+                .await
+                .status();
+                outage.end();
+                let (status, tagged) = latest(&ctx).await;
+                if (status, tagged.as_str()) != (StatusCode::OK, Some("1.0.0")) {
+                    wrong.push(format!(
+                        "after a publish ({published}) with {unreadable} {fault:?}: {status} latest {tagged}"
+                    ));
+                }
+                let asked = asked(&upstream).await;
+                if !asked.is_empty() {
+                    wrong.push(format!("upstream asked, {unreadable} {fault:?}: {asked:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// A published version whose document the store cannot read is unavailable, not absent and
