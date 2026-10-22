@@ -1528,3 +1528,66 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
         self.clone()
     }
 }
+
+/// For each of `needles`, the functions of `source` that contain it on a line
+/// that is not a comment, its `#[cfg(test)]` modules left out: what a white
+/// list over a source file compares with the places a kind of call may be in.
+/// A line outside any function is under the function before it, or `""`.
+pub fn functions_containing(
+    source: &str,
+    needles: &[String],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut found: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        Default::default();
+    let mut function = String::new();
+    let mut after_cfg_test = false;
+    let mut skipping: Option<i64> = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let braces = line.matches('{').count() as i64 - line.matches('}').count() as i64;
+        if let Some(depth) = skipping.as_mut() {
+            *depth += braces;
+            if *depth <= 0 {
+                skipping = None;
+            }
+            continue;
+        }
+        if trimmed == "#[cfg(test)]" {
+            after_cfg_test = true;
+            continue;
+        }
+        if after_cfg_test && trimmed.starts_with("#[") {
+            continue;
+        }
+        if std::mem::take(&mut after_cfg_test)
+            && trimmed
+                .split("mod ")
+                .next()
+                .is_some_and(|before| ["", "pub ", "pub(crate) ", "pub(super) "].contains(&before))
+            && trimmed.contains("mod ")
+            && braces > 0
+        {
+            skipping = Some(braces);
+            continue;
+        }
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if let Some((_, rest)) = line.split_once("fn ") {
+            function = rest
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("")
+                .to_string();
+        }
+        for needle in needles {
+            if line.contains(needle.as_str()) {
+                found
+                    .entry(needle.clone())
+                    .or_default()
+                    .insert(function.clone());
+            }
+        }
+    }
+    found
+}

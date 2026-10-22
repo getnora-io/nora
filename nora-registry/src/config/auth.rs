@@ -690,23 +690,11 @@ mod tests {
             ),
             ("rate_limit.rs", include_str!("../rate_limit.rs")),
         ] {
-            let code = source
-                .split(&["#[cfg(test)]", "\nmod tests"].concat())
-                .next()
-                .unwrap();
-            let mut function = "";
-            for line in code.lines().filter(|l| !l.trim_start().starts_with("//")) {
-                if let Some((_, rest)) = line.split_once("fn ") {
-                    function = rest
-                        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-                        .next()
-                        .unwrap_or("");
-                }
-                for needle in &needles {
+            for (needle, functions) in crate::test_helpers::functions_containing(source, &needles) {
+                for function in functions {
                     assert!(
-                        !line.contains(needle.as_str())
-                            || (file, function) == ("config/auth.rs", "canonical_network"),
-                        "{file}: {function} turns an address into IPv4: {line}"
+                        (file, function.as_str()) == ("config/auth.rs", "canonical_network"),
+                        "{file}: {function} turns an address into IPv4 ({needle})"
                     );
                 }
             }

@@ -167,8 +167,18 @@ impl AuthFailureTracker {
         account.max(address)
     }
 
+    /// Apply to the counts of `username` at `ip` what [`lockout_rule`]
+    /// decided an attempt does to them: the one way an attempt changes them.
+    pub(crate) fn count(&self, ip: IpAddr, username: &str, count: LockoutCount) {
+        match count {
+            LockoutCount::Nothing => {}
+            LockoutCount::Failure => self.record_failure(ip, username),
+            LockoutCount::Clear => self.record_success(&ip, username),
+        }
+    }
+
     /// Record a wrong password for `username` at `ip`.
-    pub fn record_failure(&self, ip: IpAddr, username: &str) {
+    fn record_failure(&self, ip: IpAddr, username: &str) {
         let now = Instant::now();
         let mut entries = self.entries.lock();
         let account = entries
@@ -182,7 +192,7 @@ impl AuthFailureTracker {
 
     /// A login as `username` from `ip`: clears that account's failures, not
     /// the address's.
-    pub fn record_success(&self, ip: &IpAddr, username: &str) {
+    fn record_success(&self, ip: &IpAddr, username: &str) {
         let mut entries = self.entries.lock();
         entries.accounts.remove(&account_key(*ip, username));
     }
@@ -647,7 +657,7 @@ pub async fn auth_middleware(
         .tokens
         .as_ref()
         .map(|store| move |password: &str| store.verify_token(password));
-    let decision = match locked_out {
+    let checked = match locked_out {
         None => {
             let htpasswd_match = match (state.auth.as_deref(), basic_credentials(encoded)) {
                 (Some(htpasswd), Ok((user, password))) => htpasswd.verify(&user, &password).await,
@@ -662,29 +672,24 @@ pub async fn auth_middleware(
         // A locked-out account gets no password checked, so no bcrypt runs for it. An API
         // token sent as the password cannot be guessed, so it is still verified, as over
         // Bearer: Docker has no other way to present one.
-        Some(retry_after) => match decide_basic_auth(
+        Some(_) => decide_basic_auth(
             encoded,
             None::<fn(&str, &str) -> bool>,
             tokens,
             request.method(),
             is_admin,
-        ) {
-            decision @ (BasicDecision::Authenticated { .. }
-            | BasicDecision::Forbidden(_)
-            | BasicDecision::ServiceUnavailable(_)) => decision,
-            _ => return too_many_failed_attempts(retry_after),
-        },
+        ),
     };
+    let (decision, count) = lockout_rule(
+        locked_out,
+        checked,
+        account.as_ref().map(|(_, user)| user.as_str()),
+    );
+    if let Some((ip, username)) = &account {
+        state.auth_failures.count(*ip, username, count);
+    }
     match decision {
         BasicDecision::Authenticated { user, role } => {
-            // A login as the username clears its failures. An API token of
-            // another owner sent under that username does not: it says nothing
-            // about the username's password.
-            if let Some((ip, username)) = &account {
-                if *username == user {
-                    state.auth_failures.record_success(ip, username);
-                }
-            }
             // Basic-auth identities and opaque (nra_) tokens are not
             // namespace-scoped (#583 is OIDC-only).
             request
@@ -697,17 +702,8 @@ pub async fn auth_middleware(
         // Valid credentials, not authorized: not a wrong password, so not
         // counted.
         BasicDecision::Forbidden(reason) => (StatusCode::FORBIDDEN, reason).into_response(),
-        BasicDecision::Unauthorized {
-            message,
-            record_failure,
-        } => {
-            if record_failure {
-                if let Some((ip, username)) = &account {
-                    state.auth_failures.record_failure(*ip, username);
-                }
-            }
-            unauthorized_response(message, realm)
-        }
+        BasicDecision::Unauthorized { message, .. } => unauthorized_response(message, realm),
+        BasicDecision::LockedOut(retry_after) => too_many_failed_attempts(retry_after),
         BasicDecision::ServiceUnavailable(e) => {
             tracing::error!(error = %e, "token store read failed during Basic auth fallback");
             (
@@ -723,7 +719,7 @@ pub async fn auth_middleware(
 /// What the Basic branch of [`auth_middleware`] does with a request, as
 /// decided by [`decide_basic_auth`].
 #[derive(Clone, Debug, PartialEq)]
-enum BasicDecision {
+pub(crate) enum BasicDecision {
     /// Valid credentials, authorized: run the request as `user` with `role`.
     Authenticated {
         user: String,
@@ -743,6 +739,71 @@ enum BasicDecision {
     ServiceUnavailable(String),
     /// Neither htpasswd nor a token store to check a Basic password against (401).
     NotConfigured,
+    /// The account is locked out and the credential was not one served under
+    /// a lockout (429, retry after so many seconds). Only [`lockout_rule`]
+    /// answers it.
+    LockedOut(u64),
+}
+
+/// What a password attempt does to the lockout counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LockoutCount {
+    /// Nothing: not a wrong password, or a password that was not checked.
+    Nothing,
+    /// A wrong password: one more failure for the username at the address
+    /// and one more toward the address ceiling.
+    Failure,
+    /// A login as the username: its own failures are cleared, not the
+    /// address's.
+    Clear,
+}
+
+/// The rules of the password lockout, in one place: what a request with a
+/// password is answered and what it does to the counts, from the lockout its
+/// account is under (`locked_out`, seconds left), what checking its
+/// credentials decided (`checked`) and the username it was sent for (`None`
+/// when there is no account to count, a header that does not decode or no
+/// client address).
+///
+/// - Under a lockout no password was checked: whatever did not pass is
+///   refused as locked out and counted nowhere, not for the username and not
+///   toward the address ceiling. What passes without a password, an API
+///   token sent as one, is served (or refused 403, or 503 on an outage) as
+///   without a lockout.
+/// - Only a wrong password counts as a failure. A 403, an outage, a header
+///   that does not decode and a missing store count nothing.
+/// - A login clears the failures of its own username only: an API token of
+///   another owner sent under the username clears nothing.
+pub(crate) fn lockout_rule(
+    locked_out: Option<u64>,
+    checked: BasicDecision,
+    username: Option<&str>,
+) -> (BasicDecision, LockoutCount) {
+    let served_locked_out = matches!(
+        checked,
+        BasicDecision::Authenticated { .. }
+            | BasicDecision::Forbidden(_)
+            | BasicDecision::ServiceUnavailable(_)
+    );
+    if let (Some(retry_after), false) = (locked_out, served_locked_out) {
+        return (BasicDecision::LockedOut(retry_after), LockoutCount::Nothing);
+    }
+    let count = match &checked {
+        BasicDecision::Authenticated { user, .. } if Some(user.as_str()) == username => {
+            LockoutCount::Clear
+        }
+        BasicDecision::Unauthorized {
+            record_failure: true,
+            ..
+        } => LockoutCount::Failure,
+        BasicDecision::Authenticated { .. }
+        | BasicDecision::Forbidden(_)
+        | BasicDecision::Unauthorized { .. }
+        | BasicDecision::ServiceUnavailable(_)
+        | BasicDecision::NotConfigured
+        | BasicDecision::LockedOut(_) => LockoutCount::Nothing,
+    };
+    (checked, count)
 }
 
 /// Decide a Basic-auth request from its credentials (`encoded`, the header
@@ -842,7 +903,7 @@ fn basic_credentials(encoded: &str) -> Result<(String, String), &'static str> {
 }
 
 /// The answer to a password from a locked-out account.
-fn too_many_failed_attempts(retry_after: u64) -> Response {
+pub(crate) fn too_many_failed_attempts(retry_after: u64) -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
         [
@@ -1667,6 +1728,183 @@ mod basic_decision_tests {
             }
         }
         rows
+    }
+
+    /// The lockout rules as a table, one row per point of the rule: what a
+    /// password attempt is answered and what it does to the counts, with the
+    /// account locked out or not.
+    #[test]
+    fn lockout_rule_table() {
+        use super::{lockout_rule, LockoutCount};
+        use LockoutCount::{Clear, Failure, Nothing};
+        let alice = || ok("alice", Role::Write);
+        let bob = || ok("bob", Role::Read);
+        let forbidden = || BasicDecision::Forbidden("Read-only token");
+        let rows: Vec<(
+            &str,
+            Option<u64>,
+            BasicDecision,
+            Option<&str>,
+            BasicDecision,
+            LockoutCount,
+        )> = vec![
+            (
+                "a wrong password counts",
+                None,
+                wrong(),
+                Some("alice"),
+                wrong(),
+                Failure,
+            ),
+            (
+                "a header that does not decode counts nothing",
+                None,
+                malformed("Invalid credentials encoding"),
+                Some("alice"),
+                malformed("Invalid credentials encoding"),
+                Nothing,
+            ),
+            (
+                "a login clears its own username",
+                None,
+                alice(),
+                Some("alice"),
+                alice(),
+                Clear,
+            ),
+            (
+                "a token of another owner clears nothing",
+                None,
+                bob(),
+                Some("alice"),
+                bob(),
+                Nothing,
+            ),
+            (
+                "a 403 counts nothing",
+                None,
+                forbidden(),
+                Some("alice"),
+                forbidden(),
+                Nothing,
+            ),
+            (
+                "an outage counts nothing",
+                None,
+                unavailable(),
+                Some("alice"),
+                unavailable(),
+                Nothing,
+            ),
+            (
+                "no store counts nothing",
+                None,
+                BasicDecision::NotConfigured,
+                Some("alice"),
+                BasicDecision::NotConfigured,
+                Nothing,
+            ),
+            (
+                "a locked-out password is refused uncounted",
+                Some(30),
+                wrong(),
+                Some("alice"),
+                BasicDecision::LockedOut(30),
+                Nothing,
+            ),
+            (
+                "a locked-out header that does not decode is refused uncounted",
+                Some(30),
+                malformed("Invalid credentials format"),
+                Some("alice"),
+                BasicDecision::LockedOut(30),
+                Nothing,
+            ),
+            (
+                "a locked-out account without a store is refused",
+                Some(30),
+                BasicDecision::NotConfigured,
+                Some("alice"),
+                BasicDecision::LockedOut(30),
+                Nothing,
+            ),
+            (
+                "its own token is served under a lockout and clears it",
+                Some(30),
+                alice(),
+                Some("alice"),
+                alice(),
+                Clear,
+            ),
+            (
+                "another owner's token is served under a lockout",
+                Some(30),
+                bob(),
+                Some("alice"),
+                bob(),
+                Nothing,
+            ),
+            (
+                "a 403 under a lockout stays a 403",
+                Some(30),
+                forbidden(),
+                Some("alice"),
+                forbidden(),
+                Nothing,
+            ),
+            (
+                "an outage under a lockout stays an outage",
+                Some(30),
+                unavailable(),
+                Some("alice"),
+                unavailable(),
+                Nothing,
+            ),
+            (
+                "a login without a username clears nothing",
+                None,
+                alice(),
+                None,
+                alice(),
+                Nothing,
+            ),
+        ];
+        for (point, locked_out, checked, username, answer, count) in rows {
+            assert_eq!(
+                lockout_rule(locked_out, checked, username),
+                (answer, count),
+                "{point}"
+            );
+        }
+    }
+
+    /// The lockout counts change only through [`AuthFailureTracker::count`],
+    /// which applies what [`lockout_rule`] decided (white list): a route that
+    /// counted an attempt itself would skip the rule. Needles are built at run
+    /// time so this text does not match.
+    #[test]
+    fn the_lockout_counts_change_only_by_the_rule() {
+        let needles = [
+            [".record", "_failure("].concat(),
+            [".record", "_success("].concat(),
+        ];
+        let mut found = std::collections::BTreeMap::new();
+        for (file, source) in [
+            ("auth/mod.rs", include_str!("mod.rs")),
+            ("auth/token_routes.rs", include_str!("token_routes.rs")),
+            ("ui/mod.rs", include_str!("../ui/mod.rs")),
+            ("admin.rs", include_str!("../admin.rs")),
+        ] {
+            for (needle, functions) in crate::test_helpers::functions_containing(source, &needles) {
+                for function in functions {
+                    found.insert((file, function), needle.clone());
+                }
+            }
+        }
+        assert_eq!(
+            found.into_keys().collect::<Vec<_>>(),
+            [("auth/mod.rs", "count".to_string())]
+        );
     }
 
     #[test]
@@ -2497,6 +2735,45 @@ mod integration_tests {
             probe_took < one_check / 2,
             "the probe waited for bcrypt: {probe_took:?} (one check {one_check:?})"
         );
+    }
+
+    /// A password sent for a locked-out username is refused unchecked, so it
+    /// is not a wrong password and counts neither for the username nor toward
+    /// the address ceiling: however many arrive, another username behind the
+    /// same address still logs in.
+    #[tokio::test]
+    async fn an_unchecked_password_counts_for_nobody() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw"), ("bob", "bobpw")]);
+        let tracker = &ctx.state.auth_failures;
+        let ip = CLIENT_IP;
+        for _ in 0..5 {
+            tracker.record_failure(ip, "alice");
+        }
+        assert!(tracker.check_blocked(&ip, "alice").is_some());
+        for _ in 0..60 {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/v2/",
+                vec![("authorization", &basic_header("alice", "guess"))],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        assert!(
+            tracker.check_blocked(&ip, "bob").is_none(),
+            "passwords refused unchecked were counted toward the address ceiling"
+        );
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &basic_header("bob", "bobpw"))],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     /// Auth enabled with no htpasswd file — the OIDC-only setup (#996). The

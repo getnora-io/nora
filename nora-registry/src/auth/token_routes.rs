@@ -5,20 +5,20 @@
 
 use axum::{
     extract::{ConnectInfo, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use utoipa::ToSchema;
 
 use crate::audit::AuditEntry;
 use crate::tokens::{ttl_secs_for_days, MintedToken, Role, SECS_PER_DAY};
 use crate::AppState;
 
-use super::resolve_client_ip;
+use super::{lockout_rule, resolve_client_ip, too_many_failed_attempts, BasicDecision};
 
 #[derive(Deserialize)]
 pub struct CreateTokenRequest {
@@ -79,6 +79,42 @@ pub struct TokenListResponse {
     pub tokens: Vec<TokenListItem>,
 }
 
+/// Check the password a token route is sent, under the password lockout
+/// ([`super::lockout_rule`]): `Err` with the answer when it does not pass.
+/// Under a lockout the password is not checked.
+async fn check_password(
+    state: &AppState,
+    client_ip: IpAddr,
+    username: &str,
+    password: &str,
+) -> Result<(), Response> {
+    let locked_out = state.auth_failures.check_blocked(&client_ip, username);
+    let wrong = || BasicDecision::Unauthorized {
+        message: "Invalid credentials",
+        record_failure: true,
+    };
+    let checked = match (locked_out, state.auth.as_ref()) {
+        (Some(_), _) => wrong(),
+        (None, None) => {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response())
+        }
+        (None, Some(auth)) if auth.verify(username, password).await => {
+            BasicDecision::Authenticated {
+                user: username.to_string(),
+                role: Role::Write,
+            }
+        }
+        (None, Some(_)) => wrong(),
+    };
+    let (decision, count) = lockout_rule(locked_out, checked, Some(username));
+    state.auth_failures.count(client_ip, username, count);
+    match decision {
+        BasicDecision::Authenticated { .. } => Ok(()),
+        BasicDecision::LockedOut(retry_after) => Err(too_many_failed_attempts(retry_after)),
+        _ => Err((StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()),
+    }
+}
+
 /// Create a new API token (requires Basic auth)
 async fn create_token(
     State(state): State<AppState>,
@@ -87,32 +123,9 @@ async fn create_token(
     Json(req): Json<CreateTokenRequest>,
 ) -> Response {
     let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip, &req.username) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.to_string())],
-            format!(
-                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                retry_after
-            ),
-        )
-            .into_response();
+    if let Err(refused) = check_password(&state, client_ip, &req.username, &req.password).await {
+        return refused;
     }
-
-    // Verify user credentials first
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
-    };
-
-    if !auth.verify(&req.username, &req.password).await {
-        state.auth_failures.record_failure(client_ip, &req.username);
-        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-    }
-
-    state
-        .auth_failures
-        .record_success(&client_ip, &req.username);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
@@ -183,31 +196,9 @@ async fn list_tokens(
     Json(req): Json<CreateTokenRequest>,
 ) -> Response {
     let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip, &req.username) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.to_string())],
-            format!(
-                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                retry_after
-            ),
-        )
-            .into_response();
+    if let Err(refused) = check_password(&state, client_ip, &req.username, &req.password).await {
+        return refused;
     }
-
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
-    };
-
-    if !auth.verify(&req.username, &req.password).await {
-        state.auth_failures.record_failure(client_ip, &req.username);
-        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-    }
-
-    state
-        .auth_failures
-        .record_success(&client_ip, &req.username);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
@@ -251,31 +242,9 @@ async fn revoke_token(
     Json(req): Json<RevokeRequest>,
 ) -> Response {
     let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip, &req.username) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.to_string())],
-            format!(
-                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                retry_after
-            ),
-        )
-            .into_response();
+    if let Err(refused) = check_password(&state, client_ip, &req.username, &req.password).await {
+        return refused;
     }
-
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
-    };
-
-    if !auth.verify(&req.username, &req.password).await {
-        state.auth_failures.record_failure(client_ip, &req.username);
-        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-    }
-
-    state
-        .auth_failures
-        .record_success(&client_ip, &req.username);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
@@ -429,6 +398,35 @@ mod mint_tests {
         let status = resp.status();
         let body = body_bytes(resp).await;
         (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    /// A password sent to a token route for a locked-out username is refused
+    /// unchecked and counted for nobody, on every route that takes one: it
+    /// does not reach the address ceiling, and another username behind the
+    /// same address still gets through.
+    #[tokio::test]
+    async fn a_locked_out_password_on_a_token_route_counts_for_nobody() {
+        for route in ["/api/tokens", "/api/tokens/list", "/api/tokens/revoke"] {
+            let ctx = audited(&[("alice", "alicepw"), ("bob", "bobpw")]);
+            let tracker = &ctx.state.auth_failures;
+            let ip: std::net::IpAddr = [127, 0, 0, 1].into();
+            for _ in 0..5 {
+                tracker.record_failure(ip, "alice");
+            }
+            let guess =
+                r#"{"username":"alice","password":"guess","hash_prefix":"0123456789abcdef"}"#;
+            for _ in 0..60 {
+                let (status, _) = post_json(&ctx, route, None, guess).await;
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{route}");
+            }
+            assert!(
+                tracker.check_blocked(&ip, "bob").is_none(),
+                "{route}: passwords refused unchecked were counted toward the address ceiling"
+            );
+            let bob = r#"{"username":"bob","password":"bobpw"}"#;
+            let (status, _) = post_json(&ctx, "/api/tokens/list", None, bob).await;
+            assert_eq!(status, StatusCode::OK, "{route}");
+        }
     }
 
     #[tokio::test]
