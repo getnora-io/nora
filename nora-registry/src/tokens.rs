@@ -16,7 +16,7 @@ use uuid::Uuid;
 
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -134,7 +134,9 @@ enum Step {
     WaitsForLock,
     /// A revoke removed a token file.
     Removed,
-    /// A revoke counted itself and purged the cache.
+    /// A revoke counted itself.
+    Counted,
+    /// A revoke purged the cache of what it removed.
     Evicted,
     /// The last_used flush read a token file.
     FlushRead,
@@ -148,6 +150,164 @@ fn pause(_step: Step) {}
 #[cfg(test)]
 fn pause(step: Step) {
     tests::interleave::pause(step)
+}
+
+/// The token files on disk, and the steps a revoke and a verify take on them.
+/// The order those steps must come in is held by the types here, which the
+/// store cannot build itself:
+/// - [`Held`], the files lock, is what removes or rewrites a token file, so a
+///   rewrite (the last_used flush, the legacy-hash migration) that read a file
+///   before a revoke cannot put it back after the revoke removed it;
+/// - [`Read`], a token file as a verify read it, carries the revocation count
+///   read before the file and is the only way into the verify cache, checked
+///   against the count in the same step as the cache entry is made;
+/// - [`Removed`], the files a revoke removed, is counted as a revoke
+///   ([`Counted`]) before the cache can be purged of them, so the count and
+///   the purge come after the removal, in that order.
+mod files {
+    use super::{pause, write_token_file, Step};
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The files lock, held.
+    pub(super) struct Held<'a> {
+        _lock: tokio::sync::MutexGuard<'a, ()>,
+    }
+
+    /// Take the files lock, waiting for a running rewrite or revoke.
+    pub(super) async fn lock(files: &tokio::sync::Mutex<()>) -> Held<'_> {
+        let held = match files.try_lock() {
+            Ok(held) => held,
+            Err(_) => {
+                pause(Step::WaitsForLock);
+                files.lock().await
+            }
+        };
+        pause(Step::Locked);
+        Held { _lock: held }
+    }
+
+    /// Take the files lock if nothing holds it.
+    pub(super) fn try_lock(files: &tokio::sync::Mutex<()>) -> Option<Held<'_>> {
+        let held = files.try_lock().ok()?;
+        pause(Step::Locked);
+        Some(Held { _lock: held })
+    }
+
+    impl Held<'_> {
+        /// Remove the token file `file_id` from `dir`.
+        pub(super) fn remove(&self, dir: &Path, file_id: &str) -> std::io::Result<Removed> {
+            std::fs::remove_file(dir.join(format!("{file_id}.json")))?;
+            pause(Step::Removed);
+            Ok(Removed(vec![file_id.to_string()]))
+        }
+
+        /// Replace the token file at `path` with `json`.
+        pub(super) fn rewrite(&self, path: &Path, json: &str) -> std::io::Result<()> {
+            write_token_file(path, json)?;
+            pause(Step::Rewritten);
+            Ok(())
+        }
+
+        /// Replace the token file at `path` with `json`, off the async workers.
+        pub(super) async fn rewrite_async(&self, path: &Path, json: &str) -> std::io::Result<()> {
+            let tmp = path.with_extension("json.tmp");
+            tokio::fs::write(&tmp, json).await?;
+            super::set_file_permissions_600(&tmp);
+            tokio::fs::rename(&tmp, path).await?;
+            pause(Step::Rewritten);
+            Ok(())
+        }
+    }
+
+    /// The token files a revoke removed, by file id.
+    pub(super) struct Removed(Vec<String>);
+
+    impl Removed {
+        /// These and `other`.
+        pub(super) fn and(mut self, other: Removed) -> Removed {
+            self.0.extend(other.0);
+            self
+        }
+
+        /// Count the revoke, so a verify that read one of these files before
+        /// it keeps its result out of the cache.
+        pub(super) fn counted(self, revocations: &AtomicU64) -> Counted {
+            revocations.fetch_add(1, Ordering::SeqCst);
+            pause(Step::Counted);
+            Counted(self.0)
+        }
+    }
+
+    /// The token files of a revoke that has been counted, by file id.
+    pub(super) struct Counted(Vec<String>);
+
+    impl Counted {
+        /// Drop the cached verifications of these files from `cache`.
+        pub(super) fn purge<V>(&self, cache: &mut HashMap<String, V>) {
+            cache.retain(|key, _| {
+                !self
+                    .0
+                    .iter()
+                    .any(|file_id| key.starts_with(file_id.as_str()))
+            });
+        }
+
+        /// How many files were removed.
+        pub(super) fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+
+    /// A token file as a verify read it.
+    pub(super) struct Read {
+        /// The revocation count read before the file.
+        revocations: u64,
+        content: String,
+    }
+
+    /// Read the token file at `path` for a verify: the revocation count
+    /// first, then the file.
+    pub(super) fn read(revocations: &AtomicU64, path: &Path) -> std::io::Result<Read> {
+        let seen = revocations.load(Ordering::SeqCst);
+        pause(Step::CountRead);
+        let content = std::fs::read_to_string(path)?;
+        pause(Step::FileRead);
+        Ok(Read {
+            revocations: seen,
+            content,
+        })
+    }
+
+    impl Read {
+        pub(super) fn content(&self) -> &str {
+            &self.content
+        }
+
+        /// Put `verified` into `cache` under `key`, unless a revoke came in
+        /// since the file was read. Takes the cache itself, so the count is
+        /// checked while the cache is held for the entry.
+        pub(super) fn cache_unless_revoked<V>(
+            &self,
+            revocations: &AtomicU64,
+            cache: &mut HashMap<String, V>,
+            key: String,
+            verified: V,
+        ) {
+            if revocations.load(Ordering::SeqCst) == self.revocations {
+                cache.insert(key, verified);
+            }
+        }
+    }
+}
+
+/// What a revoke removes.
+enum Revoke<'a> {
+    /// The token whose file id is this.
+    Token(&'a str),
+    /// Every token of this user.
+    User(&'a str),
 }
 
 /// Token store for managing API tokens
@@ -165,9 +325,10 @@ pub struct TokenStore {
     /// (the last_used flush, the legacy-hash migration) that read the file
     /// before a revoke cannot put it back after the revoke removed it.
     file_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Bumped by every revoke, under the cache lock. A verify reads it before
-    /// it reads the token file and caches its result only if no revoke came in
-    /// between, so a verify racing a revoke cannot cache the revoked token.
+    /// Bumped by every revoke before it purges the cache. A verify reads it
+    /// before it reads the token file and caches its result only if no revoke
+    /// came in between, so a verify racing a revoke cannot cache the revoked
+    /// token (see [`files`]).
     revocations: Arc<AtomicU64>,
 }
 
@@ -305,22 +466,20 @@ impl TokenStore {
             }
         }
 
-        // Slow path: read from disk and verify Argon2. A revoke after this
-        // point keeps the result out of the cache (see `revocations`).
-        let revocations = self.revocations_seen();
+        // Slow path: read from disk and verify Argon2. A revoke after the
+        // read keeps the result out of the cache (see `revocations`).
         let file_path = self.storage_path.join(format!("{}.json", &cache_key[..16]));
 
-        let content = match fs::read_to_string(&file_path) {
-            Ok(c) => c,
+        let read = match files::read(&self.revocations, &file_path) {
+            Ok(read) => read,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(TokenError::NotFound);
             }
             Err(e) => return Err(TokenError::Storage(e.to_string())),
         };
-        pause(Step::FileRead);
 
         let mut info: TokenInfo =
-            serde_json::from_str(&content).map_err(|e| TokenError::Storage(e.to_string()))?;
+            serde_json::from_str(read.content()).map_err(|e| TokenError::Storage(e.to_string()))?;
 
         // Verify hash: try Argon2id first, fall back to legacy SHA256
         let hash_valid = if info.token_hash.starts_with("$argon2") {
@@ -335,9 +494,9 @@ impl TokenStore {
                 if let Ok(new_hash) = hash_token_argon2(token) {
                     info.token_hash = new_hash;
                     if let Ok(json) = serde_json::to_string_pretty(&info) {
-                        if let Ok(_file) = self.file_lock.try_lock() {
+                        if let Some(held) = files::try_lock(&self.file_lock) {
                             if file_path.exists() {
-                                let _ = write_token_file(&file_path, &json);
+                                let _ = held.rewrite(&file_path, &json);
                             }
                         }
                     }
@@ -365,7 +524,7 @@ impl TokenStore {
         // Populate cache (key must match the fast-path lookup: full 64-char
         // SHA-256 hex), unless a revoke came in since the file was read.
         self.cache_unless_revoked(
-            revocations,
+            &read,
             cache_key.clone(),
             CachedToken {
                 user: info.user.clone(),
@@ -445,7 +604,7 @@ impl TokenStore {
             let file_path = self.storage_path.join(format!("{}.json", file_prefix));
             // From the read to the rename: a revoke waits, so it removes the
             // rewritten file instead of being undone by it.
-            let _file = self.lock_files().await;
+            let held = files::lock(&self.file_lock).await;
             let content = match tokio::fs::read_to_string(&file_path).await {
                 Ok(c) => c,
                 Err(_) => continue,
@@ -463,63 +622,55 @@ impl TokenStore {
             // file — a VALID token then 401s ("Invalid username or password")
             // until a clean read repopulates the verify cache.
             if let Ok(json) = serde_json::to_string_pretty(&info) {
-                let tmp = file_path.with_extension("json.tmp");
-                if tokio::fs::write(&tmp, &json).await.is_ok() {
-                    set_file_permissions_600(&tmp);
-                    let _ = tokio::fs::rename(&tmp, &file_path).await;
-                    pause(Step::Rewritten);
-                }
+                let _ = held.rewrite_async(&file_path, &json).await;
             }
         }
 
         tracing::debug!(count = pending.len(), "Flushed pending last_used updates");
     }
 
-    /// The revocation count a verify reads before it reads the token file.
-    fn revocations_seen(&self) -> u64 {
-        let seen = self.revocations.load(Ordering::SeqCst);
-        pause(Step::CountRead);
-        seen
-    }
-
-    /// Take the lock held to rewrite or remove a token file.
-    async fn lock_files(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        let held = match self.file_lock.try_lock() {
-            Ok(held) => held,
-            Err(_) => {
-                pause(Step::WaitsForLock);
-                self.file_lock.lock().await
-            }
-        };
-        pause(Step::Locked);
-        held
-    }
-
     /// Cache a verified token, unless a revoke came in since the verify read
-    /// `seen` from [`TokenStore::revocations_seen`].
-    fn cache_unless_revoked(&self, seen: u64, cache_key: String, verified: CachedToken) {
-        let mut cache = self.cache.write();
-        if self.revocations.load(Ordering::SeqCst) == seen {
-            cache.insert(cache_key, verified);
-        }
+    /// its file.
+    fn cache_unless_revoked(&self, read: &files::Read, cache_key: String, verified: CachedToken) {
+        read.cache_unless_revoked(
+            &self.revocations,
+            &mut self.cache.write(),
+            cache_key,
+            verified,
+        );
     }
 
-    /// Drop the cached verifications a revoke removed and count the revoke,
-    /// under the cache lock, so a verify that read a token file before the
-    /// revoke cannot cache it afterwards. Every revoke path goes through here.
-    fn evict_revoked(&self, revoked: impl Fn(&str, &CachedToken) -> bool) {
-        let mut cache = self.cache.write();
-        cache.retain(|key, cached| !revoked(key, cached));
-        self.revocations.fetch_add(1, Ordering::SeqCst);
-        drop(cache);
+    /// Count a revoke, then drop the cached verifications of the files it
+    /// removed, so a verify that read a token file before the revoke cannot
+    /// cache it afterwards. Answers how many files were removed.
+    fn evict(&self, removed: files::Removed) -> usize {
+        let counted = removed.counted(&self.revocations);
+        counted.purge(&mut self.cache.write());
         pause(Step::Evicted);
+        counted.len()
     }
 
-    /// Remove a token from the in-memory cache (called on revoke).
-    /// Cache keys are full 64-char SHA-256 hex; revoke only knows the 16-char prefix,
-    /// so we must scan for matching entries.
-    fn invalidate_cache(&self, hash_prefix: &str) {
-        self.evict_revoked(|key, _| key.starts_with(hash_prefix));
+    /// The one way a token is revoked. Under the files lock, so no rewrite of
+    /// a token file runs meanwhile: remove the files `which` selects, then
+    /// count the revoke and purge the cache of them. Once it returns, the
+    /// tokens removed are refused, from the cache too.
+    async fn revoke(&self, which: Revoke<'_>) -> Result<usize, TokenError> {
+        let held = files::lock(&self.file_lock).await;
+        let removed = match which {
+            Revoke::Token(file_id) => match held.remove(&self.storage_path, file_id) {
+                Ok(removed) => Some(removed),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(TokenError::NotFound)
+                }
+                Err(e) => return Err(TokenError::Storage(e.to_string())),
+            },
+            Revoke::User(user) => self
+                .list_tokens(user)
+                .iter()
+                .filter_map(|token| held.remove(&self.storage_path, &token.file_id).ok())
+                .reduce(files::Removed::and),
+        };
+        Ok(removed.map_or(0, |removed| self.evict(removed)))
     }
 
     /// Revoke a token by its hash prefix.
@@ -535,46 +686,13 @@ impl TokenStore {
         if !is_valid_hash_prefix(hash_prefix) {
             return Err(TokenError::NotFound);
         }
-        let file_path = self.storage_path.join(format!("{}.json", hash_prefix));
-        let _file = self.lock_files().await;
-
-        // TOCTOU fix: try remove directly
-        match fs::remove_file(&file_path) {
-            Ok(()) => {
-                pause(Step::Removed);
-                self.invalidate_cache(hash_prefix);
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(TokenError::NotFound),
-            Err(e) => Err(TokenError::Storage(e.to_string())),
-        }
+        self.revoke(Revoke::Token(hash_prefix)).await.map(drop)
     }
 
     /// Revoke all tokens for a user. Waits for a running rewrite of a token
     /// file, like [`TokenStore::revoke_token`].
     pub async fn revoke_all_for_user(&self, user: &str) -> usize {
-        let mut count = 0;
-        let _files = self.lock_files().await;
-
-        if let Ok(entries) = fs::read_dir(&self.storage_path) {
-            for entry in entries.flatten() {
-                if let Ok(content) = fs::read_to_string(entry.path()) {
-                    if let Ok(info) = serde_json::from_str::<TokenInfo>(&content) {
-                        if info.user == user && fs::remove_file(entry.path()).is_ok() {
-                            pause(Step::Removed);
-                            count += 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Evict cached entries for this user so revoked tokens fail immediately
-        if count > 0 {
-            self.evict_revoked(|_, cached| cached.user == user);
-        }
-
-        count
+        self.revoke(Revoke::User(user)).await.unwrap_or(0)
     }
 }
 
@@ -1317,116 +1435,6 @@ mod tests {
         assert!(cold.verify_token(&token).is_ok());
     }
 
-    /// A token revoked while `flush_last_used` is rewriting its file stays
-    /// revoked: the flush must not put the file back. The flush is started
-    /// first and has read the file when the revoke runs.
-    #[tokio::test]
-    async fn revoke_during_flush_stays_revoked() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
-        let token = store.create_token("alice", 30, None, Role::Write).unwrap();
-        // Schedules a pending last_used update for the flush to write.
-        store.verify_token(&token).unwrap();
-        let prefix = sha256_hex(&token)[..16].to_string();
-        let file = temp_dir.path().join(format!("{prefix}.json"));
-
-        let mut flush = Box::pin(store.flush_last_used());
-        // One poll starts the flush: it reads the token file off the runtime
-        // and yields; the sleep lets that read finish.
-        assert!(futures::poll!(flush.as_mut()).is_pending());
-        tokio::time::sleep(Duration::from_millis(50)).await;
-        // The revoke is polled first, so it runs before the flush resumes.
-        let revoke = async { store.revoke_token(&prefix).await };
-        let (revoked, ()) = tokio::join!(revoke, flush);
-
-        revoked.unwrap();
-        assert!(!file.exists(), "the flush put a revoked token file back");
-        assert!(
-            matches!(store.verify_token(&token), Err(TokenError::NotFound)),
-            "a revoked token verifies again after the flush"
-        );
-        assert!(
-            TokenStore::new(temp_dir.path())
-                .verify_token(&token)
-                .is_err(),
-            "a revoked token verifies from disk after the flush"
-        );
-    }
-
-    /// A verify that read the token file before a revoke and finishes after it
-    /// must not leave the token in the verify cache: the next verify on the
-    /// same store refuses it. The Argon2 check of a cold verify takes long
-    /// enough for the revoke to land inside it.
-    #[test]
-    fn verify_racing_revoke_leaves_nothing_cached() {
-        let temp_dir = TempDir::new().unwrap();
-        let store = TokenStore::new(temp_dir.path());
-        let token = store.create_token("alice", 30, None, Role::Write).unwrap();
-        let prefix = sha256_hex(&token)[..16].to_string();
-
-        let verifier = {
-            let store = store.clone();
-            let token = token.clone();
-            std::thread::spawn(move || store.verify_token(&token))
-        };
-        std::thread::sleep(Duration::from_millis(20));
-        futures::executor::block_on(store.revoke_token(&prefix)).unwrap();
-        // Whatever the racing verify answered, it was before the revoke.
-        let _ = verifier.join().unwrap();
-
-        assert!(
-            matches!(store.verify_token(&token), Err(TokenError::NotFound)),
-            "a verify racing the revoke cached the revoked token"
-        );
-    }
-
-    /// Every revoke path keeps a racing verify out of the cache, by prefix and
-    /// by user alike. The race is played step by step instead of by timing: a
-    /// verify reads the revocation count, the revoke lands while it checks the
-    /// file, then the verify offers its result to the cache. The revoked token
-    /// is refused afterwards, and a token the revoke left alone is still served.
-    #[test]
-    fn a_verify_racing_any_revoke_leaves_nothing_cached() {
-        type Revoke = fn(&TokenStore, &str) -> usize;
-        let paths: [(&str, Revoke); 2] = [
-            ("revoke_token", |store, token| {
-                let prefix = &sha256_hex(token)[..16];
-                futures::executor::block_on(store.revoke_token(prefix)).unwrap();
-                1
-            }),
-            ("revoke_all_for_user", |store, _| {
-                futures::executor::block_on(store.revoke_all_for_user("alice"))
-            }),
-        ];
-        for (path, revoke) in paths {
-            let temp_dir = TempDir::new().unwrap();
-            let store = TokenStore::new(temp_dir.path());
-            let token = store.create_token("alice", 30, None, Role::Write).unwrap();
-            let kept = store.create_token("bob", 30, None, Role::Read).unwrap();
-            let cached = || CachedToken {
-                user: "alice".to_string(),
-                role: Role::Write,
-                expires_at: u64::MAX,
-                cached_at: Instant::now(),
-            };
-
-            let seen = store.revocations_seen();
-            assert_eq!(revoke(&store, &token), 1, "{path}");
-            store.cache_unless_revoked(seen, sha256_hex(&token), cached());
-
-            assert!(
-                matches!(store.verify_token(&token), Err(TokenError::NotFound)),
-                "{path}: a verify racing the revoke cached the revoked token"
-            );
-            assert!(store.verify_token(&kept).is_ok(), "{path}");
-
-            // Control: with no revoke in between, the verify's result is cached.
-            let seen = store.revocations_seen();
-            store.cache_unless_revoked(seen, sha256_hex(&token), cached());
-            assert!(store.verify_token(&token).is_ok(), "{path}: control");
-        }
-    }
-
     /// A token of `user` written straight into `dir`, hashed at the lowest
     /// Argon2 cost: a verify checks it like any other, only much sooner, so
     /// every order of a race can be played.
@@ -1561,50 +1569,102 @@ mod tests {
         }
     }
 
-    /// The legacy-hash migration rewrites the token file on a verify; a revoke
-    /// landing between its read and its write must stay in force: the
-    /// migration must not put the file back.
+    /// A token file is removed only by the files lock's `remove`, and written
+    /// over only by the files lock's rewrites and by a mint, which writes a new
+    /// one (white list): a revoke or a rewrite that went another way would
+    /// skip the lock or the order [`files`] holds. Needles are built at run
+    /// time so this text does not match.
     #[test]
-    fn legacy_migration_racing_revoke_does_not_resurrect() {
-        let temp_dir = TempDir::new().unwrap();
+    fn token_files_are_removed_and_written_only_through_the_files_lock() {
+        use std::collections::{BTreeMap, BTreeSet};
+        let source = include_str!("tokens.rs");
+        let code = &source[..source.find(&["mod", " tests {"].concat()).unwrap()];
+        let needles = [
+            ["remove", "_file"].concat(),
+            ["remove", "_dir"].concat(),
+            ["rename", "("].concat(),
+            ["fs::", "write("].concat(),
+            ["write_token", "_file("].concat(),
+        ];
+        let mut found: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let mut function = "";
+        for line in code.lines().filter(|l| !l.trim_start().starts_with("//")) {
+            if let Some((_, rest)) = line.split_once("fn ") {
+                function = rest
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .next()
+                    .unwrap_or("");
+            }
+            for needle in &needles {
+                if line.contains(needle.as_str()) {
+                    found.entry(needle).or_default().insert(function);
+                }
+            }
+        }
+        let allowed: BTreeMap<&str, BTreeSet<&str>> = [
+            (needles[0].as_str(), BTreeSet::from(["remove"])),
+            (
+                needles[2].as_str(),
+                BTreeSet::from(["rewrite_async", "write_token_file"]),
+            ),
+            (
+                needles[3].as_str(),
+                BTreeSet::from(["rewrite_async", "write_token_file"]),
+            ),
+            (
+                needles[4].as_str(),
+                BTreeSet::from(["mint_token", "rewrite", "write_token_file"]),
+            ),
+        ]
+        .into();
+        assert_eq!(found, allowed);
+    }
+
+    /// The legacy-hash migration rewrites the token file on a verify. Racing a
+    /// revoke, in every order of their steps, it leaves the token revoked: it
+    /// does not put the file back, and the token is refused afterwards.
+    #[test]
+    fn a_migration_racing_a_revoke_in_any_order_leaves_the_token_revoked() {
         let raw_token = "nra_0123456789abcdef0123456789abcdef";
-        let prefix = sha256_hex(raw_token)[..16].to_string();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         let info = TokenInfo {
             token_hash: sha256_hex(raw_token),
-            user: "legacyuser".to_string(),
+            user: "alice".to_string(),
             created_at: now,
             expires_at: now + 86400,
             last_used: None,
             description: None,
             role: Role::Write,
         };
-        let file = temp_dir.path().join(format!("{prefix}.json"));
-        fs::write(&file, serde_json::to_string_pretty(&info).unwrap()).unwrap();
-
-        let store = TokenStore::new(temp_dir.path());
-        let verifier = {
-            let store = store.clone();
-            std::thread::spawn(move || store.verify_token(raw_token))
-        };
-        // The migration hashes with Argon2 between its read and its write.
-        std::thread::sleep(Duration::from_millis(20));
-        futures::executor::block_on(store.revoke_token(&prefix)).unwrap();
-        let _ = verifier.join().unwrap();
-
-        assert!(
-            !file.exists(),
-            "the migration put a revoked token file back"
-        );
-        assert!(
-            TokenStore::new(temp_dir.path())
-                .verify_token(raw_token)
-                .is_err(),
-            "a revoked legacy token verifies from disk after the migration"
-        );
+        for (path, revoke) in revokes() {
+            let played = interleave::every_order(|choose| {
+                let dir = TempDir::new().unwrap();
+                let file = token_path(dir.path(), raw_token);
+                fs::write(&file, serde_json::to_string_pretty(&info).unwrap()).unwrap();
+                let store = TokenStore::new(dir.path());
+                let migrate: interleave::Operation = {
+                    let store = store.clone();
+                    Box::new(move || drop(store.verify_token(raw_token)))
+                };
+                let revoking: interleave::Operation = {
+                    let store = store.clone();
+                    Box::new(move || revoke(&store, raw_token))
+                };
+                let taken = interleave::run(vec![migrate, revoking], &can_go(&store), choose);
+                assert!(
+                    !file.exists(),
+                    "{path}: the migration put the revoked token back after {taken:?}"
+                );
+                assert!(
+                    matches!(store.verify_token(raw_token), Err(TokenError::NotFound)),
+                    "{path}: {taken:?}"
+                );
+            });
+            assert!(played > 1, "{path}: {played} orders");
+        }
     }
 
     /// Every mint gets at most MAX_TOKEN_TTL_DAYS days, however long it asks
