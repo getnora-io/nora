@@ -68,6 +68,22 @@ impl HtpasswdAuth {
             }
         }
 
+        let mut unreadable: Vec<&str> = users
+            .iter()
+            .filter(|(_, hash)| !bcrypt_can_read(hash))
+            .map(|(username, _)| username.as_str())
+            .collect();
+        if !unreadable.is_empty() {
+            unreadable.sort_unstable();
+            // The names only: a hash is a secret too.
+            tracing::warn!(
+                file = %path.display(),
+                users = ?unreadable,
+                "htpasswd lines whose hash is not bcrypt never match a password: \
+                 rewrite them with `htpasswd -B`"
+            );
+        }
+
         if users.is_empty() {
             None
         } else {
@@ -173,12 +189,42 @@ impl HtpasswdAuth {
     }
 }
 
+/// Whether `hash` has bcrypt's form, `$2a$`, `$2b$`, `$2x$` or `$2y$`, a cost bcrypt accepts
+/// and 53 characters of its alphabet: the only hashes [`HtpasswdAuth::verify`] can match.
+fn bcrypt_can_read(hash: &str) -> bool {
+    let bytes = hash.as_bytes();
+    bytes.len() == 60
+        && hash.is_ascii()
+        && matches!(&hash[..4], "$2a$" | "$2b$" | "$2x$" | "$2y$")
+        && hash[4..6]
+            .parse::<u32>()
+            .is_ok_and(|cost| (4..=31).contains(&cost))
+        && bytes[6] == b'$'
+        && bytes[7..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'/'))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
+
+    /// Lines htpasswd writes with other schemes (`-s`, `-m`, `-d`, `-p`), an empty hash, and
+    /// a bcrypt one with a cost bcrypt refuses.
+    const UNREADABLE: [(&str, &str); 6] = [
+        ("sha", "{SHA}W6ph5Mm5Pz8GgiULbPgzG37mj9g="),
+        ("apr1", "$apr1$r31.....$HqJZimcKQFAMYayBlzkrA/"),
+        ("crypt", "rqXexS6ZhobKA"),
+        ("plain", "plaintext-secret"),
+        ("empty", ""),
+        (
+            "cost3",
+            "$2y$03$KjmTqvC8hRzE5SXXRomtA.dEqMtHvC6Fq7S6eRjsnTF0q4pFRGn2a",
+        ),
+    ];
 
     fn create_test_htpasswd(entries: &[(&str, &str)]) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -269,6 +315,100 @@ mod tests {
         );
         assert_eq!(auth.verified("a", "pw-a"), Some(true));
         assert_eq!(auth.verified("a", "pw-b"), Some(false));
+    }
+
+    /// A hash bcrypt cannot read refuses every password, every time: a line htpasswd wrote
+    /// with another scheme (`-s`, `-m`, `-d`, `-p`), an empty one, a bcrypt one with a cost
+    /// out of range. Remembered as a refusal, never as a match.
+    #[tokio::test]
+    async fn a_hash_bcrypt_cannot_read_matches_no_password() {
+        let mut file = NamedTempFile::new().unwrap();
+        for (user, hash) in UNREADABLE {
+            writeln!(file, "{user}:{hash}").unwrap();
+        }
+        file.flush().unwrap();
+        let auth = HtpasswdAuth::from_file(file.path()).unwrap();
+        for (user, hash) in UNREADABLE {
+            assert!(bcrypt::verify("password", hash).is_err(), "{user}");
+            for password in ["password", "", hash, "anything"] {
+                for _ in 0..2 {
+                    assert!(!auth.verify(user, password).await, "{user}: {password}");
+                }
+                assert_eq!(auth.verified(user, password), Some(false), "{user}");
+            }
+        }
+    }
+
+    /// Each kind of line that can never match is told apart from a bcrypt hash, the same way
+    /// bcrypt itself tells them apart.
+    #[test]
+    fn only_a_bcrypt_hash_is_readable() {
+        let bcrypt_hash = bcrypt::hash("pw", 4).unwrap();
+        for hash in [
+            bcrypt_hash.as_str(),
+            &bcrypt_hash.replacen("$2b$", "$2y$", 1),
+            &bcrypt_hash.replacen("$2b$", "$2a$", 1),
+        ] {
+            assert!(bcrypt_can_read(hash), "{hash}");
+            assert!(bcrypt::verify("pw", hash).unwrap(), "{hash}");
+        }
+        for hash in UNREADABLE.map(|(_, hash)| hash) {
+            assert!(!bcrypt_can_read(hash), "{hash}");
+            assert!(bcrypt::verify("password", hash).is_err(), "{hash}");
+        }
+    }
+
+    /// Loading a file with lines that can never match warns once, naming their users and
+    /// not their hashes; a file of bcrypt lines loads without it.
+    #[test]
+    fn lines_that_can_never_match_are_named_at_load() {
+        use tracing_subscriber::fmt::MakeWriter;
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let load = |file: &NamedTempFile| {
+            let sink = Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(sink.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                HtpasswdAuth::from_file(file.path()).unwrap();
+            });
+            let bytes = sink.0.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        };
+
+        let mut file = create_test_htpasswd(&[("good", "pw")]);
+        assert_eq!(load(&file), "");
+        for (user, hash) in UNREADABLE {
+            writeln!(file, "{user}:{hash}").unwrap();
+        }
+        file.flush().unwrap();
+        let log = load(&file);
+        assert_eq!(log.lines().count(), 1, "{log}");
+        assert!(log.contains("WARN"), "{log}");
+        for (user, hash) in UNREADABLE {
+            assert!(log.contains(&format!("\"{user}\"")), "{user}: {log}");
+            if !hash.is_empty() {
+                assert!(!log.contains(hash), "{user}'s hash: {log}");
+            }
+        }
+        assert!(!log.contains("\"good\""), "{log}");
     }
 
     /// Check every pair at once, as a flood of requests would.
