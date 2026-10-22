@@ -1693,7 +1693,7 @@ mod explain_spec_tests {
     use super::*;
 
     #[test]
-    fn parse_explain_spec_recovers_each_registrys_at_convention() {
+    fn parse_explain_spec_recovers_each_registries_at_convention() {
         let cases: &[(&str, RegistryType, &str, Option<&str>)] = &[
             (
                 "cargo:serde@1.0.0",

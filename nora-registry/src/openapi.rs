@@ -99,6 +99,7 @@ use crate::AppState;
         crate::openapi::go_module_zip,
         // Raw
         crate::openapi::raw_file_get,
+        crate::openapi::raw_file_head,
         crate::openapi::raw_file_put,
         // RubyGems
         crate::openapi::gems_info,
@@ -808,7 +809,12 @@ pub async fn go_module_zip() {}
         ("path" = String, Path, description = "File path (e.g., 'myproject/config.yaml')")
     ),
     responses(
-        (status = 200, description = "File content"),
+        (status = 200, description = "File content", headers(
+            ("ETag" = String, description = "Quoted SHA-256 of the file, when it has an integrity pin"),
+            ("X-Nora-Meta-{key}" = String, description = "One header per annotation stored with the file")
+        )),
+        (status = 206, description = "Byte range of the file, with the same ETag and X-Nora-Meta-{key} headers"),
+        (status = 304, description = "If-None-Match matches the ETag"),
         (status = 400, description = "Invalid input", body = ErrorResponse),
         (status = 404, description = "File not found"),
         (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time")
@@ -816,18 +822,41 @@ pub async fn go_module_zip() {}
 )]
 pub async fn raw_file_get() {}
 
+/// Raw file metadata
+#[utoipa::path(
+    head,
+    path = "/raw/{path}",
+    tag = "raw",
+    params(
+        ("path" = String, Path, description = "File path (e.g., 'myproject/config.yaml')")
+    ),
+    responses(
+        (status = 200, description = "File exists", headers(
+            ("Content-Length" = u64, description = "File size in bytes"),
+            ("ETag" = String, description = "Quoted SHA-256 of the file, when it has an integrity pin"),
+            ("X-Nora-Meta-{key}" = String, description = "One header per annotation stored with the file")
+        )),
+        (status = 400, description = "Invalid input"),
+        (status = 404, description = "File not found")
+    )
+)]
+pub async fn raw_file_head() {}
+
 /// Upload raw file
 #[utoipa::path(
     put,
     path = "/raw/{path}",
     tag = "raw",
     params(
-        ("path" = String, Path, description = "File path")
+        ("path" = String, Path, description = "File path"),
+        ("X-Nora-Meta-{key}" = Option<String>, Header, description = "Annotation stored with the file and returned by GET and HEAD; repeat with other keys. The key is 1 to 64 characters from a-z, 0-9 and - (not sha256); the value is 1 to 1024 printable ASCII characters. At most 32 annotations and 1978 bytes of keys and values. The annotations are part of the file: a change is a new PUT with If-Match."),
+        ("X-Nora-Copy-Source" = Option<String>, Header, description = "Raw path of a file to copy to this path in storage, with an empty body. The copy gets the bytes, the ETag and the annotations of the source; If-Match and If-None-Match apply to this path. X-Nora-Meta-{key} is refused on a copy.")
     ),
     responses(
-        (status = 200, description = "File written (created, overwritten with If-Match, or re-PUT of identical bytes)"),
-        (status = 400, description = "Invalid path (non-ASCII characters)"),
-        (status = 409, description = "File already exists with different content (immutable)"),
+        (status = 200, description = "File written (created, overwritten with If-Match, re-PUT of identical bytes and annotations, or copied)"),
+        (status = 400, description = "Invalid path (non-ASCII characters), invalid annotation, or invalid copy request"),
+        (status = 404, description = "Copy source not found"),
+        (status = 409, description = "File already exists with different content or annotations (immutable)"),
         (status = 412, description = "Precondition failed (ETag mismatch or resource state)"),
         (status = 413, description = "File too large"),
         (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time"),

@@ -1242,11 +1242,27 @@ pub fn render_package_detail(
                 } else {
                     ""
                 };
+                let annotations = if v.annotations.is_empty() {
+                    String::new()
+                } else {
+                    let chips: Vec<String> = v
+                        .annotations
+                        .iter()
+                        .map(|(key, value)| {
+                            format!(
+                                r#"<span class="inline-block px-1.5 py-0.5 text-xs font-mono text-slate-300 bg-slate-700 border border-slate-600 rounded">{}={}</span>"#,
+                                html_escape(key),
+                                html_escape(value)
+                            )
+                        })
+                        .collect();
+                    format!(r#"<div class="mt-1">{}</div>"#, chips.join(" "))
+                };
                 format!(
                     r##"
                 <tr class="hover:bg-slate-700 cursor-pointer version-row" data-version="{ver}">
                     <td class="px-3 md:px-6 py-3 md:py-4">
-                        <div class="flex items-center gap-2">{icon}<span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{ver}</span>{badge}</div>
+                        <div class="flex items-center gap-2">{icon}<span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{ver}</span>{badge}</div>{annotations}
                     </td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{size}</td>
                     <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{pub_date}</td>
@@ -1255,6 +1271,7 @@ pub fn render_package_detail(
                     ver = html_escape(&v.version),
                     icon = file_icon,
                     badge = cached_badge,
+                    annotations = annotations,
                     size = size_display,
                     pub_date = html_escape(&v.published)
                 )
@@ -2063,6 +2080,7 @@ mod tests {
                 size: 1,
                 published: H.into(),
                 cached: false,
+                annotations: nora_registry::annotations::Annotations::default(),
             }],
             prerelease_count: 0,
             total_stable: 1,
@@ -2357,6 +2375,7 @@ mod tests {
                 size: 42,
                 published: "2026-04-29".to_string(),
                 cached: true,
+                annotations: nora_registry::annotations::Annotations::default(),
             }],
             prerelease_count: 0,
             total_stable: 0,
@@ -2380,12 +2399,14 @@ mod tests {
                     size: 10,
                     published: "2026-04-29".to_string(),
                     cached: true,
+                    annotations: nora_registry::annotations::Annotations::default(),
                 },
                 crate::ui::api::VersionInfo {
                     version: "b.txt".to_string(),
                     size: 20,
                     published: "2026-04-29".to_string(),
                     cached: true,
+                    annotations: nora_registry::annotations::Annotations::default(),
                 },
             ],
             prerelease_count: 0,
@@ -2466,5 +2487,27 @@ mod tests {
             !html.contains("writeText('docker pull"),
             "Docker template must not use inline JS string interpolation"
         );
+    }
+
+    #[test]
+    fn raw_annotations_render_as_escaped_chips_under_the_file_name() {
+        let annotations = nora_registry::annotations::Annotations::try_from_pairs([(
+            "commit".to_string(),
+            "<b>abc</b>".to_string(),
+        )])
+        .unwrap();
+        let detail = PackageDetail {
+            versions: vec![crate::ui::api::VersionInfo {
+                version: "f.bin".to_string(),
+                size: 1,
+                published: "2026-10-19".to_string(),
+                cached: true,
+                annotations,
+            }],
+            ..empty_detail()
+        };
+        let html = render_package_detail("raw", "dir", &detail, Lang::En, "https://x", false);
+        assert!(html.contains("commit=&lt;b&gt;abc&lt;/b&gt;"), "{html}");
+        assert!(!html.contains("<b>abc</b>"));
     }
 }
