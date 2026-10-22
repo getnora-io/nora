@@ -193,15 +193,22 @@ pub(crate) fn proxied_repo_conflict() -> Response {
 /// `\/` form here closes that. NB: `\uXXXX`-escaped separators are a documented
 /// residual — see `rewrite-drops-upstream-host` — caught by the runtime
 /// `UPSTREAM_URL_LEAK_TOTAL` detector, not by this string pass.
+///
+/// Like every upstream rewrite, it replaces `from` only where the URL ends ([`upstream_url_ends`]).
 pub(crate) fn replace_url_escape_aware(text: &str, from: &str, to: &str) -> String {
-    let plain = text.replace(from, to);
+    let plain = replace_upstream_url_str(text, from, to);
     let esc_from = from.replace('/', "\\/");
     if !plain.contains(&esc_from) {
         return plain;
     }
     let esc_to = to.replace('/', "\\/");
-    plain.replace(&esc_from, &esc_to)
+    replace_upstream_url_str(&plain, &esc_from, &esc_to)
 }
+
+pub(crate) use nora_registry::upstream_url::{
+    ends as upstream_url_ends, replace as replace_upstream_url,
+    replace_str as replace_upstream_url_str,
+};
 
 /// Build NORA base URL from config (for URL rewriting).
 ///

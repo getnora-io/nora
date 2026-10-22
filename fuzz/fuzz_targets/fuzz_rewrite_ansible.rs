@@ -8,10 +8,12 @@
 //! occurrence of the exact upstream URL is rewritten) and asserts neither form
 //! survives. Run: `cargo +nightly fuzz run fuzz_rewrite_ansible`.
 //!
-//! NB: the invariant is on the exact upstream URL, not the bare host — arbitrary
-//! fuzz bytes may contain the bare host without it being a rewrite failure.
+//! NB: the invariant is on the exact upstream URL where it ends (`upstream_url::ends`), not
+//! the bare host — arbitrary fuzz bytes may contain the bare host, or the URL continued into
+//! another host (`.evil`, `:8443`), without it being a rewrite failure.
 use libfuzzer_sys::fuzz_target;
 use nora_registry::rewrite_fuzz::rewrite_ansible_urls;
+use nora_registry::upstream_url;
 
 const UPSTREAM: &str = "https://origin-host.invalid";
 const NORA_BASE: &str = "http://nora.test";
@@ -20,12 +22,12 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(text) = std::str::from_utf8(data) {
         let out = rewrite_ansible_urls(text, UPSTREAM, NORA_BASE);
         assert!(
-            !out.contains(UPSTREAM),
+            !upstream_url::named_in(out.as_bytes(), UPSTREAM.as_bytes()),
             "plain upstream URL leaked through ansible rewrite (#385)"
         );
         let escaped = UPSTREAM.replace('/', "\\/");
         assert!(
-            !out.contains(&escaped),
+            !upstream_url::named_in(out.as_bytes(), escaped.as_bytes()),
             "slash-escaped upstream URL leaked through ansible rewrite (#385)"
         );
     }

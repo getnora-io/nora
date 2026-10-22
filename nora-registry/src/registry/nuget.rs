@@ -2460,6 +2460,23 @@ mod tests {
         );
     }
 
+    /// A host that only starts like the upstream's is another origin: its registration and
+    /// package links are left as they are.
+    #[test]
+    fn a_host_that_only_starts_like_the_upstream_is_not_rewritten() {
+        let upstream = "https://api.example.org";
+        for other in [
+            r#"{"@id":"https://api.example.org.evil.net/v3/registration5-semver1/pkg/index.json"}"#,
+            r#"{"@id":"https://api.example.org:8443/v3-flatcontainer/pkg/1.0.0/pkg.1.0.0.nupkg"}"#,
+            r#"{"@id":"https:\/\/api.example.org.evil.net\/v3-flatcontainer\/pkg\/x.nupkg"}"#,
+        ] {
+            assert_eq!(
+                rewrite_registration_urls(other, upstream, "http://nora.test"),
+                other
+            );
+        }
+    }
+
     #[test]
     fn test_valid_package_ids() {
         assert!(is_valid_package_id("newtonsoft.json"));

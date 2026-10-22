@@ -22,6 +22,7 @@
 //! NORA Registry — library interface for fuzzing and testing
 
 pub mod pypi_files;
+pub mod upstream_url;
 pub mod validation;
 pub mod verified;
 
@@ -71,7 +72,11 @@ pub mod npm_fuzz {
                     .and_then(|t| t.as_str())
                     .map(|s| s.to_string())
                 {
-                    let rewritten = tarball_url.replace(upstream_trimmed, &nora_npm_base);
+                    let rewritten = upstream_url_forms(upstream_trimmed)
+                        .iter()
+                        .fold(tarball_url, |url, form| {
+                            crate::upstream_url::replace_str(&url, form, &nora_npm_base)
+                        });
                     if let Some(dist) = version_data.get_mut("dist") {
                         dist["tarball"] = serde_json::Value::String(rewritten);
                     }
@@ -89,26 +94,33 @@ pub mod npm_fuzz {
         ))
     }
 
-    /// Byte-level replace of upstream URL prefix (safety net for fuzz targets).
+    /// Byte-level replace of upstream URL prefix (safety net for fuzz targets), where that URL
+    /// ends ([`crate::upstream_url::ends`]).
     fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) -> Vec<u8> {
         if upstream_url.is_empty() {
             return data.to_vec();
         }
-        let needle = upstream_url.as_bytes();
-        if memchr::memmem::find(data, needle).is_none() {
-            return data.to_vec();
+        let mut result = data.to_vec();
+        for form in upstream_url_forms(upstream_url) {
+            result =
+                crate::upstream_url::replace(&result, form.as_bytes(), nora_npm_base.as_bytes());
         }
-        let replacement = nora_npm_base.as_bytes();
-        let mut result = Vec::with_capacity(data.len());
-        let mut start = 0;
-        let finder = memchr::memmem::Finder::new(needle);
-        while let Some(pos) = finder.find(&data[start..]) {
-            result.extend_from_slice(&data[start..start + pos]);
-            result.extend_from_slice(replacement);
-            start += pos + needle.len();
-        }
-        result.extend_from_slice(&data[start..]);
         result
+    }
+
+    /// Mirror of `registry::npm::upstream_url_forms`: the URL as configured and under the other
+    /// scheme.
+    fn upstream_url_forms(upstream_url: &str) -> Vec<String> {
+        let twin = if let Some(rest) = upstream_url.strip_prefix("https://") {
+            Some(format!("http://{rest}"))
+        } else {
+            upstream_url
+                .strip_prefix("http://")
+                .map(|rest| format!("https://{rest}"))
+        };
+        std::iter::once(upstream_url.to_string())
+            .chain(twin)
+            .collect()
     }
 
     #[cfg(test)]
@@ -316,13 +328,13 @@ pub mod version_fuzz {
 pub mod rewrite_fuzz {
     /// Mirror of `registry::replace_url_escape_aware`.
     fn replace_url_escape_aware(text: &str, from: &str, to: &str) -> String {
-        let plain = text.replace(from, to);
+        let plain = crate::upstream_url::replace_str(text, from, to);
         let esc_from = from.replace('/', "\\/");
         if !plain.contains(&esc_from) {
             return plain;
         }
         let esc_to = to.replace('/', "\\/");
-        plain.replace(&esc_from, &esc_to)
+        crate::upstream_url::replace_str(&plain, &esc_from, &esc_to)
     }
 
     /// Mirror of `registry::ansible::rewrite_ansible_urls`.

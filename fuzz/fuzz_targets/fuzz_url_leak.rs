@@ -9,19 +9,20 @@
 //! finding. Run: `cargo +nightly fuzz run fuzz_url_leak`.
 use libfuzzer_sys::fuzz_target;
 use nora_registry::npm_fuzz::rewrite_tarball_urls;
+use nora_registry::upstream_url;
 
 // RFC 6761 reserved `.invalid` TLD: never a real registry, so any surviving
 // occurrence is rewrite-produced, not a fixture coincidence. The nora base is
 // sentinel-free so a match is unambiguous. Scope: the EXACT configured upstream
-// URL (what the rewrite is given); scheme/case variants are a separate concern.
+// URL (what the rewrite is given) where it ends (`upstream_url::ends`) — followed by `.evil`
+// or `:8443` it names another host, which the rewrite rightly leaves; scheme/case variants
+// are a separate concern.
 const UPSTREAM: &str = "https://upstream-host.invalid";
 const NORA_BASE: &str = "http://nora.test";
 
 fuzz_target!(|data: &[u8]| {
     if let Ok(out) = rewrite_tarball_urls(data, NORA_BASE, UPSTREAM) {
-        let leaked = out
-            .windows(UPSTREAM.len())
-            .any(|w| w == UPSTREAM.as_bytes());
+        let leaked = upstream_url::named_in(&out, UPSTREAM.as_bytes());
         assert!(
             !leaked,
             "upstream URL leaked into rewritten npm metadata (#385)"

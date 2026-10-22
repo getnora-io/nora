@@ -423,7 +423,9 @@ fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Res
             {
                 let rewritten = upstream_url_forms(upstream_trimmed)
                     .iter()
-                    .fold(tarball_url, |url, form| url.replace(form, &nora_npm_base));
+                    .fold(tarball_url, |url, form| {
+                        super::replace_upstream_url_str(&url, form, &nora_npm_base)
+                    });
                 if let Some(dist) = version_data.get_mut("dist") {
                     dist["tarball"] = serde_json::Value::String(rewritten);
                 }
@@ -448,32 +450,17 @@ fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Res
 ///
 /// Used as safety net after targeted JSON rewrite, and as fallback when JSON
 /// parsing fails. Replaces full URL prefix (e.g. `https://registry.npmjs.org`)
-/// rather than bare hostname to avoid corrupting unrelated fields.
+/// rather than bare hostname to avoid corrupting unrelated fields, and only where
+/// that URL ends ([`super::upstream_url_ends`]): `https://registry.npmjs.org.evil.org`
+/// is another host.
 fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) -> Vec<u8> {
     if upstream_url.is_empty() {
         return data.to_vec();
     }
     let mut result = data.to_vec();
     for form in upstream_url_forms(upstream_url) {
-        result = replace_all_bytes(&result, form.as_bytes(), nora_npm_base.as_bytes());
+        result = super::replace_upstream_url(&result, form.as_bytes(), nora_npm_base.as_bytes());
     }
-    result
-}
-
-/// Every occurrence of `needle` in `data` replaced by `replacement`.
-fn replace_all_bytes(data: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
-    if memchr::memmem::find(data, needle).is_none() {
-        return data.to_vec();
-    }
-    let mut result = Vec::with_capacity(data.len());
-    let mut start = 0;
-    let finder = memchr::memmem::Finder::new(needle);
-    while let Some(pos) = finder.find(&data[start..]) {
-        result.extend_from_slice(&data[start..start + pos]);
-        result.extend_from_slice(replacement);
-        start += pos + needle.len();
-    }
-    result.extend_from_slice(&data[start..]);
     result
 }
 
@@ -9456,6 +9443,72 @@ mod rewrite_both_schemes {
                 "not json http://nora:5000/npm/pkg/-/pkg-1.0.1.tgz http://nora:5000/npm/pkg/-/pkg-1.0.0.tgz",
                 "{upstream}"
             );
+        }
+    }
+
+    /// A link is the upstream's only where the upstream URL ends: at a `/`, `?`, `#`, the end of
+    /// the JSON string, a `\` (a JSON escape such as `\/`), or the end of the text. A longer host,
+    /// a port, credentials before another host, or a longer last path segment name somewhere
+    /// else, under either scheme, and are left as they are — by the targeted rewrite and the
+    /// byte-level one alike.
+    #[test]
+    fn a_host_or_path_that_only_starts_like_the_upstream_is_not_rewritten() {
+        let nora = "http://nora:5000/npm";
+        for (upstream, links) in [
+            (
+                "https://registry.example.com",
+                [
+                    "https://registry.example.com.evil.org/pkg/-/pkg-1.0.0.tgz",
+                    "http://registry.example.com.evil.org/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com:8443/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com@evil.org/pkg/-/pkg-1.0.0.tgz",
+                    "http://registry.example.com-mirror.org/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.company/pkg/-/pkg-1.0.0.tgz",
+                ],
+            ),
+            (
+                "https://registry.example.com/api/npm/repo/",
+                [
+                    "https://registry.example.com/api/npm/repo-other/pkg/-/pkg-1.0.0.tgz",
+                    "http://registry.example.com/api/npm/repo2/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com/api/npm/repo.evil/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com/api/npm/repo:x/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com/api/npm/repo%2Fx/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com/api/npm/repository/pkg/-/pkg-1.0.0.tgz",
+                ],
+            ),
+        ] {
+            let trimmed = upstream.trim_end_matches('/');
+            for link in links {
+                let doc = packument(&[("1.0.0", link)]);
+                let rewritten = rewrite_tarball_urls(&doc, "http://nora:5000", upstream).unwrap();
+                assert_eq!(tarballs(&rewritten), vec![link.to_string()], "{upstream}");
+                let raw = format!("not json {link} {link}");
+                let rewritten = replace_upstream_bytes(raw.as_bytes(), trimmed, nora);
+                assert_eq!(String::from_utf8(rewritten).unwrap(), raw, "{upstream}");
+            }
+            // The upstream's own links, wherever its URL ends, under either scheme.
+            let twin = trimmed.replacen("https://", "http://", 1);
+            for own in [trimmed, twin.as_str()] {
+                for (text, expected) in [
+                    (
+                        format!("{own}/pkg/-/pkg-1.0.0.tgz"),
+                        format!("{nora}/pkg/-/pkg-1.0.0.tgz"),
+                    ),
+                    (format!("{own}?q=pkg"), format!("{nora}?q=pkg")),
+                    (format!("{own}#pkg"), format!("{nora}#pkg")),
+                    (format!("\"{own}\""), format!("\"{nora}\"")),
+                    (format!("\\\"{own}\\\""), format!("\\\"{nora}\\\"")),
+                    (own.to_string(), nora.to_string()),
+                ] {
+                    let rewritten = replace_upstream_bytes(text.as_bytes(), trimmed, nora);
+                    assert_eq!(
+                        String::from_utf8(rewritten).unwrap(),
+                        expected,
+                        "{upstream}"
+                    );
+                }
+            }
         }
     }
 

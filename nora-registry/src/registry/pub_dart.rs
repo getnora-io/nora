@@ -940,6 +940,7 @@ fn rewrite_next_url(next_url: &str, nora_base: &str, proxy_url: &str) -> String 
 
     next_url
         .strip_prefix(&upstream_prefix)
+        .filter(|suffix| super::upstream_url_ends(suffix.as_bytes()))
         .map(|suffix| format!("{}{}", nora_prefix, suffix))
         .unwrap_or_else(|| {
             tracing::warn!(
@@ -1046,6 +1047,25 @@ fn is_valid_pub_version(version: &str) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+
+    /// The next page is the upstream's only under its own `/api/packages`: a longer segment,
+    /// or a host that only starts like the upstream's, is not moved under NORA.
+    #[test]
+    fn a_next_page_only_starting_like_the_upstream_is_not_moved_under_nora() {
+        let nora = "http://nora.test/pub";
+        let proxy = "https://pub.example.dev";
+        assert_eq!(
+            rewrite_next_url("https://pub.example.dev/api/packages?page=2", nora, proxy),
+            "http://nora.test/pub/api/packages?page=2"
+        );
+        for other in [
+            "https://pub.example.dev/api/packages-evil?page=2",
+            "https://pub.example.dev/api/packagesX/y",
+            "https://pub.example.dev.evil.org/api/packages?page=2",
+        ] {
+            assert_eq!(rewrite_next_url(other, nora, proxy), other);
+        }
+    }
 
     #[test]
     fn search_names_reads_every_name_in_the_term() {

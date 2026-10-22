@@ -941,6 +941,46 @@ mod tests {
         );
     }
 
+    /// A host that only starts like the upstream's, or a longer last segment of its path, is
+    /// another origin: the catch-all rewrite leaves it, plain or slash-escaped, while the
+    /// upstream's own URL is rewritten wherever it ends.
+    #[test]
+    fn a_host_that_only_starts_like_the_upstream_is_not_rewritten() {
+        let upstream = "https://galaxy.example.com";
+        let base = "http://nora.test";
+        for other in [
+            "https://galaxy.example.com.evil.org/x",
+            "https://galaxy.example.com:8443/x",
+            "https://galaxy.example.com@evil.org/x",
+            "https://galaxy.example.community/x",
+        ] {
+            let plain = format!(r#"{{"href":"{other}"}}"#);
+            assert_eq!(rewrite_ansible_urls(&plain, upstream, base), plain);
+            let escaped = plain.replace('/', "\\/");
+            assert_eq!(rewrite_ansible_urls(&escaped, upstream, base), escaped);
+        }
+        for (own, expected) in [
+            (
+                r#"{"href":"https://galaxy.example.com"}"#,
+                r#"{"href":"http://nora.test/ansible"}"#,
+            ),
+            (
+                r#"{"href":"https://galaxy.example.com/x"}"#,
+                r#"{"href":"http://nora.test/ansible/x"}"#,
+            ),
+            (
+                r#"{"href":"https://galaxy.example.com?x"}"#,
+                r#"{"href":"http://nora.test/ansible?x"}"#,
+            ),
+            (
+                r#"{"href":"https:\/\/galaxy.example.com\/x"}"#,
+                r#"{"href":"http:\/\/nora.test\/ansible\/x"}"#,
+            ),
+        ] {
+            assert_eq!(rewrite_ansible_urls(own, upstream, base), expected);
+        }
+    }
+
     #[test]
     fn test_valid_names() {
         assert!(is_valid_name("community"));
