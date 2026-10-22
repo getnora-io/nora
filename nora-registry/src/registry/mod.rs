@@ -326,6 +326,36 @@ pub(crate) fn cached_read<T>(
     }
 }
 
+/// What the `.sha256` sidecar written beside a cached copy says of the copy's bytes.
+pub(crate) enum Sidecar {
+    /// It names these bytes, or none was written (a copy cached before sidecars were, or whose
+    /// sidecar write failed): nothing contradicts the copy.
+    Holds,
+    /// It names other bytes: the copy is not the one cached.
+    Differs { expected: String, computed: String },
+    /// The store could not read it: the copy cannot be checked, and is not served unchecked. A
+    /// copy NORA owns is unavailable; a proxied one is fetched again, as on a cache miss.
+    Unreadable(crate::storage::StorageError),
+}
+
+/// Check the cached copy `data` of `key` against the `.sha256` sidecar written beside it.
+pub(crate) async fn check_sidecar(storage: &crate::Storage, key: &str, data: &[u8]) -> Sidecar {
+    use sha2::Digest;
+    match storage.get(&format!("{key}.sha256")).await {
+        Ok(stored) => {
+            let computed = hex::encode(sha2::Sha256::digest(data));
+            let expected = String::from_utf8_lossy(&stored).into_owned();
+            if computed == expected {
+                Sidecar::Holds
+            } else {
+                Sidecar::Differs { expected, computed }
+            }
+        }
+        Err(crate::storage::StorageError::NotFound) => Sidecar::Holds,
+        Err(e) => Sidecar::Unreadable(e),
+    }
+}
+
 /// Whether anything reads the release date of a proxied download of `rt`: the running curation's
 /// release-age rule (global or `rt`'s own), or the quarantine of `rt` when upstream dates are
 /// trusted — only a trusted date seeds its first-seen. A format asks an upstream for a date only
