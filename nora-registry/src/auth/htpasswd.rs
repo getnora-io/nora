@@ -362,35 +362,10 @@ mod tests {
     /// not their hashes; a file of bcrypt lines loads without it.
     #[test]
     fn lines_that_can_never_match_are_named_at_load() {
-        use tracing_subscriber::fmt::MakeWriter;
-        #[derive(Clone, Default)]
-        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Captured {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> MakeWriter<'a> for Captured {
-            type Writer = Captured;
-            fn make_writer(&'a self) -> Self::Writer {
-                self.clone()
-            }
-        }
         let load = |file: &NamedTempFile| {
-            let sink = Captured::default();
-            let subscriber = tracing_subscriber::fmt()
-                .with_writer(sink.clone())
-                .with_ansi(false)
-                .finish();
-            tracing::subscriber::with_default(subscriber, || {
-                HtpasswdAuth::from_file(file.path()).unwrap();
-            });
-            let bytes = sink.0.lock().unwrap().clone();
-            String::from_utf8(bytes).unwrap()
+            let (log, _capture) = crate::test_helpers::LogCapture::start();
+            HtpasswdAuth::from_file(file.path()).unwrap();
+            log.text()
         };
 
         let mut file = create_test_htpasswd(&[("good", "pw")]);

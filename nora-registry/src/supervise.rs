@@ -301,6 +301,14 @@ pub fn blocking<F: FnOnce()>(name: &'static str, exit: &ExitHook, work: F) {
     }
 }
 
+/// Panics of the task `name` counted so far in this test process.
+#[cfg(test)]
+pub(crate) fn panics_counted(name: &str) -> u64 {
+    crate::metrics::TASK_PANICS_TOTAL
+        .with_label_values(&[name])
+        .get()
+}
+
 /// Every task panic: an error in the log naming the task, and the counter.
 pub(crate) fn report_panic(name: &'static str, panic: &Box<dyn std::any::Any + Send>) {
     let message = panic

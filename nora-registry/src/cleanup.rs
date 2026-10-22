@@ -185,6 +185,9 @@ mod tests {
     /// kill the scheduler.
     #[tokio::test]
     async fn pass_panic_does_not_prevent_later_passes() {
+        let (log, _capture) = crate::test_helpers::LogCapture::start();
+        let panics = || crate::supervise::panics_counted("cleanup");
+        let before = panics();
         let rec = recorder();
         let interval = Duration::from_millis(100);
         let cancel = CancellationToken::new();
@@ -202,6 +205,19 @@ mod tests {
 
         cancel.cancel();
         handle.await.unwrap();
+        // Each panic is reported like a task's: counted, and an error naming the task.
+        assert!(
+            panics() >= before + 2,
+            "{} panics counted",
+            panics() - before
+        );
+        let errors: Vec<_> = log
+            .text()
+            .lines()
+            .filter(|line| line.contains("ERROR") && line.contains("task=\"cleanup\""))
+            .map(str::to_owned)
+            .collect();
+        assert!(errors.len() >= 2, "{}", log.text());
     }
 
     /// The periodic cycle parks on a held cleanup lock instead of skipping —

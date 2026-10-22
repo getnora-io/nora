@@ -1282,3 +1282,48 @@ impl Drop for EgressRecorder {
         self.task.abort();
     }
 }
+
+/// What the current thread logs while a capture runs, as the text the server's `fmt` layer
+/// writes, for tests that prove what an event says.
+#[derive(Clone, Default)]
+pub struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    /// Capture what this thread logs, at every level, until the guard is dropped. A
+    /// current-thread runtime polls its tasks here too.
+    pub fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        let capture = Self::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        // An event another test emitted first, with no subscriber of its own, may have been
+        // registered as wanted by nobody while this one was being set; ask again.
+        tracing::callsite::rebuild_interest_cache();
+        (capture, guard)
+    }
+
+    /// Everything captured so far.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
