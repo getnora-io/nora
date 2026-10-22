@@ -39,11 +39,13 @@ use axum::{
 };
 use std::time::Duration;
 
+// The rewrite of upstream Galaxy URLs is the one the fuzz target drives.
+use nora_registry::upstream_rewrite::{rewrite_ansible_urls, ANSIBLE_API_PREFIX as API_PREFIX};
+
 const UPSTREAM_DEFAULT: &str = "https://galaxy.ansible.com";
 
 /// Storage prefix and file suffix for repo index scanning.
 pub const INDEX_PATTERN: (&str, &str) = ("ansible/", ".tar.gz");
-const API_PREFIX: &str = "/api/v3/plugin/ansible/content/published/collections/index";
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -737,75 +739,6 @@ fn serve_stale_or_bad_gateway(
         }
     }
     StatusCode::BAD_GATEWAY.into_response()
-}
-
-// ── URL rewriting ─────────────────────────────────────────────────────
-
-/// Rewrite upstream Galaxy URLs in JSON responses to point through NORA.
-///
-/// Replacements are applied most-specific-first to avoid double-rewriting:
-/// 1. `{upstream}/download/` → `{base}/ansible/download/`
-/// 2. `{upstream}/.../artifacts/` → `{base}/ansible/download/` (#438)
-/// 3. `{upstream}{API_PREFIX}/` → `{base}/ansible/v3/collections/`
-/// 4. `{upstream}` (remaining) → `{base}/ansible`
-fn rewrite_ansible_urls(json_text: &str, upstream_url: &str, base_url: &str) -> String {
-    let upstream = upstream_url.trim_end_matches('/');
-    let base = base_url.trim_end_matches('/');
-    let nora_ansible = format!("{}/ansible", base);
-    // Each mapping is escape-aware (plain + `\/`-escaped) so a slash-escaped upstream
-    // URL cannot survive and leak the host to the client (#385).
-    use super::replace_url_escape_aware as rw;
-
-    // Most specific first: download URLs
-    let s = rw(
-        json_text,
-        &format!("{}/download/", upstream),
-        &format!("{}/download/", nora_ansible),
-    );
-    // Artifact URLs → download path (#438)
-    let s = rw(
-        &s,
-        &format!(
-            "{}/api/v3/plugin/ansible/content/published/collections/artifacts/",
-            upstream
-        ),
-        &format!("{}/download/", nora_ansible),
-    );
-    // Pulp-style API paths → short v3 paths
-    let s = rw(
-        &s,
-        &format!("{}{}/", upstream, API_PREFIX),
-        &format!("{}/v3/collections/", nora_ansible),
-    );
-    // Catch-all: any remaining upstream references
-    let s = rw(&s, upstream, &nora_ansible);
-
-    // Root-relative pagination links (#851-followup): galaxy_ng emits
-    // `links.next`/`first`/`last` as host-relative paths (no scheme/host), e.g.
-    // `/api/v3/plugin/ansible/content/published/collections/index/community/docker/versions/?limit=100&offset=100`.
-    // The absolute rewrites above never match these, so without this the client
-    // resolves them against NORA's host root — dropping the `/ansible` mount —
-    // and every collection with >100 versions (e.g. community.docker) 404s on page 2.
-    // Rewrite to root-relative NORA paths so the client's relative-link
-    // resolution keeps them under `/ansible`.
-    //
-    // These needles are anchored on the opening `"` of the JSON string value
-    // (the escape-aware `rw` also matches the `\"`…`\/`-escaped form). Unlike the
-    // absolute rules above — pinned by a full `scheme://host` — a bare path is a
-    // weak anchor, so without the quote it would also rewrite the middle of a
-    // *different* host's URL or a literal path in free text (`docs_blob`). The
-    // pagination links are whole string values, so the quote is always adjacent.
-    let nora_ansible_path = format!("{}/ansible", crate::config::url_path_component(base));
-    let s = rw(
-        &s,
-        "\"/api/v3/plugin/ansible/content/published/collections/artifacts/",
-        &format!("\"{}/download/", nora_ansible_path),
-    );
-    rw(
-        &s,
-        &format!("\"{}/", API_PREFIX),
-        &format!("\"{}/v3/collections/", nora_ansible_path),
-    )
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────

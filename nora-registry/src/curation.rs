@@ -708,42 +708,8 @@ pub fn verify_integrity_by_hash(
 // Version parsers for filename-based registries (issue #187)
 // ============================================================================
 
-/// Parse version from an npm tarball filename.
-///
-/// For scoped packages `@scope/name`, the tarball is `name-VERSION.tgz` on npmjs and
-/// `@scope/name-VERSION.tgz` on GitLab's npm registry; both are accepted.
-/// For regular packages `name`, the tarball is `name-VERSION.tgz`.
-/// Font Awesome's registry puts the file under a version directory,
-/// `VERSION/name-VERSION.tgz`; it is accepted when the directory names the version
-/// the file does.
-///
-/// `None` makes the allowlist treat the request as metadata and let it through, so a
-/// form this parser misses is a curation bypass, not a cosmetic miss.
-pub fn parse_npm_tarball_version(package_name: &str, filename: &str) -> Option<String> {
-    if let Some(version) = parse_npm_tarball_file(package_name, filename) {
-        return Some(version);
-    }
-    let (dir, file) = filename.split_once('/')?;
-    parse_npm_tarball_file(package_name, file).filter(|version| version == dir)
-}
-
-fn parse_npm_tarball_file(package_name: &str, filename: &str) -> Option<String> {
-    let filename = filename.strip_suffix(".tgz")?;
-    // For scoped packages like @scope/name, the npmjs tarball uses just the "name" part
-    let name_part = if package_name.contains('/') {
-        package_name.rsplit('/').next()?
-    } else {
-        package_name
-    };
-    let version = filename
-        .strip_prefix(package_name)
-        .or_else(|| filename.strip_prefix(name_part))?
-        .strip_prefix('-')?;
-    if version.is_empty() {
-        return None;
-    }
-    Some(version.to_string())
-}
+/// Parse version from an npm tarball filename ([`nora_registry::npm_files`]).
+pub use nora_registry::npm_files::parse_npm_tarball_version;
 
 /// A PEP 440 version as `packaging.version.Version` reads one (the spec's `VERSION_PATTERN`:
 /// case-insensitive, an optional leading `v`, surrounding whitespace allowed). Numbers are kept
@@ -4228,27 +4194,6 @@ mod tests {
         assert_eq!(parse("lodash", "/lodash-4.17.21.tgz"), None);
         assert_eq!(parse("lodash", "x/4.17.21/lodash-4.17.21.tgz"), None);
         assert_eq!(parse("lodash", "4.17.21/express-4.17.21.tgz"), None);
-    }
-
-    /// The fuzz copy in `lib.rs` parses the same forms as the one curation uses.
-    #[test]
-    fn the_fuzzed_npm_parser_matches_the_one_curation_uses() {
-        for (name, file) in [
-            ("lodash", "lodash-4.17.21.tgz"),
-            ("@babel/core", "core-7.26.0.tgz"),
-            ("@vendor/a", "@vendor/a-1.0.0.tgz"),
-            ("@vendor/a", "@other/a-1.0.0.tgz"),
-            ("@fortawesome/pro-test", "1.0.0/pro-test-1.0.0.tgz"),
-            ("@fortawesome/pro-test", "9.9.9/pro-test-1.0.0.tgz"),
-            ("lodash", "x/4.17.21/lodash-4.17.21.tgz"),
-            ("lodash", "lodash-.tgz"),
-        ] {
-            assert_eq!(
-                super::parse_npm_tarball_version(name, file),
-                nora_registry::version_fuzz::parse_npm_tarball_version(name, file),
-                "{name} {file}"
-            );
-        }
     }
 
     #[test]

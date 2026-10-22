@@ -12,7 +12,7 @@
 //! the bare host — arbitrary fuzz bytes may contain the bare host, or the URL continued into
 //! another host (`.evil`, `:8443`), without it being a rewrite failure.
 use libfuzzer_sys::fuzz_target;
-use nora_registry::rewrite_fuzz::rewrite_ansible_urls;
+use nora_registry::upstream_rewrite::rewrite_ansible_urls;
 use nora_registry::upstream_url;
 
 const UPSTREAM: &str = "https://origin-host.invalid";

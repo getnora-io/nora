@@ -1888,42 +1888,12 @@ async fn nuget_catchall(Path(path): Path<String>) -> Response {
     StatusCode::NOT_FOUND.into_response()
 }
 
-/// Rewrite upstream registration URLs in NuGet registration index/page responses.
-/// Replaces all registration5-* variants with NORA registration path,
-/// and v3-flatcontainer packageContent URLs with NORA flatcontainer path.
+/// Rewrite upstream registration URLs in NuGet registration index/page responses: registration5-*
+/// and v3-flatcontainer URLs point through NORA, catalog0 `@id`s are left as they are. The rewrite
+/// is [`nora_registry::upstream_rewrite::rewrite_registration_urls`], the one the fuzz target
+/// drives; this name is where the server calls it.
 fn rewrite_registration_urls(json_text: &str, upstream_url: &str, base_url: &str) -> String {
-    let upstream = upstream_url.trim_end_matches('/');
-    let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
-    let nora_reg = format!("{}/v3/registration/", nora_nuget);
-
-    // Rewrite registration and flatcontainer URLs to point to Nora.
-    // catalog0 URLs (catalogEntry.@id) are intentionally left as-is: Nora has
-    // no catalog handler, and NuGet clients do not fetch these during restore.
-    // Rewriting them would produce Nora URLs that 404.
-    // Each mapping is escape-aware (plain + `\/`-escaped) so a slash-escaped upstream
-    // registration/flatcontainer URL cannot survive and leak the host — sending the
-    // client back to the origin, past Nora — after the client unescapes `\/` (#385).
-    use super::replace_url_escape_aware as rw;
-    let s = rw(
-        json_text,
-        &format!("{}/v3/registration5-semver1/", upstream),
-        &nora_reg,
-    );
-    let s = rw(
-        &s,
-        &format!("{}/v3/registration5-gz-semver1/", upstream),
-        &nora_reg,
-    );
-    let s = rw(
-        &s,
-        &format!("{}/v3/registration5-gz-semver2/", upstream),
-        &nora_reg,
-    );
-    rw(
-        &s,
-        &format!("{}/v3-flatcontainer/", upstream),
-        &format!("{}/v3/flatcontainer/", nora_nuget),
-    )
+    nora_registry::upstream_rewrite::rewrite_registration_urls(json_text, upstream_url, base_url)
 }
 
 // ── Hosted packages ─────────────────────────────────────────────────────

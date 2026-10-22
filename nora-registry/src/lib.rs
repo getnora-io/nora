@@ -21,7 +21,9 @@
 )]
 //! NORA Registry — library interface for fuzzing and testing
 
+pub mod npm_files;
 pub mod pypi_files;
+pub mod upstream_rewrite;
 pub mod upstream_url;
 pub mod validation;
 pub mod verified;
@@ -285,142 +287,274 @@ pub mod maven_fuzz {
     }
 }
 
-/// Re-export version parsing for fuzz targets
+/// Re-export version parsing for fuzz targets: the server's own readers, so the fuzz targets
+/// drive the code that runs.
 pub mod version_fuzz {
-    /// The same forms as `curation::parse_npm_tarball_version` in the server.
-    pub fn parse_npm_tarball_version(package_name: &str, filename: &str) -> Option<String> {
-        if let Some(version) = parse_npm_tarball_file(package_name, filename) {
-            return Some(version);
-        }
-        let (dir, file) = filename.split_once('/')?;
-        parse_npm_tarball_file(package_name, file).filter(|version| version == dir)
-    }
-
-    fn parse_npm_tarball_file(package_name: &str, filename: &str) -> Option<String> {
-        let filename = filename.strip_suffix(".tgz")?;
-        let name_part = if package_name.contains('/') {
-            package_name.rsplit('/').next()?
-        } else {
-            package_name
-        };
-        let version = filename
-            .strip_prefix(package_name)
-            .or_else(|| filename.strip_prefix(name_part))?
-            .strip_prefix('-')?;
-        if version.is_empty() {
-            return None;
-        }
-        Some(version.to_string())
-    }
-
-    /// The server's own reader (`crate::pypi_files`): the fuzz target drives the code that runs.
+    pub use crate::npm_files::parse_npm_tarball_version;
     pub use crate::pypi_files::parse_pypi_version;
 }
 
-/// Re-export of the escape-aware raw-JSON URL rewrites for fuzz targets (#385).
-///
-/// These MIRROR the private `registry::{ansible,nuget}` rewrites, which live in the
-/// binary crate and are unreachable from this library — so a fuzz-friendly copy is
-/// the only option (same constraint as `npm_fuzz`). The *real* functions are enforced
-/// on every CI run by their in-module `#[cfg(test)]` leak tests; these byte-faithful
-/// copies let `cargo fuzz` explore the encoding-space for new dodge forms. A finding
-/// here must be reproduced against the real function before it counts.
-pub mod rewrite_fuzz {
-    /// Mirror of `registry::replace_url_escape_aware`.
-    fn replace_url_escape_aware(text: &str, from: &str, to: &str) -> String {
-        let plain = crate::upstream_url::replace_str(text, from, to);
-        let esc_from = from.replace('/', "\\/");
-        if !plain.contains(&esc_from) {
-            return plain;
-        }
-        let esc_to = to.replace('/', "\\/");
-        crate::upstream_url::replace_str(&plain, &esc_from, &esc_to)
+#[cfg(test)]
+mod one_implementation_tests {
+    //! The fuzz targets drive the code the server runs. A function with a body in this file is
+    //! a copy of server code: a fuzz run explores the copy instead of it, a fix to one is no
+    //! fix to the other. Shared code lives in a module the server and the fuzz targets both
+    //! compile (`pub mod x;` here, used by the server as `nora_registry::x`), and this file
+    //! only re-exports it.
+
+    /// Copies of server code that remain, by name: a new one fails
+    /// [`this_file_holds_no_copy_of_server_code_but_these`] until it is listed here. The npm copy
+    /// stays until the npm rewrite it mirrors moves into a shared module; the others are no
+    /// host-boundary code.
+    const COPIES: &[&str] = &[
+        "docker_fuzz::detect_manifest_media_type",
+        "npm_fuzz::rewrite_tarball_urls",
+        "npm_fuzz::replace_upstream_bytes",
+        "npm_fuzz::upstream_url_forms",
+        "pypi_fuzz::extract_filename",
+        "pypi_fuzz::parse_upstream_html",
+        "maven_fuzz::classify_path",
+        "maven_fuzz::is_checksum_file",
+        "maven_fuzz::is_snapshot",
+        "maven_fuzz::compare_maven_versions",
+        "maven_fuzz::xml_escape",
+    ];
+
+    /// The modules of their own files this file declares: the code they hold is compiled once,
+    /// for the server and the fuzz targets alike.
+    const SHARED: &[&str] = &[
+        "npm_files",
+        "pypi_files",
+        "upstream_rewrite",
+        "upstream_url",
+        "validation",
+        "verified",
+    ];
+
+    /// What a source file defines outside the items under `#[cfg(test)]`: each function with a
+    /// body (`module::name`, `module::Type::name` for a method), each macro item or `include!`
+    /// that could define one, each `#[path]`, and each module declared in a file of its own.
+    /// Read with syn, so a form split over lines or written in another spacing is the same form.
+    #[derive(Default, Debug)]
+    struct Defined {
+        bodies: Vec<String>,
+        refused: Vec<String>,
+        files: Vec<String>,
+        path: Vec<String>,
     }
 
-    /// Mirror of `registry::ansible::rewrite_ansible_urls`.
-    pub fn rewrite_ansible_urls(json_text: &str, upstream_url: &str, base_url: &str) -> String {
-        const API_PREFIX: &str = "/api/v3/plugin/ansible/content/published/collections/index";
-        let upstream = upstream_url.trim_end_matches('/');
-        let base = base_url.trim_end_matches('/');
-        let nora_ansible = format!("{}/ansible", base);
-        let s = replace_url_escape_aware(
-            json_text,
-            &format!("{}/download/", upstream),
-            &format!("{}/download/", nora_ansible),
+    fn under_test(attrs: &[syn::Attribute]) -> bool {
+        attrs.iter().any(|a| {
+            a.path().is_ident("cfg")
+                && matches!(&a.meta, syn::Meta::List(l)
+                    if l.tokens.to_string().split_whitespace().collect::<String>() == "test")
+        })
+    }
+
+    impl Defined {
+        fn read(text: &str) -> Self {
+            let file = syn::parse_file(text).unwrap();
+            let mut found = Self::default();
+            if !under_test(&file.attrs) {
+                syn::visit::Visit::visit_file(&mut found, &file);
+            }
+            found
+        }
+
+        fn name(&self, last: &str) -> String {
+            self.path
+                .iter()
+                .map(String::as_str)
+                .chain([last])
+                .collect::<Vec<_>>()
+                .join("::")
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for Defined {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            let attrs: &[syn::Attribute] = match item {
+                syn::Item::Mod(m) => &m.attrs,
+                syn::Item::Fn(f) => &f.attrs,
+                syn::Item::Impl(i) => &i.attrs,
+                syn::Item::Trait(t) => &t.attrs,
+                syn::Item::Macro(m) => &m.attrs,
+                syn::Item::Use(u) => &u.attrs,
+                syn::Item::Const(c) => &c.attrs,
+                syn::Item::Static(s) => &s.attrs,
+                syn::Item::Struct(s) => &s.attrs,
+                syn::Item::Enum(e) => &e.attrs,
+                syn::Item::Type(t) => &t.attrs,
+                _ => &[],
+            };
+            if under_test(attrs) {
+                return;
+            }
+            match item {
+                syn::Item::Mod(m) => {
+                    let ident = m.ident.to_string();
+                    if m.content.is_none() {
+                        self.files.push(self.name(&ident));
+                    }
+                    self.path.push(ident);
+                    syn::visit::visit_item_mod(self, m);
+                    self.path.pop();
+                }
+                syn::Item::Fn(f) => {
+                    self.bodies.push(self.name(&f.sig.ident.to_string()));
+                    syn::visit::visit_item_fn(self, f);
+                }
+                syn::Item::Impl(i) => {
+                    let ty = i.self_ty.as_ref();
+                    let ty = quote_type(ty);
+                    for inner in &i.items {
+                        if let syn::ImplItem::Fn(f) = inner {
+                            if !under_test(&f.attrs) {
+                                self.bodies
+                                    .push(self.name(&format!("{ty}::{}", f.sig.ident)));
+                            }
+                        }
+                    }
+                    syn::visit::visit_item_impl(self, i);
+                }
+                syn::Item::Trait(t) => {
+                    for inner in &t.items {
+                        if let syn::TraitItem::Fn(f) = inner {
+                            if f.default.is_some() {
+                                self.bodies
+                                    .push(self.name(&format!("{}::{}", t.ident, f.sig.ident)));
+                            }
+                        }
+                    }
+                    syn::visit::visit_item_trait(self, t);
+                }
+                syn::Item::Macro(m) => {
+                    let mac = m.mac.path.segments.last().map(|s| s.ident.to_string());
+                    self.refused
+                        .push(self.name(&format!("{}!", mac.unwrap_or_default())));
+                }
+                _ => syn::visit::visit_item(self, item),
+            }
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            if mac.path.is_ident("include") {
+                self.refused.push(self.name("include!"));
+            }
+        }
+
+        fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+            if attr.path().is_ident("path") {
+                self.refused.push(self.name("#[path]"));
+            }
+        }
+    }
+
+    fn quote_type(ty: &syn::Type) -> String {
+        match ty {
+            syn::Type::Path(p) => p
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default(),
+            _ => "impl".to_owned(),
+        }
+    }
+
+    #[test]
+    fn this_file_holds_no_copy_of_server_code_but_these() {
+        let found = Defined::read(include_str!("lib.rs"));
+        let mut bodies = found.bodies.clone();
+        bodies.sort();
+        let mut copies: Vec<String> = COPIES.iter().map(|c| c.to_string()).collect();
+        copies.sort();
+        assert_eq!(bodies, copies, "functions with a body in lib.rs");
+        assert!(found.refused.is_empty(), "{:?}", found.refused);
+        let mut files = found.files.clone();
+        files.sort();
+        assert_eq!(files, SHARED, "modules of their own files");
+    }
+
+    /// Each way to put a copy here is found, in any spacing or over several lines; re-exports,
+    /// constants and test code are not.
+    #[test]
+    fn every_way_to_put_a_copy_here_is_found() {
+        let fine = Defined::read(
+            r#"
+            pub mod upstream_url;
+            pub mod rewrite_fuzz {
+                pub use crate::upstream_rewrite::{rewrite_ansible_urls, rewrite_registration_urls};
+                pub const UP: &str = "https://up.invalid";
+                pub type Out = String;
+                #[cfg(test)]
+                mod tests {
+                    fn helper() {}
+                    #[test]
+                    fn t() { helper() }
+                }
+            }
+            #[cfg(test)]
+            fn only_in_tests() {}
+            "#,
         );
-        let s = replace_url_escape_aware(
-            &s,
-            &format!(
-                "{}/api/v3/plugin/ansible/content/published/collections/artifacts/",
-                upstream
+        assert!(fine.bodies.is_empty(), "{:?}", fine.bodies);
+        assert!(fine.refused.is_empty(), "{:?}", fine.refused);
+        assert_eq!(fine.files, ["upstream_url"]);
+
+        for (bad, name) in [
+            ("pub fn f() {}", "f"),
+            (
+                "pub mod rewrite_fuzz {\n    fn replace_url_escape_aware(\n        t: &str,\n    ) -> String { t.into() }\n}",
+                "rewrite_fuzz::replace_url_escape_aware",
             ),
-            &format!("{}/download/", nora_ansible),
-        );
-        let s = replace_url_escape_aware(
-            &s,
-            &format!("{}{}/", upstream, API_PREFIX),
-            &format!("{}/v3/collections/", nora_ansible),
-        );
-        replace_url_escape_aware(&s, upstream, &nora_ansible)
-    }
-
-    /// Mirror of `registry::nuget::rewrite_registration_urls`.
-    pub fn rewrite_registration_urls(
-        json_text: &str,
-        upstream_url: &str,
-        base_url: &str,
-    ) -> String {
-        let upstream = upstream_url.trim_end_matches('/');
-        let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
-        let nora_reg = format!("{}/v3/registration/", nora_nuget);
-        let s = replace_url_escape_aware(
-            json_text,
-            &format!("{}/v3/registration5-semver1/", upstream),
-            &nora_reg,
-        );
-        let s = replace_url_escape_aware(
-            &s,
-            &format!("{}/v3/registration5-gz-semver1/", upstream),
-            &nora_reg,
-        );
-        let s = replace_url_escape_aware(
-            &s,
-            &format!("{}/v3/registration5-gz-semver2/", upstream),
-            &nora_reg,
-        );
-        replace_url_escape_aware(
-            &s,
-            &format!("{}/v3-flatcontainer/", upstream),
-            &format!("{}/v3/flatcontainer/", nora_nuget),
-        )
-    }
-
-    #[cfg(test)]
-    mod url_leak_tests {
-        //! Deterministic front-loop cases (no fuzz CI job) — the fuzz targets
-        //! `fuzz_rewrite_ansible` / `fuzz_rewrite_nuget` explore the rest.
-        use super::*;
-        const UP: &str = "https://origin-host.invalid";
-        const NORA: &str = "http://nora.test";
-
-        #[test]
-        fn ansible_escaped_slash_scrubbed() {
-            let out = rewrite_ansible_urls(
-                r#"{"d":"https:\/\/origin-host.invalid\/download\/a.tar.gz"}"#,
-                UP,
-                NORA,
-            );
-            assert!(!out.contains("origin-host.invalid"), "leak: {out}");
+            (
+                "pub mod a { pub mod b { pub(crate) const fn g() -> u8 { 1 } } }",
+                "a::b::g",
+            ),
+            (
+                "pub mod a { pub struct S; impl S { pub fn m(&self) {} } }",
+                "a::S::m",
+            ),
+            (
+                "pub mod a { pub trait T { fn d(&self) -> u8 { 1 } } }",
+                "a::T::d",
+            ),
+            (
+                "pub mod a { #[cfg(not(test))] pub fn h() {} }",
+                "a::h",
+            ),
+            (
+                "pub mod a { #[cfg(any(test, fuzzing))] pub fn h() {} }",
+                "a::h",
+            ),
+        ] {
+            assert_eq!(Defined::read(bad).bodies, [name], "{bad}");
         }
-
-        #[test]
-        fn nuget_escaped_slash_scrubbed() {
-            let out = rewrite_registration_urls(
-                r#"{"@id":"https:\/\/origin-host.invalid\/v3\/registration5-semver1\/p\/i.json"}"#,
-                UP,
-                NORA,
+        for (bad, name) in [
+            (
+                "pub mod a { macro_rules! m { () => { fn f() {} } } }",
+                "a::macro_rules!",
+            ),
+            (
+                "pub mod a { copy_of!(rewrite_ansible_urls); }",
+                "a::copy_of!",
+            ),
+            (
+                "pub mod a { pub const X: &str = include!(\"../src/x.rs\"); }",
+                "a::include!",
+            ),
+            (
+                "#[path = \"registry/ansible.rs\"]\npub mod ansible;",
+                "ansible::#[path]",
+            ),
+        ] {
+            assert!(
+                Defined::read(bad).refused.contains(&name.to_owned()),
+                "{bad}: {:?}",
+                Defined::read(bad).refused
             );
-            assert!(!out.contains("origin-host.invalid"), "leak: {out}");
         }
+        assert_eq!(Defined::read("pub mod a { mod copy; }").files, ["a::copy"]);
     }
 }
