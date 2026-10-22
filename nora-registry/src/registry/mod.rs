@@ -3177,7 +3177,9 @@ mod release_date_read {
     use crate::config::{Config, CurationMode};
     use crate::digest_quarantine::QuarantineMode;
     use crate::registry_type::RegistryType;
-    use crate::test_helpers::{create_test_context_with_config, reload_curation};
+    use crate::test_helpers::{
+        create_test_context_with_config, reload_curation, try_reload_curation,
+    };
 
     /// Apply `set` to every registry.
     fn each_section(c: &mut Config, set: fn(&mut Config, RegistryType)) {
@@ -3200,32 +3202,30 @@ mod release_date_read {
         }
     }
 
+    /// The quarantine a reloaded release-age rule needs on a proxy, else the reload is refused.
+    /// A reload does not install it, and without trusted dates it reads no date.
+    fn observe(c: &mut Config) {
+        c.curation.quarantine = Some(QuarantineMode::Observe);
+    }
+
     /// Whether a download's release date is read, for every registry: by a release-age rule
-    /// while curation is on — one a reload brought in too — or, with trusted dates only, by the
-    /// quarantine the registry is held to.
+    /// while curation is on, or, with trusted dates only, by the quarantine the registry is held
+    /// to.
     #[tokio::test]
     async fn a_date_is_read_by_a_running_release_age_rule_or_a_trusting_quarantine() {
         type Setup = fn(&mut Config);
-        // (row, trusted dates, the configuration NORA starts with, what a reload changes) ->
-        // read for a registry with a section of its own / for one without (Raw, Hugging Face)
-        let rows: [(&str, bool, Setup, Option<Setup>, bool, bool); 11] = [
-            ("nothing", true, |_| {}, None, false, false),
+        // (row, trusted dates, the configuration NORA starts with) -> read for a registry with a
+        // section of its own / for one without (Raw, Hugging Face)
+        let rows: [(&str, bool, Setup, bool, bool); 9] = [
+            ("nothing", true, |_| {}, false, false),
             (
                 "global rule",
                 false,
                 |c| c.curation.min_release_age = Some("1h".into()),
-                None,
                 true,
                 true,
             ),
-            (
-                "own rule",
-                false,
-                |c| each_section(c, rule),
-                None,
-                true,
-                false,
-            ),
+            ("own rule", false, |c| each_section(c, rule), true, false),
             (
                 "own rule, curation off",
                 false,
@@ -3233,31 +3233,13 @@ mod release_date_read {
                     c.curation.mode = CurationMode::Off;
                     each_section(c, rule);
                 },
-                None,
                 false,
                 false,
-            ),
-            (
-                "own rule by reload",
-                false,
-                |_| {},
-                Some(|c| each_section(c, rule)),
-                true,
-                false,
-            ),
-            (
-                "global rule by reload",
-                false,
-                |_| {},
-                Some(|c| c.curation.min_release_age = Some("1h".into())),
-                true,
-                true,
             ),
             (
                 "trusted, global quarantine",
                 true,
                 |c| c.curation.quarantine = Some(QuarantineMode::Observe),
-                None,
                 true,
                 false,
             ),
@@ -3265,7 +3247,6 @@ mod release_date_read {
                 "trusted, own quarantine",
                 true,
                 |c| each_section(c, quarantine),
-                None,
                 true,
                 false,
             ),
@@ -3280,7 +3261,6 @@ mod release_date_read {
                         }
                     });
                 },
-                None,
                 false,
                 false,
             ),
@@ -3288,7 +3268,6 @@ mod release_date_read {
                 "untrusted, global quarantine",
                 false,
                 |c| c.curation.quarantine = Some(QuarantineMode::Enforce),
-                None,
                 false,
                 false,
             ),
@@ -3296,21 +3275,17 @@ mod release_date_read {
                 "untrusted, own quarantine",
                 false,
                 |c| each_section(c, quarantine),
-                None,
                 false,
                 false,
             ),
         ];
-        for (row, trust, start, reload) in rows.iter().map(|r| (r.0, r.1, r.2, r.3)) {
+        for (row, trust, start) in rows.iter().map(|r| (r.0, r.1, r.2)) {
             let ctx = create_test_context_with_config(move |c| {
                 c.server.trust_upstream_dates = trust;
                 c.curation.mode = CurationMode::Enforce;
                 start(c);
             });
-            if let Some(change) = reload {
-                reload_curation(&ctx, change);
-            }
-            let (_, _, _, _, with_section, without_section) =
+            let (_, _, _, with_section, without_section) =
                 *rows.iter().find(|r| r.0 == row).unwrap();
             for &rt in RegistryType::all() {
                 let want = match ctx.state.config.curation.registry_override(rt) {
@@ -3321,6 +3296,56 @@ mod release_date_read {
                     super::release_date_read(&ctx.state, rt),
                     want,
                     "{rt}: {row}"
+                );
+            }
+        }
+    }
+
+    /// A release-age rule a reload brings in is read from then on: a global one by every
+    /// registry, a registry's own by that registry alone. The server refuses a reload whose
+    /// own rule cannot apply — rpm and deb downloads are not checked by name or date, cpan's
+    /// carry none — and the running engine stays.
+    #[tokio::test]
+    async fn a_release_age_rule_a_reload_brings_in_is_read() {
+        let start = || {
+            create_test_context_with_config(|c| {
+                // Untrusted: the quarantine reads no date, the rules alone do.
+                c.server.trust_upstream_dates = false;
+                c.curation.mode = CurationMode::Enforce;
+                observe(c);
+            })
+        };
+        let ctx = start();
+        reload_curation(&ctx, |c| c.curation.min_release_age = Some("1h".into()));
+        for &rt in RegistryType::all() {
+            assert!(
+                super::release_date_read(&ctx.state, rt),
+                "{rt}: global rule"
+            );
+        }
+        let refused = [RegistryType::Rpm, RegistryType::Deb, RegistryType::Cpan];
+        for &target in RegistryType::all() {
+            let ctx = start();
+            if ctx
+                .state
+                .config
+                .curation
+                .registry_override(target)
+                .is_none()
+            {
+                continue;
+            }
+            let reloaded = try_reload_curation(&ctx, move |c| rule(c, target));
+            assert_eq!(
+                reloaded.is_err(),
+                refused.contains(&target),
+                "{target}: {reloaded:?}"
+            );
+            for &rt in RegistryType::all() {
+                assert_eq!(
+                    super::release_date_read(&ctx.state, rt),
+                    rt == target && reloaded.is_ok(),
+                    "{rt}: {target}'s own rule"
                 );
             }
         }

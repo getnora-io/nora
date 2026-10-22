@@ -3760,18 +3760,17 @@ async fn run_server(mut config: Config, storage: Storage) {
     // SIGHUP handler: hot-reload curation policy
     #[cfg(unix)]
     {
-        let reload_state = state.clone();
+        let slot = state.reloadable.clone();
+        let held = Arc::new(HeldQuarantine::of(&state.config.curation));
         state.tasks.spawn("sighup", move || {
-            let reload_state = reload_state.clone();
+            let (slot, held) = (slot.clone(), held.clone());
             async move {
                 let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())
                     .expect("Failed to install SIGHUP handler");
                 loop {
                     sighup.recv().await;
                     info!("SIGHUP received — reloading curation policy");
-                    let reloaded = Config::try_load()
-                        .and_then(|config| reload_curation(&reload_state, config));
-                    match reloaded {
+                    match reload_curation(&slot, &held, Config::path_from_env()) {
                         Ok(()) => info!("Curation policy reloaded successfully"),
                         Err(e) => {
                             error!(error = %e, "Curation policy reload failed, keeping previous config")
@@ -4971,22 +4970,59 @@ async fn shutdown_signal() {
     }
 }
 
-/// Reload curation policy from `config`, the config.toml a SIGHUP re-read.
+/// The quarantine settings NORA started with, by key. Every format reads the quarantine from
+/// the configuration NORA started with, and the start decides whether the store of first-seen
+/// digests is loaded, so a SIGHUP does not apply a change to it: the reload holds these — and
+/// nothing else of that configuration — to name what it leaves for a restart.
+pub(crate) struct HeldQuarantine(Vec<(String, String)>);
+
+impl HeldQuarantine {
+    fn of(curation: &config::CurationConfig) -> Self {
+        Self(curation.unreloaded_settings())
+    }
+
+    /// The keys whose setting in `loaded` is not the one NORA started with: set, changed or
+    /// removed, globally or in a registry's own section.
+    fn unapplied(&self, loaded: &config::CurationConfig) -> Vec<String> {
+        let loaded = loaded.unreloaded_settings();
+        self.0
+            .iter()
+            .filter(|(key, held)| {
+                loaded
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .is_none_or(|(_, value)| value != held)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+}
+
+/// Reload curation policy from the configuration file at `path` (triggered by SIGHUP).
 ///
-/// Rebuilds the CurationEngine with new filters and atomically swaps the old
-/// one, with the bypass token, via ArcSwap.
-/// Storage, auth, port, and other settings are NOT reloaded — only curation, and
-/// of it not the digest quarantine: a changed key the reload does not apply is
-/// named in a warning, it waits for a restart (`CurationConfig::unreloaded_changes`).
-fn reload_curation(state: &AppState, config: Config) -> Result<(), String> {
+/// Re-reads the file, rebuilds the CurationEngine with new filters, and atomically swaps it,
+/// with the bypass token, into `slot`. It is handed the slot and the quarantine NORA started
+/// with, not the state: the rest of the start configuration is out of its reach, so the engine
+/// it installs is the one the file it read describes. Tests reload through this function, not
+/// a copy of it.
+/// Storage, auth, port, and other settings are NOT reloaded — only curation, and of it not the
+/// digest quarantine: a setting the file changes there is named in a warning, it waits for a
+/// restart ([`HeldQuarantine::unapplied`]).
+fn reload_curation(
+    slot: &ArcSwap<ReloadableConfig>,
+    held: &HeldQuarantine,
+    path: Option<String>,
+) -> Result<(), String> {
+    let config = Config::try_load_from(path)?;
+
     // Fail-closed: `build_curation_engine` returns Err in enforce mode if any
     // filter no longer parses, so a broken allowlist surfaces here and the
     // `?` short-circuits BEFORE the `store` below — the previous (working)
     // engine is kept and never swapped for an allow-all one (#586).
     let engine = build_curation_engine(&config)?;
-    let unreloaded = state.config.curation.unreloaded_changes(&config.curation);
+    let unreloaded = held.unapplied(&config.curation);
 
-    state.reloadable.store(Arc::new(ReloadableConfig {
+    slot.store(Arc::new(ReloadableConfig {
         curation_engine: engine,
         bypass_token: config.curation.bypass_token,
     }));
@@ -5409,11 +5445,11 @@ mod curation_reload_tests {
             crate::test_helpers::quarantine_7d,
         );
         let (log, _capture) = crate::test_helpers::LogCapture::start();
-        let mut config = (*ctx.state.config).clone();
-        config.curation.quarantine_ttl = Some("14d".to_string());
-        config.curation.npm.quarantine = Some(QuarantineMode::Observe);
-        config.curation.pub_dart.quarantine_ttl = Some("1d".to_string());
-        super::reload_curation(&ctx.state, config).unwrap();
+        crate::test_helpers::reload_curation(&ctx, |config| {
+            config.curation.quarantine_ttl = Some("14d".to_string());
+            config.curation.npm.quarantine = Some(QuarantineMode::Observe);
+            config.curation.pub_dart.quarantine_ttl = Some("1d".to_string());
+        });
 
         let text = log.text();
         let warning = restart_warning(&text)
@@ -5443,10 +5479,10 @@ mod curation_reload_tests {
         let npm = crate::curation::RegistryType::Npm;
         assert!(!ctx.state.curation().curation_engine.reads_release_date(npm));
         let (log, _capture) = crate::test_helpers::LogCapture::start();
-        let mut config = (*ctx.state.config).clone();
-        config.curation.min_release_age = Some("3d".to_string());
-        config.curation.npm.min_release_age = Some("1d".to_string());
-        super::reload_curation(&ctx.state, config).unwrap();
+        crate::test_helpers::reload_curation(&ctx, |config| {
+            config.curation.min_release_age = Some("3d".to_string());
+            config.curation.npm.min_release_age = Some("1d".to_string());
+        });
 
         let text = log.text();
         assert_eq!(restart_warning(&text), None, "{text}");
@@ -5456,62 +5492,137 @@ mod curation_reload_tests {
         );
     }
 
-    /// Every registry's own quarantine keys are compared, by the name of their
-    /// `[curation.<registry>]` section; a registry without one has none.
+    /// The settings a reload leaves for a restart, decided from the two configurations alone:
+    /// a quarantine key set, changed or removed — globally and in each registry's own
+    /// section — is named, by the key config.toml spells it with; an unchanged one, and every
+    /// key a reload applies (the engine's and the bypass token), is not.
     #[test]
-    fn every_registry_quarantine_key_is_compared() {
+    fn a_reload_names_each_quarantine_setting_it_leaves_for_a_restart() {
         use crate::curation::RegistryType;
-        let running = CurationConfig::default();
+        let curation = |text: &str| {
+            toml::from_str::<Config>(text)
+                .unwrap_or_else(|e| panic!("{text}: {e}"))
+                .curation
+        };
+        let unapplied = |started: &str, loaded: &str| {
+            super::HeldQuarantine::of(&curation(started)).unapplied(&curation(loaded))
+        };
+        let none: Vec<String> = Vec::new();
+        let plain = "[curation]\nmode = \"enforce\"\n";
+        let set = format!("{plain}quarantine = \"enforce\"\nquarantine_ttl = \"7d\"\n");
+        let other = format!("{plain}quarantine = \"observe\"\nquarantine_ttl = \"3d\"\n");
+        let both = ["curation.quarantine", "curation.quarantine_ttl"];
+        for (started, loaded, want, row) in [
+            (plain, plain.to_string(), none.clone(), "global: neither"),
+            (&set, set.clone(), none.clone(), "global: unchanged"),
+            (plain, set.clone(), both.map(String::from).to_vec(), "global: set"),
+            (&set, plain.to_string(), both.map(String::from).to_vec(), "global: removed"),
+            (&set, other.clone(), both.map(String::from).to_vec(), "global: changed"),
+            (
+                &set,
+                format!("{plain}quarantine = \"enforce\"\n"),
+                vec!["curation.quarantine_ttl".to_string()],
+                "global: ttl removed alone",
+            ),
+            (
+                plain,
+                "[curation]\nmode = \"audit\"\nallowlist_path = \"a.json\"\nblocklist_path = \"b.json\"\n\
+                 require_integrity = true\ninternal_namespaces = [\"corp/*\"]\nmin_release_age = \"1d\"\n\
+                 [curation.npm]\nmin_release_age = \"2d\"\n"
+                    .to_string(),
+                none.clone(),
+                "keys a reload applies",
+            ),
+        ] {
+            assert_eq!(unapplied(started, &loaded), want, "{row}");
+        }
         for &rt in RegistryType::all() {
-            let mut loaded = CurationConfig::default();
-            let Some(section) = loaded.registry_override_mut(rt) else {
-                assert_eq!(running.unreloaded_changes(&loaded), Vec::<String>::new());
+            if curation(plain).registry_override(rt).is_none() {
                 continue;
-            };
-            section.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
-            section.quarantine_ttl = Some("2d".to_string());
-            section.min_release_age = Some("2d".to_string());
-            assert_eq!(
-                running.unreloaded_changes(&loaded),
-                [
-                    format!("curation.{rt}.quarantine"),
-                    format!("curation.{rt}.quarantine_ttl")
-                ],
-                "{rt}"
-            );
+            }
+            let own = |body: &str| format!("{plain}[curation.{rt}]\n{body}");
+            let set = own("quarantine = \"enforce\"\nquarantine_ttl = \"7d\"\n");
+            let other = own("quarantine = \"off\"\nquarantine_ttl = \"1d\"\n");
+            let keys = vec![
+                format!("curation.{rt}.quarantine"),
+                format!("curation.{rt}.quarantine_ttl"),
+            ];
+            for (started, loaded, want, row) in [
+                (set.clone(), set.clone(), none.clone(), "unchanged"),
+                (plain.to_string(), set.clone(), keys.clone(), "set"),
+                (set.clone(), plain.to_string(), keys.clone(), "removed"),
+                (set.clone(), other.clone(), keys.clone(), "changed"),
+                (
+                    set.clone(),
+                    own("quarantine = \"enforce\"\n"),
+                    vec![format!("curation.{rt}.quarantine_ttl")],
+                    "ttl removed alone",
+                ),
+            ] {
+                assert_eq!(unapplied(&started, &loaded), want, "{rt}: {row}");
+            }
         }
     }
 
-    /// Each global quarantine key is named on its own, and a change a reload
-    /// applies — the engine's keys and the bypass token — names nothing.
+    /// What a SIGHUP installs is the engine of the file it reads: a release-age rule the file
+    /// brings in applies from then on, one the file drops no longer does, and a file that does
+    /// not load leaves the running engine in place.
     #[test]
-    fn the_global_quarantine_keys_are_compared_and_the_reloaded_ones_are_not() {
-        use crate::digest_quarantine::QuarantineMode;
-        let running = CurationConfig::default();
-        let loaded = CurationConfig {
-            quarantine: Some(QuarantineMode::Observe),
-            ..Default::default()
+    fn a_reload_installs_the_engine_of_the_file_it_reads() {
+        use crate::curation::RegistryType;
+        let slot = arc_swap::ArcSwap::from_pointee(super::ReloadableConfig {
+            curation_engine: build_curation_engine(&enforce()).unwrap(),
+            bypass_token: None,
+        });
+        let reads = |slot: &arc_swap::ArcSwap<super::ReloadableConfig>| {
+            RegistryType::all()
+                .iter()
+                .filter(|&&rt| slot.load().curation_engine.reads_release_date(rt))
+                .count()
         };
-        assert_eq!(running.unreloaded_changes(&loaded), ["curation.quarantine"]);
-        let loaded = CurationConfig {
-            quarantine_ttl: Some("1d".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(
-            running.unreloaded_changes(&loaded),
-            ["curation.quarantine_ttl"]
-        );
-        let loaded = CurationConfig {
-            mode: CurationMode::Enforce,
-            allowlist_path: Some("allow.json".to_string()),
-            blocklist_path: Some("block.json".to_string()),
-            bypass_token: Some("bypass".into()),
-            require_integrity: true,
-            internal_namespaces: vec!["corp/*".to_string()],
-            min_release_age: Some("1d".to_string()),
-            ..Default::default()
-        };
-        assert_eq!(running.unreloaded_changes(&loaded), Vec::<String>::new());
+        let all = RegistryType::all().len();
+        let held = super::HeldQuarantine::of(&enforce().curation);
+        assert_eq!(reads(&slot), 0, "started without a release-age rule");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let file = Some(path.to_string_lossy().into_owned());
+        // The reload applies the env overrides, so no other test may change them meanwhile.
+        let _lock = crate::test_env::env_lock();
+        for (text, loads, want, why) in [
+            (
+                "[curation]\nmode = \"enforce\"\nquarantine = \"observe\"\nmin_release_age = \"1h\"\n",
+                true,
+                all,
+                "brought in",
+            ),
+            (
+                "[curation]\nmode = \"enforce\"\nquarantine = \"observe\"\n",
+                true,
+                0,
+                "dropped",
+            ),
+            (
+                "[curation]\nmode = \"enforce\"\nquarantine = \"observe\"\n[curation.npm]\nmin_release_age = \"1h\"\n",
+                true,
+                1,
+                "npm's own",
+            ),
+            (
+                "[curation\nmode = \"enforce\"\n",
+                false,
+                1,
+                "a file that does not parse keeps npm's",
+            ),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let reloaded = super::reload_curation(&slot, &held, file.clone());
+            assert_eq!(reloaded.is_ok(), loads, "{why}: {reloaded:?}");
+            assert_eq!(reads(&slot), want, "{why}");
+        }
+        assert!(slot
+            .load()
+            .curation_engine
+            .reads_release_date(RegistryType::Npm));
     }
 }
 

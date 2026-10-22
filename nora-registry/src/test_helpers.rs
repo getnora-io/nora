@@ -1295,12 +1295,39 @@ pub async fn background_writes_done(storage: &Storage, holders: usize) {
         .expect("a background task still holds the store after 30 s");
 }
 
-/// What a SIGHUP does to `ctx`: the reload installs what it builds from the configuration
-/// changed by `customize`, while the state keeps the configuration NORA started with.
+/// A SIGHUP on `ctx`: the configuration NORA started with, changed by `customize`, is written
+/// to a file, and the server's own reload reads that file and installs the engine it describes.
+/// The state keeps the configuration NORA started with, as it does in the server.
 pub fn reload_curation(ctx: &TestContext, customize: impl FnOnce(&mut Config)) {
+    try_reload_curation(ctx, customize).expect("the reloaded curation builds");
+}
+
+/// [`reload_curation`], with the server's verdict on the file: `Err` when it refuses it and
+/// keeps the running engine.
+pub fn try_reload_curation(
+    ctx: &TestContext,
+    customize: impl FnOnce(&mut Config),
+) -> Result<(), String> {
     let mut config = (*ctx.state.config).clone();
     customize(&mut config);
-    crate::reload_curation(&ctx.state, config).expect("the reloaded curation builds");
+    // The test server listens on no port; a file the server loads names one, and the reload
+    // does not read it.
+    config.server.port = crate::config::ServerConfig::default().port;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        toml::to_string(&config).expect("the configuration serializes"),
+    )
+    .unwrap();
+    // The reload applies the env overrides, so no other test may change them meanwhile.
+    let _lock = crate::test_env::env_lock();
+    let held = crate::HeldQuarantine::of(&ctx.state.config.curation);
+    crate::reload_curation(
+        &ctx.state.reloadable,
+        &held,
+        Some(path.to_string_lossy().into_owned()),
+    )
 }
 
 /// Quarantine every proxied artifact for 7 days, curation on.

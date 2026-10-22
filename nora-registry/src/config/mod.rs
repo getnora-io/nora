@@ -1519,7 +1519,7 @@ impl Config {
     /// exit on with [`EXIT_CONFIG`].
     pub fn load() -> Result<Self, ConfigLoadError> {
         let (config, _unknown_keys) = Self::load_from(
-            env::var("NORA_CONFIG_PATH").ok(),
+            Self::path_from_env(),
             DEFAULT_CONFIG_FILE,
             config_strict_from_env(),
         )?;
@@ -1602,16 +1602,28 @@ impl Config {
         Ok(self)
     }
 
+    /// The configuration file `NORA_CONFIG_PATH` names; `None` reads `config.toml` of the
+    /// working directory when there is one. Start and SIGHUP read the same file.
+    pub fn path_from_env() -> Option<String> {
+        env::var("NORA_CONFIG_PATH").ok()
+    }
+
     /// Non-panicking config reload for SIGHUP handler.
     /// Returns Err on invalid file/TOML/validation instead of panicking.
     pub fn try_load() -> Result<Self, String> {
-        let file = match env::var("NORA_CONFIG_PATH") {
-            Ok(path) => {
+        Self::try_load_from(Self::path_from_env())
+    }
+
+    /// [`Config::try_load`] of the file at `path` (see [`Config::path_from_env`]), passed in so a
+    /// test reloads a file of its own without setting process-wide state.
+    pub fn try_load_from(path: Option<String>) -> Result<Self, String> {
+        let file = match path {
+            Some(path) => {
                 let content = fs::read_to_string(&path)
                     .map_err(|e| format!("Cannot read {}: {}", path, e))?;
                 Some((path, content))
             }
-            Err(_) => fs::read_to_string(DEFAULT_CONFIG_FILE)
+            None => fs::read_to_string(DEFAULT_CONFIG_FILE)
                 .ok()
                 .map(|content| (DEFAULT_CONFIG_FILE.to_string(), content)),
         };

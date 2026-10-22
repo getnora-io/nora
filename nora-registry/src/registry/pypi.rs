@@ -4628,10 +4628,18 @@ mod release_age_without_the_json_index {
     #[tokio::test]
     async fn a_release_age_rule_a_reload_brings_in_asks_for_the_dates() {
         type Setup = fn(&mut crate::config::Config);
+        // A release-age rule on a proxy needs a quarantine: a reload without one is refused.
+        fn observe(cfg: &mut crate::config::Config) {
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+        }
         let rules: [(&str, Setup); 2] = [
-            ("global", min_age),
+            ("global", |cfg| {
+                min_age(cfg);
+                observe(cfg);
+            }),
             ("PyPI's own", |cfg| {
                 cfg.curation.pypi.min_release_age = Some("3d".to_string());
+                observe(cfg);
             }),
         ];
         for (rule, add) in rules {

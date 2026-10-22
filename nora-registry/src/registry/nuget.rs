@@ -4546,11 +4546,10 @@ mod nuget_release_dates {
     #[tokio::test]
     async fn a_release_age_rule_a_reload_brings_in_asks_the_upstream_for_the_date() {
         let rules: [(&str, fn(&mut crate::config::Config)); 2] = [
-            ("global", |cfg| {
-                cfg.curation.min_release_age = Some("1h".to_string());
-            }),
+            ("global", min_age_1h),
             ("NuGet's own", |cfg| {
                 cfg.curation.nuget.min_release_age = Some("1h".to_string());
+                cfg.curation.quarantine = Some(QuarantineMode::Observe);
             }),
         ];
         for (rule, add) in rules {

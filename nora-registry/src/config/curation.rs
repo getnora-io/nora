@@ -219,17 +219,18 @@ impl CurationConfig {
         }
     }
 
-    /// The keys that differ between `self`, the configuration NORA started with, and
-    /// `loaded`, among those a SIGHUP reload does not apply.
+    /// The settings a SIGHUP reload does not apply, keyed as config.toml spells them, with
+    /// their values: the digest quarantine, global and each registry's own.
     ///
-    /// A reload swaps the curation engine, rebuilt from `loaded`, and the bypass token.
-    /// The digest quarantine is not in either: each format reads it from the
-    /// configuration NORA started with, and the start decides whether the store of
-    /// first-seen digests is loaded at all. A changed quarantine waits for a restart.
+    /// A reload swaps the curation engine, rebuilt from the file, and the bypass token. The
+    /// digest quarantine is not in either: each format reads it from the configuration NORA
+    /// started with, and the start decides whether the store of first-seen digests is loaded
+    /// at all. A key is listed whether it is set or not, so a key removed from the file differs
+    /// from the one NORA started with as a key set or changed does.
     ///
     /// The destructuring names every field, so a new key does not compile until it is
     /// placed on one side.
-    pub fn unreloaded_changes(&self, loaded: &Self) -> Vec<String> {
+    pub fn unreloaded_settings(&self) -> Vec<(String, String)> {
         let Self {
             // In the engine a reload builds, or the bypass token it swaps.
             mode: _,
@@ -262,32 +263,33 @@ impl CurationConfig {
             deb: _,
             cpan: _,
         } = self;
-        let mut keys = Vec::new();
-        if *quarantine != loaded.quarantine {
-            keys.push("curation.quarantine".to_string());
-        }
-        if *quarantine_ttl != loaded.quarantine_ttl {
-            keys.push("curation.quarantine_ttl".to_string());
-        }
+        let mut settings = vec![
+            ("curation.quarantine".to_string(), format!("{quarantine:?}")),
+            (
+                "curation.quarantine_ttl".to_string(),
+                format!("{quarantine_ttl:?}"),
+            ),
+        ];
         for &rt in RegistryType::all() {
-            let (Some(running), Some(new)) =
-                (self.registry_override(rt), loaded.registry_override(rt))
-            else {
+            let Some(own) = self.registry_override(rt) else {
                 continue;
             };
             let RegistryCurationOverride {
+                // In the engine a reload builds.
                 min_release_age: _,
                 quarantine,
                 quarantine_ttl,
-            } = running;
-            if *quarantine != new.quarantine {
-                keys.push(format!("curation.{rt}.quarantine"));
-            }
-            if *quarantine_ttl != new.quarantine_ttl {
-                keys.push(format!("curation.{rt}.quarantine_ttl"));
-            }
+            } = own;
+            settings.push((
+                format!("curation.{rt}.quarantine"),
+                format!("{quarantine:?}"),
+            ));
+            settings.push((
+                format!("curation.{rt}.quarantine_ttl"),
+                format!("{quarantine_ttl:?}"),
+            ));
         }
-        keys
+        settings
     }
 
     /// Test-only: [`Self::registry_override`] to change, for tests that set a section of every
