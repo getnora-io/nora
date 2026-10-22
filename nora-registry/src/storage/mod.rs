@@ -280,6 +280,13 @@ impl Storage {
         Self { inner }
     }
 
+    /// Test-only: how many handles share this store. Every clone is one, so a task that may
+    /// still write to the store is counted until it ends.
+    #[cfg(test)]
+    pub(crate) fn holders(&self) -> usize {
+        Arc::strong_count(&self.inner)
+    }
+
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         validate_storage_key(key)?;
         // A buffered body can be large; hashing it inline would stall the tokio

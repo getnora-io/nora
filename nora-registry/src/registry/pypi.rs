@@ -4733,7 +4733,9 @@ mod release_age_without_the_json_index {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod upstream_index_digest {
-    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use crate::test_helpers::{
+        background_writes_done, body_bytes, create_test_context_with_config, send, TestContext,
+    };
     use axum::http::{Method, StatusCode};
     use sha2::Digest;
     use wiremock::matchers::{method, path};
@@ -4815,6 +4817,59 @@ mod upstream_index_digest {
             let up = upstream(fragment, b"bytes").await;
             let ctx = context(&up);
             assert_eq!(download(&ctx).await.0, StatusCode::OK, "{fragment:?}");
+        }
+    }
+
+    /// Every key the store holds that names the file — the file, its digest, its hash marker —
+    /// once no work the downloads so far started is still running.
+    async fn stored_under_file(ctx: &TestContext, holders: usize) -> Vec<String> {
+        background_writes_done(&ctx.state.storage, holders).await;
+        let keys = ctx.state.storage.list("").await.unwrap();
+        keys.into_iter().filter(|k| k.contains(FILE)).collect()
+    }
+
+    /// A digest is the whole sha256 the index gives: an empty, shortened or lengthened one, or
+    /// any part of the bytes' own, matches nothing — the bytes are refused and not cached.
+    #[tokio::test]
+    async fn only_the_whole_index_digest_matches() {
+        let own = sha256(b"tampered");
+        for fragment in [
+            "#sha256=".to_string(),
+            format!("#sha256={}", &own[..8]),
+            format!("#sha256={}", &own[..63]),
+            format!("#sha256={}", &own[1..]),
+            format!("#sha256={own}00"),
+        ] {
+            let up = upstream(&fragment, b"tampered").await;
+            let ctx = context(&up);
+            let holders = ctx.state.storage.holders();
+            let (status, body) = download(&ctx).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{fragment}");
+            assert_ne!(body, b"tampered", "{fragment}");
+            let stored = stored_under_file(&ctx, holders).await;
+            assert!(stored.is_empty(), "{fragment}: {stored:?}");
+        }
+    }
+
+    /// Refused bytes are written nowhere: not by the request, nor by any work it leaves running.
+    /// The control: bytes that match are written by that same background work, which the wait
+    /// sees through.
+    #[tokio::test]
+    async fn refused_bytes_leave_nothing_in_the_store() {
+        let up = upstream(&format!("#sha256={}", sha256(b"genuine")), b"tampered").await;
+        let ctx = context(&up);
+        let holders = ctx.state.storage.holders();
+        assert_eq!(download(&ctx).await.0, StatusCode::BAD_GATEWAY);
+        let stored = stored_under_file(&ctx, holders).await;
+        assert!(stored.is_empty(), "refused bytes stored: {stored:?}");
+
+        let up = upstream(&format!("#sha256={}", sha256(b"genuine")), b"genuine").await;
+        let ctx = context(&up);
+        let holders = ctx.state.storage.holders();
+        assert_eq!(download(&ctx).await.0, StatusCode::OK);
+        let stored = stored_under_file(&ctx, holders).await;
+        for key in [format!("pypi/hm/{FILE}"), format!("pypi/hm/{FILE}.sha256")] {
+            assert!(stored.contains(&key), "control: {key} not in {stored:?}");
         }
     }
 }

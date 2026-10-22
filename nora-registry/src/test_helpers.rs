@@ -1128,6 +1128,21 @@ pub async fn put_written_days_ago(ctx: &TestContext, key: &str, body: &[u8], day
         .unwrap();
 }
 
+/// Wait until no more handles share `storage` than the `holders` it had before the requests
+/// under test ([`Storage::holders`]). A write those requests left running holds a clone of the
+/// store until it ends, so after this none of them can still land. Panics after 30 s.
+pub async fn background_writes_done(storage: &Storage, holders: usize) {
+    let done = async {
+        while storage.holders() > holders {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    // CANCEL-SAFETY: the loop only reads a count; dropping it on the deadline leaves nothing.
+    tokio::time::timeout(std::time::Duration::from_secs(30), done)
+        .await
+        .expect("a background task still holds the store after 30 s");
+}
+
 /// Quarantine every proxied artifact for 7 days, curation on.
 pub fn quarantine_7d(cfg: &mut Config) {
     cfg.curation.mode = crate::config::CurationMode::Enforce;
