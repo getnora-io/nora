@@ -4030,7 +4030,9 @@ mod nuget_version_curation {
 #[allow(clippy::unwrap_used)]
 mod nuget_release_dates {
     use crate::digest_quarantine::QuarantineMode;
-    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use crate::test_helpers::{
+        create_test_context_with_config, put_written_days_ago, send, upstream_paths, TestContext,
+    };
     use axum::http::{Method, StatusCode};
     use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4166,6 +4168,33 @@ mod nuget_release_dates {
         }
     }
 
+    /// A package cached before the quarantine recorded it is counted from now on the cache path
+    /// too: without trusted dates neither the month-old registration that lists it nor the
+    /// package's own age seeds first-seen.
+    #[tokio::test]
+    async fn a_package_cached_before_the_quarantine_saw_it_counts_from_now() {
+        let up = upstream().await;
+        let ctx = context(&up, false, quarantine_7d);
+        let listed = registration(vec![inline_page(
+            "1.2.4",
+            "1.2.4",
+            vec![leaf("1.2.4", "2019-01-01T00:00:00Z")],
+        )]);
+        cached_registration(&ctx, &listed, 30).await;
+        put_written_days_ago(
+            &ctx,
+            &format!("nuget/flatcontainer/{ID}/1.2.4/{ID}.1.2.4.nupkg"),
+            b"stored",
+            30,
+        )
+        .await;
+        assert_eq!(download(&ctx, "1.2.4").await, StatusCode::FORBIDDEN);
+        assert!(
+            upstream_paths(&up).await.is_empty(),
+            "served from the cache"
+        );
+    }
+
     /// Without trusted dates release age is the cached registration's age for a version it
     /// lists (#513), and unknown for one it does not: a version published after the index was
     /// cached was not seen by NORA then.
@@ -4245,6 +4274,35 @@ mod nuget_release_dates {
         assert_eq!(download(&ctx, "1.0.0").await, StatusCode::OK);
     }
 
+    /// A release-age rule of NuGet's own reads the date as the global one does: without a
+    /// global rule or a quarantine, the upstream registration still dates the version.
+    #[tokio::test]
+    async fn a_release_age_rule_of_nuget_alone_asks_the_upstream_for_the_date() {
+        let up = upstream().await;
+        serve_registration(
+            &up,
+            REGISTRATION,
+            registration(vec![inline_page(
+                "1.0.0",
+                "2.0.0",
+                vec![
+                    leaf("1.0.0", "2019-01-01T00:00:00Z"),
+                    leaf("2.0.0", &minutes_ago(10)),
+                ],
+            )]),
+        )
+        .await;
+        let ctx = context(&up, true, |cfg| {
+            cfg.curation.nuget.min_release_age = Some("1h".to_string());
+        });
+        assert_eq!(
+            download(&ctx, "2.0.0").await,
+            StatusCode::FORBIDDEN,
+            "published 10 minutes ago, younger than NuGet's 1h"
+        );
+        assert_eq!(download(&ctx, "1.0.0").await, StatusCode::OK);
+    }
+
     /// A cached registration that predates the version does not date it either: the
     /// upstream one, which lists it, does.
     #[tokio::test]
@@ -4275,7 +4333,7 @@ mod nuget_release_dates {
     }
 
     /// Past 128 versions the registration index carries only page bounds: the version's date
-    /// is on the page whose range holds it.
+    /// is on the page whose range holds it, its bounds included.
     #[tokio::test]
     async fn a_version_on_a_page_the_index_does_not_inline_is_dated_by_that_page() {
         let up = upstream().await;
@@ -4292,15 +4350,28 @@ mod nuget_release_dates {
             &up,
             "/v3/registration5-gz-semver2/repro.pkg/page/1.0.129/1.0.140.json",
             serde_json::json!({
-                "lower": "1.0.129", "upper": "1.0.140", "count": 2,
-                "items": [leaf("1.0.129", &minutes_ago(10)), leaf("1.0.130", "2019-01-01T00:00:00Z")]
+                "lower": "1.0.129", "upper": "1.0.140", "count": 3,
+                "items": [
+                    leaf("1.0.129", &minutes_ago(10)),
+                    leaf("1.0.130", "2019-01-01T00:00:00Z"),
+                    leaf("1.0.140", &minutes_ago(10))
+                ]
             })
             .to_string(),
         )
         .await;
         let ctx = context(&up, true, min_age_1h);
-        assert_eq!(download(&ctx, "1.0.129").await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            download(&ctx, "1.0.129").await,
+            StatusCode::FORBIDDEN,
+            "lower bound"
+        );
         assert_eq!(download(&ctx, "1.0.130").await, StatusCode::OK);
+        assert_eq!(
+            download(&ctx, "1.0.140").await,
+            StatusCode::FORBIDDEN,
+            "upper bound"
+        );
         let pages: Vec<String> = up
             .received_requests()
             .await
@@ -4317,45 +4388,115 @@ mod nuget_release_dates {
         );
     }
 
+    /// A page holds the versions from its lower bound to its upper bound, both included; a
+    /// version outside every page's range — a pre-release between two pages too — is on none.
+    #[test]
+    fn a_page_holds_the_versions_between_its_bounds_inclusive() {
+        use super::{registered, Registered};
+        let index = registration(vec![
+            remote_page("1.0.0", "1.0.128"),
+            remote_page("1.0.129", "1.0.140"),
+        ]);
+        let on = |lower: &str, upper: &str| Registered::OnPage {
+            lower: lower.to_string(),
+            upper: upper.to_string(),
+        };
+        for (version, want) in [
+            ("0.9.9", Registered::Absent),
+            ("1.0.0", on("1.0.0", "1.0.128")),
+            ("1.0.64", on("1.0.0", "1.0.128")),
+            ("1.0.128", on("1.0.0", "1.0.128")),
+            ("1.0.129-beta", Registered::Absent),
+            ("1.0.129", on("1.0.129", "1.0.140")),
+            ("1.0.140-rc.1", on("1.0.129", "1.0.140")),
+            ("1.0.140", on("1.0.129", "1.0.140")),
+            ("1.0.140.1", Registered::Absent),
+            ("1.0.141", Registered::Absent),
+        ] {
+            assert_eq!(registered(index.as_bytes(), version), want, "{version}");
+        }
+    }
+
     /// NuGet publishes an unlisted version as `1900-01-01`: that marks the date unknown, it
-    /// does not make the version 126 years old.
+    /// does not make the version 126 years old, nor as old as the cached document carrying the
+    /// marker — the index or the page that lists it.
     #[tokio::test]
     async fn the_unlisted_marker_does_not_date_a_version() {
-        let up = upstream().await;
-        let ctx = context(&up, true, min_age_1h_quarantine_7d);
-        let listed = registration(vec![inline_page(
-            "0.9.0",
-            "1.0.0",
+        let leaves = || {
             vec![
                 leaf("0.9.0", "2019-01-01T00:00:00Z"),
                 leaf("1.0.0", UNLISTED),
-            ],
-        )]);
-        cached_registration(&ctx, &listed, 0).await;
-        assert_eq!(
-            download(&ctx, "1.0.0").await,
-            StatusCode::FORBIDDEN,
-            "an undated version is held on NORA's own clock"
-        );
-        assert_eq!(download(&ctx, "0.9.0").await, StatusCode::OK);
+            ]
+        };
+        for on_page in [false, true] {
+            let up = upstream().await;
+            let ctx = context(&up, true, min_age_1h_quarantine_7d);
+            if on_page {
+                let index = registration(vec![remote_page("0.9.0", "1.0.0")]);
+                cached_registration(&ctx, &index, 30).await;
+                let page =
+                    serde_json::json!({"lower": "0.9.0", "upper": "1.0.0", "items": leaves()});
+                put_written_days_ago(
+                    &ctx,
+                    &format!("nuget/registration/{ID}/page/0.9.0/1.0.0.json"),
+                    page.to_string().as_bytes(),
+                    30,
+                )
+                .await;
+            } else {
+                let index = registration(vec![inline_page("0.9.0", "1.0.0", leaves())]);
+                cached_registration(&ctx, &index, 30).await;
+            }
+            assert_eq!(
+                download(&ctx, "1.0.0").await,
+                StatusCode::FORBIDDEN,
+                "on a page: {on_page}; an undated version is held on NORA's own clock"
+            );
+            assert_eq!(
+                download(&ctx, "0.9.0").await,
+                StatusCode::OK,
+                "on a page: {on_page}"
+            );
+            assert_eq!(registration_requests(&up).await, 0, "on a page: {on_page}");
+        }
     }
 
-    /// A package NORA already stores asks the upstream for no date: its digest is recorded, and
-    /// a cache hit does not pay an upstream round-trip.
+    /// A package NORA already stores asks the upstream for no date, whatever case the client
+    /// spells its path in and whichever prefix it comes by: its digest is recorded, and a cache
+    /// hit does not pay an upstream round-trip.
     #[tokio::test]
     async fn a_stored_package_asks_the_upstream_for_no_date() {
         let up = upstream().await;
         let ctx = context(&up, true, min_age_1h);
-        ctx.state
-            .storage
-            .put(
-                &format!("nuget/flatcontainer/{ID}/3.0.0/{ID}.3.0.0.nupkg"),
-                b"stored",
-            )
-            .await
-            .unwrap();
-        assert_eq!(download(&ctx, "3.0.0").await, StatusCode::OK);
-        assert_eq!(registration_requests(&up).await, 0);
+        for version in ["3.0.0", "3.0.1-beta"] {
+            ctx.state
+                .storage
+                .put(
+                    &format!("nuget/flatcontainer/{ID}/{version}/{ID}.{version}.nupkg"),
+                    b"stored",
+                )
+                .await
+                .unwrap();
+        }
+        for uri in [
+            "/nuget/v3/flatcontainer/repro.pkg/3.0.0/repro.pkg.3.0.0.nupkg",
+            "/nuget/v3/flatcontainer/Repro.Pkg/3.0.0/Repro.Pkg.3.0.0.nupkg",
+            "/nuget/v3/flatcontainer/repro.pkg/3.0.0/REPRO.PKG.3.0.0.NUPKG",
+            "/nuget/v3/flatcontainer/Repro.Pkg/3.0.1-Beta/Repro.Pkg.3.0.1-Beta.nupkg",
+            "/chocolatey/v3/flatcontainer/Repro.Pkg/3.0.0/Repro.Pkg.3.0.0.nupkg",
+            "/pwsh/v3/flatcontainer/REPRO.PKG/3.0.1-BETA/repro.pkg.3.0.1-beta.nupkg",
+        ] {
+            assert_eq!(
+                send(&ctx.app, Method::GET, uri, "").await.status(),
+                StatusCode::OK,
+                "{uri}"
+            );
+            assert_eq!(registration_requests(&up).await, 0, "{uri}");
+        }
+        assert!(
+            upstream_paths(&up).await.is_empty(),
+            "served from the cache"
+        );
     }
 
     /// With trusted dates the quarantine takes the release date too (#750): a version published
@@ -4394,6 +4535,68 @@ mod nuget_release_dates {
         });
         assert_eq!(download(&ctx, "4.0.0").await, StatusCode::OK);
         assert_eq!(registration_requests(&up).await, 0);
+    }
+
+    /// A quarantine switched off reads no date, and neither does a release-age rule while
+    /// curation is off: the upstream is not asked for one. NuGet's own `off` overrides a global
+    /// quarantine.
+    #[tokio::test]
+    async fn a_policy_switched_off_asks_for_no_date() {
+        let switched_off: [(&str, fn(&mut crate::config::Config)); 3] = [
+            ("quarantine off", |cfg| {
+                cfg.curation.quarantine = Some(QuarantineMode::Off);
+            }),
+            ("NuGet's quarantine off", |cfg| {
+                cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+                cfg.curation.nuget.quarantine = Some(QuarantineMode::Off);
+            }),
+            ("curation off", |cfg| {
+                cfg.curation.mode = crate::config::CurationMode::Off;
+                cfg.curation.min_release_age = Some("1h".to_string());
+                cfg.curation.nuget.min_release_age = Some("1h".to_string());
+            }),
+        ];
+        for (policy, customize) in switched_off {
+            let up = upstream().await;
+            let ctx = context(&up, true, customize);
+            assert_eq!(download(&ctx, "4.0.0").await, StatusCode::OK, "{policy}");
+            assert_eq!(registration_requests(&up).await, 0, "{policy}");
+        }
+    }
+
+    /// The date is asked of the configured upstream only: with the upstream switched off —
+    /// absent or blank — no request leaves NORA for a date, the public default host included.
+    #[tokio::test]
+    async fn the_date_is_asked_of_the_configured_upstream_only() {
+        use crate::test_helpers::{create_test_context_with_egress_proxy, EgressRecorder};
+        for proxy in [None, Some("  ".to_string())] {
+            let recorder = EgressRecorder::start().await;
+            let switched_off = proxy.clone();
+            let ctx = create_test_context_with_egress_proxy(&recorder.url, move |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = switched_off;
+                cfg.nuget.metadata_proxy_timeout = 2;
+                cfg.server.trust_upstream_dates = true;
+                cfg.circuit_breaker.enabled = true;
+                min_age_1h_quarantine_7d(cfg);
+            });
+            assert_eq!(
+                download(&ctx, "1.0.0").await,
+                StatusCode::NOT_FOUND,
+                "{proxy:?}"
+            );
+            // The breaker is asked before every upstream request; the recorder sees any request.
+            assert!(
+                ctx.state.circuit_breaker.keys().is_empty(),
+                "{proxy:?}: {:?}",
+                ctx.state.circuit_breaker.keys()
+            );
+            assert!(
+                recorder.seen().await.is_empty(),
+                "{proxy:?}: {:?}",
+                recorder.seen().await
+            );
+        }
     }
 
     #[test]
