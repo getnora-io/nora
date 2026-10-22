@@ -42,6 +42,7 @@ pub mod permissions;
 pub mod resume;
 pub mod source;
 pub mod transfer;
+mod under_key;
 
 /// Import error. STRING-backed for the scaffold (matches the `migrate.rs`
 /// sibling); TODO(#599) upgrade to a `thiserror` `ImportError` enum so the
@@ -136,9 +137,9 @@ pub enum ImportCommand {
     /// An npm repository they imported holds tarballs without version documents, and NORA does
     /// not serve them as published packages. A re-run skips an npm repository it finished, so
     /// first delete that repository's `<repo>__<hash>.done` and `<repo>__<hash>.progress` from the
-    /// source's directory under `<storage path>/.nora-import/`, then run the import again: on
-    /// local storage it writes the missing documents beside the tarballs already stored; on S3 it
-    /// transfers the tarballs again.
+    /// source's directory under `<storage path>/.nora-import/`, then run the import again: it
+    /// transfers the tarballs again and writes their documents. A tarball stored without its
+    /// document is not published as it is, since it may be what an upstream served under the name.
     Run(RunArgs),
 }
 
@@ -272,18 +273,7 @@ async fn assess(args: AssessArgs, config: &crate::config::Config) -> Result<()> 
                     layout::Compat::Partial => partial += 1,
                     layout::Compat::Unsupported => unsupported += 1,
                 }
-                let note = match (c, rt) {
-                    (layout::Compat::Full, _) => "",
-                    (_, crate::registry_type::RegistryType::PyPI) => {
-                        "distribution files only; served as hosted, never asked of an upstream"
-                    }
-                    (_, crate::registry_type::RegistryType::Nuget) => {
-                        ".nupkg only; served as hosted, never asked of an upstream"
-                    }
-                    (layout::Compat::Partial, _) => "tarballs only; metadata regenerated",
-                    (layout::Compat::Unsupported, _) => "no NORA import layout — will be skipped",
-                };
-                (format!("{c:?}"), note)
+                (format!("{c:?}"), layout::note(rt))
             }
             None => {
                 unsupported += 1;
@@ -491,31 +481,10 @@ async fn import_repo(
                 if prior.contains(&key) {
                     return Item::ResumeSkip;
                 }
-                // Fast-path only on local (per-object HEAD on S3 = $$ + latency, R5). Not for a
-                // PyPI file or a .nupkg: what is stored under the key may be what an upstream
-                // served under the name before the import made it NORA's own, and only a transfer
-                // stores the source's verified bytes and writes every record beside them.
-                let hosted_records = matches!(
-                    rt,
-                    crate::registry_type::RegistryType::PyPI
-                        | crate::registry_type::RegistryType::Nuget
-                );
-                if !on_s3 && !hosted_records && storage.stat(&key).await.is_some() {
-                    // An npm tarball an earlier import committed without its version document
-                    // (before 1.4.2, or a failed document write) is published now.
-                    if rt == crate::registry_type::RegistryType::Npm && !opts.dry_run {
-                        if let Err(e) =
-                            transfer::publish_stored_npm_tarball(storage, &key, opts.public_base)
-                                .await
-                        {
-                            return Item::Done {
-                                key,
-                                outcome: transfer::Outcome::Failed {
-                                    reason: format!("{}: {e}", art.path),
-                                },
-                            };
-                        }
-                    }
+                // What already lies under the key decides whether the artifact is transferred: one
+                // rule for every format (`under_key::action`), looked at only on local storage.
+                let under = under_key::under_key(storage, rt, on_s3, &key).await;
+                if under_key::action(rt, under) == under_key::Action::Skip {
                     return Item::CasSkip { key };
                 }
                 let cname = curation_name(rt, &art, &key);
@@ -626,7 +595,20 @@ fn curation_name(rt: crate::registry_type::RegistryType, art: &ArtifactRef, key:
         crate::registry_type::RegistryType::PyPI => segment(1),
         // `nuget/flatcontainer/<id>/<version>/<file>`
         crate::registry_type::RegistryType::Nuget => segment(2),
-        _ => art.path.clone(),
+        crate::registry_type::RegistryType::Maven
+        | crate::registry_type::RegistryType::Raw
+        | crate::registry_type::RegistryType::Docker
+        | crate::registry_type::RegistryType::Cargo
+        | crate::registry_type::RegistryType::Go
+        | crate::registry_type::RegistryType::Gems
+        | crate::registry_type::RegistryType::Terraform
+        | crate::registry_type::RegistryType::Ansible
+        | crate::registry_type::RegistryType::PubDart
+        | crate::registry_type::RegistryType::Conan
+        | crate::registry_type::RegistryType::Rpm
+        | crate::registry_type::RegistryType::Deb
+        | crate::registry_type::RegistryType::Cpan
+        | crate::registry_type::RegistryType::HuggingFace => art.path.clone(),
     }
 }
 
@@ -1547,6 +1529,8 @@ mod integration_tests {
         assert_eq!(h.storage.list("npm/").await.unwrap(), Vec::<String>::new());
     }
 
+    /// What an import before 1.4.2 left, a tarball without its version document, is published by
+    /// the next run: the source's tarball is transferred again and its document written.
     #[tokio::test]
     async fn a_tarball_an_earlier_import_committed_alone_is_published_by_the_next_run() {
         let h = harness("npm-upgrade").await;
@@ -1563,7 +1547,7 @@ mod integration_tests {
             state.path(),
         )
         .await;
-        assert_eq!((res.skipped, res.failed), (1, 0), "{res:?}");
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
         let doc: serde_json::Value =
             serde_json::from_slice(&h.storage.get("npm/pkg/versions/1.0.0.json").await.unwrap())
                 .unwrap();
@@ -2285,6 +2269,65 @@ mod integration_tests {
         )
         .await;
         assert_eq!(nuspec.status(), StatusCode::OK);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+    }
+
+    /// The same for an npm tarball: what an upstream served under the key is not published as
+    /// the imported version. The source's verified tarball is, with the document read from it.
+    #[tokio::test]
+    async fn an_npm_tarball_an_upstream_cached_under_its_key_is_imported_over_it() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        let served = npm_tgz(&json!({
+            "name": "corp-lib",
+            "version": "1.0.0",
+            "description": "FROM-PUBLIC-UPSTREAM",
+        }));
+        ctx.state
+            .storage
+            .put("npm/corp-lib/tarballs/corp-lib-1.0.0.tgz", &served)
+            .await
+            .unwrap();
+        let own = npm_tgz(&json!({
+            "name": "corp-lib",
+            "version": "1.0.0",
+            "description": "INTERNAL-ARTIFACTORY",
+        }));
+        let state = tempfile::tempdir().unwrap();
+        let res = import_npm(
+            &ctx.state.storage,
+            vec![("corp-lib/-/corp-lib-1.0.0.tgz".into(), own.clone())],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        let resp = send(&ctx.app, Method::GET, "/npm/corp-lib", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(
+            doc["versions"]["1.0.0"]["description"], "INTERNAL-ARTIFACTORY",
+            "{doc}"
+        );
+        let tarball = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/corp-lib/-/corp-lib-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(tarball.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(tarball).await[..], &own[..]);
         assert_eq!(asked(&upstream).await, Vec::<String>::new());
     }
 

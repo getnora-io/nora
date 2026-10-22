@@ -42,7 +42,20 @@ pub const LAYOUT: u32 = 2;
 pub fn imported_since(rt: RegistryType) -> u32 {
     match rt {
         RegistryType::PyPI | RegistryType::Nuget => 2,
-        _ => 1,
+        RegistryType::Maven | RegistryType::Raw | RegistryType::Npm => 1,
+        // Not imported by any layout: a finished repository of one is not walked again.
+        RegistryType::Docker
+        | RegistryType::Cargo
+        | RegistryType::Go
+        | RegistryType::Gems
+        | RegistryType::Terraform
+        | RegistryType::Ansible
+        | RegistryType::PubDart
+        | RegistryType::Conan
+        | RegistryType::Rpm
+        | RegistryType::Deb
+        | RegistryType::Cpan
+        | RegistryType::HuggingFace => 1,
     }
 }
 
@@ -60,7 +73,42 @@ pub fn compat(rt: RegistryType) -> Compat {
     match rt {
         RegistryType::Maven | RegistryType::Raw => Compat::Full,
         RegistryType::Npm | RegistryType::PyPI | RegistryType::Nuget => Compat::Partial,
-        _ => Compat::Unsupported,
+        RegistryType::Docker
+        | RegistryType::Cargo
+        | RegistryType::Go
+        | RegistryType::Gems
+        | RegistryType::Terraform
+        | RegistryType::Ansible
+        | RegistryType::PubDart
+        | RegistryType::Conan
+        | RegistryType::Rpm
+        | RegistryType::Deb
+        | RegistryType::Cpan
+        | RegistryType::HuggingFace => Compat::Unsupported,
+    }
+}
+
+/// What `assess` tells an operator about a repository of format `rt`.
+pub fn note(rt: RegistryType) -> &'static str {
+    match rt {
+        RegistryType::Maven | RegistryType::Raw => "",
+        RegistryType::Npm => "tarballs only; metadata regenerated",
+        RegistryType::PyPI => {
+            "distribution files only; served as hosted, never asked of an upstream"
+        }
+        RegistryType::Nuget => ".nupkg only; served as hosted, never asked of an upstream",
+        RegistryType::Docker
+        | RegistryType::Cargo
+        | RegistryType::Go
+        | RegistryType::Gems
+        | RegistryType::Terraform
+        | RegistryType::Ansible
+        | RegistryType::PubDart
+        | RegistryType::Conan
+        | RegistryType::Rpm
+        | RegistryType::Deb
+        | RegistryType::Cpan
+        | RegistryType::HuggingFace => "no NORA import layout — will be skipped",
     }
 }
 
@@ -115,7 +163,18 @@ pub fn map_artifact(rt: RegistryType, art: &ArtifactRef) -> Mapping {
             Ok(k) => k,
             Err(mapping) => return mapping,
         },
-        _ => return Mapping::Skip("format not hosted by NORA import"),
+        RegistryType::Docker
+        | RegistryType::Cargo
+        | RegistryType::Go
+        | RegistryType::Gems
+        | RegistryType::Terraform
+        | RegistryType::Ansible
+        | RegistryType::PubDart
+        | RegistryType::Conan
+        | RegistryType::Rpm
+        | RegistryType::Deb
+        | RegistryType::Cpan
+        | RegistryType::HuggingFace => return Mapping::Skip("format not hosted by NORA import"),
     };
 
     match validate_storage_key(&key) {
@@ -277,6 +336,66 @@ mod tests {
         assert_eq!(compat(RegistryType::Nuget), Compat::Partial);
         assert_eq!(compat(RegistryType::Cargo), Compat::Unsupported);
         assert_eq!(compat(RegistryType::Docker), Compat::Unsupported);
+    }
+
+    /// Every format: how it maps, the first layout that imported its files, and whether a
+    /// source artifact of it is mapped to a key at all.
+    #[test]
+    fn every_format_has_its_import_decisions() {
+        use Compat::{Full, Partial, Unsupported};
+        use RegistryType as R;
+        let table: &[(RegistryType, Compat, u32, bool)] = &[
+            (R::Docker, Unsupported, 1, false),
+            (R::Maven, Full, 1, true),
+            (R::Npm, Partial, 1, true),
+            (R::Cargo, Unsupported, 1, false),
+            (R::PyPI, Partial, 2, true),
+            (R::Go, Unsupported, 1, false),
+            (R::Raw, Full, 1, true),
+            (R::Gems, Unsupported, 1, false),
+            (R::Terraform, Unsupported, 1, false),
+            (R::Ansible, Unsupported, 1, false),
+            (R::Nuget, Partial, 2, true),
+            (R::PubDart, Unsupported, 1, false),
+            (R::Conan, Unsupported, 1, false),
+            (R::Rpm, Unsupported, 1, false),
+            (R::Deb, Unsupported, 1, false),
+            (R::Cpan, Unsupported, 1, false),
+            (R::HuggingFace, Unsupported, 1, false),
+        ];
+        let rows: Vec<RegistryType> = table.iter().map(|row| row.0).collect();
+        assert_eq!(rows, RegistryType::all(), "a row for every format");
+        for &(rt, want, since, mapped) in table {
+            assert_eq!(compat(rt), want, "{rt:?}");
+            assert_eq!(imported_since(rt), since, "{rt:?}");
+            assert_eq!(note(rt).is_empty(), want == Full, "{rt:?}");
+            assert_eq!(
+                note(rt) == "no NORA import layout — will be skipped",
+                want == Unsupported,
+                "{rt:?}"
+            );
+            // A path every mapped format reads as one of its files.
+            let path = match rt {
+                R::Npm => "a/-/a-1.0.0.tgz",
+                R::PyPI => "a/1.0/a-1.0.tar.gz",
+                R::Nuget => "A/A.1.0.0.nupkg",
+                _ => "com/a/1.0/a-1.0.jar",
+            };
+            let art = super::super::ArtifactRef {
+                repo: "r".into(),
+                path: path.into(),
+                name: "x".into(),
+                size: None,
+                sha256: None,
+                sha1: None,
+            };
+            assert_eq!(
+                matches!(map_artifact(rt, &art), Mapping::Key(_)),
+                mapped,
+                "{rt:?}: {:?}",
+                map_artifact(rt, &art)
+            );
+        }
     }
 
     #[test]

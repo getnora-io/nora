@@ -296,7 +296,8 @@ pub async fn transfer_artifact(
     }
     guard.disarm(); // storage moved the temp file into place
                     // The tarball first, as a publish writes it: a version document always names bytes that are
-                    // there. A failed document write is retried by the next run (see `publish_stored_npm_tarball`).
+                    // there. A failed document write is retried by the next run, which transfers the
+                    // tarball again: a tarball without its document is not taken for the import's.
     if let Some((version_key, document)) = npm_version {
         if let Err(e) = storage.put(&version_key, &document).await {
             return Outcome::Failed {
@@ -360,8 +361,6 @@ async fn staged_nuget_package(
 pub enum NpmVersionError {
     #[error(transparent)]
     Tarball(#[from] crate::registry::npm::ImportedTarballError),
-    #[error("storage: {0}")]
-    Storage(#[from] crate::storage::StorageError),
     #[error("reading the tarball stopped: {0}")]
     Join(#[from] tokio::task::JoinError),
 }
@@ -388,40 +387,6 @@ async fn staged_npm_version(
     })
     .await??;
     Ok(document)
-}
-
-/// Write the version document of an npm tarball already stored at `key` when it has none: an
-/// import before 1.4.2, or one whose document write failed, committed the tarball alone. `Ok(true)`
-/// when a document was written.
-pub async fn publish_stored_npm_tarball(
-    storage: &Storage,
-    key: &str,
-    public_base: &str,
-) -> std::result::Result<bool, NpmVersionError> {
-    let Some(version_key) = crate::registry::npm::imported_version_key(key) else {
-        return Ok(false);
-    };
-    if storage.stat(&version_key).await.is_some() {
-        return Ok(false);
-    }
-    let tarball = storage.get(key).await?;
-    let (key, public_base) = (key.to_string(), public_base.to_string());
-    let (version_key, document) = tokio::task::spawn_blocking(move || {
-        // SAFETY(deprecated-hash-algo): SHA-1 is npm's own `dist.shasum`, which clients check
-        // beside the SHA-512 `integrity`; it vouches for nothing on its own here.
-        let sha1 = hex::encode(sha1::Sha1::digest(&tarball)); // nosemgrep: deprecated-hash-algo
-        let sha512: [u8; 64] = sha2::Sha512::digest(&tarball).into();
-        crate::registry::npm::imported_version_document(
-            &key,
-            &tarball[..],
-            &sha1,
-            &sha512,
-            &public_base,
-        )
-    })
-    .await??;
-    storage.put(&version_key, &document).await?;
-    Ok(true)
 }
 
 /// A staged temp file plus its incrementally-computed digests.
