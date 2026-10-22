@@ -42,13 +42,31 @@ pub const MAX_TOKEN_TTL_DAYS: u64 = 3650;
 
 pub const SECS_PER_DAY: u64 = 24 * 60 * 60;
 
-/// A lifetime of `ttl_days` days in seconds, at most [`MAX_TOKEN_TTL_DAYS`]
-/// days: a lifetime too long to count in seconds is longer than the cap.
-pub fn ttl_secs_for_days(ttl_days: u64) -> u64 {
-    let max_secs = MAX_TOKEN_TTL_DAYS * SECS_PER_DAY;
-    ttl_days
-        .checked_mul(SECS_PER_DAY)
-        .map_or(max_secs, |secs| secs.min(max_secs))
+/// The lifetime a mint grants, in seconds. Built only by
+/// [`MintLifetime::days`] and taken by [`TokenStore::mint_token`], so every
+/// route that mints, whatever it is asked, goes through the one rule there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MintLifetime(u64);
+
+impl MintLifetime {
+    /// The lifetime of a token asked for `requested_days` days by a caller
+    /// whose own credential allows it `ceiling_secs` seconds more (`None` when
+    /// it imposes no ceiling: Basic and opaque callers). First the cap of
+    /// [`MAX_TOKEN_TTL_DAYS`] days, a lifetime too long to count in seconds
+    /// being longer than the cap, then the ceiling, kept to the second: 0 once
+    /// nothing is left of the credential, and the route mints nothing.
+    pub fn days(requested_days: u64, ceiling_secs: Option<u64>) -> Self {
+        let max_secs = MAX_TOKEN_TTL_DAYS * SECS_PER_DAY;
+        let capped = requested_days
+            .checked_mul(SECS_PER_DAY)
+            .map_or(max_secs, |secs| secs.min(max_secs));
+        Self(ceiling_secs.map_or(capped, |ceiling| capped.min(ceiling)))
+    }
+
+    /// The lifetime in seconds.
+    pub fn secs(self) -> u64 {
+        self.0
+    }
 }
 
 /// A token just minted, with what it was granted: what a route answers and
@@ -376,23 +394,21 @@ impl TokenStore {
         description: Option<String>,
         role: Role,
     ) -> Result<String, TokenError> {
-        self.mint_token(user, ttl_secs_for_days(ttl_days), description, role)
+        self.mint_token(user, MintLifetime::days(ttl_days, None), description, role)
             .map(|minted| minted.token)
     }
 
-    /// Generate a new API token living `ttl_secs` seconds — at most
-    /// [`MAX_TOKEN_TTL_DAYS`] days — and report the lifetime granted. Seconds,
-    /// for a caller whose own credential lives less than a day: the token it
-    /// mints must not outlive it.
+    /// Generate a new API token living `lifetime` and report the lifetime
+    /// granted.
     pub fn mint_token(
         &self,
         user: &str,
-        ttl_secs: u64,
+        lifetime: MintLifetime,
         description: Option<String>,
         role: Role,
     ) -> Result<MintedToken, TokenError> {
         let granted_role = role.clone();
-        let ttl_secs = ttl_secs.min(MAX_TOKEN_TTL_DAYS * SECS_PER_DAY);
+        let ttl_secs = lifetime.secs();
         // Generate random token
         let raw_token = format!(
             "{}{}",
@@ -1698,15 +1714,54 @@ mod tests {
         }
     }
 
+    /// The lifetime of a mint, as a table: at most ten years whatever the days
+    /// asked, days too many to count in seconds included, then at most the
+    /// caller's ceiling, to the second.
+    #[test]
+    fn a_mint_lifetime_is_capped_then_held_to_the_ceiling() {
+        const DAY: u64 = 86_400;
+        const TEN_YEARS: u64 = 3650 * DAY;
+        let last_whole = u64::MAX / DAY;
+        for (days, ceiling, secs) in [
+            (30, None, 30 * DAY),
+            (0, None, 0),
+            (1, None, DAY),
+            (3650, None, TEN_YEARS),
+            (3651, None, TEN_YEARS),
+            (1_000_000_000, None, TEN_YEARS),
+            (last_whole, None, TEN_YEARS),
+            (last_whole + 1, None, TEN_YEARS),
+            (u64::MAX, None, TEN_YEARS),
+            (3650, Some(7 * DAY), 7 * DAY),
+            (3, Some(7 * DAY), 3 * DAY),
+            (3650, Some(DAY), DAY),
+            (3650, Some(900), 900),
+            (3650, Some(0), 0),
+            (last_whole + 1, Some(900), 900),
+            (u64::MAX, Some(900), 900),
+            (last_whole + 1, Some(20 * 365 * DAY), TEN_YEARS),
+            (u64::MAX, Some(u64::MAX), TEN_YEARS),
+        ] {
+            assert_eq!(
+                MintLifetime::days(days, ceiling).secs(),
+                secs,
+                "{days} days, ceiling {ceiling:?}"
+            );
+        }
+    }
+
     /// The store reports the lifetime it granted, not the one asked for: a
     /// route answers and audits what the token really lives.
     #[test]
     fn mint_token_reports_the_lifetime_granted() {
         let temp_dir = TempDir::new().unwrap();
         let store = TokenStore::new(temp_dir.path());
-        for (asked, granted) in [(900, 900), (u64::MAX, 3650 * 86_400)] {
+        for (asked, granted) in [
+            (MintLifetime::days(1, Some(900)), 900),
+            (MintLifetime::days(u64::MAX, None), 3650 * 86_400),
+        ] {
             let minted = store.mint_token("u", asked, None, Role::Write).unwrap();
-            assert_eq!(minted.ttl_secs, granted, "asked {asked}");
+            assert_eq!(minted.ttl_secs, granted, "asked {asked:?}");
             assert_eq!((minted.owner.as_str(), minted.role), ("u", Role::Write));
             let entry = store
                 .list_all_tokens()

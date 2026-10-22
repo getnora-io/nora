@@ -40,22 +40,6 @@ pub struct AuthenticatedRole(pub crate::tokens::Role);
 #[derive(Clone, Copy, Debug)]
 pub struct MintLifetimeCeiling(pub u64);
 
-/// The lifetime in seconds of a token asked for `requested_days` days by a
-/// caller whose credential imposes `ceiling` — an OIDC caller's provider
-/// `max_token_lifetime_secs` and what is left of its JWT (#1094). A ceiling
-/// shorter than a day is kept to the second: the token never outlives what the
-/// caller's own credential may. `None` (Basic/opaque callers, which carry no
-/// ceiling) leaves the lifetime unchanged. 0 once nothing is left of the
-/// credential: the route mints nothing. Every route that mints for an
-/// authenticated caller (the UI and the admin route) takes its lifetime here.
-pub(crate) fn mint_ttl_secs(requested_days: u64, ceiling: Option<MintLifetimeCeiling>) -> u64 {
-    let requested = requested_days.saturating_mul(crate::tokens::SECS_PER_DAY);
-    match ceiling {
-        Some(MintLifetimeCeiling(ceiling)) => requested.min(ceiling),
-        None => requested,
-    }
-}
-
 use axum::{
     body::Body,
     extract::{ConnectInfo, State},
@@ -958,26 +942,6 @@ mod tests {
 
     /// #1094: an OIDC caller's lifetime ceiling caps the minted token; a
     /// caller with no ceiling (Basic/opaque) is unchanged.
-    #[test]
-    fn mint_ttl_secs_respects_the_ceiling() {
-        const DAY: u64 = 86_400;
-        let ceiling = |secs| Some(MintLifetimeCeiling(secs));
-        // No ceiling: the requested (already clamped) lifetime is unchanged.
-        assert_eq!(mint_ttl_secs(3650, None), 3650 * DAY);
-        assert_eq!(mint_ttl_secs(1, None), DAY);
-        // A whole-day ceiling caps a longer request…
-        assert_eq!(mint_ttl_secs(3650, ceiling(7 * DAY)), 7 * DAY);
-        // …but leaves a shorter request alone.
-        assert_eq!(mint_ttl_secs(3, ceiling(7 * DAY)), 3 * DAY);
-        // Exactly one day.
-        assert_eq!(mint_ttl_secs(3650, ceiling(DAY)), DAY);
-        // A sub-day ceiling is kept to the second, not rounded up to a day.
-        assert_eq!(mint_ttl_secs(3650, ceiling(900)), 900);
-        assert_eq!(mint_ttl_secs(3650, ceiling(0)), 0);
-        // A lifetime too long to count in seconds still caps.
-        assert_eq!(mint_ttl_secs(u64::MAX, ceiling(900)), 900);
-    }
-
     #[test]
     fn audit_actor_resolves_user_or_anonymous() {
         // #985 — the audit actor is the authenticated username (whatever auth

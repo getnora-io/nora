@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::audit::AuditEntry;
 use crate::auth::{AuthenticatedUser, MintLifetimeCeiling, NamespaceAuthority};
 use crate::registry_type::RegistryType;
-use crate::tokens::Role;
+use crate::tokens::{MintLifetime, Role};
 use crate::AppState;
 
 /// Minimum seconds between two accepted reindex calls. A reindex flips dirty
@@ -238,16 +238,18 @@ async fn admin_create_token(
     // An OIDC admin is held to its credential as on the UI: the token lives no
     // longer than the provider ceiling and what is left of the JWT, and a JWT
     // with nothing left mints nothing.
-    let ttl_secs =
-        crate::auth::mint_ttl_secs(req.ttl_days, caller_mint_ceiling.map(|Extension(c)| c));
-    if ttl_secs == 0 {
+    let lifetime = MintLifetime::days(
+        req.ttl_days,
+        caller_mint_ceiling.map(|Extension(MintLifetimeCeiling(secs))| secs),
+    );
+    if lifetime.secs() == 0 {
         return (
             StatusCode::FORBIDDEN,
             "The credential has expired; a token minted from it would outlive it",
         )
             .into_response();
     }
-    match token_store.mint_token(&req.username, ttl_secs, req.description, role) {
+    match token_store.mint_token(&req.username, lifetime, req.description, role) {
         Ok(minted) => {
             state.audit.log(AuditEntry::token_mint(
                 &caller.0,

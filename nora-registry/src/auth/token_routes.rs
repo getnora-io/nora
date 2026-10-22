@@ -15,7 +15,7 @@ use std::net::{IpAddr, SocketAddr};
 use utoipa::ToSchema;
 
 use crate::audit::AuditEntry;
-use crate::tokens::{ttl_secs_for_days, MintedToken, Role, SECS_PER_DAY};
+use crate::tokens::{MintLifetime, MintedToken, Role, SECS_PER_DAY};
 use crate::AppState;
 
 use super::{lockout_rule, resolve_client_ip, too_many_failed_attempts, BasicDecision};
@@ -170,7 +170,7 @@ async fn create_token(
 
     match token_store.mint_token(
         &req.username,
-        ttl_secs_for_days(req.ttl_days),
+        MintLifetime::days(req.ttl_days, None),
         req.description,
         role,
     ) {
@@ -426,6 +426,75 @@ mod mint_tests {
             let bob = r#"{"username":"bob","password":"bobpw"}"#;
             let (status, _) = post_json(&ctx, "/api/tokens/list", None, bob).await;
             assert_eq!(status, StatusCode::OK, "{route}");
+        }
+    }
+
+    /// Every route that mints holds a lifetime too long to count in seconds to
+    /// the cap, instead of wrapping around to hours: the API and admin routes
+    /// answer the lifetime granted, and the token lives it.
+    #[tokio::test]
+    async fn every_mint_route_holds_an_overflowing_lifetime_to_the_cap() {
+        let last_whole = u64::MAX / 86_400;
+        for ttl_days in [last_whole, last_whole + 1, u64::MAX] {
+            let ctx = audited(&[("alice", "alicepw")]);
+            let store = ctx.state.tokens.as_ref().unwrap();
+            let admin = store.create_token("root", 30, None, Role::Admin).unwrap();
+            let (status, json) = post_json(
+                &ctx,
+                "/api/tokens",
+                None,
+                &format!(r#"{{"username":"alice","password":"alicepw","ttl_days":{ttl_days}}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "api, ttl_days={ttl_days}: {json}");
+            assert_eq!(
+                json["expires_in_secs"], TEN_YEARS,
+                "api, ttl_days={ttl_days}"
+            );
+            assert_eq!(
+                lifetime_of(&ctx, "alice"),
+                TEN_YEARS,
+                "api, ttl_days={ttl_days}"
+            );
+
+            let (status, json) = post_json(
+                &ctx,
+                "/api/v1/admin/tokens",
+                Some(&format!("Bearer {admin}")),
+                &format!(r#"{{"username":"svc","role":"read","ttl_days":{ttl_days}}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "admin, ttl_days={ttl_days}: {json}");
+            assert_eq!(
+                json["expires_in_secs"], TEN_YEARS,
+                "admin, ttl_days={ttl_days}"
+            );
+            assert_eq!(
+                lifetime_of(&ctx, "svc"),
+                TEN_YEARS,
+                "admin, ttl_days={ttl_days}"
+            );
+
+            let ui = create_test_context_with_auth(&[("bob", "bobpw")]);
+            let basic = format!("Basic {}", STANDARD.encode("bob:bobpw"));
+            let resp = send_with_headers(
+                &ui.app,
+                Method::POST,
+                "/api/ui/tokens/create",
+                vec![
+                    ("authorization", &basic),
+                    ("hx-request", "true"),
+                    ("content-type", "application/x-www-form-urlencoded"),
+                ],
+                format!("description=ci&role=write&ttl_days={ttl_days}").into_bytes(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "ui, ttl_days={ttl_days}");
+            assert_eq!(
+                lifetime_of(&ui, "bob"),
+                TEN_YEARS,
+                "ui, ttl_days={ttl_days}"
+            );
         }
     }
 

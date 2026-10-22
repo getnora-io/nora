@@ -1081,14 +1081,12 @@ async fn tokens_create(
         }
     };
 
-    let ttl_secs = crate::auth::mint_ttl_secs(
-        form.ttl_days
-            .unwrap_or(90)
-            .clamp(1, crate::tokens::MAX_TOKEN_TTL_DAYS),
-        caller_mint_ceiling.map(|Extension(c)| c),
+    let lifetime = crate::tokens::MintLifetime::days(
+        form.ttl_days.unwrap_or(90).max(1),
+        caller_mint_ceiling.map(|Extension(MintLifetimeCeiling(secs))| secs),
     );
     // Nothing left of the caller's credential: fail closed, mint nothing.
-    if ttl_secs == 0 {
+    if lifetime.secs() == 0 {
         return (
             StatusCode::FORBIDDEN,
             Html(format!(
@@ -1104,7 +1102,7 @@ async fn tokens_create(
         Some(form.description.trim().to_string())
     };
 
-    match store.mint_token(&user, ttl_secs, description, granted_role) {
+    match store.mint_token(&user, lifetime, description, granted_role) {
         Ok(minted) => {
             state.audit.log(crate::audit::AuditEntry::token_mint(
                 &user,
