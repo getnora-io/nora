@@ -8937,6 +8937,138 @@ mod publish_attachments {
         assert_eq!(after["npm/foo/tarballs/foo-1.0.1.tgz"], b"next");
     }
 
+    /// Which attachments a publish stores, each case with its bytes and without them: only the
+    /// tarball (`<name>-<version>.tgz`, the name with its scope or without it) of a version the
+    /// payload publishes. Anything else refuses the whole publish, whether or not it carries
+    /// bytes, and beside a tarball that would be stored.
+    #[test]
+    fn an_attachment_is_stored_only_as_a_tarball_of_this_publish() {
+        use super::publish_tarballs;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"bytes");
+        let cases: [(&str, &str, Option<&str>); 24] = [
+            (
+                "foo",
+                "foo-1.0.1.tgz",
+                Some("npm/foo/tarballs/foo-1.0.1.tgz"),
+            ),
+            (
+                "@s/pkg",
+                "@s/pkg-1.0.1.tgz",
+                Some("npm/@s/pkg/tarballs/pkg-1.0.1.tgz"),
+            ),
+            (
+                "@s/pkg",
+                "pkg-1.0.1.tgz",
+                Some("npm/@s/pkg/tarballs/pkg-1.0.1.tgz"),
+            ),
+            // Another version's tarball, or a key beside a tarball.
+            ("foo", "foo-1.0.0.tgz", None),
+            ("foo", "foo-1.0.1.tgz.sha256", None),
+            ("foo", "foo-1.0.0.tgz.sha256", None),
+            ("foo", "foo-1.0.1.tar.gz", None),
+            // Another package's tarball, under any scope or path.
+            ("foo", "bar-1.0.1.tgz", None),
+            ("foo", "@s/foo-1.0.1.tgz", None),
+            ("foo", "x/foo-1.0.1.tgz", None),
+            ("foo", "../foo-1.0.1.tgz", None),
+            ("foo", "FOO-1.0.1.tgz", None),
+            ("foo", "", None),
+            ("@s/pkg", "@other/pkg-1.0.1.tgz", None),
+            ("@s/pkg", "x/pkg-1.0.1.tgz", None),
+            ("@s/pkg", "s/pkg-1.0.1.tgz", None),
+            ("@s/pkg", "@s/x/pkg-1.0.1.tgz", None),
+            ("@s/pkg", "@s/@s/pkg-1.0.1.tgz", None),
+            ("@s/pkg", "@s/../pkg-1.0.1.tgz", None),
+            ("@s/pkg", "@spkg-1.0.1.tgz", None),
+            ("@s/pkg", "@s-pkg-1.0.1.tgz", None),
+            ("@s/pkg", "@s/pkg-1.0.0.tgz", None),
+            ("@s/pkg", "@s/pkg-1.0.1.tgz.sha256", None),
+            ("@s/pkg", "other-1.0.1.tgz", None),
+        ];
+        let versions: serde_json::Map<String, serde_json::Value> =
+            [("1.0.1".to_string(), serde_json::json!({}))]
+                .into_iter()
+                .collect();
+        let attachments = |entries: &[(&str, serde_json::Value)]| {
+            entries
+                .iter()
+                .map(|(file, attachment)| (file.to_string(), attachment.clone()))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        };
+        let with_data = serde_json::json!({ "data": encoded });
+        let without_data = serde_json::json!({ "length": 5 });
+        for (package, file, stored_as) in cases {
+            let own = format!("{}-1.0.1.tgz", package.rsplit('/').next().unwrap());
+            for attachment in [&with_data, &without_data] {
+                let alone = publish_tarballs(
+                    package,
+                    &attachments(&[(file, attachment.clone())]),
+                    &versions,
+                );
+                let beside_own = publish_tarballs(
+                    package,
+                    &attachments(&[(&own, with_data.clone()), (file, attachment.clone())]),
+                    &versions,
+                );
+                let has_data = attachment.get("data").is_some();
+                match stored_as {
+                    Some(key) => {
+                        let expected: Vec<(String, Vec<u8>)> = if has_data {
+                            vec![(key.to_string(), b"bytes".to_vec())]
+                        } else {
+                            Vec::new()
+                        };
+                        assert_eq!(alone.unwrap(), expected, "{package}: {file:?}");
+                        assert!(beside_own.is_ok(), "{package}: {file:?} beside its own");
+                    }
+                    None => {
+                        assert!(alone.is_err(), "{package}: {file:?}, data: {has_data}");
+                        assert!(
+                            beside_own.is_err(),
+                            "{package}: {file:?} beside its own, data: {has_data}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Through the endpoint: a scoped publish carrying another scope's tarball, or a refused
+    /// attachment without bytes, is refused and stores nothing.
+    #[tokio::test]
+    async fn a_publish_with_a_foreign_attachment_stores_nothing() {
+        let ctx = create_test_context();
+        for file in [
+            "@other/pkg-1.0.0.tgz",
+            "x/pkg-1.0.0.tgz",
+            "@s/x/pkg-1.0.0.tgz",
+        ] {
+            assert_eq!(
+                publish(&ctx, "@s/pkg", &["1.0.0"], &[(file, b"evil")]).await,
+                StatusCode::BAD_REQUEST,
+                "{file}"
+            );
+            assert!(stored(&ctx, "@s/pkg").await.is_empty(), "{file} stored");
+        }
+        let payload = serde_json::json!({
+            "name": "foo",
+            "versions": { "1.0.1": { "name": "foo", "version": "1.0.1", "dist": {} } },
+            "_attachments": {
+                "foo-1.0.1.tgz": { "data": base64::engine::general_purpose::STANDARD.encode(b"next") },
+                "foo-1.0.0.tgz.sha256": { "length": 64 },
+            },
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/foo",
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(stored(&ctx, "foo").await.is_empty());
+    }
+
     #[tokio::test]
     async fn a_scoped_publish_carries_its_own_tarball_only() {
         let ctx = create_test_context();
