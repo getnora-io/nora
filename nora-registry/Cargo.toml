@@ -96,8 +96,9 @@ wiremock = "0.6"
 criterion = { version = "0.8", features = ["html_reports"] }
 http-body-util = "0.1"
 insta = { version = "1", features = ["json"] }
-# Reads `impl Storage` for the list test of the UI storage boundary (already in the lock).
-syn = { version = "2", default-features = false, features = ["full", "parsing"] }
+# Reads `impl Storage` for the list test of the UI storage boundary, and every `cfg` of the
+# sources for the test that no shipped build compiles fault-injection (already in the lock).
+syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
 
 [[bench]]
 name = "parsing"
