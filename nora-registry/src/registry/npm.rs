@@ -2394,20 +2394,30 @@ pub(crate) async fn regenerate_packument(
     storage: &crate::storage::Storage,
     package_name: &str,
 ) -> Result<(), ()> {
-    let bytes = assemble_packument(storage, package_name)
-        .await
-        .map_err(|_| ())?;
+    let bytes = match assemble_packument(storage, package_name).await {
+        Ok(bytes) => bytes,
+        Err(unassembled) => {
+            tracing::error!(registry = "npm", package = %package_name, reason = %unassembled, "packument not regenerated");
+            return Err(());
+        }
+    };
     store_assembled_packument(storage, package_name, &bytes)
         .await
         .map_err(|_| ())
 }
 
 /// Why a published package's packument could not be assembled.
+#[derive(Debug, thiserror::Error)]
 enum Unassembled {
     /// The store could not read this key (or list this prefix).
+    #[error("{0} cannot be read: {1}")]
     Unreadable(String, crate::storage::StorageError),
     /// The package fields are not a JSON object.
+    #[error("the package fields are not a JSON object")]
     Malformed,
+    /// The assembled document could not be encoded.
+    #[error("the packument cannot be encoded: {0}")]
+    Encode(#[from] serde_json::Error),
 }
 
 impl Unassembled {
@@ -2418,8 +2428,8 @@ impl Unassembled {
             Unassembled::Unreadable(key, e) => {
                 crate::registry::local_copy_unreadable("npm", key, e)
             }
-            Unassembled::Malformed => {
-                tracing::warn!(registry = "npm", package = %name, "published packument cannot be assembled");
+            Unassembled::Malformed | Unassembled::Encode(_) => {
+                tracing::warn!(registry = "npm", package = %name, reason = %self, "published packument cannot be assembled");
                 StatusCode::SERVICE_UNAVAILABLE.into_response()
             }
         }
@@ -2488,7 +2498,7 @@ async fn assemble_packument(
     );
     obj.insert("versions".to_string(), serde_json::Value::Object(versions));
 
-    serde_json::to_vec(&packument).map_err(|_| Unassembled::Malformed)
+    Ok(serde_json::to_vec(&packument)?)
 }
 
 /// Why retention could not bring a packument back in line with storage.
