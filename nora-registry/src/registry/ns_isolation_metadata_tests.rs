@@ -1337,7 +1337,7 @@ const INTERNAL_STORED_ELSEWHERE: [(&str, &str); 17] = [
 ];
 
 /// A context serving [`INTERNAL_STORED_ELSEWHERE`] from `storage`, its formats turned on.
-fn other_formats_context(storage: crate::storage::Storage) -> crate::test_helpers::TestContext {
+fn other_formats_context(storage: crate::Storage) -> crate::test_helpers::TestContext {
     crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
         c.curation.internal_namespaces = vec!["internal*".to_string()];
         c.gems.enabled = true;
@@ -1503,9 +1503,7 @@ fn internal_terraform() -> (Vec<(String, Vec<u8>)>, [(String, StatusCode); 8]) {
 }
 
 /// A context serving [`internal_terraform`] from `storage`, seeded.
-async fn internal_terraform_context(
-    storage: crate::storage::Storage,
-) -> crate::test_helpers::TestContext {
+async fn internal_terraform_context(storage: crate::Storage) -> crate::test_helpers::TestContext {
     let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
         c.curation.internal_namespaces = vec!["internal*".to_string()];
         c.terraform.enabled = true;
