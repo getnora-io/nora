@@ -4056,12 +4056,40 @@ mod nuget_release_dates {
         serde_json::json!({"lower": lower, "upper": upper, "count": leaves.len(), "items": leaves})
     }
 
-    fn remote_page(lower: &str, upper: &str) -> serde_json::Value {
+    /// A page the index names by its bounds only. Its `@id` is on `elsewhere`, a host that is
+    /// not the configured upstream, at the path the page has there: the page is asked of the
+    /// configured upstream, so `elsewhere` gets no request.
+    fn remote_page(elsewhere: &str, lower: &str, upper: &str) -> serde_json::Value {
         serde_json::json!({
-            "@id": format!("https://upstream.invalid/v3/registration5-gz-semver2/{ID}/page/{lower}/{upper}.json"),
+            "@id": format!("{elsewhere}/v3/registration5-gz-semver2/{ID}/page/{lower}/{upper}.json"),
             "lower": lower, "upper": upper, "count": 64
         })
     }
+
+    /// A live host other than the configured upstream, which dates every version a page of it
+    /// is asked about — both bounds — as old: a page fetched from it lets a new version pass.
+    /// Tests count only its registration requests: wiremock hands a dropped server on to the
+    /// next one started, and a background request of an earlier context may still reach it.
+    async fn elsewhere() -> MockServer {
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/page/[^/]+/[^/]+\.json$"))
+            .respond_with(|req: &wiremock::Request| {
+                let bounds: Vec<&str> = req.url.path().rsplit('/').take(2).collect();
+                let (upper, lower) = (bounds[0].trim_end_matches(".json"), bounds[1]);
+                let page = serde_json::json!({
+                    "lower": lower, "upper": upper,
+                    "items": [leaf(lower, "2019-01-01T00:00:00Z"), leaf(upper, "2019-01-01T00:00:00Z")]
+                });
+                ResponseTemplate::new(200).set_body_string(page.to_string())
+            })
+            .mount(&elsewhere)
+            .await;
+        elsewhere
+    }
+
+    /// The prefixes a client reaches the NuGet routes by: its own and the aliases.
+    const PREFIXES: [&str; 3] = ["nuget", "chocolatey", "pwsh"];
 
     fn registration(pages: Vec<serde_json::Value>) -> String {
         serde_json::json!({"count": pages.len(), "items": pages}).to_string()
@@ -4132,7 +4160,11 @@ mod nuget_release_dates {
     }
 
     async fn download(ctx: &TestContext, version: &str) -> StatusCode {
-        let uri = format!("/nuget/v3/flatcontainer/{ID}/{version}/{ID}.{version}.nupkg");
+        download_via(ctx, "nuget", version).await
+    }
+
+    async fn download_via(ctx: &TestContext, prefix: &str, version: &str) -> StatusCode {
+        let uri = format!("/{prefix}/v3/flatcontainer/{ID}/{version}/{ID}.{version}.nupkg");
         send(&ctx.app, Method::GET, &uri, "").await.status()
     }
 
@@ -4340,12 +4372,13 @@ mod nuget_release_dates {
     #[tokio::test]
     async fn a_version_on_a_page_the_index_does_not_inline_is_dated_by_that_page() {
         let up = upstream().await;
+        let elsewhere = elsewhere().await;
         serve_registration(
             &up,
             REGISTRATION,
             registration(vec![
-                remote_page("1.0.0", "1.0.128"),
-                remote_page("1.0.129", "1.0.140"),
+                remote_page(&elsewhere.uri(), "1.0.0", "1.0.128"),
+                remote_page(&elsewhere.uri(), "1.0.129", "1.0.140"),
             ]),
         )
         .await;
@@ -4389,6 +4422,7 @@ mod nuget_release_dates {
                 .all(|p| p.ends_with("/page/1.0.129/1.0.140.json")),
             "only the page whose range holds the version is asked for: {pages:?}"
         );
+        assert_eq!(registration_requests(&elsewhere).await, 0);
     }
 
     /// A page holds the versions from its lower bound to its upper bound, both included; a
@@ -4397,8 +4431,8 @@ mod nuget_release_dates {
     fn a_page_holds_the_versions_between_its_bounds_inclusive() {
         use super::{registered, Registered};
         let index = registration(vec![
-            remote_page("1.0.0", "1.0.128"),
-            remote_page("1.0.129", "1.0.140"),
+            remote_page("https://elsewhere.example", "1.0.0", "1.0.128"),
+            remote_page("https://elsewhere.example", "1.0.129", "1.0.140"),
         ]);
         let on = |lower: &str, upper: &str| Registered::OnPage {
             lower: lower.to_string(),
@@ -4433,9 +4467,10 @@ mod nuget_release_dates {
         };
         for on_page in [false, true] {
             let up = upstream().await;
+            let elsewhere = elsewhere().await;
             let ctx = context(&up, true, min_age_1h_quarantine_7d);
             if on_page {
-                let index = registration(vec![remote_page("0.9.0", "1.0.0")]);
+                let index = registration(vec![remote_page(&elsewhere.uri(), "0.9.0", "1.0.0")]);
                 cached_registration(&ctx, &index, 30).await;
                 let page =
                     serde_json::json!({"lower": "0.9.0", "upper": "1.0.0", "items": leaves()});
@@ -4461,6 +4496,11 @@ mod nuget_release_dates {
                 "on a page: {on_page}"
             );
             assert_eq!(registration_requests(&up).await, 0, "on a page: {on_page}");
+            assert_eq!(
+                registration_requests(&elsewhere).await,
+                0,
+                "on a page: {on_page}"
+            );
         }
     }
 
@@ -4636,6 +4676,196 @@ mod nuget_release_dates {
                 recorder.seen().await.is_empty(),
                 "{proxy:?}: {:?}",
                 recorder.seen().await
+            );
+        }
+    }
+
+    /// What a registration document says of a version, decided from the document alone: the
+    /// version's own leaf dates it, on whichever inline page lists it — the first, a later one,
+    /// the last — and never a leaf whose version merely begins with it; a version within the
+    /// bounds of a page the index does not inline, both bounds included, is on that page; the
+    /// unlisted marker dates nothing. Versions compare as NuGet compares them: case, a missing
+    /// trailing zero and build metadata do not count.
+    #[test]
+    fn a_registration_document_dates_a_version_by_its_own_leaf() {
+        use super::{registered, Registered};
+        const Y2019: &str = "2019-01-01T00:00:00Z";
+        const Y2023: &str = "2023-01-01T00:00:00Z";
+        const Y2024: &str = "2024-01-01T00:00:00Z";
+        const MID2024: &str = "2024-06-01T00:00:00Z";
+        const Y2025: &str = "2025-01-01T00:00:00Z";
+        let y2019 = || Registered::Listed(Some(1_546_300_800));
+        let y2023 = || Registered::Listed(Some(1_672_531_200));
+        let y2024 = || Registered::Listed(Some(1_704_067_200));
+        let mid2024 = || Registered::Listed(Some(1_717_200_000));
+        let y2025 = || Registered::Listed(Some(1_735_689_600));
+        let unlisted = || Registered::Listed(None);
+        let on = |lower: &str, upper: &str| Registered::OnPage {
+            lower: lower.to_string(),
+            upper: upper.to_string(),
+        };
+        let index = registration(vec![
+            inline_page(
+                "1.0.0",
+                "1.0.10",
+                vec![
+                    leaf("1.0.10", Y2019),
+                    leaf("1.0.1-beta", Y2023),
+                    leaf("1.0.1", MID2024),
+                    leaf("1.0.0", Y2024),
+                ],
+            ),
+            inline_page(
+                "2.0.0",
+                "2.0.5",
+                vec![leaf("2.0.0", Y2025), leaf("2.0.5-RC.1", Y2023)],
+            ),
+            remote_page("https://elsewhere.example", "3.0.0", "3.0.9"),
+            inline_page("4.0.0", "4.0.0", vec![leaf("4.0.0", UNLISTED)]),
+            inline_page("5.0.0", "5.0.0", vec![leaf("5.0.0", Y2024)]),
+        ]);
+        let page = serde_json::json!({
+            "lower": "3.0.0", "upper": "3.0.9",
+            "items": [
+                leaf("3.0.0", UNLISTED),
+                leaf("3.0.1-beta", Y2019),
+                leaf("3.0.1", Y2023),
+                leaf("3.0.9", Y2025)
+            ]
+        })
+        .to_string();
+        for (doc, version, want) in [
+            (&index, "1.0.1", mid2024()),
+            (&index, "1.0.1-beta", y2023()),
+            (&index, "1.0.1-BETA", y2023()),
+            (&index, "1.0", y2024()),
+            (&index, "1.0.0+build", y2024()),
+            (&index, "1.0.10", y2019()),
+            (&index, "1.0.2", Registered::Absent),
+            (&index, "2.0.0", y2025()),
+            (&index, "2.0.5-rc.1", y2023()),
+            (&index, "2.0.5", Registered::Absent),
+            (&index, "2.9.9", Registered::Absent),
+            (&index, "3.0.0", on("3.0.0", "3.0.9")),
+            (&index, "3.0.1", on("3.0.0", "3.0.9")),
+            (&index, "3.0.9", on("3.0.0", "3.0.9")),
+            (&index, "3.0.9.1", Registered::Absent),
+            (&index, "4.0.0", unlisted()),
+            (&index, "5.0.0", y2024()),
+            (&index, "5.0", y2024()),
+            (&index, "5.0.0-alpha", Registered::Absent),
+            (&page, "3.0.0", unlisted()),
+            (&page, "3.0.1", y2023()),
+            (&page, "3.0.1-beta", y2019()),
+            (&page, "3.0.9", y2025()),
+            (&page, "3.0.2", Registered::Absent),
+            (&page, "3.0", unlisted()),
+        ] {
+            assert_eq!(registered(doc.as_bytes(), version), want, "{version}");
+        }
+    }
+
+    /// The upstream index dates a version on whichever of its inline pages lists it, through
+    /// every prefix a client comes by: one on the second page, published minutes ago, is held.
+    #[tokio::test]
+    async fn a_version_on_a_later_inline_page_of_the_upstream_index_is_dated() {
+        for prefix in PREFIXES {
+            let up = upstream().await;
+            serve_registration(
+                &up,
+                REGISTRATION,
+                registration(vec![
+                    inline_page(
+                        "1.0.0",
+                        "1.0.0",
+                        vec![leaf("1.0.0", "2019-01-01T00:00:00Z")],
+                    ),
+                    inline_page("2.0.0", "2.0.0", vec![leaf("2.0.0", &minutes_ago(10))]),
+                ]),
+            )
+            .await;
+            let ctx = context(&up, true, min_age_1h);
+            assert_eq!(
+                download_via(&ctx, prefix, "2.0.0").await,
+                StatusCode::FORBIDDEN,
+                "{prefix}: on the second page, published 10 minutes ago"
+            );
+            assert_eq!(
+                download_via(&ctx, prefix, "1.0.0").await,
+                StatusCode::OK,
+                "{prefix}"
+            );
+        }
+    }
+
+    /// A version is dated by its own leaf, not one whose version begins with it: listed after
+    /// a 2019 `1.0.10` and a 2019 `1.0.1-beta`, a `1.0.1` published minutes ago is held.
+    #[tokio::test]
+    async fn a_version_is_not_dated_by_one_it_prefixes() {
+        for prefix in PREFIXES {
+            let up = upstream().await;
+            serve_registration(
+                &up,
+                REGISTRATION,
+                registration(vec![inline_page(
+                    "1.0.1-beta",
+                    "1.0.10",
+                    vec![
+                        leaf("1.0.10", "2019-01-01T00:00:00Z"),
+                        leaf("1.0.1-beta", "2019-01-01T00:00:00Z"),
+                        leaf("1.0.1", &minutes_ago(10)),
+                    ],
+                )]),
+            )
+            .await;
+            let ctx = context(&up, true, min_age_1h);
+            assert_eq!(
+                download_via(&ctx, prefix, "1.0.1").await,
+                StatusCode::FORBIDDEN,
+                "{prefix}: 1.0.1 is not 1.0.10 nor 1.0.1-beta"
+            );
+            assert_eq!(
+                download_via(&ctx, prefix, "1.0.10").await,
+                StatusCode::OK,
+                "{prefix}"
+            );
+        }
+    }
+
+    /// The page a version is on is asked of the configured upstream, never of the host the
+    /// upstream index names in the page's `@id`: that host, live and dating the version as
+    /// old, gets no request, and the version published minutes ago is held.
+    #[tokio::test]
+    async fn the_page_is_asked_of_the_configured_upstream_not_the_index_s_at_id() {
+        for prefix in PREFIXES {
+            let up = upstream().await;
+            let elsewhere = elsewhere().await;
+            serve_registration(
+                &up,
+                REGISTRATION,
+                registration(vec![remote_page(&elsewhere.uri(), "1.0.129", "1.0.140")]),
+            )
+            .await;
+            serve_registration(
+                &up,
+                "/v3/registration5-gz-semver2/repro.pkg/page/1.0.129/1.0.140.json",
+                serde_json::json!({
+                    "lower": "1.0.129", "upper": "1.0.140",
+                    "items": [leaf("1.0.129", &minutes_ago(10))]
+                })
+                .to_string(),
+            )
+            .await;
+            let ctx = context(&up, true, min_age_1h);
+            assert_eq!(
+                download_via(&ctx, prefix, "1.0.129").await,
+                StatusCode::FORBIDDEN,
+                "{prefix}"
+            );
+            assert_eq!(
+                registration_requests(&elsewhere).await,
+                0,
+                "{prefix}: the host of the page's @id was asked"
             );
         }
     }
