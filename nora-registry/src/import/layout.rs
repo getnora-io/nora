@@ -112,6 +112,103 @@ pub fn note(rt: RegistryType) -> &'static str {
     }
 }
 
+// ── What lies under a key ──────────────────────────────────────────────
+//
+// What `nora import` does with an artifact from what already lies under the key it built, before
+// anything is downloaded. One rule, [`action`], for every format: a format without a decision
+// does not compile, and the import looks under a key only through `super::under_key`.
+
+/// What lies under an artifact's key, as far as the import looked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum UnderKey {
+    /// The import did not look: on S3 a look is a request per object (review R5).
+    NotLooked,
+    /// Nothing.
+    Nothing,
+    /// An object, and the record the format writes after it once the object is NORA's own
+    /// ([`record_key`]).
+    Recorded,
+    /// An object without such a record: what an import stored before its record was written,
+    /// what an upstream served under the name, or an object of a format without a record. Which
+    /// one, the import cannot tell.
+    Unrecorded,
+}
+
+/// What the import does with an artifact before any transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Action {
+    /// Transfer the source's artifact: download, verify, curate, and commit it with every record
+    /// its format keeps beside it.
+    Transfer,
+    /// Leave what is there; the journal records the key.
+    Skip,
+}
+
+/// What the import does with an artifact of format `rt` when `under` lies under its key.
+///
+/// - Maven and Raw keep no record: whatever is under the key is served as it is, so the import
+///   leaves it. Raw has no upstream; a Maven coordinate is served from storage before any
+///   upstream, whoever stored it.
+/// - npm: a tarball whose version document is there is published, and is left. One without it
+///   may be what an upstream served under the name, and publishing it would make the upstream's
+///   bytes the imported version: the source's tarball is transferred, and its document written.
+/// - PyPI and NuGet: what is under the key may be what an upstream served before the import made
+///   the name NORA's own, and only a transfer stores the source's verified bytes and writes every
+///   record beside them.
+/// - The other formats are not imported ([`map_artifact`] skips them first).
+pub(super) fn action(rt: RegistryType, under: UnderKey) -> Action {
+    use Action::{Skip, Transfer};
+    use UnderKey::{NotLooked, Nothing, Recorded, Unrecorded};
+    match rt {
+        RegistryType::Maven | RegistryType::Raw => match under {
+            NotLooked | Nothing => Transfer,
+            Recorded | Unrecorded => Skip,
+        },
+        RegistryType::Npm => match under {
+            NotLooked | Nothing | Unrecorded => Transfer,
+            Recorded => Skip,
+        },
+        RegistryType::PyPI | RegistryType::Nuget => Transfer,
+        RegistryType::Docker
+        | RegistryType::Cargo
+        | RegistryType::Go
+        | RegistryType::Gems
+        | RegistryType::Terraform
+        | RegistryType::Ansible
+        | RegistryType::PubDart
+        | RegistryType::Conan
+        | RegistryType::Rpm
+        | RegistryType::Deb
+        | RegistryType::Cpan
+        | RegistryType::HuggingFace => Transfer,
+    }
+}
+
+/// The record that makes the object at `key` of format `rt` NORA's own, written after the object:
+/// an npm tarball's version document. The formats [`action`] does not skip by a record have none
+/// here.
+pub(super) fn record_key(rt: RegistryType, key: &str) -> Option<String> {
+    match rt {
+        RegistryType::Npm => crate::registry::npm::imported_version_key(key),
+        RegistryType::Maven
+        | RegistryType::Raw
+        | RegistryType::PyPI
+        | RegistryType::Nuget
+        | RegistryType::Docker
+        | RegistryType::Cargo
+        | RegistryType::Go
+        | RegistryType::Gems
+        | RegistryType::Terraform
+        | RegistryType::Ansible
+        | RegistryType::PubDart
+        | RegistryType::Conan
+        | RegistryType::Rpm
+        | RegistryType::Deb
+        | RegistryType::Cpan
+        | RegistryType::HuggingFace => None,
+    }
+}
+
 /// Outcome of mapping one source artifact to a NORA storage key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mapping {
@@ -304,6 +401,65 @@ fn first_unsafe_segment(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every format against every state of its key: what the import does. `upstream cache` is
+    /// an object without a record, which is how an upstream's copy of the same version lies.
+    #[test]
+    fn what_the_import_does_with_what_lies_under_the_key() {
+        use Action::{Skip, Transfer};
+        use RegistryType as R;
+        //            not looked (S3)  nothing    recorded   upstream cache / unrecorded
+        let table: &[(RegistryType, [Action; 4])] = &[
+            (R::Docker, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Maven, [Transfer, Transfer, Skip, Skip]),
+            (R::Npm, [Transfer, Transfer, Skip, Transfer]),
+            (R::Cargo, [Transfer, Transfer, Transfer, Transfer]),
+            (R::PyPI, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Go, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Raw, [Transfer, Transfer, Skip, Skip]),
+            (R::Gems, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Terraform, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Ansible, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Nuget, [Transfer, Transfer, Transfer, Transfer]),
+            (R::PubDart, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Conan, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Rpm, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Deb, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Cpan, [Transfer, Transfer, Transfer, Transfer]),
+            (R::HuggingFace, [Transfer, Transfer, Transfer, Transfer]),
+        ];
+        let states = [
+            UnderKey::NotLooked,
+            UnderKey::Nothing,
+            UnderKey::Recorded,
+            UnderKey::Unrecorded,
+        ];
+        for (rt, row) in table {
+            for (under, want) in states.into_iter().zip(row) {
+                assert_eq!(action(*rt, under), *want, "{rt:?} with {under:?}");
+            }
+        }
+        let rows: Vec<RegistryType> = table.iter().map(|(rt, _)| *rt).collect();
+        assert_eq!(rows, RegistryType::all(), "a row for every format");
+    }
+
+    /// An npm tarball's record is its version document; no other format is skipped by one.
+    #[test]
+    fn only_an_npm_tarball_is_told_by_its_record() {
+        assert_eq!(
+            record_key(RegistryType::Npm, "npm/@scope/a/tarballs/a-1.0.0.tgz").as_deref(),
+            Some("npm/@scope/a/versions/1.0.0.json")
+        );
+        for rt in RegistryType::all() {
+            if *rt != RegistryType::Npm {
+                assert_eq!(
+                    record_key(*rt, "npm/a/tarballs/a-1.0.0.tgz"),
+                    None,
+                    "{rt:?}"
+                );
+            }
+        }
+    }
 
     fn art(repo: &str, path: &str) -> ArtifactRef {
         ArtifactRef {
