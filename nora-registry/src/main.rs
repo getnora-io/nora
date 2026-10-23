@@ -611,19 +611,22 @@ pub(crate) fn build_same_origin_client(tls: &TlsConfig) -> reqwest::Client {
     build_http_client(tls, None, false, same_origin_redirects())
 }
 
+/// Each redirect is decided by [`nora_registry::npm_links::next_hop`]: one the credential may go
+/// along is followed, one off the origin is handed back, and past the tenth the request fails.
 pub(crate) fn same_origin_redirects() -> reqwest::redirect::Policy {
+    use nora_registry::npm_links::{self, Hop};
     reqwest::redirect::Policy::custom(|attempt| {
-        // The first of the previous URLs is the one asked.
-        let on_origin = attempt
-            .previous()
-            .first()
-            .is_some_and(|asked| nora_registry::npm_links::same_origin(asked, attempt.url()));
-        if !on_origin {
-            attempt.stop()
-        } else if attempt.previous().len() > 10 {
-            attempt.error("too many redirects")
-        } else {
-            attempt.follow()
+        // The previous URLs are the one asked, first, and every hop followed since: the
+        // redirect being decided is the `len()`-th.
+        let previous = attempt.previous();
+        let Some(asked) = previous.first() else {
+            return attempt.stop();
+        };
+        let left_origin = previous.iter().any(|u| !npm_links::same_origin(asked, u));
+        match npm_links::next_hop(previous.len(), asked, left_origin, attempt.url()) {
+            Hop::WithCredential => attempt.follow(),
+            Hop::WithoutCredential => attempt.stop(),
+            Hop::Refuse => attempt.error("redirect not followed"),
         }
     })
 }

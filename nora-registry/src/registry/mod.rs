@@ -405,35 +405,34 @@ fn policy_block_reason(headers: &reqwest::header::HeaderMap) -> Option<&'static 
 
 /// Where a redirect the client handed back unfollowed points, resolved against the URL that
 /// answered: `None` for one pointing nowhere readable.
-fn unfollowed_redirect(response: &reqwest::Response) -> Option<String> {
+fn unfollowed_redirect(response: &reqwest::Response) -> Option<reqwest::Url> {
     response
         .headers()
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| response.url().join(v).ok())
-        .map(String::from)
 }
 
-/// What a fetch with a client that follows redirects only on the origin of the URL asked
-/// (`build_same_origin_client`) gave.
+/// What one request of a redirect chain NORA walks itself gave, with a client that follows no
+/// redirect (`build_no_redirect_client`).
 #[derive(Debug)]
-pub(crate) enum OnOrigin {
-    /// The body, from the origin.
+pub(crate) enum Hopped {
+    /// The body.
     Body(Vec<u8>),
-    /// A redirect off the origin, to this URL, not followed.
-    Elsewhere(String),
+    /// A redirect, to this URL, not followed: the caller decides on the next hop.
+    Redirect(reqwest::Url),
 }
 
-/// [`proxy_fetch`] with a client that follows redirects only on the origin of `url`: a redirect
-/// off it is the answer, [`OnOrigin::Elsewhere`], for the caller to follow or not.
-pub(crate) async fn proxy_fetch_on_origin(
+/// [`proxy_fetch`] of one URL of a redirect chain: a redirect the client hands back is the
+/// answer, [`Hopped::Redirect`].
+pub(crate) async fn proxy_fetch_hop(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
     auth: Option<UpstreamAuth<'_>>,
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
-) -> Result<OnOrigin, ProxyError> {
+) -> Result<Hopped, ProxyError> {
     proxy_fetch_core_with(
         client,
         url,
@@ -441,8 +440,8 @@ pub(crate) async fn proxy_fetch_on_origin(
         auth,
         None,
         (
-            |r: reqwest::Response| async { r.bytes().await.map(|b| OnOrigin::Body(b.to_vec())) },
-            |r: &reqwest::Response| unfollowed_redirect(r).map(OnOrigin::Elsewhere),
+            |r: reqwest::Response| async { r.bytes().await.map(|b| Hopped::Body(b.to_vec())) },
+            |r: &reqwest::Response| unfollowed_redirect(r).map(Hopped::Redirect),
         ),
         (cb, scope.into()),
     )

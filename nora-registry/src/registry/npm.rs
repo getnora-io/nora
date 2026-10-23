@@ -9,8 +9,8 @@ use crate::config::npm_scope_of;
 use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
-    proxy_fetch_on_origin, proxy_forward_post, read_validators, validators_key, write_validators,
-    OnOrigin, ProxyError, Revalidation, Validators,
+    proxy_fetch_hop, proxy_forward_post, read_validators, validators_key, write_validators, Hopped,
+    ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -24,7 +24,8 @@ use axum::{
 };
 use base64::Engine;
 use nora_registry::npm_links::{
-    self, link_host, max_semver, replace_upstream_bytes, Links, Placed, TarballSource, Unrewritable,
+    self, link_host, max_semver, replace_upstream_bytes, Hop, Links, Placed, TarballSource,
+    Unrewritable,
 };
 use sha2::Digest;
 use std::sync::Arc;
@@ -866,10 +867,8 @@ async fn handle_request(
 /// copy). Returns what the download is recorded as, with what it gave; a version not listed is
 /// `NotFound` without a request for the tarball.
 ///
-/// The credential goes as far as the upstream's origin. A redirect off it (a registry keeping
-/// its files on a storage host) ends the walk there, and NORA follows it on its own without the
-/// credential: reqwest would drop the header on the hop to the other host but put it back on
-/// the next hop within that host.
+/// The credential goes as far as the upstream's origin, the redirects followed by
+/// [`fetch_following`].
 async fn fetch_upstream_tarball(
     state: &AppState,
     upstream: &str,
@@ -914,38 +913,74 @@ async fn fetch_upstream_tarball(
         );
         return (at_upstream, Err(ProxyError::NotFound));
     };
-    let timeout = Duration::from_secs(state.config.npm.proxy_timeout);
-    let scope = || BreakerScope::upstream(RegistryType::Npm, upstream);
-    let fetched = match proxy_fetch_on_origin(
-        &state.http_client_same_origin,
-        &asked,
-        timeout,
-        auth,
-        &state.circuit_breaker,
-        scope(),
-    )
-    .await
-    {
-        Ok(OnOrigin::Body(body)) => Ok(body),
-        Ok(OnOrigin::Elsewhere(location)) => {
-            tracing::debug!(
-                registry = "npm",
-                to = %link_host(&location, &nora_npm_base),
-                "tarball on another origin, fetched without the upstream's credential"
-            );
-            proxy_fetch(
-                &state.http_client,
-                &location,
-                timeout,
-                None,
-                &state.circuit_breaker,
-                scope(),
-            )
-            .await
-        }
-        Err(e) => Err(e),
-    };
+    let fetched = fetch_following(state, upstream, &asked, auth, &nora_npm_base).await;
     (named, fetched)
+}
+
+/// Download `asked` from `upstream` with its credential, following the redirects here, one at
+/// a time: the client follows none, so the whole chain has one budget and every hop is decided
+/// by [`npm_links::next_hop`] — ten redirects pass and the eleventh is a failure (502), and the
+/// credential goes only while the chain is on `asked`'s origin. A registry keeping its files on
+/// a storage host is reached without it, and so is its origin again from there: reqwest drops
+/// the header on the hop to another host but puts it back on the next hop within that host.
+/// The chain shares one `proxy_timeout`.
+async fn fetch_following(
+    state: &AppState,
+    upstream: &str,
+    asked: &str,
+    mut auth: Option<crate::config::UpstreamAuth<'_>>,
+    nora_npm_base: &str,
+) -> Result<Vec<u8>, ProxyError> {
+    let origin = reqwest::Url::parse(asked)
+        .map_err(|e| ProxyError::Network(format!("tarball URL not readable: {e}")))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(state.config.npm.proxy_timeout);
+    let mut url = asked.to_string();
+    let mut left_origin = false;
+    let mut hop = 0;
+    loop {
+        hop += 1;
+        let next = match proxy_fetch_hop(
+            &state.http_client_no_redirect,
+            &url,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            auth,
+            &state.circuit_breaker,
+            BreakerScope::upstream(RegistryType::Npm, upstream),
+        )
+        .await?
+        {
+            Hopped::Body(body) => return Ok(body),
+            Hopped::Redirect(next) => next,
+        };
+        url = match npm_links::next_hop(hop, &origin, left_origin, &next) {
+            // The URL asked carries the upstream's userinfo, if its URL has one; the hop on
+            // its origin carries it too.
+            Hop::WithCredential => {
+                npm_links::with_userinfo_of(next.as_str(), asked).unwrap_or_else(|| next.into())
+            }
+            Hop::WithoutCredential => {
+                if !left_origin {
+                    tracing::debug!(
+                        registry = "npm",
+                        to = %link_host(next.as_str(), nora_npm_base),
+                        "tarball on another origin, fetched without the upstream's credential"
+                    );
+                }
+                left_origin = true;
+                auth = None;
+                next.into()
+            }
+            Hop::Refuse => {
+                tracing::warn!(
+                    registry = "npm",
+                    hop,
+                    to = %link_host(next.as_str(), nora_npm_base),
+                    "tarball redirect not followed: past the redirect limit or not http(s)"
+                );
+                return Err(ProxyError::Network("redirect not followed".to_string()));
+            }
+        };
+    }
 }
 
 /// The client an upstream's metadata is fetched with. An upstream bound to a scope answers from
@@ -11460,7 +11495,7 @@ mod tarball_redirects {
         }
     }
 
-    /// A walk on the origin is cut off after ten hops, as reqwest cuts off any other.
+    /// A walk on the origin is cut off after ten hops, as any chain of a download is.
     #[tokio::test]
     async fn a_walk_on_the_origin_ends() {
         let upstream = registry(|_| redirect(TARBALL)).await;
@@ -11602,6 +11637,190 @@ mod tarball_redirects {
             .collect();
         assert_eq!(tarball_asks, vec![(file.clone(), true)]);
     }
+
+    /// Invariant 2: the whole redirect chain of a tarball download is bounded (≤10 hops) → 502.
+    /// 8 hops on the upstream's origin, one to a storage host, 8 more there: 17 hops in all.
+    #[tokio::test]
+    async fn a_chain_longer_than_ten_hops_across_origins_is_502() {
+        let storage = MockServer::start().await;
+        for i in 0..8 {
+            Mock::given(method("GET"))
+                .and(path(format!("/h{i}")))
+                .respond_with(redirect(&format!("{}/h{}", storage.uri(), i + 1)))
+                .mount(&storage)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/h8"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"FAR-TGZ".to_vec()))
+            .mount(&storage)
+            .await;
+        let s = storage.uri();
+        let upstream = registry(|_| redirect("/r1")).await;
+        for i in 1..8 {
+            Mock::given(method("GET"))
+                .and(path(format!("/r{i}")))
+                .respond_with(redirect(&format!("/r{}", i + 1)))
+                .mount(&upstream)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/r8"))
+            .respond_with(redirect(&format!("{s}/h0")))
+            .mount(&upstream)
+            .await;
+        let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let (status, body) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_eq!(
+            (status, String::from_utf8_lossy(&body).into_owned()),
+            (StatusCode::BAD_GATEWAY, String::new()),
+            "17 redirects were followed"
+        );
+    }
+
+    /// Invariant 2: the hops on the storage host count too — a chain that goes on there past ten
+    /// hops ends in 502, it is not walked to its end.
+    #[tokio::test]
+    async fn a_walk_on_the_storage_host_ends() {
+        let storage = MockServer::start().await;
+        for i in 0..30 {
+            Mock::given(method("GET"))
+                .and(path(format!("/h{i}")))
+                .respond_with(redirect(&format!("{}/h{}", storage.uri(), i + 1)))
+                .mount(&storage)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/h30"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"FAR-TGZ".to_vec()))
+            .mount(&storage)
+            .await;
+        let to = format!("{}/h0", storage.uri());
+        let upstream = registry(|_| redirect(&to)).await;
+        let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// A download whose first `on` redirects stay on the upstream's origin (`/r1`…) and whose
+    /// next `off` go to a storage host (`/h1`…), the last URL answering the file: what NORA
+    /// answers, with the requests each server received.
+    async fn walk(on: usize, off: usize) -> (StatusCode, Vec<(String, bool)>, Vec<(String, bool)>) {
+        let storage = MockServer::start().await;
+        let s = storage.uri();
+        let first = match (on, off) {
+            (0, 0) => ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec()),
+            (0, _) => redirect(&format!("{s}/h1")),
+            _ => redirect("/r1"),
+        };
+        let upstream = registry(|_| first.clone()).await;
+        for i in 1..=on {
+            let answer = if i < on {
+                redirect(&format!("/r{}", i + 1))
+            } else if off > 0 {
+                redirect(&format!("{s}/h1"))
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec())
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/r{i}")))
+                .respond_with(answer)
+                .mount(&upstream)
+                .await;
+        }
+        for j in 1..=off {
+            let answer = if j < off {
+                redirect(&format!("{s}/h{}", j + 1))
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec())
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/h{j}")))
+                .respond_with(answer)
+                .mount(&storage)
+                .await;
+        }
+        let ctx = context(&with_userinfo(&upstream), &open_server().await.uri());
+        let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        (status, asked(&upstream).await, asked(&storage).await)
+    }
+
+    /// Invariant 2: ten redirects of one download pass and the eleventh is 502, however the
+    /// chain is split between the upstream's origin and a storage host; the credential goes on
+    /// each hop on the origin and on none on the storage host.
+    #[tokio::test]
+    async fn ten_redirects_pass_and_the_eleventh_is_502_across_origins() {
+        for (on, off, expected) in [
+            (10, 0, StatusCode::OK),
+            (11, 0, StatusCode::BAD_GATEWAY),
+            (0, 10, StatusCode::OK),
+            (0, 11, StatusCode::BAD_GATEWAY),
+            (4, 6, StatusCode::OK),
+            (4, 7, StatusCode::BAD_GATEWAY),
+            (9, 1, StatusCode::OK),
+            (10, 1, StatusCode::BAD_GATEWAY),
+        ] {
+            let (status, upstream, storage) = walk(on, off).await;
+            assert_eq!(status, expected, "{on} on the origin, {off} off it");
+            let hops: Vec<_> = upstream
+                .iter()
+                .filter(|(p, _)| p.starts_with("/r"))
+                .collect();
+            assert!(hops.iter().all(|(_, credential)| *credential), "{hops:?}");
+            assert!(
+                storage.iter().all(|(_, credential)| !credential),
+                "{storage:?}"
+            );
+            if expected == StatusCode::BAD_GATEWAY {
+                // The eleventh redirect is not followed.
+                assert_eq!(
+                    hops.len() + storage.len(),
+                    10,
+                    "{on} {off}: {upstream:?} {storage:?}"
+                );
+            }
+        }
+    }
+
+    /// A chain that leaves the upstream's origin and comes back to it goes on without the
+    /// credential: the hop back is asked on behalf of the storage host's answer.
+    #[tokio::test]
+    async fn a_hop_back_to_the_origin_goes_without_the_credential() {
+        for (uri, file) in [
+            ("/npm/pkg/-/pkg-1.0.0.tgz", TARBALL),
+            ("/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz", SCOPED),
+        ] {
+            let storage = MockServer::start().await;
+            let upstream = registry(|_| redirect(&format!("{}/a", storage.uri()))).await;
+            Mock::given(method("GET"))
+                .and(path("/a"))
+                .respond_with(redirect(&format!("{}/back", upstream.uri())))
+                .mount(&storage)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/back"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"BACK-TGZ".to_vec()))
+                .mount(&upstream)
+                .await;
+            let ctx = context(&with_userinfo(&upstream), &upstream.uri());
+            let (status, body) = get(&ctx, uri).await;
+            assert_eq!(
+                (status, body.as_slice()),
+                (StatusCode::OK, b"BACK-TGZ".as_slice()),
+                "{uri}"
+            );
+            let hops: Vec<_> = asked(&upstream)
+                .await
+                .into_iter()
+                .filter(|(p, _)| p == file || p == "/back")
+                .collect();
+            assert_eq!(
+                hops,
+                vec![(file.to_string(), true), ("/back".to_string(), false)],
+                "{uri}"
+            );
+        }
+    }
 }
 
 /// An upstream bound to a scope answers that scope's metadata from its own origin only: a
@@ -11701,6 +11920,58 @@ mod scoped_metadata_origin {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let written = ctx.state.storage.list("npm/").await.unwrap();
         assert!(written.is_empty(), "cached: {written:?}");
+    }
+
+    /// A scoped upstream that answers its packument after `hops` redirects on its own origin
+    /// (`/hop/1/…`, `/hop/2/…`, …).
+    async fn walking(hops: usize) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(move |req: &wiremock::Request| {
+                let p = req.url.path();
+                let (n, rest) = match p.strip_prefix("/hop/").and_then(|r| r.split_once('/')) {
+                    Some((n, rest)) => (n.parse::<usize>().unwrap(), format!("/{rest}")),
+                    None => (0, p.to_string()),
+                };
+                if n < hops {
+                    ResponseTemplate::new(302)
+                        .insert_header("location", format!("/hop/{}{rest}", n + 1).as_str())
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "name": "@vendor/pkg",
+                        "versions": {"1.0.0": {"name": "@vendor/pkg", "version": "1.0.0", "dist": {}}},
+                        "dist-tags": {"latest": "1.0.0"},
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// On its own origin a scoped upstream's metadata follows ten redirects, each with the
+    /// token, and the eleventh is 502.
+    #[tokio::test]
+    async fn a_scoped_upstreams_metadata_follows_ten_redirects_on_its_origin() {
+        for (hops, expected) in [(10, StatusCode::OK), (11, StatusCode::BAD_GATEWAY)] {
+            let private = walking(hops).await;
+            let public = MockServer::start().await;
+            let ctx = context(&public.uri(), &private.uri());
+            let status = send(&ctx.app, Method::GET, "/npm/@vendor/pkg", "")
+                .await
+                .status();
+            assert_eq!(status, expected, "{hops} redirects");
+            let asked = private.received_requests().await.unwrap();
+            assert!(
+                asked
+                    .iter()
+                    .all(|r| r.headers.contains_key("authorization")),
+                "{asked:?}"
+            );
+            if expected == StatusCode::OK {
+                assert_eq!(asked.len(), hops + 1, "{asked:?}");
+            }
+        }
     }
 
     /// Control: the default upstream's redirect is followed, as before.

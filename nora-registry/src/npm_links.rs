@@ -16,6 +16,37 @@ pub fn same_origin(a: &Url, b: &Url) -> bool {
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
+/// The most redirects one download follows, the whole chain counted whatever origins it
+/// crosses: reqwest's default ten.
+pub const MAX_REDIRECTS: usize = 10;
+
+/// What a download does with a redirect of its chain ([`next_hop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hop {
+    /// Follow it with the upstream's credential: the chain so far and the next URL are on the
+    /// origin of the URL asked.
+    WithCredential,
+    /// Follow it without the credential: the next URL, or a hop before it, is off that origin.
+    WithoutCredential,
+    /// Do not follow it, and the download fails (502): the chain is past [`MAX_REDIRECTS`], or
+    /// the next URL is not http(s).
+    Refuse,
+}
+
+/// The decision on the `hop`-th redirect (from 1) of a download asked at `asked`, to `next`,
+/// `left_origin` telling whether a hop before it went off `asked`'s origin. The credential goes
+/// only while the whole chain is on that origin: once a hop leaves it, none goes until the
+/// end, a hop back to the origin included.
+pub fn next_hop(hop: usize, asked: &Url, left_origin: bool, next: &Url) -> Hop {
+    if hop > MAX_REDIRECTS || !matches!(next.scheme(), "http" | "https") {
+        Hop::Refuse
+    } else if left_origin || !same_origin(asked, next) {
+        Hop::WithoutCredential
+    } else {
+        Hop::WithCredential
+    }
+}
+
 /// Parse version from an npm tarball filename.
 ///
 /// For scoped packages `@scope/name`, the tarball is `name-VERSION.tgz` on npmjs and
@@ -567,6 +598,61 @@ mod tests {
 
     fn any_key(_: &str) -> bool {
         true
+    }
+
+    /// Each redirect of a download: ten pass and the eleventh is refused whether the chain
+    /// stays on the origin asked or crosses to another; the credential goes only while every
+    /// hop so far is on that origin (scheme, host and port), never after one left it.
+    #[test]
+    fn a_redirect_is_followed_with_the_credential_only_while_the_chain_is_on_the_origin() {
+        use Hop::{Refuse, WithCredential as With, WithoutCredential as Without};
+        let asked = "http://registry.example/pkg/-/pkg-1.0.0.tgz";
+        // (hop, a hop before left the origin, next URL, decision)
+        let rows = [
+            (1, false, "http://registry.example/files/a.tgz", With),
+            (1, false, "/elsewhere-relative", With),
+            (10, false, "http://registry.example/r10", With),
+            (11, false, "http://registry.example/r11", Refuse),
+            (12, false, "http://registry.example/r12", Refuse),
+            (1, false, "http://storage.example/a", Without),
+            (10, false, "http://storage.example/a", Without),
+            (11, false, "http://storage.example/a", Refuse),
+            (2, true, "http://storage.example/b", Without),
+            (10, true, "http://storage.example/b", Without),
+            (11, true, "http://storage.example/b", Refuse),
+            // Back on the origin after leaving it.
+            (2, true, "http://registry.example/back", Without),
+            (10, true, "http://registry.example/back", Without),
+            (11, true, "http://registry.example/back", Refuse),
+            // Another port, another scheme: another origin. The scheme's own port is the same.
+            (1, false, "http://registry.example:8080/a", Without),
+            (1, false, "https://registry.example/a", Without),
+            (1, false, "http://registry.example:80/a", With),
+            (1, false, "http://REGISTRY.example/a", With),
+            (1, false, "ftp://registry.example/a", Refuse),
+            (1, false, "file:///etc/passwd", Refuse),
+            (1, true, "data:text/plain,x", Refuse),
+        ];
+        let asked = Url::parse(asked).unwrap();
+        for (hop, left, next, expected) in rows {
+            let next = asked.join(next).unwrap();
+            assert_eq!(
+                next_hop(hop, &asked, left, &next),
+                expected,
+                "hop {hop}, left the origin before: {left}, to {next}"
+            );
+        }
+        // Under https the same: the asked URL's own scheme and port make the origin.
+        let asked = Url::parse("https://registry.example:8443/pkg").unwrap();
+        for (next, expected) in [
+            ("https://registry.example:8443/r", With),
+            ("https://registry.example/r", Without),
+            ("http://registry.example:8443/r", Without),
+        ] {
+            let next = Url::parse(next).unwrap();
+            assert_eq!(next_hop(10, &asked, false, &next), expected, "{next}");
+            assert_eq!(next_hop(11, &asked, false, &next), Refuse, "{next}");
+        }
     }
 
     /// Every combination of the upstream (path or not, userinfo or not, port), the link's port,
