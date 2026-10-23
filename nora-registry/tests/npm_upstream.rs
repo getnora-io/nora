@@ -289,3 +289,103 @@ fn a_retried_upstream_url_is_logged_without_its_credential() {
         assert!(!log.contains(secret), "log holds {secret}: {log}");
     }
 }
+
+/// The secrets of the upstream URLs the log-mode test configures.
+const LOG_SECRETS: [&str; 2] = ["s3cret-pass", "nora-user"];
+
+/// `path`'s text once it holds `needle`, within a deadline: a file layer writes from a worker
+/// thread of its own.
+fn log_with(path: &std::path::Path, needle: &str) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        if text.contains(needle) || Instant::now() > deadline {
+            return text;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Every log mode `init_logging` builds keeps the userinfo of a URL out of every sink: JSON
+/// for `nora serve` (the retry of an upstream's 5xx names its URL), text for the other commands
+/// (`nora mirror` names the registry it could not reach), each on stdout alone and on stdout
+/// with `NORA_LOG_FILE`. Each sink holds the URL, masked.
+#[test]
+fn every_log_mode_writes_a_url_without_its_userinfo() {
+    let registry = upstream(|_| {
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string()
+    });
+    let masked = "***@127.0.0.1";
+    let mut wrong = Vec::new();
+    for with_file in [false, true] {
+        let proxy = format!("http://nora-user:s3cret-pass@127.0.0.1:{}", registry.port);
+        let mut env = vec![("NORA_NPM_PROXY", proxy.as_str()), ("RUST_LOG", "debug")];
+        if with_file {
+            env.push(("NORA_LOG_FILE", "nora-file.log"));
+        }
+        let server = serve(&env);
+        let _ = status_of(server.port, "/npm/pkg");
+        let mut sinks = vec![server.dir.path().join("nora.log")];
+        if with_file {
+            sinks.push(server.dir.path().join("nora-file.log"));
+        }
+        for sink in sinks {
+            let log = log_with(&sink, "retrying");
+            if !log.contains("retrying") || !log.contains(masked) {
+                wrong.push(format!(
+                    "serve, {}: no masked retry line: {log}",
+                    sink.display()
+                ));
+            }
+            for secret in LOG_SECRETS {
+                if log.contains(secret) {
+                    wrong.push(format!("serve, {}: holds {secret}", sink.display()));
+                }
+            }
+        }
+    }
+    let closed = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    for with_file in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = dir.path().join("nora.log");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_nora"));
+        cmd.args(["mirror", "--registry"])
+            .arg(format!("http://nora-user:s3cret-pass@127.0.0.1:{closed}"))
+            .args(["npm", "--packages", "left-pad"])
+            .current_dir(dir.path())
+            .env_remove("NORA_CONFIG_PATH")
+            .env("NORA_STORAGE_PATH", dir.path().join("data"))
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(Stdio::null());
+        if with_file {
+            cmd.env("NORA_LOG_FILE", "nora-file.log");
+        }
+        let status = cmd.status().unwrap();
+        assert!(!status.success(), "mirror reached a closed port");
+        let mut sinks = vec![stdout];
+        if with_file {
+            sinks.push(dir.path().join("nora-file.log"));
+        }
+        for sink in sinks {
+            let log = log_with(&sink, "Mirror failed");
+            if !log.contains("Mirror failed") || !log.contains(masked) {
+                wrong.push(format!(
+                    "mirror, {}: no masked failure line: {log}",
+                    sink.display()
+                ));
+            }
+            for secret in LOG_SECRETS {
+                if log.contains(secret) {
+                    wrong.push(format!("mirror, {}: holds {secret}", sink.display()));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

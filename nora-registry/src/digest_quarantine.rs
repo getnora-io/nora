@@ -11,10 +11,10 @@
 //! Persistence: append-only JSONL file, compacted on startup via atomic rewrite.
 //! Fail-open: corrupt or missing JSONL → empty store, all pulls pass.
 
+use crate::log_redact::RecordedUrl;
 use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -84,8 +84,8 @@ pub struct DigestEntry {
     /// Unix timestamp (seconds) when first seen by NORA.
     pub first_seen: i64,
     /// Upstream that provided the content (e.g. "registry-1.docker.io"), any userinfo in its
-    /// URL masked as in the log ([`crate::log_redact::url_for_record`]).
-    pub upstream: String,
+    /// URL masked as in the log, by its type.
+    pub upstream: RecordedUrl,
 }
 
 // ============================================================================
@@ -156,14 +156,9 @@ impl DigestStore {
                             continue;
                         }
                         match serde_json::from_str::<DigestEntry>(&line) {
-                            Ok(mut entry) => {
-                                // A line written before the credential was masked loses it in
-                                // the rewrite below.
-                                if let Cow::Owned(named) =
-                                    crate::log_redact::url_for_record(&entry.upstream)
-                                {
-                                    entry.upstream = named;
-                                }
+                            // A line written before the credential was masked is read masked,
+                            // and loses it in the rewrite below.
+                            Ok(entry) => {
                                 if entry.first_seen >= cutoff {
                                     let key = format!("{}:{}", entry.registry, entry.digest);
                                     entries.entry(key).or_insert(entry);
@@ -248,7 +243,7 @@ impl DigestStore {
             registry: registry.to_string(),
             digest: digest.to_string(),
             first_seen: first_seen.unwrap_or_else(|| Utc::now().timestamp()),
-            upstream: crate::log_redact::url_for_record(upstream).into_owned(),
+            upstream: RecordedUrl::new(upstream),
         };
 
         entries.insert(key, entry.clone());
@@ -681,7 +676,7 @@ mod tests {
             None,
         );
         let named = "https://***@npm.example/pkg/-/pkg-1.0.0.tgz?x=1";
-        assert_eq!(entry.upstream, named);
+        assert_eq!(entry.upstream.as_str(), named);
         let ledger = tmp.path().join("quarantine.jsonl");
         let mut written = String::new();
         for _ in 0..100 {
@@ -911,7 +906,7 @@ mod tests {
             registry: "docker".to_string(),
             digest: "sha256:abc".to_string(),
             first_seen: 1700000000,
-            upstream: "registry-1.docker.io".to_string(),
+            upstream: "registry-1.docker.io".into(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(json.contains("\"registry\":\"docker\""));
@@ -942,5 +937,81 @@ mod tests {
         let written = std::fs::read_to_string(&ledger).unwrap();
         assert!(!written.contains("s3cret"), "{written}");
         assert!(!written.contains("-user"), "{written}");
+    }
+    /// Each line of a ledger is loaded as the log has its URL, whatever the lines around it
+    /// hold: userinfo masked up to its last `@`, a URL without userinfo kept as it is; the
+    /// rewritten file and a new record alike.
+    #[tokio::test]
+    async fn every_ledger_line_is_loaded_with_its_upstream_masked() {
+        let rows = [
+            (
+                "sha256:a1",
+                "https://ci-user:s3cret@npm.example/pkg/-/pkg-1.0.0.tgz",
+                "https://***@npm.example/pkg/-/pkg-1.0.0.tgz",
+            ),
+            (
+                "sha256:a2",
+                "https://npm.example/pkg/-/pkg-2.0.0.tgz",
+                "https://npm.example/pkg/-/pkg-2.0.0.tgz",
+            ),
+            (
+                "sha256:a3",
+                "https://ci-user:p@ss@w0rd@npm.example/pkg",
+                "https://***@npm.example/pkg",
+            ),
+            ("sha256:a4", "registry-1.docker.io", "registry-1.docker.io"),
+            (
+                "sha256:a5",
+                "http://only-user@127.0.0.1:4873/pkg",
+                "http://***@127.0.0.1:4873/pkg",
+            ),
+            (
+                "sha256:a6",
+                "https://second:s3cret@npm.example/x?q=a@b",
+                "https://***@npm.example/x?q=a@b",
+            ),
+        ];
+        let secrets = ["s3cret", "ci-user", "p@ss", "w0rd", "only-user", "second"];
+        let now = Utc::now().timestamp();
+        for reversed in [false, true] {
+            let mut lines: Vec<_> = rows.iter().collect();
+            if reversed {
+                lines.reverse();
+            }
+            let tmp = TempDir::new().unwrap();
+            let ledger = tmp.path().join("quarantine.jsonl");
+            let text: String = lines
+                .iter()
+                .map(|(digest, upstream, _)| {
+                    let line = serde_json::json!({
+                        "registry": "npm", "digest": digest, "first_seen": now,
+                        "upstream": upstream,
+                    });
+                    format!("{line}\n")
+                })
+                .collect();
+            std::fs::write(&ledger, text).unwrap();
+            let store = DigestStore::load(tmp.path().to_str().unwrap());
+            assert_eq!(store.len(), rows.len());
+            for (digest, upstream, recorded) in rows {
+                // A digest already recorded answers its entry as loaded.
+                let entry = store.record("npm", digest, "unused", None);
+                assert_eq!(
+                    entry.upstream.as_str(),
+                    recorded,
+                    "{upstream}, reversed: {reversed}"
+                );
+            }
+            let written = std::fs::read_to_string(&ledger).unwrap();
+            for secret in secrets {
+                assert!(!written.contains(secret), "{secret} in {written}");
+            }
+            for (_, upstream, _) in rows {
+                let entry = store.record("npm", &format!("new:{upstream}"), upstream, None);
+                for secret in secrets {
+                    assert!(!entry.upstream.as_str().contains(secret), "{entry:?}");
+                }
+            }
+        }
     }
 }

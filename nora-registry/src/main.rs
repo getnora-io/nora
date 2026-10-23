@@ -79,13 +79,12 @@ mod test_helpers;
 use arc_swap::ArcSwap;
 use axum::{body::Bytes, extract::DefaultBodyLimit, http::HeaderValue, middleware, Router};
 use clap::{Parser, Subcommand};
-use log_redact::RedactUserinfo;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::signal;
 use tracing::{error, info, warn};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 use activity_log::ActivityLog;
 use audit::AuditLog;
@@ -2931,71 +2930,25 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
         _ => None,
     };
 
-    match (json_format, file_writer) {
-        (true, Some((non_blocking, guard))) => {
+    // Every layer comes from `log_redact::layer`, the one that writes through the redaction:
+    // stdout always, `NORA_LOG_FILE` when set, JSON for the server and text for the commands.
+    let (file_layer, guard) = match file_writer {
+        Some((non_blocking, guard)) => {
             let file_filter =
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(
-                    fmt::layer()
-                        .json()
-                        .with_target(true)
-                        .with_writer(RedactUserinfo(std::io::stdout)),
-                )
-                .with(
-                    fmt::layer()
-                        .json()
-                        .with_target(true)
-                        .with_writer(RedactUserinfo(non_blocking))
-                        .with_filter(file_filter),
-                )
-                .init();
-            Some(guard)
+            (
+                Some(log_redact::layer(json_format, non_blocking).with_filter(file_filter)),
+                Some(guard),
+            )
         }
-        (true, None) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(
-                    fmt::layer()
-                        .json()
-                        .with_target(true)
-                        .with_writer(RedactUserinfo(std::io::stdout)),
-                )
-                .init();
-            None
-        }
-        (false, Some((non_blocking, guard))) => {
-            let file_filter =
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(
-                    fmt::layer()
-                        .with_target(false)
-                        .with_writer(RedactUserinfo(std::io::stdout)),
-                )
-                .with(
-                    fmt::layer()
-                        .with_target(false)
-                        .with_writer(RedactUserinfo(non_blocking))
-                        .with_filter(file_filter),
-                )
-                .init();
-            Some(guard)
-        }
-        (false, None) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(
-                    fmt::layer()
-                        .with_target(false)
-                        .with_writer(RedactUserinfo(std::io::stdout)),
-                )
-                .init();
-            None
-        }
-    }
+        None => (None, None),
+    };
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(log_redact::layer(json_format, std::io::stdout))
+        .with(file_layer)
+        .init();
+    guard
 }
 
 /// Open a log file for non-blocking writes. Creates parent directories as needed.

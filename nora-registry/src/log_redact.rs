@@ -3,13 +3,17 @@
 //! An upstream may be configured as `https://user:secret@host/…`, and its URL reaches
 //! log fields in dozens of places (request URL, upstream name, retry and error lines).
 //! Fixing each call site leaves the next new log line to leak, so the formatted event
-//! is cleaned in one place instead: every `fmt` layer writes through [`RedactUserinfo`].
+//! is cleaned in one place instead: every `fmt` layer is built by [`layer`], which writes
+//! through [`RedactUserinfo`].
 //! `tracing-subscriber` formats a whole event into one buffer and hands it to the
 //! writer with a single `write_all`, so each write here sees complete lines.
 
+use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 use std::io;
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::Layer;
 
 /// The text that replaces a URL's userinfo.
 const MASK: &[u8] = b"***";
@@ -64,13 +68,68 @@ pub(crate) fn url_for_record(url: &str) -> Cow<'_, str> {
     }
 }
 
+/// A URL as a record keeps it: built only through [`url_for_record`], from a URL being recorded
+/// ([`RecordedUrl::new`]) and from one read back from a record (its `Deserialize`), so no
+/// record holds userinfo, a line written before masking included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub struct RecordedUrl(String);
+
+impl RecordedUrl {
+    /// `url` with its userinfo masked.
+    pub fn new(url: &str) -> Self {
+        Self(url_for_record(url).into_owned())
+    }
+
+    /// The URL as recorded.
+    #[cfg(test)]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for RecordedUrl {
+    fn from(url: &str) -> Self {
+        Self::new(url)
+    }
+}
+
+impl<'de> Deserialize<'de> for RecordedUrl {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(|url| Self::new(&url))
+    }
+}
+
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// A `fmt` layer writing `writer`'s events through [`RedactUserinfo`]: JSON with each event's
+/// target, or text without. The one way the server builds a log layer, stdout and file alike;
+/// the redacting writer cannot be made or unwrapped outside this module.
+pub(crate) fn layer<S, M>(json: bool, writer: M) -> Box<dyn Layer<S> + Send + Sync>
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    M: for<'w> MakeWriter<'w> + Send + Sync + 'static,
+{
+    let writer = RedactUserinfo(writer);
+    if json {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_target(true)
+            .with_writer(writer)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer()
+            .with_target(false)
+            .with_writer(writer)
+            .boxed()
+    }
+}
+
 /// A [`MakeWriter`] whose writers pass every event through [`redact_userinfo`].
 #[derive(Clone, Copy)]
-pub(crate) struct RedactUserinfo<M>(pub(crate) M);
+struct RedactUserinfo<M>(M);
 
 impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for RedactUserinfo<M> {
     type Writer = RedactingWriter<M::Writer>;
@@ -86,7 +145,7 @@ impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for RedactUserinfo<M> {
 
 /// Writes the redacted form of each buffer in full, so the caller's `write_all` never
 /// splits an event (and with it a URL) across two calls.
-pub(crate) struct RedactingWriter<W>(W);
+struct RedactingWriter<W>(W);
 
 impl<W: io::Write> io::Write for RedactingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
@@ -180,44 +239,15 @@ mod tests {
         assert!(!out.contains("user:"), "{out}");
     }
 
-    /// End to end through a real `fmt` layer, JSON and text: the secret of a `Display`
-    /// field, a `Debug` field and the message never reaches the writer.
+    /// End to end through the layer the server builds, JSON and text: the secret of a
+    /// `Display` field, a `Debug` field and the message never reaches the writer.
     #[test]
-    fn a_fmt_layer_writing_through_it_never_emits_the_secret() {
+    fn a_log_layer_never_emits_the_secret() {
         use tracing_subscriber::prelude::*;
-        let json = Captured::default();
-        emit(
-            tracing_subscriber::registry().with(
-                tracing_subscriber::fmt::layer()
-                    .json()
-                    .with_writer(RedactUserinfo(json.clone())),
-            ),
-        );
-        assert_clean(&json);
-        let text = Captured::default();
-        emit(
-            tracing_subscriber::registry()
-                .with(tracing_subscriber::fmt::layer().with_writer(RedactUserinfo(text.clone()))),
-        );
-        assert_clean(&text);
-    }
-
-    /// Every `fmt` layer the server installs writes through [`RedactUserinfo`]: stdout
-    /// and `NORA_LOG_FILE`, JSON and text. A layer added without it would leak again.
-    #[test]
-    fn every_log_layer_of_the_server_is_redacted() {
-        let main = include_str!("main.rs");
-        let start = main
-            .find("fn init_logging(")
-            .expect("init_logging in main.rs");
-        let body = &main[start..];
-        let body = &body[..body[1..].find("\nfn ").map_or(body.len(), |n| n + 1)];
-        let layers = body.matches("fmt::layer()").count();
-        let redacted = body.matches("with_writer(RedactUserinfo(").count();
-        assert!(
-            layers >= 4,
-            "expected the four logging setups, found {layers} layers"
-        );
-        assert_eq!(layers, redacted, "a log layer without RedactUserinfo");
+        for json in [true, false] {
+            let sink = Captured::default();
+            emit(tracing_subscriber::registry().with(layer(json, sink.clone())));
+            assert_clean(&sink);
+        }
     }
 }
