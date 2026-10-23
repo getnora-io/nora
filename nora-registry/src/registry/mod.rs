@@ -440,10 +440,11 @@ pub(crate) async fn proxy_fetch_on_origin(
         timeout,
         auth,
         None,
-        |r| async { r.bytes().await.map(|b| OnOrigin::Body(b.to_vec())) },
-        |r| unfollowed_redirect(r).map(OnOrigin::Elsewhere),
-        cb,
-        scope,
+        (
+            |r: reqwest::Response| async { r.bytes().await.map(|b| OnOrigin::Body(b.to_vec())) },
+            |r: &reqwest::Response| unfollowed_redirect(r).map(OnOrigin::Elsewhere),
+        ),
+        (cb, scope.into()),
     )
     .await
 }
@@ -469,27 +470,23 @@ where
         timeout,
         auth,
         extra_headers,
-        extract,
-        |_| None,
-        cb,
-        scope,
+        (extract, |_: &reqwest::Response| None),
+        (cb, scope.into()),
     )
     .await
 }
 
-/// [`proxy_fetch_core`], a redirect handed back unfollowed answered by `redirected` when it
-/// makes something of it, else an `Upstream` error of its status.
-#[allow(clippy::too_many_arguments)]
+/// [`proxy_fetch_core`] reading a response with `(extract, redirected)`: a redirect handed back
+/// unfollowed is answered by `redirected` when it makes something of it, else an `Upstream`
+/// error of its status.
 async fn proxy_fetch_core_with<T, F, Fut, R>(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
     auth: Option<UpstreamAuth<'_>>,
     extra_headers: Option<(&str, &str)>,
-    extract: F,
-    redirected: R,
-    cb: &CircuitBreakerRegistry,
-    scope: impl Into<BreakerScope<'_>>,
+    (extract, redirected): (F, R),
+    (cb, scope): (&CircuitBreakerRegistry, BreakerScope<'_>),
 ) -> Result<T, ProxyError>
 where
     F: Fn(reqwest::Response) -> Fut + Copy,
@@ -497,7 +494,6 @@ where
     R: Fn(&reqwest::Response) -> Option<T>,
 {
     let auth_header = upstream_auth_header(auth)?;
-    let scope = scope.into();
     let registry_str = scope.registry().as_str();
     let cb_key = scope.key();
     let probe = cb.check(&cb_key)?;
