@@ -897,7 +897,7 @@ async fn fetch_upstream_tarball(
     let mut found = source(trusted_listed_link(state, package, version).await);
     if found == TarballSource::NotListed {
         let key = upstream_packument_key(package);
-        match refetched_metadata(state, package, &key, &key, true, false).await {
+        match refetch_metadata(state, package, &key, &key, true, false).await {
             Ok(doc) => found = source(npm_links::listed_link(&doc, version)),
             Err(ProxyError::NotFound) => {}
             // A packument the upstream failed to give says nothing of the version: the
@@ -1229,29 +1229,15 @@ async fn cached_copy_trusted(
     origin == origin_of(owner.url) && state.storage.pin(key).await.as_deref() == Some(digest)
 }
 
-/// Refetch metadata from upstream, rewrite URLs, update cache.
-/// Returns None if upstream is unavailable (caller serves stale cache).
+/// Refetch metadata from upstream, rewrite URLs, update cache. An error says why there is no
+/// document: `NotFound` for one the upstream does not have or NORA does not serve, the
+/// upstream's failure otherwise (a caller with a cached copy serves it stale).
 ///
 /// `key` is the cache written; `seed_key` holds the copy being revalidated (`key`, or what an
 /// older release cached), from which a missing first-seen ledger starts. `ledger` says whether
 /// the document is a packument, whose versions the ledger records. `conditional` says whether the
 /// cached copy may be kept on a 304: not one holding a link past NORA.
 async fn refetch_metadata(
-    state: &AppState,
-    path: &str,
-    key: &str,
-    seed_key: &str,
-    ledger: bool,
-    conditional: bool,
-) -> Option<Vec<u8>> {
-    refetched_metadata(state, path, key, seed_key, ledger, conditional)
-        .await
-        .ok()
-}
-
-/// [`refetch_metadata`], saying why there is no document: `NotFound` for one the upstream does
-/// not have or NORA does not serve, the upstream's failure otherwise.
-async fn refetched_metadata(
     state: &AppState,
     path: &str,
     key: &str,
@@ -1996,6 +1982,7 @@ async fn upstream_metadata(
         let refetch = || async {
             refetch_metadata(state, path, cache_key, &from_key, packument, !past_nora)
                 .await
+                .ok()
                 .map(Bytes::from)
         };
         let refreshed = if state.config.server.proxy_coalesce {
@@ -5630,10 +5617,7 @@ mod spec_conformance_tests {
         // entered the cache-hit path (body was present at get_verified), TTL
         // expired, but GC deleted the body before refetch_metadata re-reads it.
         let result = refetch_metadata(&ctx.state, "ghost-pkg", key, key, true, true).await;
-        assert!(
-            result.is_none(),
-            "must return None when body is missing on 304"
-        );
+        assert!(result.is_err(), "must fail when body is missing on 304");
 
         // The critical assertion: .meta must be gone after the 304 body-miss.
         // Before the fix, `.ok()?` silently returned None but left .meta intact,
