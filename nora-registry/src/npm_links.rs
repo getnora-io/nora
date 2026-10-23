@@ -611,13 +611,13 @@ mod tests {
                             ]
                         };
                         for (holder, exact) in &holders {
-                            // (file in the link, it is this version's file)
-                            for (file, this) in [
-                                ("pkg-1.0.0.tgz", true),
-                                ("pkg-1.1.0.tgz", false),
-                                ("pkg-1.0.0.tgz.sig", false),
-                                ("pkg-1.0.0.tgzx", false),
-                                ("pkg-1.0.0.tgz/x", false),
+                            // (file in the link, this version's file, a tarball of the package)
+                            for (file, this, tarball) in [
+                                ("pkg-1.0.0.tgz", true, true),
+                                ("pkg-1.1.0.tgz", false, true),
+                                ("pkg-1.0.0.tgz.sig", false, false),
+                                ("pkg-1.0.0.tgzx", false, false),
+                                ("pkg-1.0.0.tgz/x", false, false),
                             ] {
                                 rows += 1;
                                 let creds = if userinfo { "u:p@" } else { "" };
@@ -652,6 +652,11 @@ mod tests {
                                 } else {
                                     TarballSource::NotListed
                                 };
+                                // What the rewrite serves on NORA: any tarball of the package.
+                                let own = origin_file(&link, &upstream, package, &any_key);
+                                if own.is_some() != (same && *exact && tarball) {
+                                    wrong.push(format!("{upstream} {package} {link}: {own:?}"));
+                                }
                                 if got != expected {
                                     wrong.push(format!(
                                         "{upstream} {package} {link}: {got:?}, expected {expected:?}"
