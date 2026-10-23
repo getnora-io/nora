@@ -55,74 +55,28 @@ pub mod docker_fuzz {
 
 /// Re-export npm metadata rewriting for fuzz targets
 pub mod npm_fuzz {
+    /// The packument as NORA serves it ([`crate::npm_links::place_document`], the server's own
+    /// rewrite, with its storage-key check): `Err` for a document that is not JSON.
     #[allow(clippy::result_unit_err)]
     pub fn rewrite_tarball_urls(
         data: &[u8],
         nora_base: &str,
         upstream_url: &str,
     ) -> Result<Vec<u8>, ()> {
-        let mut json: serde_json::Value = serde_json::from_slice(data).map_err(|_| ())?;
-
-        let upstream_trimmed = upstream_url.trim_end_matches('/');
-        let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-
-        if let Some(versions) = json.get_mut("versions").and_then(|v| v.as_object_mut()) {
-            for (_ver, version_data) in versions.iter_mut() {
-                if let Some(tarball_url) = version_data
-                    .get("dist")
-                    .and_then(|d| d.get("tarball"))
-                    .and_then(|t| t.as_str())
-                    .map(|s| s.to_string())
-                {
-                    let rewritten = upstream_url_forms(upstream_trimmed)
-                        .iter()
-                        .fold(tarball_url, |url, form| {
-                            crate::upstream_url::replace_str(&url, form, &nora_npm_base)
-                        });
-                    if let Some(dist) = version_data.get_mut("dist") {
-                        dist["tarball"] = serde_json::Value::String(rewritten);
-                    }
-                }
-            }
-        }
-
-        let output = serde_json::to_vec(&json).map_err(|_| ())?;
-
-        // Safety net: byte-level replace of any remaining upstream URL prefix (#439)
-        Ok(replace_upstream_bytes(
-            &output,
-            upstream_trimmed,
-            &nora_npm_base,
-        ))
-    }
-
-    /// Byte-level replace of upstream URL prefix (safety net for fuzz targets), where that URL
-    /// ends ([`crate::upstream_url::ends`]).
-    fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) -> Vec<u8> {
-        if upstream_url.is_empty() {
-            return data.to_vec();
-        }
-        let mut result = data.to_vec();
-        for form in upstream_url_forms(upstream_url) {
-            result =
-                crate::upstream_url::replace(&result, form.as_bytes(), nora_npm_base.as_bytes());
-        }
-        result
-    }
-
-    /// Mirror of `registry::npm::upstream_url_forms`: the URL as configured and under the other
-    /// scheme.
-    fn upstream_url_forms(upstream_url: &str) -> Vec<String> {
-        let twin = if let Some(rest) = upstream_url.strip_prefix("https://") {
-            Some(format!("http://{rest}"))
-        } else {
-            upstream_url
-                .strip_prefix("http://")
-                .map(|rest| format!("https://{rest}"))
-        };
-        std::iter::once(upstream_url.to_string())
-            .chain(twin)
-            .collect()
+        let package = serde_json::from_slice::<serde_json::Value>(data)
+            .ok()
+            .and_then(|doc| doc.get("name")?.as_str().map(str::to_string));
+        let key_ok = |key: &str| crate::validation::validate_storage_key(key).is_ok();
+        crate::npm_links::place_document(
+            data,
+            nora_base,
+            upstream_url,
+            package.as_deref(),
+            crate::npm_links::Links::Served,
+            &key_ok,
+        )
+        .map(|placed| placed.body)
+        .map_err(|_| ())
     }
 
     #[cfg(test)]
@@ -302,15 +256,13 @@ mod one_implementation_tests {
     //! compile (`pub mod x;` here, used by the server as `nora_registry::x`), and this file
     //! only re-exports it.
 
-    /// Copies of server code that remain, by name: a new one fails
-    /// [`this_file_holds_no_copy_of_server_code_but_these`] until it is listed here. The npm copy
-    /// stays until the npm rewrite it mirrors moves into a shared module; the others are no
-    /// host-boundary code.
+    /// Functions with a body that remain, by name: a new one fails
+    /// [`this_file_holds_no_copy_of_server_code_but_these`] until it is listed here. The npm one
+    /// holds no rule of its own: it reads the package name and calls the server's rewrite
+    /// ([`crate::npm_links::place_document`]). The others are copies, of no host-boundary code.
     const COPIES: &[&str] = &[
         "docker_fuzz::detect_manifest_media_type",
         "npm_fuzz::rewrite_tarball_urls",
-        "npm_fuzz::replace_upstream_bytes",
-        "npm_fuzz::upstream_url_forms",
         "pypi_fuzz::extract_filename",
         "pypi_fuzz::parse_upstream_html",
         "maven_fuzz::classify_path",

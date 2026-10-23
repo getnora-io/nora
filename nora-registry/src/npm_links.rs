@@ -280,6 +280,283 @@ pub fn listed_link(doc: &[u8], version: &str) -> Option<String> {
         .tarball
 }
 
+/// Why an upstream npm document cannot be served as NORA's after the rewrite.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Unrewritable {
+    /// It is not JSON: only the byte-level rewrite applies.
+    NotJson,
+    /// A version manifest whose tarball lies outside the upstream: no version NORA serves.
+    OffUpstream,
+}
+
+/// What a placed document is for. A tarball link the upstream keeps on its own origin, outside
+/// its path ([`origin_file`]), is NORA's to serve but only the upstream's link says where
+/// to fetch it: the cached copy keeps it as it is, and the copy served moves it onto NORA.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Links {
+    /// The copy NORA caches.
+    Stored,
+    /// The copy a client gets.
+    Served,
+}
+
+/// An upstream npm document as NORA serves it.
+pub struct Placed {
+    pub body: Vec<u8>,
+    /// Whether a version was left out: its tarball lies outside the upstream.
+    pub left_out: bool,
+}
+
+/// Rewrite tarball URLs in npm metadata to point to NORA.
+///
+/// Replaces upstream registry URLs (e.g. `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`)
+/// with NORA URLs (e.g. `http://nora:5000/npm/lodash/-/lodash-4.17.21.tgz`).
+///
+/// Two-layer approach (#439):
+/// 1. Targeted: parse JSON, rewrite `versions.*.dist.tarball` (and a version manifest's own
+///    `dist.tarball`)
+/// 2. Safety net: byte-level replace of upstream URL prefix in serialized output
+///
+/// A version whose tarball lies anywhere but the upstream, NORA or a relative path is left out
+/// ([`place_tarball`]): npm would download it from there, past NORA. A version manifest whose
+/// tarball does is [`Unrewritable::OffUpstream`]. `package` is the package the document was asked
+/// for, `None` for a registry endpoint that is not one package's.
+pub fn place_document(
+    data: &[u8],
+    nora_base: &str,
+    upstream_url: &str,
+    package_asked: Option<&str>,
+    links: Links,
+    key_ok: &dyn Fn(&str) -> bool,
+) -> Result<Placed, Unrewritable> {
+    let mut json: serde_json::Value = serde_json::from_slice(data).map_err(|e| {
+        tracing::warn!(error = %e, "npm: JSON parse failed in rewrite_tarball_urls");
+        Unrewritable::NotJson
+    })?;
+
+    let upstream_trimmed = upstream_url.trim_end_matches('/');
+    let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+    let package = json
+        .get("name")
+        .and_then(|n| n.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let mut left_out = Vec::new();
+    if let Some(versions) = json.get_mut("versions").and_then(|v| v.as_object_mut()) {
+        versions.retain(|version, version_data| {
+            let Some(tarball_url) = tarball_of(version_data) else {
+                return true;
+            };
+            match place_tarball(
+                tarball_url,
+                &nora_npm_base,
+                upstream_trimmed,
+                package_asked,
+                links,
+                key_ok,
+            ) {
+                Some(placed) => {
+                    version_data["dist"]["tarball"] = serde_json::Value::String(placed);
+                    true
+                }
+                None => {
+                    warn_left_out(&package, version, tarball_url, &nora_npm_base);
+                    left_out.push(version.clone());
+                    false
+                }
+            }
+        });
+    } else if let Some(tarball_url) = tarball_of(&json) {
+        let Some(placed) = place_tarball(
+            tarball_url,
+            &nora_npm_base,
+            upstream_trimmed,
+            package_asked,
+            links,
+            key_ok,
+        ) else {
+            let version = json.get("version").and_then(|v| v.as_str());
+            warn_left_out(
+                &package,
+                version.unwrap_or_default(),
+                tarball_url,
+                &nora_npm_base,
+            );
+            return Err(Unrewritable::OffUpstream);
+        };
+        json["dist"]["tarball"] = serde_json::Value::String(placed);
+    }
+    if !left_out.is_empty() {
+        leave_out_of_tags_and_times(&mut json, &left_out);
+    }
+
+    let output = serde_json::to_vec(&json).map_err(|e| {
+        tracing::warn!(error = %e, "npm: JSON serialize failed in rewrite_tarball_urls");
+        Unrewritable::NotJson
+    })?;
+
+    // Safety net: byte-level replace of any remaining upstream URL prefix (#439).
+    // Catches edge cases where targeted rewrite missed (e.g. new npm metadata fields).
+    Ok(Placed {
+        body: replace_upstream_bytes(&output, upstream_trimmed, &nora_npm_base),
+        left_out: !left_out.is_empty(),
+    })
+}
+
+/// A version document's `dist.tarball`, if it names one.
+fn tarball_of(version_data: &serde_json::Value) -> Option<&str> {
+    version_data.get("dist")?.get("tarball")?.as_str()
+}
+
+/// Where the tarball link `link` of an upstream document leads once NORA serves it: the
+/// upstream's own link (its URL under either scheme, ending where [`crate::upstream_url::ends`]
+/// says) moved under `nora_npm_base`; a link already on NORA, or a relative one, as it is. `None`
+/// for a link anywhere else — another host, a URL that only starts like the upstream's, a
+/// network-path reference — which would send the client past NORA. Where a link leads is what a
+/// URL parser (npm's included) reads, not how it starts: `//host`, `/\host` and ` https://host`
+/// all name `host`. A link on the upstream's origin outside its path is the upstream's too
+/// ([`origin_file`]): as it is in the copy [`Links::Stored`], on NORA in the one
+/// [`Links::Served`].
+pub fn place_tarball(
+    link: &str,
+    nora_npm_base: &str,
+    upstream: &str,
+    package: Option<&str>,
+    links: Links,
+    key_ok: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let under_upstream = upstream_url_forms(upstream)
+        .iter()
+        .filter(|form| !form.is_empty())
+        .find_map(|form| {
+            link.strip_prefix(form.as_str())
+                .filter(|rest| crate::upstream_url::ends(rest.as_bytes()))
+                .map(|rest| format!("{nora_npm_base}{rest}"))
+        });
+    if under_upstream.is_none() {
+        if let Some(package) = package {
+            if let Some(file) = origin_file(link, upstream, package, key_ok) {
+                return Some(match links {
+                    Links::Stored => link.to_string(),
+                    Links::Served => format!("{nora_npm_base}/{package}/-/{}", file.raw),
+                });
+            }
+        }
+    }
+    let placed = under_upstream.unwrap_or_else(|| link.to_string());
+    let nora = Url::parse(&format!("{nora_npm_base}/")).ok()?;
+    let target = nora.join(&placed).ok()?;
+    let same_server = matches!(target.scheme(), "http" | "https")
+        && target.username().is_empty()
+        && target.password().is_none()
+        && target.host_str() == nora.host_str()
+        && target.port_or_known_default() == nora.port_or_known_default();
+    same_server.then_some(placed)
+}
+
+/// The host a tarball link names, for a log line that must not carry the link itself (it may
+/// hold a token).
+pub fn link_host(link: &str, nora_npm_base: &str) -> String {
+    Url::parse(&format!("{nora_npm_base}/"))
+        .and_then(|nora| nora.join(link))
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_string))
+        .unwrap_or_else(|| "<unparsed>".to_string())
+}
+
+/// The `package@version` pairs already warned about, by hash: one line each in bounded memory. A
+/// pair whose slot another took over is warned about again.
+static LEFT_OUT_WARNED: [std::sync::atomic::AtomicU64; 1024] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 1024];
+
+/// Warn, once per package and version, that a version is left out of what NORA serves.
+fn warn_left_out(package: &str, version: &str, link: &str, nora_npm_base: &str) {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    (package, version).hash(&mut hasher);
+    let hash = hasher.finish();
+    let slot = &LEFT_OUT_WARNED[(hash % LEFT_OUT_WARNED.len() as u64) as usize];
+    if slot.swap(hash, std::sync::atomic::Ordering::Relaxed) != hash {
+        tracing::warn!(
+            registry = "npm",
+            package = %package,
+            version = %version,
+            host = %link_host(link, nora_npm_base),
+            "version left out: its tarball is outside the upstream, npm would fetch it past NORA"
+        );
+    }
+}
+
+/// Drop the versions `left_out` of a packument from `time` and its tags. `latest` on one falls
+/// back to the highest release below it still listed, the version npm picks when no tag names one
+/// (pnpm and yarn need the tag); any other tag on one goes, since no other version is what its
+/// publisher tagged. No tag is left naming a version the packument does not list.
+fn leave_out_of_tags_and_times(json: &mut serde_json::Value, left_out: &[String]) {
+    let listed: Vec<String> = json
+        .get("versions")
+        .and_then(|v| v.as_object())
+        .map(|versions| versions.keys().cloned().collect())
+        .unwrap_or_default();
+    if let Some(time) = json.get_mut("time").and_then(|t| t.as_object_mut()) {
+        time.retain(|version, _| !left_out.contains(version));
+    }
+    if let Some(tags) = json.get_mut("dist-tags").and_then(|t| t.as_object_mut()) {
+        tags.retain(|tag, tagged| {
+            let Some(cut) = tagged.as_str().filter(|v| left_out.iter().any(|c| c == v)) else {
+                return true;
+            };
+            if tag != "latest" {
+                return false;
+            }
+            let below = listed
+                .iter()
+                .filter(|v| !v.contains('-') && semver_key(v) < semver_key(cut));
+            match max_semver(below) {
+                Some(release) => {
+                    *tagged = serde_json::Value::String(release);
+                    true
+                }
+                None => false,
+            }
+        });
+    }
+}
+
+/// Byte-level replace of upstream URL prefix in response body (#439).
+///
+/// Used as safety net after targeted JSON rewrite, and as fallback when JSON
+/// parsing fails. Replaces full URL prefix (e.g. `https://registry.npmjs.org`)
+/// rather than bare hostname to avoid corrupting unrelated fields, and only where
+/// that URL ends ([`crate::upstream_url::ends`]): `https://registry.npmjs.org.evil.org`
+/// is another host.
+pub fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) -> Vec<u8> {
+    if upstream_url.is_empty() {
+        return data.to_vec();
+    }
+    let mut result = data.to_vec();
+    for form in upstream_url_forms(upstream_url) {
+        result = crate::upstream_url::replace(&result, form.as_bytes(), nora_npm_base.as_bytes());
+    }
+    result
+}
+
+/// Highest version by a naive numeric semver comparison (a release outranks a prerelease at the
+/// same core). Used only as the `latest` dist-tag fallback when publish did not set one.
+pub fn max_semver<'a>(versions: impl Iterator<Item = &'a String>) -> Option<String> {
+    versions
+        .max_by(|a, b| semver_key(a).cmp(&semver_key(b)))
+        .cloned()
+}
+
+/// A version's release order: major, minor, patch, and a release above its pre-releases.
+pub fn semver_key(v: &str) -> (u64, u64, u64, bool) {
+    let core = v.split(['-', '+']).next().unwrap_or(v);
+    let mut it = core.trim_start_matches('v').split('.');
+    let n = |x: Option<&str>| x.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    (n(it.next()), n(it.next()), n(it.next()), !v.contains('-'))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -458,6 +735,47 @@ mod tests {
         let none = tarball_source(upstream, NORA, "@vendor/pkg", path, None, &any_key);
         if none != TarballSource::NotListed {
             wrong.push(format!("no link: {none:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// The upstream's URL is the upstream's only where it ends: at the end of the text or before
+    /// one of `/ ? # \ "`, under either scheme. Past that, a longer path segment is left as it
+    /// is by the byte-level rewrite, and after the host a longer host or a port is another host,
+    /// whose tarball link is left out.
+    #[test]
+    fn the_upstream_url_ends_at_a_boundary_under_either_scheme() {
+        let upstream = "https://registry.example/npm";
+        let nora = "https://nora.example/npm";
+        let mut wrong = Vec::new();
+        for scheme in ["https://", "http://"] {
+            let at = format!("{scheme}registry.example/npm");
+            for tail in ["", "/", "?", "#", "\\", "\""] {
+                let got = replace_upstream_bytes(format!("{at}{tail}").as_bytes(), upstream, nora);
+                if got != format!("{nora}{tail}").into_bytes() {
+                    wrong.push(format!("{at}{tail:?}: {}", String::from_utf8_lossy(&got)));
+                }
+            }
+            for tail in ["x", ".evil.example", ":8443", "-1", "%2F"] {
+                let text = format!("{at}{tail}");
+                let got = replace_upstream_bytes(text.as_bytes(), upstream, nora);
+                if got != text.as_bytes() {
+                    wrong.push(format!("{text}: {}", String::from_utf8_lossy(&got)));
+                }
+                // After the host, the same tail names another host or port.
+                let link = format!("{scheme}registry.example{tail}/p/-/p-1.0.0.tgz");
+                let host_only = "https://registry.example";
+                let placed =
+                    place_tarball(&link, nora, host_only, Some("p"), Links::Served, &any_key);
+                if placed.is_some() {
+                    wrong.push(format!("{link} placed at {placed:?}"));
+                }
+            }
+            let link = format!("{at}/p/-/p-1.0.0.tgz");
+            let placed = place_tarball(&link, nora, upstream, Some("p"), Links::Served, &any_key);
+            if placed.as_deref() != Some("https://nora.example/npm/p/-/p-1.0.0.tgz") {
+                wrong.push(format!("{link} placed at {placed:?}"));
+            }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }

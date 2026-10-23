@@ -185,9 +185,7 @@ pub(crate) fn proxied_repo_conflict() -> Response {
         .into_response()
 }
 
-pub(crate) use nora_registry::upstream_url::{
-    ends as upstream_url_ends, replace as replace_upstream_url,
-};
+pub(crate) use nora_registry::upstream_url::ends as upstream_url_ends;
 
 /// Build NORA base URL from config (for URL rewriting).
 ///
