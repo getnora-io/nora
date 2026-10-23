@@ -614,12 +614,10 @@ pub(crate) fn build_same_origin_client(tls: &TlsConfig) -> reqwest::Client {
 pub(crate) fn same_origin_redirects() -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(|attempt| {
         // The first of the previous URLs is the one asked.
-        let on_origin = attempt.previous().first().is_some_and(|asked| {
-            let next = attempt.url();
-            asked.scheme() == next.scheme()
-                && asked.host_str() == next.host_str()
-                && asked.port_or_known_default() == next.port_or_known_default()
-        });
+        let on_origin = attempt
+            .previous()
+            .first()
+            .is_some_and(|asked| nora_registry::npm_links::same_origin(asked, attempt.url()));
         if !on_origin {
             attempt.stop()
         } else if attempt.previous().len() > 10 {
