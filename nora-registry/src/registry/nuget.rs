@@ -1892,9 +1892,10 @@ fn rewrite_registration_urls(json_text: &str, upstream_url: &str, base_url: &str
 //
 // NORA takes no push, but `nora import` brings packages in from the operator's own registry. An
 // imported version is stored under the flat-container keys a client reads — the .nupkg and its
-// .nuspec — and a record of it under `nuget/hosted/<id>/<version>.json`. A package with a record
-// is NORA's own: its version list and registration are built from the records, a version
-// without one is not served, and no upstream is asked for the id.
+// .nuspec — and a record of it under `nuget/hosted/<id>/<version>.json`. Before it stores anything
+// of a package the import writes the marker `nuget/hosted/<id>/imported`. A package with the
+// marker or a record is NORA's own: its version list and registration are built from the
+// records, a version without one is not served, and no upstream is asked for the id.
 
 /// The flat-container key of the .nupkg of `id` at `version`, as a client asks for it: the id and
 /// the normalized version, both in lowercase. `None` when either is not NuGet's. `nora import`
@@ -1925,6 +1926,13 @@ fn hosted_record_key(id_lower: &str, version: &str) -> String {
     format!("{}{version}.json", hosted_prefix(id_lower))
 }
 
+/// The marker that makes package `id_lower` hosted: `nora import` writes it before it stores
+/// anything of the package, so an import that stops after it leaves the package hosted and
+/// empty, and its id is not asked of an upstream.
+fn hosted_marker_key(id_lower: &str) -> String {
+    format!("{}imported", hosted_prefix(id_lower))
+}
+
 /// What a package's records say of it and of each of its versions, read from one listing of
 /// them. What a version is, is asked of [`hosted::Versions::version`] alone, and the list a
 /// hosted package serves of [`hosted::Versions::listed`]: the records are private to the module,
@@ -1943,20 +1951,28 @@ mod hosted {
         Foreign,
     }
 
-    /// The versions a package has records of (lowercase, normalized), in NuGet's order.
+    /// Whether a package is hosted, and the versions it has records of (lowercase, normalized),
+    /// in NuGet's order.
     pub(super) struct Versions {
+        marker: bool,
         listed: Vec<String>,
     }
 
     impl Versions {
         /// A package nothing is recorded of.
         pub(super) fn none() -> Self {
-            Self { listed: Vec::new() }
+            Self {
+                marker: false,
+                listed: Vec::new(),
+            }
         }
 
-        /// The versions `names` record: the keys under the package's prefix, without it, each
-        /// `<version>.json`. A package with a record of a version is hosted.
+        /// The records `names` name: the keys under the package's prefix, without it. The marker
+        /// `imported` makes the package hosted, and so does a record of a version,
+        /// `<version>.json`.
         pub(super) fn from_listing<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+            let names: Vec<&str> = names.into_iter().collect();
+            let marker = names.contains(&"imported");
             let mut listed: Vec<String> = names
                 .into_iter()
                 .filter_map(|name| name.strip_suffix(".json"))
@@ -1964,13 +1980,13 @@ mod hosted {
                 .map(str::to_string)
                 .collect();
             listed.sort_by(|a, b| super::nuget_version_order(a, b).unwrap_or_else(|| a.cmp(b)));
-            Self { listed }
+            Self { marker, listed }
         }
 
         /// Whether the package is hosted: its versions and registration are built from its
         /// records, and its id is not asked of an upstream.
         pub(super) fn hosted(&self) -> bool {
-            !self.listed.is_empty()
+            self.marker || !self.listed.is_empty()
         }
 
         /// The versions a hosted package serves: those it has records of, and no other.
@@ -2046,6 +2062,8 @@ struct Dependency {
 /// What `nora import` stores beside an imported .nupkg: its .nuspec and its record, each with
 /// its key. The record is written last — it is what makes the version served.
 pub(crate) struct ImportedPackage {
+    /// The marker that makes the package hosted, written before anything of it is stored.
+    pub marker_key: String,
     pub nuspec_key: String,
     pub nuspec: Vec<u8>,
     pub record_key: String,
@@ -2100,6 +2118,7 @@ pub(crate) fn imported_package(
         return Err(ImportedPackageError::Mismatch { found, expected });
     }
     Ok(ImportedPackage {
+        marker_key: hosted_marker_key(id_lower),
         nuspec_key: nuspec_key(id_lower, version),
         nuspec,
         record_key: hosted_record_key(id_lower, version),
@@ -2468,15 +2487,16 @@ mod tests {
     use super::*;
 
     /// What a package's records say of one of its versions, and the list it serves. A hosted
-    /// package serves exactly the versions it has records of; a key under its prefix that
-    /// records no version makes nothing hosted.
+    /// package serves exactly the versions it has records of: with the marker and no record it
+    /// serves none. A key under its prefix that is neither makes nothing hosted.
     #[test]
     fn a_hosted_package_serves_only_the_versions_it_records() {
         use super::hosted::{Version, Versions};
-        let rows: [(&[&str], &[&str], &str, Version); 9] = [
-            (&[], &[], "1.0.0", Version::Proxied),
-            (&["1.0.0.json"], &["1.0.0"], "1.0.0", Version::Own),
-            (&["1.0.0.json"], &["1.0.0"], "2.0.0", Version::Foreign),
+        // listing, hosted, served versions, version asked, what it is
+        let rows: [(&[&str], bool, &[&str], &str, Version); 12] = [
+            (&[], false, &[], "1.0.0", Version::Proxied),
+            (&["1.0.0.json"], true, &["1.0.0"], "1.0.0", Version::Own),
+            (&["1.0.0.json"], true, &["1.0.0"], "2.0.0", Version::Foreign),
             (
                 &[
                     "10.0.0.json",
@@ -2484,30 +2504,49 @@ mod tests {
                     "1.0.0.json",
                     "2.0.0.json",
                 ],
+                true,
                 &["1.0.0", "2.0.0-beta.1", "2.0.0", "10.0.0"],
                 "2.0.0-beta.1",
                 Version::Own,
             ),
-            (&["1.0.0.txt"], &[], "1.0.0", Version::Proxied),
-            (&[".json"], &[], "", Version::Proxied),
-            (&["x/1.0.0.json"], &[], "1.0.0", Version::Proxied),
+            // The marker alone: an import that stopped before the first version was stored.
+            (&["imported"], true, &[], "1.0.0", Version::Foreign),
+            (
+                &["imported", "1.0.0.json"],
+                true,
+                &["1.0.0"],
+                "1.0.0",
+                Version::Own,
+            ),
+            (
+                &["importedx", "x/imported"],
+                false,
+                &[],
+                "1.0.0",
+                Version::Proxied,
+            ),
+            (&["1.0.0.txt"], false, &[], "1.0.0", Version::Proxied),
+            (&[".json"], false, &[], "", Version::Proxied),
+            (&["x/1.0.0.json"], false, &[], "1.0.0", Version::Proxied),
             (
                 &["x/1.0.0.json", "2.0.0.json"],
+                true,
                 &["2.0.0"],
                 "1.0.0",
                 Version::Foreign,
             ),
             (
                 &["1.0.0.json.tmp", "1.0.0.json"],
+                true,
                 &["1.0.0"],
                 "1.0.0.json",
                 Version::Foreign,
             ),
         ];
-        for (names, listed, version, want) in rows {
+        for (names, hosted, listed, version, want) in rows {
             let versions = Versions::from_listing(names.iter().copied());
             assert_eq!(versions.listed(), listed, "{names:?}");
-            assert_eq!(versions.hosted(), !listed.is_empty(), "{names:?}");
+            assert_eq!(versions.hosted(), hosted, "{names:?}");
             assert_eq!(versions.version(version), want, "{names:?} {version}");
         }
         assert!(!Versions::none().hosted());

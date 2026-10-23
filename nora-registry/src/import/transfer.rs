@@ -271,21 +271,21 @@ pub async fn transfer_artifact(
         return Outcome::Imported { bytes, sha256 }; // rehearsal — guard drops temp
     }
     let _ = provenance; // (Weak provenance is surfaced by the orchestrator's report, not here.)
-                        // The project is made hosted before its first file is stored: from the moment the import
-                        // stores anything of it, its name is not asked of an upstream.
-                        // Its record follows: a hosted project lists only the files it owns.
-    if let Some((project, file)) = pypi_file {
+
+    // The name is made hosted before its first file is stored: from the moment the import stores
+    // anything of it, its name is not asked of an upstream. An import that stops after this
+    // leaves the name hosted and empty.
+    if let Some((project, _)) = pypi_file {
         if let Err(e) = crate::registry::pypi_claim_imported_project(storage, project).await {
             return Outcome::Failed {
                 reason: format!("{}: making project {project} hosted: {e}", artifact.path),
             };
         }
-        if let Err(e) = crate::registry::pypi_record_own_file(storage, project, file).await {
+    }
+    if let Some(package) = &nuget_package {
+        if let Err(e) = storage.put(&package.marker_key, b"").await {
             return Outcome::Failed {
-                reason: format!(
-                    "{}: recording {file} as the project's own: {e}",
-                    artifact.path
-                ),
+                reason: format!("{}: making the package hosted: {e}", artifact.path),
             };
         }
     }
@@ -305,14 +305,24 @@ pub async fn transfer_artifact(
             };
         }
     }
-    // A PyPI file's digest is recorded as an upload records it. A failed write fails the
-    // artifact: the next run transfers it again and writes the record.
+    // A PyPI file's digest is recorded as an upload records it, and then the record that makes it
+    // one of the project's own files: a record always names bytes the import stored, never what
+    // an upstream left under the same name. A failed write fails the artifact, and the next run
+    // transfers it again.
     if let Some((project, file)) = pypi_file {
         if let Err(e) =
             crate::registry::pypi_record_stored_file(storage, project, file, &sha256).await
         {
             return Outcome::Failed {
                 reason: format!("commit {key}.sha256: {e}"),
+            };
+        }
+        if let Err(e) = crate::registry::pypi_record_own_file(storage, project, file).await {
+            return Outcome::Failed {
+                reason: format!(
+                    "{}: recording {file} as the project's own: {e}",
+                    artifact.path
+                ),
             };
         }
     }

@@ -834,12 +834,6 @@ async fn upload(
         }
     }
 
-    // The record first: in a hosted project a file is listed only once it is recorded.
-    if let Err(e) = record_own_file(&state.storage, &normalized, &filename).await {
-        tracing::warn!(key = %file_key, error = %e, "pypi: failed to record an uploaded file");
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-    }
-
     // Store file
     if state.storage.put(&file_key, &data).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
@@ -853,6 +847,13 @@ async fn upload(
 
     // Hash marker: the simple index reads every digest from one listing.
     put_hash_marker(&state.storage, &normalized, &filename, &computed_hash).await;
+
+    // The record last: in a hosted project a file is listed once it is recorded, so a record
+    // always names the bytes this upload stored, never a file an upstream left under the name.
+    if let Err(e) = record_own_file(&state.storage, &normalized, &filename).await {
+        tracing::warn!(key = %file_key, error = %e, "pypi: failed to record an uploaded file");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     state.metrics.record_upload("pypi");
     let artifact = format!("{}-{}", name, version);
@@ -1327,9 +1328,9 @@ pub(crate) async fn claim_imported_project(
         .await
 }
 
-/// Record file `filename` of project `normalized` as NORA's own. Written before the file is
-/// stored: a hosted project lists a file only once it is recorded, and a record of a file that
-/// is not there lists nothing.
+/// Record file `filename` of project `normalized` as NORA's own. Written after the file and its
+/// digest are stored: a hosted project lists a file only once it is recorded, so a record always
+/// names bytes NORA stored, never what an upstream left under the same name.
 pub(crate) async fn record_own_file(
     storage: &crate::storage::Storage,
     normalized: &str,

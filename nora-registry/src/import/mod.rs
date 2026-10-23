@@ -2470,6 +2470,244 @@ mod integration_tests {
         assert_eq!(asked(&upstream).await, Vec::<String>::new());
     }
 
+    /// A store that fails, once armed, every write of an artifact under the key a client reads it
+    /// from (a `.whl` under `pypi/`, a `.nupkg` under the flat container): an import or an upload
+    /// that stops between making a name hosted and storing its first file.
+    struct FailsArtifactWrites {
+        inner: crate::storage::ObjectStorage,
+        armed: std::sync::atomic::AtomicBool,
+    }
+
+    impl FailsArtifactWrites {
+        fn fails(&self, key: &str) -> bool {
+            self.armed.load(std::sync::atomic::Ordering::SeqCst)
+                && ((key.starts_with("pypi/") && key.ends_with(".whl"))
+                    || (key.starts_with("nuget/flatcontainer/") && key.ends_with(".nupkg")))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for FailsArtifactWrites {
+        async fn put(&self, k: &str, d: &[u8], s: &str) -> crate::storage::Result<()> {
+            if self.fails(k) {
+                return Err(crate::storage::StorageError::Io(std::io::Error::other(
+                    "disk full",
+                )));
+            }
+            self.inner.put(k, d, s).await
+        }
+        async fn get(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            self.inner.get(k).await
+        }
+        async fn pin(&self, k: &str) -> Option<String> {
+            self.inner.pin(k).await
+        }
+        async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+            self.inner.delete(k).await
+        }
+        async fn list(&self, p: &str) -> crate::storage::Result<Vec<String>> {
+            self.inner.list(p).await
+        }
+        async fn stat(&self, k: &str) -> Option<crate::storage::FileMeta> {
+            self.inner.stat(k).await
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            0
+        }
+        fn backend_name(&self) -> &'static str {
+            "s3"
+        }
+        async fn put_from_path(
+            &self,
+            k: &str,
+            src: &std::path::Path,
+            s: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            if self.fails(k) {
+                return Err(crate::storage::StorageError::Io(std::io::Error::other(
+                    "disk full",
+                )));
+            }
+            self.inner.put_from_path(k, src, s).await
+        }
+        async fn copy(&self, a: &str, b: &str, s: Option<&str>) -> crate::storage::Result<()> {
+            self.inner.copy(a, b, s).await
+        }
+        async fn get_reader(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(k).await
+        }
+    }
+
+    /// An import that stops after it made a PyPI project or a NuGet package hosted and before
+    /// its first file is stored leaves the name NORA's own with nothing in it: no file an
+    /// upstream left under the same key is listed or served, and the upstream is not asked.
+    #[tokio::test]
+    async fn an_import_that_stops_before_the_first_file_leaves_the_name_hosted_and_empty() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_storage_and_config, send};
+        use axum::http::{Method, StatusCode};
+        use std::sync::atomic::Ordering;
+
+        struct Case {
+            rt: crate::registry_type::RegistryType,
+            format: &'static str,
+            cached: &'static str,
+            source: &'static str,
+            listing: &'static str,
+            file: &'static str,
+            name: &'static str,
+        }
+        for case in [
+            Case {
+                rt: crate::registry_type::RegistryType::PyPI,
+                format: "pypi",
+                cached: "pypi/corppkg/corppkg-1.0.0-py3-none-any.whl",
+                source: "corppkg/1.0.0/corppkg-1.0.0-py3-none-any.whl",
+                listing: "/simple/corppkg/",
+                file: "/simple/corppkg/corppkg-1.0.0-py3-none-any.whl",
+                name: "corppkg-1.0.0",
+            },
+            Case {
+                rt: crate::registry_type::RegistryType::Nuget,
+                format: "nuget",
+                cached: "nuget/flatcontainer/corp.lib/1.0.0/corp.lib.1.0.0.nupkg",
+                source: "Corp.Lib/Corp.Lib.1.0.nupkg",
+                listing: "/nuget/v3/flatcontainer/corp.lib/index.json",
+                file: "/nuget/v3/flatcontainer/corp.lib/1.0.0/corp.lib.1.0.0.nupkg",
+                name: "1.0.0",
+            },
+        ] {
+            let upstream = MockServer::start().await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                    r#"{{"versions":["1.0.0"]}} <a href="/f/{0}">{0}</a>"#,
+                    case.name
+                )))
+                .mount(&upstream)
+                .await;
+            let uri = upstream.uri();
+            let backend = std::sync::Arc::new(FailsArtifactWrites {
+                inner: crate::storage::ObjectStorage::in_memory(),
+                armed: Default::default(),
+            });
+            let ctx = create_test_context_with_storage_and_config(
+                crate::storage::Storage::from_backend(backend.clone()),
+                move |cfg| {
+                    cfg.pypi.enabled = true;
+                    cfg.pypi.proxy = Some(format!("{uri}/simple/"));
+                    cfg.nuget.enabled = true;
+                    cfg.nuget.proxy = Some(uri);
+                },
+            );
+            ctx.state
+                .storage
+                .put(case.cached, b"what an upstream served")
+                .await
+                .unwrap();
+            backend.armed.store(true, Ordering::SeqCst);
+            let artifact = match case.rt {
+                crate::registry_type::RegistryType::Nuget => nupkg("Corp.Lib", "1.0"),
+                _ => zip(&[("corppkg/__init__.py", b"", true)]),
+            };
+            let state = tempfile::tempdir().unwrap();
+            let res = import_as(
+                &ctx.state.storage,
+                case.rt,
+                case.format,
+                vec![(case.source.into(), artifact)],
+                state.path(),
+            )
+            .await;
+            assert_eq!(
+                (res.imported, res.failed),
+                (0, 1),
+                "{}: {res:?}",
+                case.format
+            );
+            let listing = send(&ctx.app, Method::GET, case.listing, "").await;
+            let status = listing.status();
+            let body = String::from_utf8_lossy(&body_bytes(listing).await).into_owned();
+            assert!(
+                !body.contains(case.name),
+                "{}: {status} {body}",
+                case.format
+            );
+            let file = send(&ctx.app, Method::GET, case.file, "").await;
+            assert_eq!(file.status(), StatusCode::NOT_FOUND, "{}", case.format);
+            assert_eq!(
+                asked(&upstream).await,
+                Vec::<String>::new(),
+                "{}",
+                case.format
+            );
+        }
+    }
+
+    /// An upload to a hosted project that fails to store its file does not make a file an
+    /// upstream left under the same name one of the project's own.
+    #[tokio::test]
+    async fn a_failed_upload_does_not_make_an_upstream_file_the_projects_own() {
+        use crate::test_helpers::{create_test_context_with_storage_and_config, send};
+        use axum::http::{Method, StatusCode};
+        use std::sync::atomic::Ordering;
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let backend = std::sync::Arc::new(FailsArtifactWrites {
+            inner: crate::storage::ObjectStorage::in_memory(),
+            armed: Default::default(),
+        });
+        let ctx = create_test_context_with_storage_and_config(
+            crate::storage::Storage::from_backend(backend.clone()),
+            move |cfg| {
+                cfg.pypi.enabled = true;
+                cfg.pypi.proxy = Some(format!("{uri}/simple/"));
+            },
+        );
+        let cached = "corppkg-1.0.0-py3-none-any.whl";
+        ctx.state
+            .storage
+            .put(
+                &format!("pypi/corppkg/{cached}"),
+                b"what an upstream served",
+            )
+            .await
+            .unwrap();
+        crate::registry::pypi_claim_imported_project(&ctx.state.storage, "corppkg")
+            .await
+            .unwrap();
+        backend.armed.store(true, Ordering::SeqCst);
+        let wheel = zip(&[("corppkg/__init__.py", b"", true)]);
+        let status = twine_upload(&ctx.app, "corppkg", "1.0.0", cached, &wheel).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(!simple_index(&ctx.app, "corppkg").await.contains(cached));
+        let file = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/simple/corppkg/{cached}"),
+            "",
+        )
+        .await;
+        assert_eq!(file.status(), StatusCode::NOT_FOUND);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+    }
+
     /// A .nupkg is imported only when it is a package of the id and version its key names: one
     /// whose .nuspec names another id or version, or that is no zip with a .nuspec, leaves
     /// nothing behind.
