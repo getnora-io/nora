@@ -1179,6 +1179,12 @@ pub(crate) async fn proxy_fetch_conditional(
                 cb.record_alive(&cb_key, probe);
                 return Err(ProxyError::NotFound);
             }
+            if status.is_redirection() {
+                // A redirect the client did not follow (off the upstream's origin): the
+                // upstream answered, as in proxy_fetch_core.
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(code));
+            }
             cb.record_failure(&cb_key, probe);
             Err(ProxyError::Upstream(code))
         }

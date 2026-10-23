@@ -1192,6 +1192,18 @@ async fn fetch_upstream_tarball(
     (named, fetched)
 }
 
+/// The client an upstream's metadata is fetched with. An upstream bound to a scope answers from
+/// its own origin only: a redirect off it is not followed, and the fetch fails with the 3xx (a
+/// 502 to the client), so neither the scope's package names nor the credential reach another
+/// origin. The default upstream follows redirects.
+fn metadata_client(state: &AppState, scoped: bool) -> &reqwest::Client {
+    if scoped {
+        &state.http_client_same_origin
+    } else {
+        &state.http_client
+    }
+}
+
 /// The link the trusted cached packument of `package` names for the tarball of `version`, if it
 /// lists that version: only a copy the package's owner delivered counts
 /// ([`cached_copy_trusted`]). Reached for a package not published here: the legacy key is then
@@ -1508,7 +1520,7 @@ async fn refetched_metadata(
     let had_validators = validators.is_some();
 
     match proxy_fetch_conditional(
-        &state.http_client,
+        metadata_client(state, upstream.scoped),
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -2140,7 +2152,7 @@ async fn uncached_upstream_metadata(
     };
     let url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
     match proxy_fetch(
-        &state.http_client,
+        metadata_client(state, upstream.scoped),
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -2285,7 +2297,7 @@ async fn upstream_metadata(
     };
     let url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
     match proxy_fetch(
-        &state.http_client,
+        metadata_client(state, upstream.scoped),
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -3137,7 +3149,7 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
     let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), package_name);
     if let Ok(data) = proxy_fetch(
-        &state.http_client,
+        metadata_client(state, upstream.scoped),
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -11852,5 +11864,134 @@ mod tarball_redirects {
             .filter(|(p, _)| *p == file)
             .collect();
         assert_eq!(tarball_asks, vec![(file.clone(), true)]);
+    }
+}
+
+/// An upstream bound to a scope answers that scope's metadata from its own origin only: a
+/// redirect off it is not followed — 502, nothing asked of the other origin, nothing cached —
+/// for a packument, a version manifest, any other metadata path and the packument a tarball
+/// download reads. The default upstream follows redirects as before.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod scoped_metadata_origin {
+    use crate::config::{NpmConfig, NpmProxyEntry};
+    use crate::secrets::ProtectedString;
+    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A server that sends every request to `to` + its path.
+    async fn redirecting(to: &str) -> MockServer {
+        let server = MockServer::start().await;
+        let to = to.to_string();
+        Mock::given(any())
+            .respond_with(move |req: &wiremock::Request| {
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{to}{}", req.url.path()).as_str())
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A server that answers anything with a packument listing `@vendor/pkg@1.0.0` and `pkg`'s.
+    async fn elsewhere() -> MockServer {
+        let server = MockServer::start().await;
+        let doc = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "versions": {"1.0.0": {"name": name, "version": "1.0.0", "dist": {}}},
+                "dist-tags": {"latest": "1.0.0"},
+            })
+        };
+        Mock::given(any())
+            .respond_with(move |req: &wiremock::Request| {
+                let name = if req.url.path().contains("@vendor") {
+                    "@vendor/pkg"
+                } else {
+                    "pkg"
+                };
+                ResponseTemplate::new(200).set_body_json(doc(name))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn context(public: &str, private: &str) -> TestContext {
+        let mut npm: NpmConfig = toml::from_str(&format!(
+            r#"proxies = ["{public}", {{ url = "{private}", scopes = ["@vendor"], auth_bearer_env = "NORA_NPM_VENDOR_TOKEN" }}]"#
+        ))
+        .unwrap();
+        if let NpmProxyEntry::Full(p) = &mut npm.proxies[1] {
+            p.auth_bearer = Some(ProtectedString::from("vendor-tok"));
+        }
+        let proxies = npm.proxies;
+        create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.server.trust_upstream_dates = true;
+        })
+    }
+
+    #[tokio::test]
+    async fn a_scoped_upstream_redirecting_metadata_elsewhere_is_502() {
+        let foreign = elsewhere().await;
+        let private = redirecting(&foreign.uri()).await;
+        let public = MockServer::start().await;
+        let ctx = context(&public.uri(), &private.uri());
+        let mut wrong = Vec::new();
+        for (uri, expected) in [
+            ("/npm/@vendor%2fpkg", StatusCode::BAD_GATEWAY),
+            ("/npm/@vendor/pkg", StatusCode::BAD_GATEWAY),
+            ("/npm/@vendor/pkg/1.0.0", StatusCode::BAD_GATEWAY),
+            ("/npm/@vendor/pkg/a/b", StatusCode::BAD_GATEWAY),
+            (
+                "/npm/-/package/@vendor/pkg/dist-tags",
+                StatusCode::BAD_GATEWAY,
+            ),
+            ("/npm/@vendor/pkg/-/pkg-1.0.0.tgz", StatusCode::BAD_GATEWAY),
+        ] {
+            let status = send(&ctx.app, Method::GET, uri, "").await.status();
+            if status != expected {
+                wrong.push(format!("{uri}: {status}, expected {expected}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        let asked = foreign.received_requests().await.unwrap();
+        assert!(asked.is_empty(), "the other origin was asked: {asked:?}");
+        assert!(public.received_requests().await.unwrap().is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let written = ctx.state.storage.list("npm/").await.unwrap();
+        assert!(written.is_empty(), "cached: {written:?}");
+    }
+
+    /// Control: the default upstream's redirect is followed, as before.
+    #[tokio::test]
+    async fn the_default_upstream_still_follows_a_redirect() {
+        let foreign = elsewhere().await;
+        let public = redirecting(&foreign.uri()).await;
+        let private = MockServer::start().await;
+        let ctx = context(&public.uri(), &private.uri());
+        let status = send(&ctx.app, Method::GET, "/npm/pkg", "").await.status();
+        assert_eq!(status, StatusCode::OK);
+        assert!(!foreign.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The audit endpoints name no scope, so they go to the default upstream — never one bound
+    /// to a scope, whose redirects are not followed.
+    #[test]
+    fn the_audit_endpoints_go_to_the_default_upstream() {
+        let ctx = context("https://registry.example", "https://vendor.example");
+        for path in [
+            "-/npm/v1/security/advisories/bulk",
+            "-/npm/v1/security/audits/quick",
+            "-/npm/v1/security/audits",
+        ] {
+            let upstream = ctx.state.config.npm.route(path).unwrap();
+            assert_eq!(upstream.url, "https://registry.example", "{path}");
+            assert!(!upstream.scoped, "{path}");
+        }
+        assert!(ctx.state.config.npm.route("@vendor/pkg").unwrap().scoped);
     }
 }
