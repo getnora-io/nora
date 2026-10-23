@@ -920,4 +920,27 @@ mod tests {
         let parsed: DigestEntry = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.digest, "sha256:abc");
     }
+
+    /// Every line of an old ledger loses its credential on load, not only the first: the
+    /// rewrite keeps none of the users or passwords any line carried.
+    #[test]
+    fn every_credential_already_in_the_ledger_is_masked_on_load() {
+        let tmp = TempDir::new().unwrap();
+        let ledger = tmp.path().join("quarantine.jsonl");
+        let now = Utc::now().timestamp();
+        let mut text = String::new();
+        for (digest, user) in [("sha256:aaa", "first-user"), ("sha256:bbb", "second-user")] {
+            let line = serde_json::json!({
+                "registry": "npm", "digest": digest, "first_seen": now,
+                "upstream": format!("https://{user}:s3cret@npm.example/pkg/-/pkg-1.0.0.tgz"),
+            });
+            text.push_str(&format!("{line}\n"));
+        }
+        std::fs::write(&ledger, text).unwrap();
+        let store = DigestStore::load(tmp.path().to_str().unwrap());
+        assert_eq!(store.len(), 2);
+        let written = std::fs::read_to_string(&ledger).unwrap();
+        assert!(!written.contains("s3cret"), "{written}");
+        assert!(!written.contains("-user"), "{written}");
+    }
 }

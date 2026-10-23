@@ -266,3 +266,26 @@ fn the_credential_in_the_upstream_url_is_not_written_down() {
         }
     }
 }
+
+/// A log line that carries the upstream's URL as it is (the retry of a 5xx) is masked on
+/// stdout too.
+#[test]
+fn a_retried_upstream_url_is_logged_without_its_credential() {
+    let registry = upstream(|_| {
+        "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            .to_string()
+    });
+    let server = serve(&[
+        (
+            "NORA_NPM_PROXY",
+            &format!("http://nora-user:s3cret-pass@127.0.0.1:{}", registry.port),
+        ),
+        ("RUST_LOG", "debug"),
+    ]);
+    let _ = status_of(server.port, "/npm/pkg");
+    let log = std::fs::read_to_string(server.dir.path().join("nora.log")).unwrap();
+    assert!(log.contains("retrying"), "no retry logged: {log}");
+    for secret in ["s3cret-pass", "nora-user"] {
+        assert!(!log.contains(secret), "log holds {secret}: {log}");
+    }
+}

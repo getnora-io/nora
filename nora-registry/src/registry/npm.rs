@@ -4330,6 +4330,44 @@ mod integration_tests {
         );
     }
 
+    /// A GitHub Packages download path of a version the upstream's packument does not list is
+    /// not asked for, as for the `/-/` form: 404, no `/download/` request.
+    #[tokio::test]
+    async fn an_unlisted_github_packages_download_is_not_asked_for() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SHA: &str = "04fef883382f5a7c9b9ac2015dcc419009e2a858";
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/download/@vendor/a/0.9.0/{SHA}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UNLISTED".to_vec()))
+            .mount(&upstream)
+            .await;
+        let listed = format!("download/@vendor/a/1.0.0/{SHA}");
+        super::mount_listing(&upstream, "@vendor/a", &[("1.0.0", &listed)]).await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/npm/download/@vendor/a/0.9.0/{SHA}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let fetched = upstream.received_requests().await.unwrap();
+        assert!(
+            fetched
+                .iter()
+                .all(|r| !r.url.path().starts_with("/download/")),
+            "an unlisted tarball was fetched"
+        );
+    }
+
     #[tokio::test]
     async fn allowlist_refuses_a_tarball_whose_version_it_cannot_read() {
         use crate::test_helpers::{create_test_context_with_config, send};
@@ -11241,6 +11279,69 @@ mod upstream_origin_tarballs {
             (StatusCode::OK, "GITLAB-TGZ".to_string())
         );
     }
+
+    /// A copy an older release cached under the legacy key, not delivered by the scope's owner,
+    /// does not say where to fetch either: the owner's own listing does, with its token.
+    #[tokio::test]
+    async fn a_legacy_copy_the_owner_did_not_deliver_does_not_say_where_to_fetch() {
+        let public = open_server().await;
+        let gitlab = gitlab(MockServer::uri).await;
+        let squatted = "/api/v4/projects/666/packages/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz";
+        Mock::given(method("GET"))
+            .and(path(squatted))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SQUATTED".to_vec()))
+            .mount(&gitlab)
+            .await;
+        let ctx = context_with(&public.uri(), &instance(&gitlab), 3600, false);
+        let cached = packument(NAME, &format!("{}{squatted}", gitlab.uri()));
+        ctx.state
+            .storage
+            .put(&super::legacy_cache_key(NAME), cached.as_bytes())
+            .await
+            .unwrap();
+        let (status, body) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, b"GITLAB-TGZ".as_slice()),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let asked: Vec<String> = log(&gitlab).await.into_iter().map(|(p, _)| p).collect();
+        assert!(!asked.iter().any(|p| p == squatted), "{asked:?}");
+    }
+
+    /// The public upstream at the root of the owner's host is another upstream: a copy it
+    /// delivered (its provenance names `npm:http://host:port`, a prefix of the owner's
+    /// `…/api/v4/packages/npm`) is not the owner's.
+    #[tokio::test]
+    async fn a_copy_from_an_upstream_whose_url_prefixes_the_owners_is_not_trusted() {
+        let gitlab = gitlab(MockServer::uri).await;
+        let squatted = "/api/v4/projects/666/packages/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz";
+        Mock::given(method("GET"))
+            .and(path(squatted))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SQUATTED".to_vec()))
+            .mount(&gitlab)
+            .await;
+        let ctx = context_with(&gitlab.uri(), &instance(&gitlab), 3600, false);
+        let cached = packument(NAME, &format!("{}{squatted}", gitlab.uri()));
+        super::put_with_origin(
+            &ctx.state.storage,
+            &super::upstream_packument_key(NAME),
+            cached.as_bytes(),
+            &super::origin_of(&gitlab.uri()),
+        )
+        .await
+        .unwrap();
+        let (status, body) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, b"GITLAB-TGZ".as_slice()),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let asked: Vec<String> = log(&gitlab).await.into_iter().map(|(p, _)| p).collect();
+        assert!(!asked.iter().any(|p| p == squatted), "{asked:?}");
+    }
 }
 
 /// A tarball is fetched only for a version the upstream's trusted packument lists, from the link
@@ -11820,6 +11921,23 @@ mod tarball_redirects {
                 "{uri}"
             );
         }
+    }
+
+    /// An upstream that has no packument for the package lists no version of it: the tarball
+    /// is not asked for, 404, nothing cached.
+    #[tokio::test]
+    async fn a_package_without_a_packument_upstream_is_not_asked_for_a_tarball() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/-/pkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UNLISTED".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(asks_of(&upstream, "/pkg/-/pkg-1.0.0.tgz").await, 0);
+        assert!(cached_tarballs(&ctx).await.is_empty());
     }
 }
 
