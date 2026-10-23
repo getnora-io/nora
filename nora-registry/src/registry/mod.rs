@@ -405,7 +405,51 @@ fn policy_block_reason(headers: &reqwest::header::HeaderMap) -> Option<&'static 
     Some(if is_geo { "geo" } else { "waf" })
 }
 
-/// Core fetch logic with retry. Callers provide a response extractor.
+/// Where a redirect the client handed back unfollowed points, resolved against the URL that
+/// answered: `None` for one pointing nowhere readable.
+fn unfollowed_redirect(response: &reqwest::Response) -> Option<String> {
+    response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| response.url().join(v).ok())
+        .map(String::from)
+}
+
+/// What a fetch with a client that follows redirects only on the origin of the URL asked
+/// (`build_same_origin_client`) gave.
+#[derive(Debug)]
+pub(crate) enum OnOrigin {
+    /// The body, from the origin.
+    Body(Vec<u8>),
+    /// A redirect off the origin, to this URL, not followed.
+    Elsewhere(String),
+}
+
+/// [`proxy_fetch`] with a client that follows redirects only on the origin of `url`: a redirect
+/// off it is the answer, [`OnOrigin::Elsewhere`], for the caller to follow or not.
+pub(crate) async fn proxy_fetch_on_origin(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<OnOrigin, ProxyError> {
+    proxy_fetch_core_with(
+        client,
+        url,
+        timeout,
+        auth,
+        None,
+        |r| async { r.bytes().await.map(|b| OnOrigin::Body(b.to_vec())) },
+        |r| unfollowed_redirect(r).map(OnOrigin::Elsewhere),
+        cb,
+        scope,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_fetch_core<T, F, Fut>(
     client: &reqwest::Client,
@@ -420,6 +464,39 @@ async fn proxy_fetch_core<T, F, Fut>(
 where
     F: Fn(reqwest::Response) -> Fut + Copy,
     Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
+{
+    proxy_fetch_core_with(
+        client,
+        url,
+        timeout,
+        auth,
+        extra_headers,
+        extract,
+        |_| None,
+        cb,
+        scope,
+    )
+    .await
+}
+
+/// [`proxy_fetch_core`], a redirect handed back unfollowed answered by `redirected` when it
+/// makes something of it, else an `Upstream` error of its status.
+#[allow(clippy::too_many_arguments)]
+async fn proxy_fetch_core_with<T, F, Fut, R>(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    extra_headers: Option<(&str, &str)>,
+    extract: F,
+    redirected: R,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<T, ProxyError>
+where
+    F: Fn(reqwest::Response) -> Fut + Copy,
+    Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
+    R: Fn(&reqwest::Response) -> Option<T>,
 {
     let auth_header = upstream_auth_header(auth)?;
     let scope = scope.into();
@@ -461,26 +538,10 @@ where
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "3xx"])
                         .observe(elapsed);
-                    // A redirect the client did not follow (one off the upstream's origin, see
-                    // `build_same_origin_client`) is the upstream's answer, not its failure: it
-                    // is not asked again, and the breaker sees it alive. Only the host it pointed
-                    // to is logged; the path names the package.
-                    let to = response
-                        .headers()
-                        .get(header::LOCATION)
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(|v| reqwest::Url::parse(url).ok()?.join(v).ok())
-                        .and_then(|v| v.host_str().map(str::to_string))
-                        .unwrap_or_default();
-                    tracing::warn!(
-                        registry = registry_str,
-                        url,
-                        status,
-                        to,
-                        "upstream redirected off its origin, not followed"
-                    );
+                    // The upstream answered, and pointed elsewhere: not asked again, and alive
+                    // to the breaker. What follows is the caller's.
                     cb.record_alive(&cb_key, probe);
-                    return Err(ProxyError::Upstream(status));
+                    return redirected(&response).ok_or(ProxyError::Upstream(status));
                 }
                 if (400..500).contains(&status) {
                     UPSTREAM_REQUEST_DURATION
@@ -1804,6 +1865,12 @@ mod first_download_integrity {
     #[tokio::test]
     async fn npm() {
         let s = upstream().await;
+        crate::registry::npm::mount_listing(
+            &s,
+            "corp-lib",
+            &[("1.0.0", "corp-lib/-/corp-lib-1.0.0.tgz")],
+        )
+        .await;
         let uri = "/npm/corp-lib/-/corp-lib-1.0.0.tgz";
         refused(&s, "npm", "corp-lib", "1.0.0", uri, |c, u| {
             c.npm.proxy = Some(u);

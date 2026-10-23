@@ -95,7 +95,7 @@ fn status_of(port: u16, path: &str) -> String {
 }
 
 /// A local upstream on a thread of its own: a request gets what `answer` makes of its request
-/// line, and the line is kept.
+/// line, and the line is kept, ` +authorization` after it when the request carried one.
 struct Upstream {
     port: u16,
     seen: Arc<Mutex<Vec<String>>>,
@@ -115,13 +115,18 @@ fn upstream(answer: impl Fn(&str) -> String + Send + 'static) -> Upstream {
             while !request.ends_with(b"\r\n\r\n") && stream.read(&mut byte).unwrap_or(0) == 1 {
                 request.push(byte[0]);
             }
+            let head = String::from_utf8_lossy(&request).to_ascii_lowercase();
             let line = String::from_utf8_lossy(&request)
                 .lines()
                 .next()
                 .unwrap_or("")
                 .to_string();
             let _ = stream.write_all(answer(&line).as_bytes());
-            log.lock().unwrap().push(line);
+            let authorized = head.lines().any(|h| h.starts_with("authorization:"));
+            log.lock().unwrap().push(format!(
+                "{line}{}",
+                if authorized { " +authorization" } else { "" }
+            ));
         }
     });
     Upstream { port, seen }
@@ -129,69 +134,102 @@ fn upstream(answer: impl Fn(&str) -> String + Send + 'static) -> Upstream {
 
 const NOT_FOUND: &str = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
+/// A packument listing `pkg@1.0.0` at `http://127.0.0.1:<port>/pkg/-/pkg-1.0.0.tgz`: the
+/// upstream's origin, as a registry names its own tarballs.
+fn listing(port: u16) -> String {
+    let body = format!(
+        r#"{{"name":"pkg","versions":{{"1.0.0":{{"dist":{{"tarball":"http://127.0.0.1:{port}/pkg/-/pkg-1.0.0.tgz"}}}}}}}}"#
+    );
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// A listed tarball the upstream keeps on another origin (GitHub Packages' storage host) is
+/// fetched from there, and the upstream's credential goes no further than its origin: neither
+/// the first hop off it nor a later one on that other host carries it.
 #[test]
-fn the_served_npm_client_does_not_follow_a_redirect_to_another_origin() {
-    let foreign = upstream(|_| {
-        "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nELSEWHERE".to_string()
+fn a_tarball_redirected_to_another_origin_is_fetched_without_the_credential() {
+    let foreign = upstream(|line| {
+        if line.starts_with("GET /hop1 ") {
+            "HTTP/1.1 302 Found\r\nLocation: /files/pkg-1.0.0.tgz\r\n\
+             Content-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string()
+        } else {
+            "HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nELSEWHERE".to_string()
+        }
     });
     let to = foreign.port;
-    let registry = upstream(move |line| {
+    let registry = Arc::new(Mutex::new(0u16));
+    let own = Arc::clone(&registry);
+    let registry_upstream = upstream(move |line| {
         if line.starts_with("GET /pkg/-/pkg-1.0.0.tgz ") {
             format!(
-                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{to}/files/pkg-1.0.0.tgz\r\n\
+                "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:{to}/hop1\r\n\
                  Content-Length: 0\r\nConnection: close\r\n\r\n"
             )
+        } else if line.starts_with("GET /pkg ") {
+            listing(*own.lock().unwrap())
         } else {
             NOT_FOUND.to_string()
         }
     });
-    let server = serve(&[(
-        "NORA_NPM_PROXY",
-        &format!("http://nora-user:s3cret-pass@127.0.0.1:{}", registry.port),
-    )]);
+    *registry.lock().unwrap() = registry_upstream.port;
+    let server = serve(&[
+        (
+            "NORA_NPM_PROXY",
+            &format!(
+                "http://nora-user:s3cret-pass@127.0.0.1:{}",
+                registry_upstream.port
+            ),
+        ),
+        ("RUST_LOG", "debug"),
+    ]);
     let status = status_of(server.port, "/npm/pkg/-/pkg-1.0.0.tgz");
-    assert!(status.contains(" 502 "), "{status}");
-    // The refusal is logged with the upstream's URL, its credential masked.
-    let log = std::fs::read_to_string(server.dir.path().join("nora.log")).unwrap();
+    assert!(status.contains(" 200 "), "{status}");
+    let asked = registry_upstream.seen.lock().unwrap().clone();
     assert!(
-        log.contains(&format!("***@127.0.0.1:{}", registry.port)),
-        "the log does not name the upstream: {log}"
-    );
-    assert!(
-        !log.contains("s3cret-pass") && !log.contains("nora-user"),
-        "{log}"
-    );
-    // Of where it pointed, only the host: the path names the package.
-    assert!(log.contains(r#""to":"127.0.0.1""#), "{log}");
-    assert!(!log.contains("/files/pkg-1.0.0.tgz"), "{log}");
-    assert!(
-        registry
-            .seen
-            .lock()
-            .unwrap()
+        asked
             .iter()
-            .any(|line| line.contains("/pkg/-/pkg-1.0.0.tgz")),
-        "the registry was not asked: {:?}",
-        registry.seen.lock().unwrap()
+            .any(|line| line.starts_with("GET /pkg/-/pkg-1.0.0.tgz ")
+                && line.ends_with(" +authorization")),
+        "the upstream was not asked with its credential: {asked:?}"
     );
+    let elsewhere = foreign.seen.lock().unwrap().clone();
+    assert_eq!(elsewhere.len(), 2, "{elsewhere:?}");
     assert!(
-        foreign.seen.lock().unwrap().is_empty(),
-        "{:?}",
-        foreign.seen.lock().unwrap()
+        elsewhere
+            .iter()
+            .all(|line| !line.contains("+authorization")),
+        "the credential left the upstream's origin: {elsewhere:?}"
     );
+    // Of where it pointed, the log names only the host: the path names the package.
+    let log = std::fs::read_to_string(server.dir.path().join("nora.log")).unwrap();
+    assert!(log.contains(r#""to":"127.0.0.1""#), "{log}");
+    assert!(!log.contains("/hop1"), "{log}");
+    for secret in ["s3cret-pass", "nora-user"] {
+        assert!(!log.contains(secret), "{log}");
+    }
 }
 
 /// The quarantine ledger and the server's log name the upstream a tarball came from without
 /// the credential in its URL.
 #[test]
 fn the_credential_in_the_upstream_url_is_not_written_down() {
-    let registry = upstream(|line| {
+    let port = Arc::new(Mutex::new(0u16));
+    let own = Arc::clone(&port);
+    let registry = upstream(move |line| {
         if line.starts_with("GET /pkg/-/pkg-1.0.0.tgz ") {
             "HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: close\r\n\r\nTGZ".to_string()
+        } else if line.starts_with("GET /pkg ") {
+            listing(*own.lock().unwrap())
         } else {
             NOT_FOUND.to_string()
         }
     });
+    *port.lock().unwrap() = registry.port;
     let server = serve(&[
         (
             "NORA_NPM_PROXY",

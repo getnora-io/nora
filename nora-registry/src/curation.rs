@@ -708,8 +708,8 @@ pub fn verify_integrity_by_hash(
 // Version parsers for filename-based registries (issue #187)
 // ============================================================================
 
-/// Parse version from an npm tarball filename ([`nora_registry::npm_files`]).
-pub use nora_registry::npm_files::parse_npm_tarball_version;
+/// The version an npm tarball file name gives ([`nora_registry::npm_links`]).
+pub use nora_registry::npm_links::parse_npm_tarball_version;
 
 /// A PEP 440 version as `packaging.version.Version` reads one (the spec's `VERSION_PATTERN`:
 /// case-insensitive, an optional leading `v`, surrounding whitespace allowed). Numbers are kept
@@ -4194,6 +4194,27 @@ mod tests {
         assert_eq!(parse("lodash", "/lodash-4.17.21.tgz"), None);
         assert_eq!(parse("lodash", "x/4.17.21/lodash-4.17.21.tgz"), None);
         assert_eq!(parse("lodash", "4.17.21/express-4.17.21.tgz"), None);
+    }
+
+    /// The fuzz copy in `lib.rs` parses the same forms as the one curation uses.
+    #[test]
+    fn the_fuzzed_npm_parser_matches_the_one_curation_uses() {
+        for (name, file) in [
+            ("lodash", "lodash-4.17.21.tgz"),
+            ("@babel/core", "core-7.26.0.tgz"),
+            ("@vendor/a", "@vendor/a-1.0.0.tgz"),
+            ("@vendor/a", "@other/a-1.0.0.tgz"),
+            ("@fortawesome/pro-test", "1.0.0/pro-test-1.0.0.tgz"),
+            ("@fortawesome/pro-test", "9.9.9/pro-test-1.0.0.tgz"),
+            ("lodash", "x/4.17.21/lodash-4.17.21.tgz"),
+            ("lodash", "lodash-.tgz"),
+        ] {
+            assert_eq!(
+                super::parse_npm_tarball_version(name, file),
+                nora_registry::version_fuzz::parse_npm_tarball_version(name, file),
+                "{name} {file}"
+            );
+        }
     }
 
     #[test]

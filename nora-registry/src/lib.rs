@@ -21,7 +21,7 @@
 )]
 //! NORA Registry — library interface for fuzzing and testing
 
-pub mod npm_files;
+pub mod npm_links;
 pub mod pypi_files;
 pub mod upstream_rewrite;
 pub mod upstream_url;
@@ -290,7 +290,7 @@ pub mod maven_fuzz {
 /// Re-export version parsing for fuzz targets: the server's own readers, so the fuzz targets
 /// drive the code that runs.
 pub mod version_fuzz {
-    pub use crate::npm_files::parse_npm_tarball_version;
+    pub use crate::npm_links::parse_npm_tarball_version;
     pub use crate::pypi_files::parse_pypi_version;
 }
 
@@ -323,7 +323,7 @@ mod one_implementation_tests {
     /// The modules of their own files this file declares: the code they hold is compiled once,
     /// for the server and the fuzz targets alike.
     const SHARED: &[&str] = &[
-        "npm_files",
+        "npm_links",
         "pypi_files",
         "upstream_rewrite",
         "upstream_url",
