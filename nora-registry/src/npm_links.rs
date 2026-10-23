@@ -289,6 +289,185 @@ pub fn upstream_url_forms(upstream_url: &str) -> Vec<String> {
         .collect()
 }
 
+/// The upstream a cached copy came from, as an upstream's URL names it and as a provenance record
+/// names the upstream (`npm:<url>`, the breaker's key): scheme, host, port, path and query,
+/// parsed. Userinfo, a trailing `/`, the case of the host and a port that is the scheme's own are
+/// not part of it, so one upstream is one identity; two upstreams on one host are two.
+#[derive(Debug, PartialEq, Eq)]
+pub struct UpstreamIdentity {
+    scheme: String,
+    host: Option<String>,
+    port: Option<u16>,
+    path: String,
+    query: Option<String>,
+}
+
+impl UpstreamIdentity {
+    /// The identity of the upstream at `url`, `None` for a URL that does not parse.
+    pub fn of_url(url: &str) -> Option<Self> {
+        let url = Url::parse(url).ok()?;
+        Some(Self {
+            scheme: url.scheme().to_string(),
+            host: url.host_str().map(str::to_string),
+            port: url.port_or_known_default(),
+            path: url.path().trim_end_matches('/').to_string(),
+            query: url.query().map(str::to_string),
+        })
+    }
+
+    /// The identity a provenance record of the npm format names, `None` for any other.
+    pub fn of_record(origin: &str) -> Option<Self> {
+        Self::of_url(origin.strip_prefix("npm:")?)
+    }
+}
+
+/// Whether a cached copy is the one the upstream at `owner_url` delivered: its provenance
+/// `record` (`None`: there is no sidecar) names that upstream ([`UpstreamIdentity`], not a
+/// string or a prefix of it) and vouches for exactly the bytes stored, whose pin is `pin`.
+pub fn copy_is_owners(record: Option<&[u8]>, pin: Option<&str>, owner_url: &str) -> bool {
+    let Some((origin, digest)) = record
+        .and_then(|r| std::str::from_utf8(r).ok())
+        .and_then(|r| r.split_once('\n'))
+    else {
+        return false;
+    };
+    match (
+        UpstreamIdentity::of_record(origin),
+        UpstreamIdentity::of_url(owner_url),
+    ) {
+        (Some(recorded), Some(owner)) => recorded == owner && pin == Some(digest),
+        _ => false,
+    }
+}
+
+/// GitHub Packages' tarball path, `download/<@scope/name>/<version>/<sha1>`: the package
+/// name and version, or `None` for any other path. It has no `/-/`, so without this it
+/// would be taken for the packument of a package named `download/…` and skip every
+/// tarball check, curation included.
+pub fn github_packages_tarball(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("download/")?;
+    let mut segments = rest.split('/');
+    let (scope, name, version, sha) = (
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+        segments.next()?,
+    );
+    if segments.next().is_some()
+        || scope.len() < 2
+        || !scope.starts_with('@')
+        || name.is_empty()
+        || version.is_empty()
+        || sha.is_empty()
+        || !sha.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some((&rest[..scope.len() + 1 + name.len()], version))
+}
+
+/// A download of an upstream tarball, whichever route form asked it — `<package>/-/<file>` or
+/// GitHub Packages' `download/<package>/<version>/<sha1>` — parsed once ([`TarballAsk::parse`]),
+/// so what is done with it ([`tarball_step`]) does not depend on the form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TarballAsk<'a> {
+    package: &'a str,
+    version: String,
+    path: &'a str,
+}
+
+impl<'a> TarballAsk<'a> {
+    /// The download `path` asks, `None` for a path that is no tarball of a version.
+    pub fn parse(path: &'a str) -> Option<Self> {
+        if let Some((package, version)) = github_packages_tarball(path) {
+            return Some(Self {
+                package,
+                version: version.to_string(),
+                path,
+            });
+        }
+        let (package, file) = path.split_once("/-/")?;
+        Some(Self {
+            package,
+            version: parse_npm_tarball_version(package, file)?,
+            path,
+        })
+    }
+
+    pub fn package(&self) -> &'a str {
+        self.package
+    }
+
+    pub fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub fn path(&self) -> &'a str {
+        self.path
+    }
+}
+
+/// What the upstream's packument, fetched again for a download, said.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Refetched<E> {
+    /// The packument: the link it names for the version, `None` when it lists no such version.
+    Packument(Option<String>),
+    /// The upstream has no packument for the package (404).
+    NoPackument,
+    /// The upstream failed to give one: nothing is known of the version.
+    Failed(E),
+}
+
+/// What a download of an upstream tarball does next ([`tarball_step`]).
+#[derive(Debug, PartialEq, Eq)]
+pub enum TarballStep<E> {
+    /// Ask `asked` with the upstream's credential; `named` is what the download is recorded as.
+    Ask { asked: String, named: String },
+    /// Fetch the upstream's packument again: the trusted copy does not list the version (it may
+    /// be newer than the copy).
+    Refetch,
+    /// No packument of the upstream lists the file: 404, nothing asked.
+    NotFound,
+    /// The upstream failed to give its packument: its failure, not a missing tarball.
+    UpstreamFailed(E),
+}
+
+/// The one decision on a download of `ask` from `upstream` (invariant: a tarball is asked only
+/// for a version the upstream's trusted packument lists): `copy` is the link the trusted copy
+/// of the owner names for the version, `refetched` what the packument fetched again said
+/// (`None` before it is fetched). Either route form of `ask` is decided alike.
+pub fn tarball_step<E>(
+    ask: &TarballAsk<'_>,
+    upstream: &str,
+    nora_npm_base: &str,
+    copy: Option<&str>,
+    refetched: Option<Refetched<E>>,
+    key_ok: &dyn Fn(&str) -> bool,
+) -> TarballStep<E> {
+    let source = |listed: Option<&str>| {
+        tarball_source(
+            upstream,
+            nora_npm_base,
+            ask.package,
+            ask.path,
+            listed,
+            key_ok,
+        )
+    };
+    if let TarballSource::Ask { asked, named } = source(copy) {
+        return TarballStep::Ask { asked, named };
+    }
+    match refetched {
+        None => TarballStep::Refetch,
+        Some(Refetched::Packument(listed)) => match source(listed.as_deref()) {
+            TarballSource::Ask { asked, named } => TarballStep::Ask { asked, named },
+            TarballSource::NotListed => TarballStep::NotFound,
+        },
+        Some(Refetched::NoPackument) => TarballStep::NotFound,
+        Some(Refetched::Failed(e)) => TarballStep::UpstreamFailed(e),
+    }
+}
+
 /// The link the packument `doc` names for the tarball of `version`, if it lists that version.
 pub fn listed_link(doc: &[u8], version: &str) -> Option<String> {
     #[derive(serde::Deserialize)]
@@ -598,6 +777,240 @@ mod tests {
 
     fn any_key(_: &str) -> bool {
         true
+    }
+
+    /// A cached copy is the owner's only when its provenance names the owner's upstream —
+    /// parsed, so userinfo, a trailing `/`, the host's case and the scheme's own port do not
+    /// matter, and an upstream at the root of the owner's host (or under it) is another — and
+    /// vouches for the bytes stored.
+    #[test]
+    fn a_copy_is_the_owners_only_when_its_provenance_names_the_owner() {
+        const OWNER: &str = "http://h:4873/api/v4/packages/npm";
+        const PIN: &str = "d1g3st";
+        let record = |origin: &str| format!("{origin}\n{PIN}");
+        // (provenance record, pin of the stored bytes, owner URL, the owner's copy)
+        let rows: [(Option<String>, Option<&str>, &str, bool); 17] = [
+            (
+                Some(record("npm:http://h:4873/api/v4/packages/npm")),
+                Some(PIN),
+                OWNER,
+                true,
+            ),
+            (
+                Some(record("npm:http://h:4873/api/v4/packages/npm")),
+                Some(PIN),
+                "http://u:p@h:4873/api/v4/packages/npm/",
+                true,
+            ),
+            (
+                Some(record("npm:http://h:4873/api/v4/packages/npm")),
+                Some(PIN),
+                "http://H:4873/api/v4/packages/npm",
+                true,
+            ),
+            (
+                Some(record("npm:http://h/api")),
+                Some(PIN),
+                "http://h:80/api",
+                true,
+            ),
+            (
+                Some(record("npm:https://h/api")),
+                Some(PIN),
+                "https://h:443/api/",
+                true,
+            ),
+            // An origin prefix, either way: another upstream on the same host.
+            (Some(record("npm:http://h:4873")), Some(PIN), OWNER, false),
+            (
+                Some(record("npm:http://h:4873/api")),
+                Some(PIN),
+                OWNER,
+                false,
+            ),
+            (
+                Some(record("npm:http://h:4873/api/v4/packages/npm/sub")),
+                Some(PIN),
+                OWNER,
+                false,
+            ),
+            (
+                Some(record("npm:http://h:4873/api/v4/packages/npm")),
+                Some(PIN),
+                "http://h:4873",
+                false,
+            ),
+            (
+                Some(record("npm:http://h:4874/api/v4/packages/npm")),
+                Some(PIN),
+                OWNER,
+                false,
+            ),
+            (
+                Some(record("npm:https://h:4873/api/v4/packages/npm")),
+                Some(PIN),
+                OWNER,
+                false,
+            ),
+            (
+                Some(record("npm:http://other:4873/api/v4/packages/npm")),
+                Some(PIN),
+                OWNER,
+                false,
+            ),
+            (
+                Some(record("pypi:http://h:4873/api/v4/packages/npm")),
+                Some(PIN),
+                OWNER,
+                false,
+            ),
+            // No sidecar, bytes it does not vouch for, a record that does not read.
+            (None, Some(PIN), OWNER, false),
+            (
+                Some(record("npm:http://h:4873/api/v4/packages/npm")),
+                Some("other"),
+                OWNER,
+                false,
+            ),
+            (
+                Some(record("npm:http://h:4873/api/v4/packages/npm")),
+                None,
+                OWNER,
+                false,
+            ),
+            (
+                Some("npm:http://h:4873/api/v4/packages/npm".to_string()),
+                Some(PIN),
+                OWNER,
+                false,
+            ),
+        ];
+        for (record, pin, owner, expected) in rows {
+            assert_eq!(
+                copy_is_owners(record.as_deref().map(str::as_bytes), pin, owner),
+                expected,
+                "{record:?} pin {pin:?} owner {owner}"
+            );
+        }
+    }
+
+    /// Both route forms of a download parse to one value: the package, the version and the
+    /// path asked; anything else is no download.
+    #[test]
+    fn either_route_form_of_a_download_parses_to_one_value() {
+        const SHA: &str = "04fef883382f5a7c9b9ac2015dcc419009e2a858";
+        let ghp = format!("download/@vendor/pkg/1.0.0/{SHA}");
+        for (path, expected) in [
+            ("pkg/-/pkg-1.0.0.tgz", Some(("pkg", "1.0.0"))),
+            (
+                "@vendor/pkg/-/pkg-1.0.0.tgz",
+                Some(("@vendor/pkg", "1.0.0")),
+            ),
+            (
+                "@vendor/pkg/-/@vendor/pkg-1.0.0.tgz",
+                Some(("@vendor/pkg", "1.0.0")),
+            ),
+            (ghp.as_str(), Some(("@vendor/pkg", "1.0.0"))),
+            ("pkg", None),
+            ("pkg/-/other-1.0.0.tgz", None),
+            ("download/@vendor/pkg/1.0.0/not-hex", None),
+        ] {
+            let parsed = TarballAsk::parse(path);
+            assert_eq!(
+                parsed.as_ref().map(|a| (a.package(), a.version())),
+                expected,
+                "{path}"
+            );
+            if let Some(ask) = parsed {
+                assert_eq!(ask.path(), path);
+            }
+        }
+    }
+
+    /// The one decision on a download, every combination of what the owner's trusted copy
+    /// names for the version and what the packument fetched again said, for both route forms
+    /// alike: the tarball is asked only when one of them lists this file on the upstream; the
+    /// packument is fetched again when the copy does not; no packument, or one without the
+    /// file, is 404; a packument the upstream failed to give is the upstream's failure.
+    #[test]
+    fn a_tarball_is_asked_only_when_a_packument_of_the_upstream_lists_it() {
+        const UP: &str = "http://registry.example";
+        const SHA: &str = "04fef883382f5a7c9b9ac2015dcc419009e2a858";
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Link {
+            Own,
+            Foreign,
+            Absent,
+        }
+        #[derive(Debug, Clone, Copy, PartialEq)]
+        enum Got {
+            Ask,
+            Refetch,
+            NotFound,
+            Failed,
+        }
+        let ghp = format!("download/@vendor/pkg/1.0.0/{SHA}");
+        for (path, own) in [
+            (
+                "@vendor/pkg/-/pkg-1.0.0.tgz",
+                format!("{UP}/@vendor/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (ghp.as_str(), format!("{UP}/{ghp}")),
+        ] {
+            let ask = TarballAsk::parse(path).unwrap();
+            let foreign = own.replace("registry.example", "elsewhere.example");
+            let link = |l: Link| match l {
+                Link::Own => Some(own.clone()),
+                Link::Foreign => Some(foreign.clone()),
+                Link::Absent => None,
+            };
+            for copy in [Link::Own, Link::Foreign, Link::Absent] {
+                // (what the packument fetched again said, `None` before it is fetched)
+                let refetches: [Option<Refetched<&str>>; 6] = [
+                    None,
+                    Some(Refetched::Packument(link(Link::Own))),
+                    Some(Refetched::Packument(link(Link::Foreign))),
+                    Some(Refetched::Packument(None)),
+                    Some(Refetched::NoPackument),
+                    Some(Refetched::Failed("upstream down")),
+                ];
+                for refetched in refetches {
+                    let expected = match (copy, &refetched) {
+                        (Link::Own, _) => Got::Ask,
+                        (_, None) => Got::Refetch,
+                        (_, Some(Refetched::Packument(Some(l)))) if *l == own => Got::Ask,
+                        (_, Some(Refetched::Failed(_))) => Got::Failed,
+                        _ => Got::NotFound,
+                    };
+                    let row = format!("{path}: copy {copy:?}, refetched {refetched:?}");
+                    let got = tarball_step(
+                        &ask,
+                        UP,
+                        "http://nora.example/npm",
+                        link(copy).as_deref(),
+                        refetched,
+                        &any_key,
+                    );
+                    let got = match got {
+                        TarballStep::Ask { asked, named } => {
+                            assert_eq!(
+                                (asked.as_str(), named.as_str()),
+                                (own.as_str(), own.as_str()),
+                                "{row}"
+                            );
+                            Got::Ask
+                        }
+                        TarballStep::Refetch => Got::Refetch,
+                        TarballStep::NotFound => Got::NotFound,
+                        TarballStep::UpstreamFailed(e) => {
+                            assert_eq!(e, "upstream down", "{row}");
+                            Got::Failed
+                        }
+                    };
+                    assert_eq!(got, expected, "{row}");
+                }
+            }
+        }
     }
 
     /// Each redirect of a download: ten pass and the eleventh is refused whether the chain

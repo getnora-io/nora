@@ -24,8 +24,8 @@ use axum::{
 };
 use base64::Engine;
 use nora_registry::npm_links::{
-    self, link_host, max_semver, replace_upstream_bytes, Hop, Links, Placed, TarballSource,
-    Unrewritable,
+    self, github_packages_tarball, link_host, max_semver, replace_upstream_bytes, Hop, Links,
+    Placed, Refetched, TarballAsk, TarballStep, Unrewritable,
 };
 use sha2::Digest;
 use std::sync::Arc;
@@ -373,32 +373,6 @@ async fn strip_published_bulk(state: &AppState, body: Vec<u8>) -> Result<Vec<u8>
             "audit body could not be re-serialized",
         )
     })
-}
-
-/// GitHub Packages' tarball path, `download/<@scope/name>/<version>/<sha1>`: the package
-/// name and version, or `None` for any other path. It has no `/-/`, so without this it
-/// would be taken for the packument of a package named `download/…` and skip every
-/// tarball check, curation included.
-fn github_packages_tarball(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("download/")?;
-    let mut segments = rest.split('/');
-    let (scope, name, version, sha) = (
-        segments.next()?,
-        segments.next()?,
-        segments.next()?,
-        segments.next()?,
-    );
-    if segments.next().is_some()
-        || scope.len() < 2
-        || !scope.starts_with('@')
-        || name.is_empty()
-        || version.is_empty()
-        || sha.is_empty()
-        || !sha.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return None;
-    }
-    Some((&rest[..scope.len() + 1 + name.len()], version))
 }
 
 /// [`npm_links::place_document`] with the server's storage-key check.
@@ -756,8 +730,7 @@ async fn handle_request(
             upstream.url,
             upstream.auth,
             &path,
-            &package_name,
-            tarball_version.as_deref(),
+            TarballAsk::parse(&path).as_ref(),
         )
         .await;
 
@@ -861,11 +834,11 @@ async fn handle_request(
     StatusCode::NOT_FOUND.into_response()
 }
 
-/// Fetch the tarball at `path`, of `version`, from `upstream` where [`npm_links::tarball_source`]
-/// says, with the upstream's credential: only for a version the upstream's trusted packument
-/// lists, that packument fetched again once when it does not (the version may be newer than the
-/// copy). Returns what the download is recorded as, with what it gave; a version not listed is
-/// `NotFound` without a request for the tarball.
+/// Fetch the tarball `ask` names from `upstream` where [`npm_links::tarball_step`] decides, with
+/// the upstream's credential: only for a version the owner's trusted packument lists, that
+/// packument fetched again once when it does not (the version may be newer than the copy).
+/// Returns what the download is recorded as, with what it gave; `None` (no tarball of a version)
+/// and a version not listed are `NotFound` without a request for the tarball.
 ///
 /// The credential goes as far as the upstream's origin, the redirects followed by
 /// [`fetch_following`].
@@ -874,44 +847,50 @@ async fn fetch_upstream_tarball(
     upstream: &str,
     auth: Option<crate::config::UpstreamAuth<'_>>,
     path: &str,
-    package: &str,
-    version: Option<&str>,
+    ask: Option<&TarballAsk<'_>>,
 ) -> (String, Result<Vec<u8>, ProxyError>) {
     let at_upstream = format!("{}/{}", upstream.trim_end_matches('/'), path);
-    let Some(version) = version else {
+    let Some(ask) = ask else {
         return (at_upstream, Err(ProxyError::NotFound));
     };
     let nora_npm_base = format!("{}/npm", nora_base_url(state).trim_end_matches('/'));
     let key_ok = |key: &str| crate::validation::validate_storage_key(key).is_ok();
-    let source = |listed: Option<String>| {
-        npm_links::tarball_source(
+    let copy = trusted_copy(state, ask.package())
+        .await
+        .and_then(|copy| copy.listed_link(ask.version()));
+    let step = |refetched| {
+        npm_links::tarball_step(
+            ask,
             upstream,
             &nora_npm_base,
-            package,
-            path,
-            listed.as_deref(),
+            copy.as_deref(),
+            refetched,
             &key_ok,
         )
     };
-    let mut found = source(trusted_listed_link(state, package, version).await);
-    if found == TarballSource::NotListed {
-        let key = upstream_packument_key(package);
-        match refetch_metadata(state, package, &key, &key, true, false).await {
-            Ok(doc) => found = source(npm_links::listed_link(&doc, version)),
-            Err(ProxyError::NotFound) => {}
-            // A packument the upstream failed to give says nothing of the version: the
-            // upstream's failure, not a missing tarball.
-            Err(e) => return (at_upstream, Err(e)),
-        }
+    let mut decided = step(None);
+    if matches!(decided, TarballStep::Refetch) {
+        let key = upstream_packument_key(ask.package());
+        let refetched = match refetch_metadata(state, ask.package(), &key, &key, true, false).await
+        {
+            Ok(doc) => Refetched::Packument(npm_links::listed_link(&doc, ask.version())),
+            Err(ProxyError::NotFound) => Refetched::NoPackument,
+            Err(e) => Refetched::Failed(e),
+        };
+        decided = step(Some(refetched));
     }
-    let TarballSource::Ask { asked, named } = found else {
-        tracing::info!(
-            registry = "npm",
-            package = %package,
-            version = %version,
-            "tarball not listed by its upstream's packument, not asked for"
-        );
-        return (at_upstream, Err(ProxyError::NotFound));
+    let (asked, named) = match decided {
+        TarballStep::Ask { asked, named } => (asked, named),
+        TarballStep::UpstreamFailed(e) => return (at_upstream, Err(e)),
+        TarballStep::NotFound | TarballStep::Refetch => {
+            tracing::info!(
+                registry = "npm",
+                package = %ask.package(),
+                version = %ask.version(),
+                "tarball not listed by its upstream's packument, not asked for"
+            );
+            return (at_upstream, Err(ProxyError::NotFound));
+        }
     };
     let fetched = fetch_following(state, upstream, &asked, auth, &nora_npm_base).await;
     (named, fetched)
@@ -995,28 +974,49 @@ fn metadata_client(state: &AppState, scoped: bool) -> &reqwest::Client {
     }
 }
 
-/// The link the trusted cached packument of `package` names for the tarball of `version`, if it
-/// lists that version: only a copy the package's owner delivered counts
-/// ([`cached_copy_trusted`]). Reached for a package not published here: the legacy key is then
-/// an older release's upstream cache.
-async fn trusted_listed_link(state: &AppState, package: &str, version: &str) -> Option<String> {
+/// The trusted cached packument of `package`: the copy under the upstream key, else an older
+/// release's upstream cache under the legacy key (reached for a package not published here),
+/// each trusted on its own provenance ([`trusted::TrustedPackument::at`]).
+async fn trusted_copy(state: &AppState, package: &str) -> Option<trusted::TrustedPackument> {
     for key in [upstream_packument_key(package), legacy_cache_key(package)] {
-        if !cached_copy_trusted(state, package, &key, package, None).await {
-            continue;
+        if let Some(copy) = trusted::TrustedPackument::at(state, package, &key).await {
+            return Some(copy);
         }
-        let (Some(outcome), _) =
-            crate::registry::cached_read(state.storage.get_verified(&key).await)
-        else {
-            continue;
-        };
-        use nora_registry::verified::{verified_body, GateOutcome};
-        let data = match outcome {
-            GateOutcome::Verified(blob) => verified_body(blob),
-            GateOutcome::Unpinned(blob) => blob.into_inner(),
-        };
-        return npm_links::listed_link(&data, version);
     }
     None
+}
+
+mod trusted {
+    use crate::AppState;
+    use nora_registry::npm_links;
+
+    /// A cached packument its owner delivered: the only copy a tarball link is taken from.
+    /// Its one constructor checks the copy's provenance at the key it is read from.
+    pub(super) struct TrustedPackument(axum::body::Bytes);
+
+    impl TrustedPackument {
+        /// The copy at `key`, if [`super::cached_copy_trusted`] trusts it and it reads.
+        pub(super) async fn at(state: &AppState, package: &str, key: &str) -> Option<Self> {
+            if !super::cached_copy_trusted(state, package, key, package, None).await {
+                return None;
+            }
+            let (Some(outcome), _) =
+                crate::registry::cached_read(state.storage.get_verified(key).await)
+            else {
+                return None;
+            };
+            use nora_registry::verified::{verified_body, GateOutcome};
+            Some(Self(match outcome {
+                GateOutcome::Verified(blob) => verified_body(blob),
+                GateOutcome::Unpinned(blob) => blob.into_inner(),
+            }))
+        }
+
+        /// The link this copy names for the tarball of `version`, if it lists that version.
+        pub(super) fn listed_link(&self, version: &str) -> Option<String> {
+            npm_links::listed_link(&self.0, version)
+        }
+    }
 }
 
 /// Whether `name` is in an internal namespace: served from its local copies only, never asked of
@@ -1252,16 +1252,9 @@ async fn cached_copy_trusted(
     let Some(owner) = state.config.npm.route(path) else {
         return false;
     };
-    let Ok(recorded) = state.storage.get(&origin_key(key)).await else {
-        return false;
-    };
-    let Some((origin, digest)) = std::str::from_utf8(&recorded)
-        .ok()
-        .and_then(|record| record.split_once('\n'))
-    else {
-        return false;
-    };
-    origin == origin_of(owner.url) && state.storage.pin(key).await.as_deref() == Some(digest)
+    let recorded = state.storage.get(&origin_key(key)).await.ok();
+    let pin = state.storage.pin(key).await;
+    npm_links::copy_is_owners(recorded.as_deref(), pin.as_deref(), owner.url)
 }
 
 /// Refetch metadata from upstream, rewrite URLs, update cache. An error says why there is no
@@ -4366,6 +4359,44 @@ mod integration_tests {
                 .all(|r| !r.url.path().starts_with("/download/")),
             "an unlisted tarball was fetched"
         );
+    }
+
+    /// A GitHub Packages download path of a package whose packument the upstream does not have
+    /// (404) is not asked for either: 404, no `/download/` request, nothing cached.
+    #[tokio::test]
+    async fn a_github_packages_download_without_a_packument_upstream_is_not_asked_for() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SHA: &str = "04fef883382f5a7c9b9ac2015dcc419009e2a858";
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/download/@vendor/a/1.0.0/{SHA}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UNLISTED".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/npm/download/@vendor/a/1.0.0/{SHA}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let fetched = upstream.received_requests().await.unwrap();
+        assert!(
+            fetched
+                .iter()
+                .all(|r| !r.url.path().starts_with("/download/")),
+            "a tarball without a packument was fetched"
+        );
+        let cached = ctx.state.storage.list("npm/").await.unwrap();
+        assert!(cached.iter().all(|k| !k.contains("tarballs")), "{cached:?}");
     }
 
     #[tokio::test]
@@ -9050,7 +9081,7 @@ mod published_and_upstream_keys {
                 "ensure_npm_metadata_cached",
                 "handle_request",
                 "packument_key_for_reading",
-                "trusted_listed_link",
+                "trusted_copy",
                 "upstream_metadata",
             ]
         );
