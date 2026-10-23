@@ -482,7 +482,7 @@ async fn import_repo(
                 }
                 // What already lies under the key decides whether the artifact is transferred: one
                 // rule for every format (`layout::action`), looked at only on local storage.
-                let under = under_key(storage, rt, on_s3, &key).await;
+                let under = under_key(storage, rt, on_s3, &key, art.sha256.as_deref()).await;
                 if layout::action(rt, under) == layout::Action::Skip {
                     return Item::CasSkip { key };
                 }
@@ -563,13 +563,16 @@ async fn import_repo(
     Ok(result)
 }
 
-/// What lies under `key` of format `rt`: not looked at on S3, else the object and its record.
-/// The only place the import looks at storage before a transfer ([`layout::action`] decides).
+/// What lies under `key` of format `rt`: not looked at on S3, else the object and whether it is
+/// the import's own ([`layout::own_by`]) — its record, or its pin against `source_sha256`, the
+/// digest the source advertises. The only place the import looks at storage before a transfer
+/// ([`layout::action`] decides).
 async fn under_key(
     storage: &crate::storage::Storage,
     rt: crate::registry_type::RegistryType,
     on_s3: bool,
     key: &str,
+    source_sha256: Option<&str>,
 ) -> layout::UnderKey {
     if on_s3 {
         return layout::UnderKey::NotLooked;
@@ -577,9 +580,21 @@ async fn under_key(
     if storage.stat(key).await.is_none() {
         return layout::UnderKey::Nothing;
     }
-    match layout::record_key(rt, key) {
-        Some(record) if storage.stat(&record).await.is_some() => layout::UnderKey::Recorded,
-        _ => layout::UnderKey::Unrecorded,
+    let own = match layout::own_by(rt, key) {
+        layout::Own::Record(record) => storage.stat(&record).await.is_some(),
+        layout::Own::Pin => match source_sha256 {
+            Some(want) => storage
+                .pin(key)
+                .await
+                .is_some_and(|pin| pin.eq_ignore_ascii_case(want)),
+            None => false,
+        },
+        layout::Own::Unknown => false,
+    };
+    if own {
+        layout::UnderKey::Recorded
+    } else {
+        layout::UnderKey::Unrecorded
     }
 }
 
@@ -2395,6 +2410,66 @@ mod integration_tests {
         assert_eq!(asked(&upstream).await, Vec::<String>::new());
     }
 
+    /// A Maven artifact an upstream cached under the coordinate an import writes is replaced by
+    /// the source's verified artifact: the client gets the source's bytes, not the cache.
+    #[tokio::test]
+    async fn a_maven_artifact_an_upstream_cached_under_its_key_is_imported_over_it() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri)];
+        });
+        let key = "maven/com/corp/lib/1.0/lib-1.0.jar";
+        ctx.state
+            .storage
+            .put(key, b"what an upstream served")
+            .await
+            .unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let own = b"the source's jar".to_vec();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Maven,
+            "maven",
+            vec![("com/corp/lib/1.0/lib-1.0.jar".into(), own.clone())],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        let jar = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/corp/lib/1.0/lib-1.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(jar.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(jar).await[..], &own[..]);
+        // What the import committed is its own: the next run without a journal leaves it.
+        let again = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Maven,
+            "maven",
+            vec![("com/corp/lib/1.0/lib-1.0.jar".into(), own.clone())],
+            again.path(),
+        )
+        .await;
+        assert_eq!(
+            (res.imported, res.skipped, res.failed),
+            (0, 1, 0),
+            "{res:?}"
+        );
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+    }
+
     /// A .nupkg is imported only when it is a package of the id and version its key names: one
     /// whose .nuspec names another id or version, or that is no zip with a .nuspec, leaves
     /// nothing behind.
@@ -2905,8 +2980,8 @@ mod integration_tests {
 mod storage_read_tests {
     use std::path::{Path, PathBuf};
 
-    /// What the import sees under a key: nothing looked at on S3, else the object and, for npm,
-    /// its version document.
+    /// What the import sees under a key: nothing looked at on S3, else the object and whether it
+    /// is the import's own — for npm its version document, for Maven its pin.
     #[tokio::test]
     async fn what_lies_under_a_key_is_looked_at_on_local_storage_only() {
         use super::layout::UnderKey;
@@ -2916,21 +2991,33 @@ mod storage_read_tests {
         let storage = crate::storage::Storage::new_local(root.path().to_str().unwrap());
         let (jar, tgz) = ("maven/com/a/1.0/a-1.0.jar", "npm/a/tarballs/a-1.0.0.tgz");
         assert_eq!(
-            under_key(&storage, RegistryType::Maven, false, jar).await,
+            under_key(&storage, RegistryType::Maven, false, jar, None).await,
             UnderKey::Nothing
         );
         storage.put(jar, b"jar").await.unwrap();
         storage.put(tgz, b"tgz").await.unwrap();
         assert_eq!(
-            under_key(&storage, RegistryType::Maven, true, jar).await,
+            under_key(&storage, RegistryType::Maven, true, jar, None).await,
             UnderKey::NotLooked
         );
         assert_eq!(
-            under_key(&storage, RegistryType::Maven, false, jar).await,
+            under_key(&storage, RegistryType::Maven, false, jar, None).await,
+            UnderKey::Unrecorded
+        );
+        // A Maven artifact pinned to the digest the source advertises is the import's own.
+        use sha2::Digest;
+        let digest = hex::encode(sha2::Sha256::digest(b"jar"));
+        assert_eq!(
+            under_key(&storage, RegistryType::Maven, false, jar, Some(&digest)).await,
+            UnderKey::Recorded
+        );
+        let other = hex::encode(sha2::Sha256::digest(b"other"));
+        assert_eq!(
+            under_key(&storage, RegistryType::Maven, false, jar, Some(&other)).await,
             UnderKey::Unrecorded
         );
         assert_eq!(
-            under_key(&storage, RegistryType::Npm, false, tgz).await,
+            under_key(&storage, RegistryType::Npm, false, tgz, None).await,
             UnderKey::Unrecorded
         );
         storage
@@ -2938,19 +3025,20 @@ mod storage_read_tests {
             .await
             .unwrap();
         assert_eq!(
-            under_key(&storage, RegistryType::Npm, false, tgz).await,
+            under_key(&storage, RegistryType::Npm, false, tgz, None).await,
             UnderKey::Recorded
         );
         assert_eq!(
-            under_key(&storage, RegistryType::Npm, true, tgz).await,
+            under_key(&storage, RegistryType::Npm, true, tgz, None).await,
             UnderKey::NotLooked
         );
     }
 
     /// The reads of [`crate::storage::Storage`] whose names nothing else in the import uses.
     /// `get` is also a map's and a client's: it counts when called on a `storage`.
-    const READS: [&str; 7] = [
+    const READS: [&str; 8] = [
         "stat",
+        "pin",
         "list",
         "list_internal",
         "list_with_meta",
@@ -3115,7 +3203,11 @@ mod storage_read_tests {
         }
         assert_eq!(
             found,
-            ["mod.rs: under_key", "mod.rs: under_key"],
+            [
+                "mod.rs: under_key",
+                "mod.rs: under_key",
+                "mod.rs: under_key"
+            ],
             "the storage reads of the import"
         );
     }

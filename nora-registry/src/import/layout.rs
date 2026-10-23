@@ -125,12 +125,12 @@ pub(super) enum UnderKey {
     NotLooked,
     /// Nothing.
     Nothing,
-    /// An object, and the record the format writes after it once the object is NORA's own
-    /// ([`record_key`]).
+    /// An object the import can tell is its own ([`own_by`]): the record its format writes after
+    /// it, or a pin to the very bytes the source advertises.
     Recorded,
-    /// An object without such a record: what an import stored before its record was written,
-    /// what an upstream served under the name, or an object of a format without a record. Which
-    /// one, the import cannot tell.
+    /// An object the import cannot tell is its own: what an import stored before its record was
+    /// written, what an upstream served under the name, or an object of a format with no such
+    /// mark.
     Unrecorded,
 }
 
@@ -146,9 +146,11 @@ pub(super) enum Action {
 
 /// What the import does with an artifact of format `rt` when `under` lies under its key.
 ///
-/// - Maven and Raw keep no record: whatever is under the key is served as it is, so the import
-///   leaves it. Raw has no upstream; a Maven coordinate is served from storage before any
-///   upstream, whoever stored it.
+/// - Maven: a coordinate is served from storage before any upstream, whoever stored it. An object
+///   pinned to the source's bytes is left; any other may be what an upstream served under the
+///   coordinate, and the source's artifact is transferred over it.
+/// - Raw has no upstream: an object under the key is an upload or an earlier import, NORA's own,
+///   and is left.
 /// - npm: a tarball whose version document is there is published, and is left. One without it
 ///   may be what an upstream served under the name, and publishing it would make the upstream's
 ///   bytes the imported version: the source's tarball is transferred, and its document written.
@@ -160,11 +162,11 @@ pub(super) fn action(rt: RegistryType, under: UnderKey) -> Action {
     use Action::{Skip, Transfer};
     use UnderKey::{NotLooked, Nothing, Recorded, Unrecorded};
     match rt {
-        RegistryType::Maven | RegistryType::Raw => match under {
+        RegistryType::Raw => match under {
             NotLooked | Nothing => Transfer,
             Recorded | Unrecorded => Skip,
         },
-        RegistryType::Npm => match under {
+        RegistryType::Maven | RegistryType::Npm => match under {
             NotLooked | Nothing | Unrecorded => Transfer,
             Recorded => Skip,
         },
@@ -184,14 +186,28 @@ pub(super) fn action(rt: RegistryType, under: UnderKey) -> Action {
     }
 }
 
-/// The record that makes the object at `key` of format `rt` NORA's own, written after the object:
-/// an npm tarball's version document. The formats [`action`] does not skip by a record have none
-/// here.
-pub(super) fn record_key(rt: RegistryType, key: &str) -> Option<String> {
+/// How the import tells that the object at an artifact's key is NORA's own and not what an
+/// upstream served under the name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum Own {
+    /// By a record the format writes after the object: an npm tarball's version document.
+    Record(String),
+    /// By the object's pin: the import commits an artifact pinned to the SHA-256 the source
+    /// advertises, so an object pinned to that digest holds the source's bytes.
+    Pin,
+    /// It cannot tell.
+    Unknown,
+}
+
+/// How the import tells that the object at `key` of format `rt` is its own ([`Own`]).
+pub(super) fn own_by(rt: RegistryType, key: &str) -> Own {
     match rt {
-        RegistryType::Npm => crate::registry::npm::imported_version_key(key),
-        RegistryType::Maven
-        | RegistryType::Raw
+        RegistryType::Npm => match crate::registry::npm::imported_version_key(key) {
+            Some(record) => Own::Record(record),
+            None => Own::Unknown,
+        },
+        RegistryType::Maven => Own::Pin,
+        RegistryType::Raw
         | RegistryType::PyPI
         | RegistryType::Nuget
         | RegistryType::Docker
@@ -205,7 +221,7 @@ pub(super) fn record_key(rt: RegistryType, key: &str) -> Option<String> {
         | RegistryType::Rpm
         | RegistryType::Deb
         | RegistryType::Cpan
-        | RegistryType::HuggingFace => None,
+        | RegistryType::HuggingFace => Own::Unknown,
     }
 }
 
@@ -411,7 +427,7 @@ mod tests {
         //            not looked (S3)  nothing    recorded   upstream cache / unrecorded
         let table: &[(RegistryType, [Action; 4])] = &[
             (R::Docker, [Transfer, Transfer, Transfer, Transfer]),
-            (R::Maven, [Transfer, Transfer, Skip, Skip]),
+            (R::Maven, [Transfer, Transfer, Skip, Transfer]),
             (R::Npm, [Transfer, Transfer, Skip, Transfer]),
             (R::Cargo, [Transfer, Transfer, Transfer, Transfer]),
             (R::PyPI, [Transfer, Transfer, Transfer, Transfer]),
@@ -443,22 +459,39 @@ mod tests {
         assert_eq!(rows, RegistryType::all(), "a row for every format");
     }
 
-    /// An npm tarball's record is its version document; no other format is skipped by one.
+    /// How the import tells its own object: an npm tarball by its version document, a Maven
+    /// artifact by its pin; any other format it cannot tell.
     #[test]
-    fn only_an_npm_tarball_is_told_by_its_record() {
+    fn the_import_tells_its_own_npm_tarball_by_its_document_and_a_maven_artifact_by_its_pin() {
         assert_eq!(
-            record_key(RegistryType::Npm, "npm/@scope/a/tarballs/a-1.0.0.tgz").as_deref(),
-            Some("npm/@scope/a/versions/1.0.0.json")
+            own_by(RegistryType::Npm, "npm/@scope/a/tarballs/a-1.0.0.tgz"),
+            Own::Record("npm/@scope/a/versions/1.0.0.json".to_owned())
+        );
+        assert_eq!(own_by(RegistryType::Npm, "npm/a/a-1.0.0.tgz"), Own::Unknown);
+        assert_eq!(
+            own_by(RegistryType::Maven, "maven/com/a/1.0/a-1.0.jar"),
+            Own::Pin
         );
         for rt in RegistryType::all() {
-            if *rt != RegistryType::Npm {
+            if !matches!(rt, RegistryType::Npm | RegistryType::Maven) {
                 assert_eq!(
-                    record_key(*rt, "npm/a/tarballs/a-1.0.0.tgz"),
-                    None,
+                    own_by(*rt, "npm/a/tarballs/a-1.0.0.tgz"),
+                    Own::Unknown,
                     "{rt:?}"
                 );
             }
         }
+    }
+
+    #[test]
+    fn compat_classes() {
+        assert_eq!(compat(RegistryType::Maven), Compat::Full);
+        assert_eq!(compat(RegistryType::Raw), Compat::Full);
+        assert_eq!(compat(RegistryType::Npm), Compat::Partial);
+        assert_eq!(compat(RegistryType::PyPI), Compat::Partial);
+        assert_eq!(compat(RegistryType::Nuget), Compat::Partial);
+        assert_eq!(compat(RegistryType::Cargo), Compat::Unsupported);
+        assert_eq!(compat(RegistryType::Docker), Compat::Unsupported);
     }
 
     fn art(repo: &str, path: &str) -> ArtifactRef {
@@ -481,17 +514,6 @@ mod tests {
         assert_eq!(normalize_format("yum"), Some(RegistryType::Rpm));
         assert_eq!(normalize_format("docker"), Some(RegistryType::Docker));
         assert_eq!(normalize_format("nonsense"), None);
-    }
-
-    #[test]
-    fn compat_classes() {
-        assert_eq!(compat(RegistryType::Maven), Compat::Full);
-        assert_eq!(compat(RegistryType::Raw), Compat::Full);
-        assert_eq!(compat(RegistryType::Npm), Compat::Partial);
-        assert_eq!(compat(RegistryType::PyPI), Compat::Partial);
-        assert_eq!(compat(RegistryType::Nuget), Compat::Partial);
-        assert_eq!(compat(RegistryType::Cargo), Compat::Unsupported);
-        assert_eq!(compat(RegistryType::Docker), Compat::Unsupported);
     }
 
     /// Every format: how it maps, the first layout that imported its files, and whether a
