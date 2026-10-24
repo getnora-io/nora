@@ -396,22 +396,24 @@ pub fn validate_docker_reference(reference: &str) -> Result<(), ValidationError>
 /// unexpected 500 errors. This middleware intercepts null bytes early and
 /// returns a clean 400 Bad Request.
 ///
-/// It ALSO rejects any raw path carrying an encoded percent sign (`%25`), the
-/// signature of double- (or deeper) encoding. Handlers validate and match names
-/// on the path as the router decoded it ONCE (`validate_storage_key`, the
-/// curation blocklist, `internal_namespaces`), but the effective name/path is
-/// decoded AGAIN downstream — by `reqwest`/`Url` when building the upstream URL
-/// (`%2e%2e` collapses → path traversal past the upstream prefix, carrying NORA's
-/// proxy credential) and by the upstream server itself (`%65`→`e`, `%40`→`@` →
-/// a blocklisted or internal name slips the guard). A legitimate registry path
-/// never carries a literal `%`, so refusing `%25` closes the whole over-encoding
-/// class at every depth and for every format at one chokepoint, before auth and
-/// before any handler.
+/// It ALSO rejects any raw path that still holds a `%` once decoded
+/// ([`decodes_to_no_percent`]), the signature of double- (or deeper) encoding.
+/// Handlers validate and match names on the path as the router decoded it ONCE
+/// (`validate_storage_key`, the curation blocklist, `internal_namespaces`), but
+/// the effective name/path is decoded AGAIN downstream — by `reqwest`/`Url` when
+/// building the upstream URL (`%2e%2e` collapses → path traversal past the
+/// upstream prefix, carrying NORA's proxy credential) and by the upstream server
+/// itself (`%65`→`e`, `%40`→`@` → a blocklisted or internal name slips the
+/// guard). A `%` survives one decode as `%25` and as a `%` that opens no escape
+/// (`%%32%65` decodes to `%2e`), so the rule is the escapes the path may hold,
+/// not the one way to over-encode: a legitimate registry path never carries a
+/// literal `%`, and this closes the class at every depth and for every format
+/// at one chokepoint, before auth and before any handler.
 pub async fn reject_null_bytes_middleware(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path();
 
-    // Check for literal null byte (already URL-decoded by hyper) or
-    // percent-encoded null byte in the raw URI.
+    // Check for a literal null byte or a percent-encoded one in the raw URI
+    // (hyper does not decode the path).
     if path.contains('\0') || path.contains("%00") || path.contains("%2500") {
         return (
             StatusCode::BAD_REQUEST,
@@ -420,12 +422,11 @@ pub async fn reject_null_bytes_middleware(request: Request<Body>, next: Next) ->
             .into_response();
     }
 
-    // Reject double-encoding: a raw `%25` is an encoded `%`, so the string the
-    // handler sees after one decode still holds a `%XX` that a downstream decode
-    // (reqwest/Url, or the upstream server) resolves — smuggling `..`/`/` or an
-    // alias past name- and path-based checks. Registry paths never carry a
-    // literal `%`; refuse it (covers `%252e`, `%2565`, `%2540`, `%25252e`, …).
-    if path.contains("%25") {
+    // Reject double-encoding: a path that still holds a `%` after one decode
+    // holds a `%XX` that a downstream decode (reqwest/Url, or the upstream
+    // server) resolves — smuggling `..`/`/` or an alias past name- and
+    // path-based checks.
+    if !decodes_to_no_percent(path) {
         return (
             StatusCode::BAD_REQUEST,
             "Bad Request: double-encoded sequence in URL path",
@@ -434,6 +435,26 @@ pub async fn reject_null_bytes_middleware(request: Request<Body>, next: Next) ->
     }
 
     next.run(request).await
+}
+
+/// Whether `path` (raw, as it came in) holds no `%` once decoded: every `%` in
+/// it opens a two-hex-digit escape, and none of them is `%25`. A `%` that opens
+/// no escape is kept by the decode as it is, so `%%32%65` decodes to `%2e`, and
+/// `%2%65` too; `%25` decodes to `%` itself (white list: the escapes the path
+/// may hold, not the forms of double encoding).
+pub(crate) fn decodes_to_no_percent(path: &str) -> bool {
+    let mut rest = path.as_bytes();
+    while let Some(at) = rest.iter().position(|&byte| byte == b'%') {
+        match rest.get(at + 1..at + 3) {
+            Some(&[high, low])
+                if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() && [high, low] != *b"25" =>
+            {
+                rest = &rest[at + 3..];
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Match an artifact namespace `value` (a slash-separated coordinate such as
@@ -1200,6 +1221,39 @@ mod encoding_guard_tests {
     use axum::routing::get;
     use axum::Router;
     use tower::ServiceExt;
+
+    /// Which raw paths decode, once, to no `%`: single escapes, either case, pass
+    /// (invariant 3); `%25` at any depth, place and length, a `%` that opens no
+    /// escape, and a cut-off escape do not (invariant 1).
+    #[test]
+    fn a_path_passes_only_when_one_decode_leaves_no_percent() {
+        let long = format!("/npm/@acme/{}/%252e%252e/x", "a".repeat(200));
+        for (path, passes) in [
+            ("/npm/lodash", true),
+            ("/npm/@acme%2Fcore", true),
+            ("/npm/%2e%2E/x", true),
+            ("/raw/dir/my%20file.txt", true),
+            ("/maven2/%41%62c", true),
+            ("", true),
+            ("/npm/%252e%252e/x", false),
+            ("/npm/a/b/c/%252e%252e/x", false),
+            (long.as_str(), false),
+            ("/npm/ev%2569l-pkg", false),
+            ("/npm/%2565vil-pkg", false),
+            ("/go/%25252e%25252e/x", false),
+            ("/npm/%25zz", false),
+            ("/npm/%25", false),
+            ("/npm/%%32%65%%32%65/x", false),
+            ("/npm/%%36%35vil-pkg", false),
+            ("/npm/%2%65%2%65/x", false),
+            ("/npm/%zz", false),
+            ("/npm/%2", false),
+            ("/npm/%", false),
+            ("/npm/%%", false),
+        ] {
+            assert_eq!(super::decodes_to_no_percent(path), passes, "{path}");
+        }
+    }
 
     fn guarded() -> Router {
         Router::new()
