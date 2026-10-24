@@ -2305,6 +2305,77 @@ mod tests {
         assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 0);
     }
 
+    /// A file the disk cannot take a write into fails the write step, one it cannot flush
+    /// fails the fsync step: Linux refuses fsync on `/dev/null` (EINVAL), and a write into
+    /// `/dev/full` (ENOSPC).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_steps_fail_on_a_file_that_takes_no_write_or_no_fsync() {
+        use super::{ProbeDisk, ProbeStep};
+        let temp_dir = TempDir::new().unwrap();
+        let on = |device: &str| super::OnDisk {
+            base: temp_dir.path(),
+            path: temp_dir.path().join("probe"),
+            file: Some(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(device)
+                    .unwrap(),
+            ),
+        };
+        let mut no_fsync = on("/dev/null");
+        assert!(no_fsync.run(ProbeStep::Write).is_ok());
+        assert!(
+            no_fsync.run(ProbeStep::Sync).is_err(),
+            "an fsync the file refuses"
+        );
+        let mut no_write = on("/dev/full");
+        assert!(
+            no_write.run(ProbeStep::Write).is_err(),
+            "a write the disk refuses"
+        );
+    }
+
+    /// The verdict is a probe of the store itself: one that cannot take a file (its root under
+    /// a plain file, ENOTDIR) is unreachable, a writable one reachable, through `write_probe`
+    /// and through `refresh_reachability`.
+    #[tokio::test]
+    async fn the_verdict_is_a_probe_of_the_store_itself() {
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let under_a_file = file.join("store");
+        assert!(!super::write_probe(&under_a_file), "a root under a file");
+        assert!(super::write_probe(temp_dir.path()), "a writable root");
+        let dead = LocalStorage::new(under_a_file.to_str().unwrap());
+        dead.refresh_reachability().await;
+        assert!(!dead.health_check().await, "a root under a file");
+        let live = LocalStorage::new(temp_dir.path().join("live").to_str().unwrap());
+        live.refresh_reachability().await;
+        assert!(live.health_check().await, "a writable root");
+    }
+
+    /// `health_check` answers the verdict of the last probe and touches no disk: a store moved
+    /// away after the probe still reads as reachable until the next one.
+    #[tokio::test]
+    async fn health_check_answers_the_last_probe_without_touching_the_disk() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("store");
+        let storage = LocalStorage::new(base.to_str().unwrap());
+        storage.refresh_reachability().await;
+        assert!(storage.health_check().await);
+        std::fs::rename(&base, temp_dir.path().join("moved")).unwrap();
+        assert!(
+            storage.health_check().await,
+            "health_check looked at the disk"
+        );
+        storage.refresh_reachability().await;
+        assert!(
+            storage.health_check().await,
+            "the next probe recreates the root"
+        );
+    }
+
     #[tokio::test]
     async fn test_nested_directory_creation() {
         let temp_dir = TempDir::new().unwrap();

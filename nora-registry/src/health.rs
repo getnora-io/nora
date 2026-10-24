@@ -153,6 +153,24 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// `/ready` answers the last storage verdict and does no storage I/O: a root moved away
+    /// after the probe leaves it ready until the next tick.
+    #[tokio::test]
+    async fn ready_answers_the_last_verdict_without_touching_storage() {
+        let ctx = create_test_context();
+        ctx.state.storage.refresh_reachability().await;
+        let root = std::path::PathBuf::from(&ctx.state.config.storage.path);
+        let moved = root.with_extension("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+        std::fs::rename(&moved, &root).unwrap();
+        assert_eq!(
+            ready.status(),
+            StatusCode::OK,
+            "/ready looked at the storage root"
+        );
+    }
+
     #[tokio::test]
     async fn test_health_returns_200() {
         let ctx = create_test_context();

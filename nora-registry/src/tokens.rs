@@ -1550,6 +1550,103 @@ mod tests {
         }
     }
 
+    /// The token file, the revocation count and the cache entry of `token`,
+    /// as a run sees them between two steps.
+    fn sees(store: &TokenStore, dir: &Path, token: &str) -> (bool, u64, bool) {
+        (
+            token_path(dir, token).exists(),
+            store.revocations.load(std::sync::atomic::Ordering::SeqCst),
+            store.cache.read().contains_key(&sha256_hex(token)),
+        )
+    }
+
+    /// A revoke removes the file, then counts itself, then purges the cache,
+    /// one step each. The races above play orders between steps only, so a
+    /// revoke that took two of these in one step, or in another order, would
+    /// leave the orders that break it unplayed.
+    #[test]
+    fn a_revoke_removes_then_counts_then_purges_one_step_each() {
+        // Past which step: the file there, revokes counted, the token cached.
+        let expected = [
+            (None, (true, 0, true)),
+            (Some(Step::Locked), (true, 0, true)),
+            (Some(Step::Removed), (false, 0, true)),
+            (Some(Step::Counted), (false, 1, true)),
+            (Some(Step::Evicted), (false, 1, false)),
+        ];
+        for (path, revoke) in revokes() {
+            let dir = TempDir::new().unwrap();
+            let store = TokenStore::new(dir.path());
+            let token = cheap_token(dir.path(), "alice");
+            store.verify_token(&token).unwrap();
+            let revoking: interleave::Operation = {
+                let (store, token) = (store.clone(), token.clone());
+                Box::new(move || revoke(&store, &token))
+            };
+            let mut seen = Vec::new();
+            let taken = interleave::run(vec![revoking], &can_go(&store), &mut |ready| {
+                seen.push(sees(&store, dir.path(), &token));
+                ready[0]
+            });
+            let steps: Vec<_> = taken.into_iter().map(|(_, step)| step).zip(seen).collect();
+            assert_eq!(steps, expected, "{path}");
+        }
+    }
+
+    /// A verify reads the revocation count, then the token file, one step
+    /// each: a revoke counted past the first step keeps the result out of the
+    /// cache, a file removed past it is not found.
+    #[test]
+    fn a_verify_reads_the_count_then_the_file_one_step_each() {
+        type Meanwhile = fn(&TokenStore, &Path, &str);
+        // What lands past the count step: the verify served, the token cached.
+        let cases: [(&str, Meanwhile, bool, bool); 3] = [
+            ("nothing", |_, _, _| {}, true, true),
+            (
+                "a revoke counted",
+                |store, _, _| {
+                    store
+                        .revocations
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                },
+                true,
+                false,
+            ),
+            (
+                "the file removed",
+                |_, dir, token| fs::remove_file(token_path(dir, token)).unwrap(),
+                false,
+                false,
+            ),
+        ];
+        for (meanwhile, land, served, cached) in cases {
+            let dir = TempDir::new().unwrap();
+            let store = TokenStore::new(dir.path());
+            let token = cheap_token(dir.path(), "alice");
+            let (answer, answered) = std::sync::mpsc::channel();
+            let verify: interleave::Operation = {
+                let (store, token) = (store.clone(), token.clone());
+                Box::new(move || answer.send(store.verify_token(&token).is_ok()).unwrap())
+            };
+            let mut turn = 0;
+            let taken = interleave::run(vec![verify], &can_go(&store), &mut |ready| {
+                if turn == 1 {
+                    land(&store, dir.path(), &token);
+                }
+                turn += 1;
+                ready[0]
+            });
+            assert_eq!(
+                taken.get(1).map(|&(_, step)| step),
+                Some(Some(Step::CountRead)),
+                "{meanwhile} lands past the count step: {taken:?}"
+            );
+            assert_eq!(answered.recv().unwrap(), served, "{meanwhile}: served");
+            let (_, _, in_cache) = sees(&store, dir.path(), &token);
+            assert_eq!(in_cache, cached, "{meanwhile}: cached");
+        }
+    }
+
     /// The last_used flush racing a revoke, in every order of their steps,
     /// leaves the token revoked: the flush does not put the file back, and the
     /// token is refused by this store and by one that starts afresh.
