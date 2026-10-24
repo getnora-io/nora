@@ -84,6 +84,8 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 | Package metadata (GET) | Full | JSON with all versions |
 | Scoped packages `@scope/name` | Full | URL-encoded path |
 | Tarball download | Full | SHA256 verified |
+| Tarball on another host (redirect) | Full | A tarball is fetched only for a version the upstream's packument lists (else 404, no tarball request). Redirects are followed to any http(s) host, at most 10 for the whole chain and within one `npm.proxy_timeout`; the upstream's credentials go only to its own origin, never past a hop that left it. An 11th redirect answers 502. Works with registries that serve tarballs from a storage host (GitHub Packages). |
+| Scoped upstream (`npm.proxies` with a scope) | Full | Metadata is read from the upstream's own origin only: a packument redirect to another origin answers 502. |
 | Tarball URL rewriting | Full | Points to NORA, not upstream |
 | Publish (`npm publish`) | Full | Immutable versions |
 | Unpublish | — | Immutable; use quarantine/blocklist to disable a version |
