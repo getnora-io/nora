@@ -11,7 +11,9 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use indicatif::{ProgressBar, ProgressStyle};
-use serde::{Deserialize, Serialize};
+use nora_registry::annotations::Annotations;
+use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -25,6 +27,22 @@ pub struct BackupMetadata {
     pub artifact_count: usize,
     pub total_bytes: u64,
     pub storage_backend: String,
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "stored_annotations"
+    )]
+    pub annotations: BTreeMap<String, Annotations>,
+}
+
+fn stored_annotations<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, Annotations>, D::Error> {
+    let stored = BTreeMap::<String, BTreeMap<String, String>>::deserialize(deserializer)?;
+    Ok(stored
+        .into_iter()
+        .map(|(key, pairs)| (key, Annotations::from_stored(pairs)))
+        .collect())
 }
 
 /// Statistics returned after backup
@@ -99,11 +117,12 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
 
     let mut total_bytes: u64 = 0;
     let mut artifact_count = 0;
+    let mut annotations = BTreeMap::new();
 
     for key in &keys {
         // Get file data
-        let data = match storage.get(key).await {
-            Ok(data) => data,
+        let (data, recorded) = match storage.get_pinned(key).await {
+            Ok(v) => v,
             Err(e) => {
                 pb.println(format!("Warning: Failed to read {}: {}", key, e));
                 continue;
@@ -127,6 +146,9 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
             .append_data(&mut header, key, &*data)
             .map_err(|e| format!("Failed to add {} to archive: {}", key, e))?;
 
+        if !recorded.annotations.is_empty() {
+            annotations.insert(key.clone(), recorded.annotations);
+        }
         total_bytes += data.len() as u64;
         artifact_count += 1;
         pb.inc(1);
@@ -139,6 +161,7 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
         artifact_count,
         total_bytes,
         storage_backend: storage.backend_name().to_string(),
+        annotations,
     };
 
     let metadata_json = serde_json::to_vec_pretty(&metadata)
@@ -259,6 +282,8 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
         println!("  Original size: {} bytes", meta.total_bytes);
         println!();
     }
+    let annotations = metadata.map(|meta| meta.annotations).unwrap_or_default();
+    let no_annotations = Annotations::default();
 
     // Progress bar
     let pb = ProgressBar::new(entry_count as u64);
@@ -299,7 +324,11 @@ pub async fn restore_backup(storage: &Storage, input: &Path) -> Result<RestoreSt
 
         // Put to storage
         storage
-            .put(&path, &data)
+            .put_annotated(
+                &path,
+                &data,
+                annotations.get(&path).unwrap_or(&no_annotations),
+            )
             .await
             .map_err(|e| format!("Failed to store {}: {}", path, e))?;
 
@@ -336,6 +365,7 @@ mod tests {
             artifact_count: 42,
             total_bytes: 1024000,
             storage_backend: "local".to_string(),
+            annotations: BTreeMap::new(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"version\":\"0.3.0\""));
@@ -367,6 +397,7 @@ mod tests {
             artifact_count: 100,
             total_bytes: 999999,
             storage_backend: "local".to_string(),
+            annotations: BTreeMap::new(),
         };
         let json = serde_json::to_value(&meta).unwrap();
         let restored: BackupMetadata = serde_json::from_value(json).unwrap();
@@ -453,6 +484,31 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(&data[..], b"test-content");
+    }
+
+    #[tokio::test]
+    async fn test_backup_restore_carries_annotations() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = Storage::new_local(dir.path().join("data").to_str().unwrap());
+        let tags =
+            Annotations::try_from_pairs([("commit".to_string(), "abc".to_string())]).unwrap();
+        storage
+            .put_annotated("raw/a/2026.bin", b"release", &tags)
+            .await
+            .unwrap();
+        storage.put("raw/a/plain.bin", b"plain").await.unwrap();
+
+        let backup_file = dir.path().join("backup.tar.gz");
+        create_backup(&storage, &backup_file).await.unwrap();
+        let restored = Storage::new_local(dir.path().join("restored").to_str().unwrap());
+        restore_backup(&restored, &backup_file).await.unwrap();
+
+        assert_eq!(restored.recorded("raw/a/2026.bin").await.annotations, tags);
+        assert!(restored
+            .recorded("raw/a/plain.bin")
+            .await
+            .annotations
+            .is_empty());
     }
 
     /// npm cache provenance (#1055) is hidden from list() but must survive a backup,

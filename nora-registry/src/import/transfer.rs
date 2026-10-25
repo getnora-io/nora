@@ -26,6 +26,7 @@ use super::{ArtifactRef, Result, SourceRegistry};
 use crate::curation::{CurationEngine, Decision, FilterRequest};
 use crate::registry_type::RegistryType;
 use crate::storage::Storage;
+use nora_registry::annotations::Annotations;
 
 /// RAII guard that deletes a temp file on drop unless disarmed. Import owns its
 /// own copy rather than reaching into `registry::docker::TempFileGuard` (whose
@@ -218,7 +219,10 @@ pub async fn transfer_artifact(
         return Outcome::Imported { bytes, sha256 }; // rehearsal — guard drops temp
     }
     let _ = provenance; // (Weak provenance is surfaced by the orchestrator's report, not here.)
-    match storage.put_from_path(key, &temp_path, Some(&sha256)).await {
+    match storage
+        .put_from_path(key, &temp_path, Some(&sha256), &Annotations::default())
+        .await
+    {
         Ok(()) => {
             guard.disarm(); // storage moved the temp file into place
             Outcome::Imported { bytes, sha256 }

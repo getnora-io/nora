@@ -9,6 +9,7 @@ use std::path::Path;
 /// The reads, as the `clippy.toml` comment names them.
 const READS: &[&str] = &[
     "get",
+    "get_pinned",
     "get_verified",
     "get_reader",
     "get_range",
@@ -19,6 +20,7 @@ const READS: &[&str] = &[
     "total_size",
     "backend_name",
     "pin",
+    "recorded",
 ];
 
 fn is_test_only(attrs: &[syn::Attribute]) -> bool {

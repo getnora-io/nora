@@ -23,21 +23,53 @@
 //! `fsync` on `put_from_path`, so the pin is never made *more* durable than the
 //! bytes it pins.)
 
+use crate::storage::Recorded;
+use nora_registry::annotations::Annotations;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufRead, Write};
 use std::path::PathBuf;
 use tracing::warn;
 
 #[derive(Serialize, Deserialize)]
-struct PinEntry {
+struct Line {
     k: String,
     h: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    a: BTreeMap<String, String>,
+}
+
+impl Line {
+    fn new(key: &str, entry: &Entry) -> Self {
+        Self {
+            k: key.to_string(),
+            h: entry.h.clone(),
+            a: entry
+                .a
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    fn tombstone(key: &str) -> Self {
+        Self {
+            k: key.to_string(),
+            h: String::new(),
+            a: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(PartialEq, Eq)]
+struct Entry {
+    h: String,
+    a: Annotations,
 }
 
 pub struct HashPinStore {
-    pins: RwLock<HashMap<String, String>>,
+    pins: RwLock<HashMap<String, Entry>>,
     path: PathBuf,
 }
 
@@ -52,13 +84,18 @@ impl HashPinStore {
             Ok(file) => {
                 let reader = std::io::BufReader::new(file);
                 for line in reader.lines().map_while(Result::ok) {
-                    if let Ok(entry) = serde_json::from_str::<PinEntry>(&line) {
-                        if entry.h.is_empty() {
-                            pins.remove(&entry.k);
-                        } else {
-                            pins.insert(entry.k, entry.h);
-                        }
+                    let Ok(line) = serde_json::from_str::<Line>(&line) else {
+                        continue;
+                    };
+                    if line.h.is_empty() {
+                        pins.remove(&line.k);
+                        continue;
                     }
+                    let a = Annotations::try_from_pairs(line.a).unwrap_or_else(|e| {
+                        warn!(key = %line.k, error = %e, "annotations in the pin log dropped, pin kept");
+                        Annotations::default()
+                    });
+                    pins.insert(line.k, Entry { h: line.h, a });
                 }
             }
             // First run / empty store — nothing to replay.
@@ -106,22 +143,26 @@ impl HashPinStore {
     /// claim a pin the disk does not hold, or a `get()` after a failed `put()`
     /// would verify against a RAM-only pin that vanishes on restart, and a
     /// retried `put()` would skip the (still-missing) append.
-    pub fn record_hash(&self, key: &str, hash: &str) -> io::Result<()> {
+    pub fn record(&self, key: &str, hash: &str, annotations: &Annotations) -> io::Result<()> {
         debug_assert!(
             hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()),
-            "record_hash: expected 64-char hex SHA-256, got: {hash}"
+            "record: expected 64-char hex SHA-256, got: {hash}"
         );
+        let entry = Entry {
+            h: hash.to_string(),
+            a: annotations.clone(),
+        };
 
         // Atomic per key: hold the write lock across check → append → insert.
         // The disk append happens before the in-memory update (durability), and
-        // no concurrent record_hash() for the same key can interleave its append
+        // no concurrent record() for the same key can interleave its append
         // and insert with ours, so disk and memory cannot diverge. (An earlier
         // two-lock version — read-check, release, append, write-insert — had a
         // TOCTOU where two same-key writers' append and insert orders disagreed.)
         let mut pins = self.pins.write();
-        if pins.get(key).is_none_or(|existing| *existing != hash) {
-            Self::append_to_file(&self.path, key, hash)?;
-            pins.insert(key.to_string(), hash.to_string());
+        if pins.get(key) != Some(&entry) {
+            Self::append_to_file(&self.path, &Line::new(key, &entry))?;
+            pins.insert(key.to_string(), entry);
         }
         Ok(())
     }
@@ -134,18 +175,25 @@ impl HashPinStore {
     /// before verification, and a later `put()` of the key overwrites the pin —
     /// so callers may treat a remove failure as non-fatal.
     pub fn remove(&self, key: &str) -> io::Result<()> {
-        // Atomic tombstone: append + drop under one write lock (see record_hash()).
+        // Atomic tombstone: append + drop under one write lock (see record()).
         let mut pins = self.pins.write();
         if pins.contains_key(key) {
-            Self::append_to_file(&self.path, key, "")?;
+            Self::append_to_file(&self.path, &Line::tombstone(key))?;
             pins.remove(key);
         }
         Ok(())
     }
 
     /// Look up the stored SHA-256 hash for a key, if pinned.
-    pub fn get(&self, key: &str) -> Option<String> {
-        self.pins.read().get(key).cloned()
+    pub fn get(&self, key: &str) -> Recorded {
+        self.pins
+            .read()
+            .get(key)
+            .map(|entry| Recorded {
+                sha256: Some(entry.h.clone()),
+                annotations: entry.a.clone(),
+            })
+            .unwrap_or_default()
     }
 
     /// Compact the NDJSON file: rewrite with only live entries via a temp file
@@ -164,12 +212,8 @@ impl HashPinStore {
 
         let temp_path = self.path.with_extension("ndjson.tmp");
         let mut file = std::fs::File::create(&temp_path)?;
-        for (key, hash) in pins.iter() {
-            let entry = PinEntry {
-                k: key.clone(),
-                h: hash.clone(),
-            };
-            let line = serde_json::to_string(&entry).map_err(io::Error::other)?;
+        for (key, entry) in pins.iter() {
+            let line = serde_json::to_string(&Line::new(key, entry)).map_err(io::Error::other)?;
             writeln!(file, "{line}")?;
         }
         std::fs::rename(&temp_path, &self.path)?;
@@ -179,16 +223,12 @@ impl HashPinStore {
     /// Append a single entry to the NDJSON file (static, safe to call from any
     /// thread). Propagates any open/serialize/write error to the caller instead
     /// of swallowing it.
-    fn append_to_file(path: &std::path::Path, key: &str, hash: &str) -> io::Result<()> {
+    fn append_to_file(path: &std::path::Path, line: &Line) -> io::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)?;
-        let entry = PinEntry {
-            k: key.to_string(),
-            h: hash.to_string(),
-        };
-        let line = serde_json::to_string(&entry).map_err(io::Error::other)?;
+        let line = serde_json::to_string(line).map_err(io::Error::other)?;
         writeln!(file, "{line}")?;
         Ok(())
     }
@@ -215,12 +255,14 @@ mod tests {
         let store = HashPinStore::new(pin_path(&dir));
         let key = "maven/com/example/1.0/app.jar";
 
-        store.record_hash(key, &sha(b"jar-content")).unwrap();
+        store
+            .record(key, &sha(b"jar-content"), &Annotations::default())
+            .unwrap();
         assert_eq!(
-            store.get(key).as_deref(),
+            store.get(key).sha256.as_deref(),
             Some(sha(b"jar-content").as_str())
         );
-        assert_eq!(store.get("unknown/key"), None);
+        assert_eq!(store.get("unknown/key").sha256, None);
     }
 
     #[test]
@@ -229,10 +271,14 @@ mod tests {
         let store = HashPinStore::new(pin_path(&dir));
         let key = "npm/meta/express";
 
-        store.record_hash(key, &sha(b"v1")).unwrap();
+        store
+            .record(key, &sha(b"v1"), &Annotations::default())
+            .unwrap();
         // Metadata update — pin is updated
-        store.record_hash(key, &sha(b"v2")).unwrap();
-        assert_eq!(store.get(key).as_deref(), Some(sha(b"v2").as_str()));
+        store
+            .record(key, &sha(b"v2"), &Annotations::default())
+            .unwrap();
+        assert_eq!(store.get(key).sha256.as_deref(), Some(sha(b"v2").as_str()));
     }
 
     #[test]
@@ -240,9 +286,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let store = HashPinStore::new(pin_path(&dir));
 
-        store.record_hash("key", &sha(b"data")).unwrap();
+        store
+            .record("key", &sha(b"data"), &Annotations::default())
+            .unwrap();
         store.remove("key").unwrap();
-        assert_eq!(store.get("key"), None);
+        assert_eq!(store.get("key").sha256, None);
     }
 
     #[test]
@@ -252,15 +300,22 @@ mod tests {
 
         {
             let store = HashPinStore::new(&path);
-            store.record_hash("a", &sha(b"data-a")).unwrap();
-            store.record_hash("b", &sha(b"data-b")).unwrap();
+            store
+                .record("a", &sha(b"data-a"), &Annotations::default())
+                .unwrap();
+            store
+                .record("b", &sha(b"data-b"), &Annotations::default())
+                .unwrap();
             store.remove("b").unwrap();
         }
 
         // Reload from disk
         let store = HashPinStore::new(&path);
-        assert_eq!(store.get("a").as_deref(), Some(sha(b"data-a").as_str()));
-        assert_eq!(store.get("b"), None);
+        assert_eq!(
+            store.get("a").sha256.as_deref(),
+            Some(sha(b"data-a").as_str())
+        );
+        assert_eq!(store.get("b").sha256, None);
     }
 
     #[test]
@@ -270,14 +325,18 @@ mod tests {
 
         {
             let store = HashPinStore::new(&path);
-            store.record_hash("keep", &sha(b"data")).unwrap();
-            store.record_hash("remove", &sha(b"data")).unwrap();
+            store
+                .record("keep", &sha(b"data"), &Annotations::default())
+                .unwrap();
+            store
+                .record("remove", &sha(b"data"), &Annotations::default())
+                .unwrap();
             store.remove("remove").unwrap();
         }
 
         // After reload + compact, file should only have 1 entry
         let store = HashPinStore::new(&path);
-        assert!(store.get("keep").is_some());
+        assert!(store.get("keep").sha256.is_some());
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
@@ -292,12 +351,16 @@ mod tests {
         let store = HashPinStore::new(&path);
 
         // Same hash twice — should not append duplicate
-        store.record_hash("key", &sha(b"data")).unwrap();
-        store.record_hash("key", &sha(b"data")).unwrap();
+        store
+            .record("key", &sha(b"data"), &Annotations::default())
+            .unwrap();
+        store
+            .record("key", &sha(b"data"), &Annotations::default())
+            .unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = content.lines().collect();
-        assert_eq!(lines.len(), 1, "duplicate record_hash should be idempotent");
+        assert_eq!(lines.len(), 1, "a duplicate record is idempotent");
     }
 
     #[test]
@@ -306,7 +369,7 @@ mod tests {
         let path = pin_path(&dir);
         let store = HashPinStore::new(&path);
 
-        assert_eq!(store.get("anything"), None);
+        assert_eq!(store.get("anything").sha256, None);
         assert!(!path.exists(), "empty store should not create file");
     }
 
@@ -327,18 +390,20 @@ mod tests {
 
         let store = HashPinStore::new(&unwritable);
         assert!(
-            store.record_hash("k", &sha(b"data")).is_err(),
+            store
+                .record("k", &sha(b"data"), &Annotations::default())
+                .is_err(),
             "pin write to an unwritable path must return an error, not swallow it"
         );
         // The in-memory index must not claim a pin the disk never accepted.
         assert_eq!(
-            store.get("k"),
+            store.get("k").sha256,
             None,
             "failed pin write must not update memory"
         );
     }
 
-    /// Regression for the disk-first TOCTOU: concurrent record_hash() calls for
+    /// Regression for the disk-first TOCTOU: concurrent record() calls for
     /// the SAME key with DIFFERENT hashes must leave the in-memory pin equal to
     /// what a fresh reload from disk sees — disk and memory cannot diverge.
     /// Holding the write lock across check → append → insert makes each call
@@ -356,7 +421,11 @@ mod tests {
             .map(|i| {
                 let s = Arc::clone(&store);
                 std::thread::spawn(move || {
-                    let _ = s.record_hash(key, &sha(format!("data-{i}").as_bytes()));
+                    let _ = s.record(
+                        key,
+                        &sha(format!("data-{i}").as_bytes()),
+                        &Annotations::default(),
+                    );
                 })
             })
             .collect();
@@ -373,6 +442,100 @@ mod tests {
             reloaded.get(key),
             "in-memory pin must match the durably-recorded pin (no TOCTOU divergence)"
         );
-        assert!(in_memory.is_some(), "some writer must have recorded a pin");
+        assert!(
+            in_memory.sha256.is_some(),
+            "some writer must have recorded a pin"
+        );
+    }
+
+    fn tags() -> Annotations {
+        Annotations::try_from_pairs([("commit".to_string(), "abc".to_string())]).unwrap()
+    }
+
+    #[test]
+    fn annotations_survive_the_log_a_reload_and_compaction() {
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        {
+            let store = HashPinStore::new(&path);
+            store.record("a", &sha(b"a"), &tags()).unwrap();
+            store
+                .record("b", &sha(b"b"), &Annotations::default())
+                .unwrap();
+        }
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert!(log.contains(&format!(
+            r#"{{"k":"a","h":"{}","a":{{"commit":"abc"}}}}"#,
+            sha(b"a")
+        )));
+        assert!(log.contains(&format!(r#"{{"k":"b","h":"{}"}}"#, sha(b"b"))));
+
+        let compacted = HashPinStore::new(&path);
+        assert_eq!(compacted.get("a").annotations, tags());
+        drop(compacted);
+        let reloaded = HashPinStore::new(&path);
+        assert_eq!(
+            reloaded.get("a"),
+            Recorded {
+                sha256: Some(sha(b"a")),
+                annotations: tags(),
+            }
+        );
+        assert_eq!(reloaded.get("b").annotations, Annotations::default());
+    }
+
+    #[test]
+    fn a_log_line_written_before_annotations_loads() {
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        std::fs::write(
+            &path,
+            format!("{{\"k\":\"old\",\"h\":\"{}\"}}\n", sha(b"old")),
+        )
+        .unwrap();
+        let store = HashPinStore::new(&path);
+        assert_eq!(
+            store.get("old"),
+            Recorded {
+                sha256: Some(sha(b"old")),
+                annotations: Annotations::default(),
+            }
+        );
+    }
+
+    #[test]
+    fn a_change_of_the_annotations_alone_is_recorded() {
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        let store = HashPinStore::new(&path);
+        store
+            .record("k", &sha(b"data"), &Annotations::default())
+            .unwrap();
+        store.record("k", &sha(b"data"), &tags()).unwrap();
+        assert_eq!(store.get("k").annotations, tags());
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content.lines().count(), 2);
+    }
+
+    #[test]
+    fn invalid_annotations_in_the_log_are_dropped_and_the_pin_is_kept() {
+        let dir = TempDir::new().unwrap();
+        let path = pin_path(&dir);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"k\":\"x\",\"h\":\"{}\",\"a\":{{\"Bad Key\":\"v\"}}}}\n",
+                sha(b"x")
+            ),
+        )
+        .unwrap();
+        let store = HashPinStore::new(&path);
+        assert_eq!(
+            store.get("x"),
+            Recorded {
+                sha256: Some(sha(b"x")),
+                annotations: Annotations::default(),
+            }
+        );
     }
 }
