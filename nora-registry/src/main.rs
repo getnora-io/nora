@@ -1321,7 +1321,7 @@ mod panic_strategy_tests {
         }
         for fine in [
             "[profile.release]\npanic = \"unwind\"",
-            "# panic = \"abort\" was the setting before 1.4.2",
+            "# panic = \"abort\" was the setting up to 1.4.2",
             "tracing::error!(\"background cache task panicked\")",
         ] {
             assert!(abort_switches(fine).is_empty(), "{fine}");
