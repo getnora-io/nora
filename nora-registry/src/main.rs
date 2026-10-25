@@ -1919,7 +1919,7 @@ mod connection_limit_tests {
     async fn an_http2_prior_knowledge_client_is_served() {
         let server = start(16).await;
         let addr = server.addr;
-        let client = reqwest::Client::builder()
+        let client = reqwest::Client::builder() // nosemgrep: reqwest-client-bypass
             .http2_prior_knowledge()
             .no_proxy()
             .build()
