@@ -126,10 +126,10 @@ pub enum ImportCommand {
     /// Only distribution files (.whl, .tar.gz, .zip, .egg) and .nupkg files are imported; a
     /// .nupkg must hold one .nuspec naming the id and version of its file name. An imported PyPI
     /// project lists and serves only the files imported or uploaded to it: a file NORA held under
-    /// its name before — cached from an upstream, or uploaded by 1.4.1 or older — is not, until it
+    /// its name before — cached from an upstream, or uploaded by 1.4.2 or older — is not, until it
     /// is uploaded again.
     ///
-    /// Upgrading from 1.4.1 or older: those releases skipped every PyPI and NuGet file yet marked
+    /// Upgrading from 1.4.2 or older: those releases skipped every PyPI and NuGet file yet marked
     /// the repository finished. Run the import again: a PyPI or NuGet repository finished by them
     /// is walked again and its files are imported, with nothing to delete first.
     ///
@@ -1360,7 +1360,7 @@ mod integration_tests {
     }
 
     /// `nora import run --help` tells an operator what an npm import depends on: the public URL the
-    /// version documents are written under, and how to publish an import made by 1.4.1 or older.
+    /// version documents are written under, and how to publish an import made by 1.4.2 or older.
     #[test]
     fn run_help_names_the_public_url_and_the_upgrade_path() {
         use clap::Subcommand;
@@ -1375,7 +1375,7 @@ mod integration_tests {
             ".nora-import",
             "<repo>__<hash>.done",
             "<repo>__<hash>.progress",
-            "1.4.1",
+            "1.4.2",
             "PyPI or NuGet repository finished by them is walked again",
             "with nothing to delete first",
             "until it is uploaded again",
@@ -1563,13 +1563,13 @@ mod integration_tests {
         assert_eq!(h.storage.list("npm/").await.unwrap(), Vec::<String>::new());
     }
 
-    /// What an import before 1.4.2 left, a tarball without its version document, is published by
-    /// the next run: the source's tarball is transferred again and its document written.
+    /// What an import by 1.4.2 or older left, a tarball without its version document, is published
+    /// by the next run: the source's tarball is transferred again and its document written.
     #[tokio::test]
     async fn a_tarball_an_earlier_import_committed_alone_is_published_by_the_next_run() {
         let h = harness("npm-upgrade").await;
         let tgz = npm_tgz(&json!({ "name": "pkg", "version": "1.0.0" }));
-        // What an import before 1.4.2 left: the tarball, no version document.
+        // What an import by 1.4.2 or older left: the tarball, no version document.
         h.storage
             .put("npm/pkg/tarballs/pkg-1.0.0.tgz", &tgz)
             .await
@@ -2858,7 +2858,7 @@ mod integration_tests {
         }
     }
 
-    /// An import by 1.4.1 or older skipped every PyPI and NuGet file and still marked their
+    /// An import by 1.4.2 or older skipped every PyPI and NuGet file and still marked their
     /// repositories finished. The next run imports them without the operator touching the
     /// markers, and the run after it transfers nothing; a finished npm repository stays finished.
     #[tokio::test]
@@ -2892,7 +2892,7 @@ mod integration_tests {
             ],
         };
         for name in ["npm-local", "pypi-local", "nuget-local"] {
-            h.resume.mark_repo_done_as_1_4_1(name).await;
+            h.resume.mark_repo_done_as_layout_1(name).await;
         }
         let run = RunContext {
             source: &source,

@@ -33,7 +33,7 @@ pub enum Compat {
 }
 
 /// The layout `nora import` writes, recorded in the marker of every repository it finishes.
-/// Layout 1 — releases up to 1.4.1, whose markers record none — skipped every PyPI and NuGet
+/// Layout 1 — releases up to 1.4.2, whose markers record none — skipped every PyPI and NuGet
 /// file; layout 2 imports them.
 pub const LAYOUT: u32 = 2;
 

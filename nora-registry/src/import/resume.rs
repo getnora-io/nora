@@ -133,9 +133,9 @@ impl ResumeStore {
 
 #[cfg(test)]
 impl ResumeStore {
-    /// Mark `repo` finished as releases up to 1.4.1 did: a marker that says `done` and nothing
+    /// Mark `repo` finished as releases up to 1.4.2 did: a marker that says `done` and nothing
     /// else.
-    pub(crate) async fn mark_repo_done_as_1_4_1(&self, repo: &str) {
+    pub(crate) async fn mark_repo_done_as_layout_1(&self, repo: &str) {
         tokio::fs::write(self.done_path(repo), b"done\n")
             .await
             .unwrap();
@@ -274,7 +274,7 @@ mod tests {
     async fn a_marker_without_a_layout_is_layout_1() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ResumeStore::open(tmp.path(), "h").await.unwrap();
-        store.mark_repo_done_as_1_4_1("pypi-local").await;
+        store.mark_repo_done_as_layout_1("pypi-local").await;
         assert_eq!(store.done_layout("pypi-local").await, Some(1));
     }
 
