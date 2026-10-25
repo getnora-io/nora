@@ -1,6 +1,16 @@
 # Changelog
 ## [Unreleased]
 
+## [1.4.2] - 2026-10-25
+
+### Changed
+- **A provisioned repository signing key must be Ed25519** *(Action may be needed)* — NORA signed rpm/deb indexes with whatever key it found at `signing.key_path`, including RSA and ECDSA keys, whose secret arithmetic runs through dependencies that are not constant-time (`rsa`, `crypto-bigint` 0.5). A key at that path whose primary key is not Ed25519 now stops the server from starting with an error naming the algorithm and exit status 78, which the packaged systemd units do not restart into (a key file that does not parse stops the same way; one that cannot be read keeps exit status 1), and the file is left as it is; a key NORA generated itself is Ed25519 and is unaffected. If you provisioned your own RSA or ECDSA key, replace it with an Ed25519 one (or remove the file to let NORA generate one) and re-distribute the public key to clients before upgrading. With that, RUSTSEC-2026-0387 (`crypto-bigint`) does not apply to NORA and is recorded as an accepted exclusion in `SECURITY.md`.
+
+### Security
+- **`webpki-roots` 1.0.9 → 1.0.11 and `rustls-webpki` 0.103.15 → 0.103.16 (eMudhra distrust, RUSTSEC-2026-0382)** — reqwest is built with `rustls-tls`, so upstreams are verified against the roots compiled in from `webpki-roots`, not the system store. 1.0.9 still trusts `emSign ECC Root CA - G3`, the root above the revoked `EM DV TLS CA - G3B` intermediate, so an upstream (or a man in the middle) presenting a certificate from that chain was accepted. 1.0.10 removes the emSign G3 root, 1.0.11 also removes `emSign Root CA - C1` and `emSign ECC Root CA - C3` (Mozilla bug 2083709). `rustls-webpki` 0.103.16 fixes certificate verification accepting distrusted intermediates (RUSTSEC-2026-0382), which `cargo audit` flags against 0.103.15. Lock-only bumps, no code change. Fixed by @obervinov.
+- **tokio 1.53.3 (RUSTSEC-2026-0386, #1173)** — `tokio::io::unix::AsyncFd` constructors that accepted any file descriptor are deprecated upstream as an I/O-safety violation; NORA does not construct `AsyncFd` itself, and 1.53.3 is the patched release in the same minor line. Lock-only.
+- **A request path that still holds a percent sign after one decode is refused at the edge (GHSA-4pcp-mwwr-fjj6)** — a raw `%25` in the request path is an encoded percent sign: the name a handler validated after the router decoded the path once still carried a `%XX` that a later decode resolved — when NORA built an upstream URL, or at the upstream server itself — which could re-introduce `..`/`/` past the name and path checks, or let a blocked or internal name through. A registry path never carries a literal `%`, so an edge check now answers `400` for any path that still holds a `%` once decoded — `%25` at any depth, or a `%` that opens no `%HH` escape — before authentication and before any handler, for every format and method, over HTTP/1.1 and HTTP/2; the null-byte check keeps precedence. A singly encoded path (`%2F`, `%40`, `%2e`) is handled as before. No configuration change.
+
 ## [1.4.1] - 2026-10-20
 
 ### Fixed
