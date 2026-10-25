@@ -1459,7 +1459,14 @@ fn build_signer(
         }
         Err(e) => {
             eprintln!("Fatal: repository index signing key error: {e}");
-            std::process::exit(1);
+            // A key file NORA will not sign with is refused on every restart:
+            // EXIT_CONFIG, which the units do not restart into (#1025). A key
+            // that could not be read may appear on a restart, so that keeps 1.
+            let code = match e {
+                signing::KeyLoadError::Refused(_) => config::EXIT_CONFIG,
+                signing::KeyLoadError::Io(_) => 1,
+            };
+            std::process::exit(code);
         }
     }
 }
@@ -2588,7 +2595,10 @@ async fn run_server(mut config: Config, storage: Storage) {
     // metrics MUST be next-outermost so it counts ALL responses including
     // auth rejections (401/403/429) in nora_http_requests_total.
     // The layers inside metrics are built by `request_layers`, which the test
-    // router uses too, so the tests run the order the server runs.
+    // router uses too, so the tests run the order the server runs. The order of
+    // the two outer ones is held by the shipped server with auth on
+    // (tests/edge_double_encoding.rs): a refused path is 400, not 401, and is not
+    // counted; a 401 is.
     let app = request_layers(app, &state)
         .layer(middleware::from_fn(metrics::metrics_middleware))
         .layer(middleware::from_fn(
@@ -3313,26 +3323,6 @@ mod middleware_stack_whitelist {
             .flat_map(|l| l.chars())
             .filter(|c| !c.is_whitespace())
             .collect()
-    }
-
-    #[test]
-    fn the_server_stack_is_request_layers_plus_metrics_and_null_bytes() {
-        let code = squash(include_str!("main.rs"));
-        let fn_start = ["async", "fnrun_server("].concat();
-        let body = &code[code.find(&fn_start).expect("run_server")..];
-        let start = ["letapp=request_layers", "(app,&state)"].concat();
-        let at = body
-            .find(&start)
-            .expect("run_server must build its stack with request_layers");
-        let tail = &body[at..];
-        let end = tail.find(".with_state(state.clone());").unwrap();
-        let expected = [
-            "letapp=request_layers(app,&state)",
-            ".layer(middleware::from_fn(metrics::metrics_middleware))",
-            ".layer(middleware::from_fn(validation::reject_null_bytes_middleware,))",
-        ]
-        .concat();
-        assert_eq!(&tail[..end], expected);
     }
 
     #[test]

@@ -389,26 +389,86 @@ pub fn validate_docker_reference(reference: &str) -> Result<(), ValidationError>
     Ok(())
 }
 
-/// Middleware that rejects requests with null bytes in the URI path.
+/// Middleware that rejects requests with null bytes or double-encoding in the URI path.
 ///
 /// Null bytes in URLs are used in path-traversal attacks. Axum URL-decodes
 /// `%00` before passing the path to handlers, which can cause panics or
 /// unexpected 500 errors. This middleware intercepts null bytes early and
 /// returns a clean 400 Bad Request.
+///
+/// It ALSO rejects any raw path that still holds a `%` once decoded
+/// ([`decodes_to_no_percent`]), the signature of double- (or deeper) encoding.
+/// Handlers validate and match names on the path as the router decoded it ONCE
+/// (`validate_storage_key`, the curation blocklist, `internal_namespaces`), but
+/// the effective name/path is decoded AGAIN downstream — by `reqwest`/`Url` when
+/// building the upstream URL (`%2e%2e` collapses → path traversal past the
+/// upstream prefix, carrying NORA's proxy credential) and by the upstream server
+/// itself (`%65`→`e`, `%40`→`@` → a blocklisted or internal name slips the
+/// guard). A `%` survives one decode as `%25` and as a `%` that opens no escape
+/// (`%%32%65` decodes to `%2e`), so the rule is the escapes the path may hold,
+/// not the one way to over-encode: a legitimate registry path never carries a
+/// literal `%`, and this closes the class at every depth and for every format
+/// at one chokepoint, before auth and before any handler.
+///
+/// The decision is [`edge_refusal`] of the raw path alone; the middleware only
+/// answers it, for every method and before the inner layers run.
 pub async fn reject_null_bytes_middleware(request: Request<Body>, next: Next) -> Response {
-    let path = request.uri().path();
-
-    // Check for literal null byte (already URL-decoded by hyper) or
-    // percent-encoded null byte in the raw URI.
-    if path.contains('\0') || path.contains("%00") || path.contains("%2500") {
-        return (
-            StatusCode::BAD_REQUEST,
-            "Bad Request: null byte in URL path",
-        )
-            .into_response();
+    match edge_refusal(request.uri().path()) {
+        Some(refusal) => (StatusCode::BAD_REQUEST, refusal.message()).into_response(),
+        None => next.run(request).await,
     }
+}
 
-    next.run(request).await
+/// Why the edge refuses a request path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EdgeRefusal {
+    /// A literal null byte, or one encoded once or twice.
+    NullByte,
+    /// A `%` that one decode leaves in the path.
+    DoubleEncoded,
+}
+
+impl EdgeRefusal {
+    /// The body of the `400` answer.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::NullByte => "Bad Request: null byte in URL path",
+            Self::DoubleEncoded => "Bad Request: double-encoded sequence in URL path",
+        }
+    }
+}
+
+/// The edge verdict on a raw request path (hyper does not decode it): `None`
+/// passes it on. A null byte, literal or encoded, keeps its own reason ahead of
+/// the double-encoding one, which `%2500` matches too.
+pub(crate) fn edge_refusal(path: &str) -> Option<EdgeRefusal> {
+    if path.contains('\0') || path.contains("%00") || path.contains("%2500") {
+        Some(EdgeRefusal::NullByte)
+    } else if !decodes_to_no_percent(path) {
+        Some(EdgeRefusal::DoubleEncoded)
+    } else {
+        None
+    }
+}
+
+/// Whether `path` (raw, as it came in) holds no `%` once decoded: every `%` in
+/// it opens a two-hex-digit escape, and none of them is `%25`. A `%` that opens
+/// no escape is kept by the decode as it is, so `%%32%65` decodes to `%2e`, and
+/// `%2%65` too; `%25` decodes to `%` itself (white list: the escapes the path
+/// may hold, not the forms of double encoding).
+pub(crate) fn decodes_to_no_percent(path: &str) -> bool {
+    let mut rest = path.as_bytes();
+    while let Some(at) = rest.iter().position(|&byte| byte == b'%') {
+        match rest.get(at + 1..at + 3) {
+            Some(&[high, low])
+                if high.is_ascii_hexdigit() && low.is_ascii_hexdigit() && [high, low] != *b"25" =>
+            {
+                rest = &rest[at + 3..];
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Match an artifact namespace `value` (a slash-separated coordinate such as
@@ -1156,6 +1216,187 @@ mod namespace_match_tests {
             ("**/x", "/x"),
         ] {
             assert!(!namespace_match(pattern, value), "{pattern} {value}");
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod encoding_guard_tests {
+    //! Direct unit tests for `reject_null_bytes_middleware` on its OWN minimal
+    //! router. The integration test router (test_helpers) deliberately omits the
+    //! edge middleware stack (pinned by `middleware_stack_whitelist`), so this
+    //! edge guard is exercised here, not there; the server as it ships is driven by
+    //! `tests/edge_double_encoding.rs`. Regression for the double-encoding class:
+    //! upstream-URL traversal carrying the proxy credential, and the curation
+    //! blocklist / internal_namespaces alias.
+    use super::{edge_refusal, reject_null_bytes_middleware, EdgeRefusal};
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use axum::Router;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    /// The prefix of every route family the server mounts, and none.
+    const PREFIXES: [&str; 19] = [
+        "/v2",
+        "/npm",
+        "/go",
+        "/maven2",
+        "/pypi",
+        "/simple",
+        "/cargo",
+        "/raw",
+        "/nuget",
+        "/gems",
+        "/conan",
+        "/pub",
+        "/terraform",
+        "/ansible",
+        "/cpan",
+        "/hf",
+        "/api",
+        "/ui",
+        "",
+    ];
+
+    const METHODS: [&str; 7] = ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
+    /// Raw paths and the edge verdict on each. Passed: a path where every `%`
+    /// opens a two-hex-digit escape other than `%25`, in either case (invariant
+    /// 3). Double-encoded: `%25` at any depth, place and length, before or after
+    /// a good escape, followed by another escape; a `%` that opens no escape; a
+    /// cut-off escape (invariant 1). Null byte: literal, `%00` or `%2500`
+    /// anywhere, ahead of the double-encoding reason (invariant 2).
+    fn table() -> Vec<(String, Option<EdgeRefusal>)> {
+        use EdgeRefusal::{DoubleEncoded, NullByte};
+        let mut rows: Vec<(String, Option<EdgeRefusal>)> = [
+            ("/npm/lodash", None),
+            ("/npm/@acme%2Fcore", None),
+            ("/npm/@acme%2fcore", None),
+            ("/npm/%40acme%2Fcore", None),
+            ("/npm/%40acme%2fcore", None),
+            ("/npm/%2e%2E/x", None),
+            ("/raw/dir/my%20file.txt", None),
+            ("/maven2/%41%62c", None),
+            ("", None),
+            ("/npm/%252e%252e/x", Some(DoubleEncoded)),
+            ("/npm/a/b/c/%252e%252e/x", Some(DoubleEncoded)),
+            ("/npm/ev%2569l-pkg", Some(DoubleEncoded)),
+            ("/npm/%2565vil-pkg", Some(DoubleEncoded)),
+            ("/npm/%2540acme%2Fcore", Some(DoubleEncoded)),
+            ("/go/%25252e%25252e/x", Some(DoubleEncoded)),
+            ("/npm/@acme%2F%2565vil-pkg", Some(DoubleEncoded)),
+            ("/npm/%2e/%252e%252e/x", Some(DoubleEncoded)),
+            ("/npm/@acme%2Fcore%%34%30x", Some(DoubleEncoded)),
+            ("/npm/%25%32%65%25%32%65/x", Some(DoubleEncoded)),
+            ("/npm/%25%36%35vil-pkg", Some(DoubleEncoded)),
+            ("/npm/%25%34%30acme%2Fcore", Some(DoubleEncoded)),
+            ("/npm/%25%25", Some(DoubleEncoded)),
+            ("/npm/%25zz", Some(DoubleEncoded)),
+            ("/npm/%25", Some(DoubleEncoded)),
+            ("/npm/%%32%65%%32%65/x", Some(DoubleEncoded)),
+            ("/npm/%%36%35vil-pkg", Some(DoubleEncoded)),
+            ("/npm/%2%65%2%65/x", Some(DoubleEncoded)),
+            ("/npm/%zz", Some(DoubleEncoded)),
+            ("/npm/%2", Some(DoubleEncoded)),
+            ("/npm/%", Some(DoubleEncoded)),
+            ("/npm/foo%", Some(DoubleEncoded)),
+            ("/npm/%%", Some(DoubleEncoded)),
+            ("/npm/%00", Some(NullByte)),
+            ("/npm/%00x", Some(NullByte)),
+            ("/npm/a%00/b", Some(NullByte)),
+            ("/npm/%00%2e", Some(NullByte)),
+            ("/x/%2500", Some(NullByte)),
+            ("/npm/a%2500/b", Some(NullByte)),
+            ("/npm/a\0b", Some(NullByte)),
+        ]
+        .into_iter()
+        .map(|(path, verdict)| (path.to_string(), verdict))
+        .collect();
+        for len in [200, 300, 1000, 4000] {
+            let tail = "a".repeat(len);
+            rows.push((
+                format!("/npm/@acme/{tail}/%252e%252e/x"),
+                Some(DoubleEncoded),
+            ));
+            rows.push((format!("/npm/@acme/{tail}/%00"), Some(NullByte)));
+            rows.push((format!("/npm/@acme/{tail}/%2e%40"), None));
+        }
+        for prefix in PREFIXES {
+            rows.push((
+                format!("{prefix}/%252e%252e/x/manifests/latest"),
+                Some(DoubleEncoded),
+            ));
+            rows.push((format!("{prefix}/%%32%65/x"), Some(DoubleEncoded)));
+            rows.push((format!("{prefix}/x%00"), Some(NullByte)));
+            rows.push((format!("{prefix}/x%2Fy"), None));
+        }
+        rows
+    }
+
+    #[test]
+    fn the_edge_verdict_on_each_raw_path() {
+        for (path, verdict) in table() {
+            assert_eq!(edge_refusal(&path), verdict, "{path:?}");
+        }
+    }
+
+    /// The middleware answers the verdict of the table for every method, before
+    /// the inner service runs: a refused path is 400 with its reason and runs no
+    /// handler, a passed one reaches the handler once.
+    #[tokio::test]
+    async fn the_middleware_answers_the_verdict_for_every_method_before_the_handler() {
+        for (path, verdict) in table() {
+            if path.contains('\0') {
+                continue; // not a valid URI: hyper refuses it before any service
+            }
+            let uri = if path.is_empty() {
+                "/".to_string()
+            } else {
+                path.clone()
+            };
+            for method in METHODS {
+                let ran = Arc::new(AtomicUsize::new(0));
+                let seen = Arc::clone(&ran);
+                let app = Router::new()
+                    .fallback(move || {
+                        let seen = Arc::clone(&seen);
+                        async move {
+                            seen.fetch_add(1, Ordering::SeqCst);
+                            "ok"
+                        }
+                    })
+                    .layer(axum::middleware::from_fn(reject_null_bytes_middleware));
+                let request = Request::builder()
+                    .method(method)
+                    .uri(&uri)
+                    .body(Body::from("bytes"))
+                    .unwrap();
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), 1 << 16).await.unwrap();
+                let body = String::from_utf8_lossy(&body);
+                let ran = ran.load(Ordering::SeqCst);
+                match verdict {
+                    Some(refusal) => {
+                        assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {uri}");
+                        // A HEAD answer carries no body.
+                        let reason = if method == "HEAD" {
+                            ""
+                        } else {
+                            refusal.message()
+                        };
+                        assert_eq!(body, reason, "{method} {uri}");
+                        assert_eq!(ran, 0, "{method} {uri}: the handler ran");
+                    }
+                    None => {
+                        assert_eq!(status, StatusCode::OK, "{method} {uri}");
+                        assert_eq!(ran, 1, "{method} {uri}: the handler did not run");
+                    }
+                }
+            }
         }
     }
 }
