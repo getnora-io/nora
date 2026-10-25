@@ -1459,7 +1459,14 @@ fn build_signer(
         }
         Err(e) => {
             eprintln!("Fatal: repository index signing key error: {e}");
-            std::process::exit(1);
+            // A key file NORA will not sign with is refused on every restart:
+            // EXIT_CONFIG, which the units do not restart into (#1025). A key
+            // that could not be read may appear on a restart, so that keeps 1.
+            let code = match e {
+                signing::KeyLoadError::Refused(_) => config::EXIT_CONFIG,
+                signing::KeyLoadError::Io(_) => 1,
+            };
+            std::process::exit(code);
         }
     }
 }

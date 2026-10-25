@@ -199,3 +199,52 @@ fn a_port_another_process_holds_is_not_taken_for_nora_serving() {
     }
     drop(held);
 }
+
+/// A signing key file NORA will not sign with — one it cannot parse, or one whose primary key is
+/// not Ed25519 — is a configuration it cannot start with: EX_CONFIG, so the unit stops instead of
+/// restarting into the same refusal every few seconds. A key file that cannot be read at all is
+/// not that: a volume mounted late can still appear, so it keeps the code a restart follows.
+#[test]
+fn a_signing_key_nora_will_not_sign_with_stops_with_ex_config() {
+    use pgp::composed::{ArmorOptions, KeyType, SecretKeyParamsBuilder};
+    use pgp::crypto::ecc_curve::ECCCurve;
+
+    let dir = tempfile::tempdir().unwrap();
+    let ecdsa = SecretKeyParamsBuilder::default()
+        .key_type(KeyType::ECDSA(ECCCurve::P256))
+        .can_sign(true)
+        .primary_user_id("operator key".into())
+        .build()
+        .unwrap()
+        .generate(rand::thread_rng())
+        .unwrap()
+        .to_armored_string(ArmorOptions::default())
+        .unwrap();
+    let ecdsa_path = dir.path().join("ecdsa.key");
+    std::fs::write(&ecdsa_path, &ecdsa).unwrap();
+    let corrupt_path = dir.path().join("corrupt.key");
+    std::fs::write(&corrupt_path, "not a pgp key").unwrap();
+    let unreadable_path = dir.path().join("a-directory.key");
+    std::fs::create_dir(&unreadable_path).unwrap();
+
+    for (path, code, says) in [
+        (&ecdsa_path, 78, "ECDSA keys are not accepted"),
+        (&corrupt_path, 78, "parse signing key"),
+        (&unreadable_path, 1, "read signing key"),
+    ] {
+        let path_str = path.to_str().unwrap();
+        match serve(&[
+            ("NORA_REGISTRIES_ENABLE", "rpm,deb"),
+            ("NORA_SIGNING_ENABLED", "true"),
+            ("NORA_SIGNING_KEY_PATH", path_str),
+        ]) {
+            Outcome::Exited(got, stderr) => {
+                assert_eq!(got, Some(code), "{path_str}: {stderr}");
+                assert!(stderr.contains(says), "{path_str}: {stderr}");
+            }
+            Outcome::Serving => panic!("{path_str}: served with a key it must refuse"),
+        }
+    }
+    // The refusal leaves the operator's file as it was.
+    assert_eq!(std::fs::read_to_string(&ecdsa_path).unwrap(), ecdsa);
+}

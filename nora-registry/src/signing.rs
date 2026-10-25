@@ -56,13 +56,15 @@ impl RepoSigner {
     /// first boot. Fail-closed: any error other than "file absent" is
     /// returned, never papered over with a fresh key — silently rotating
     /// the key would invalidate every client's pinned public key.
-    pub fn load_or_generate(path: &Path) -> Result<Self, String> {
+    pub fn load_or_generate(path: &Path) -> Result<Self, KeyLoadError> {
         let mut generated = false;
         let key = match std::fs::read_to_string(path).map(Zeroizing::new) {
-            Ok(armored) => parse_key(&armored).map_err(|e| e.describe(path))?,
+            Ok(armored) => {
+                parse_key(&armored).map_err(|e| KeyLoadError::Refused(e.describe(path)))?
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let key = generate_key()?;
-                match persist_key(&key, path)? {
+                let key = generate_key().map_err(KeyLoadError::Io)?;
+                match persist_key(&key, path).map_err(KeyLoadError::Io)? {
                     Persisted::Written => {
                         tracing::info!(path = %path.display(), "generated new repository signing key");
                         generated = true;
@@ -74,19 +76,27 @@ impl RepoSigner {
                     Persisted::LostRace => {
                         let armored =
                             Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
-                                format!("re-read signing key {}: {e}", path.display())
+                                KeyLoadError::Io(format!(
+                                    "re-read signing key {}: {e}",
+                                    path.display()
+                                ))
                             })?);
-                        parse_key(&armored).map_err(|e| e.describe(path))?
+                        parse_key(&armored).map_err(|e| KeyLoadError::Refused(e.describe(path)))?
                     }
                 }
             }
-            Err(e) => return Err(format!("read signing key {}: {e}", path.display())),
+            Err(e) => {
+                return Err(KeyLoadError::Io(format!(
+                    "read signing key {}: {e}",
+                    path.display()
+                )))
+            }
         };
 
         let public = key
             .to_public_key()
             .to_armored_string(ArmorOptions::default())
-            .map_err(|e| format!("armor public key: {e}"))?;
+            .map_err(|e| KeyLoadError::Io(format!("armor public key: {e}")))?;
         let fingerprint = key.fingerprint().to_string();
         Ok(Self {
             key,
@@ -129,6 +139,26 @@ impl RepoSigner {
 
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
+    }
+}
+
+/// Why [`RepoSigner::load_or_generate`] gave no signer.
+#[derive(Debug)]
+pub enum KeyLoadError {
+    /// The key file holds no key NORA signs with — it does not parse, or its
+    /// primary key is not Ed25519. A configuration NORA cannot start with:
+    /// the same file is refused on every restart.
+    Refused(String),
+    /// The key could not be read, generated or written; a restart may find
+    /// the path in place (a volume mounted late).
+    Io(String),
+}
+
+impl std::fmt::Display for KeyLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(e) | Self::Io(e) => f.write_str(e),
+        }
     }
 }
 
@@ -307,7 +337,8 @@ mod tests {
         let path = dir.path().join("nora.key");
         std::fs::write(&path, "not a pgp key").unwrap();
         let err = RepoSigner::load_or_generate(&path).err().unwrap();
-        assert!(err.contains("parse signing key"), "{err}");
+        assert!(matches!(err, KeyLoadError::Refused(_)), "{err}");
+        assert!(err.to_string().contains("parse signing key"), "{err}");
         // The corrupt file must not be overwritten with a fresh key.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a pgp key");
     }
@@ -353,7 +384,8 @@ mod tests {
                 }
                 Err(e) => {
                     assert!(!accepted, "{key_type:?} key was refused: {e}");
-                    assert!(e.contains("Ed25519 only"), "{key_type:?}: {e}");
+                    assert!(matches!(e, KeyLoadError::Refused(_)), "{key_type:?}: {e}");
+                    assert!(e.to_string().contains("Ed25519 only"), "{key_type:?}: {e}");
                 }
             }
             // Refused or not, the operator's file is never replaced.
