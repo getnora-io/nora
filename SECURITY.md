@@ -54,7 +54,7 @@ with documented rationale:
 | Advisory | [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html) |
 | Crate | `rsa` 0.9.x (transitive via `jsonwebtoken`) |
 | Attack | Marvin Attack — timing side-channel on RSA PKCS#1 v1.5 **decryption** |
-| NORA usage | JWT signature **verification** only (OIDC workload identity) |
+| NORA usage | JWT signature **verification** only (OIDC workload identity); index signing (`pgp`) refuses RSA keys at load |
 | Applicable | **No** — NORA calls `rsa::verify`, never `rsa::decrypt` |
 | Upstream fix | None available; `rsa` crate maintainers have not patched |
 
@@ -68,6 +68,17 @@ from the dependency tree without breaking OIDC integration.
 - Default allowed algorithms: RS256, ES256 (EdDSA ready when providers adopt it)
 - Symmetric algorithms (HS256/384/512) rejected globally
 - `ed25519-dalek` already compiled in via `jsonwebtoken` `rust_crypto` feature
+
+### RUSTSEC-2026-0387 — timing variability (`crypto-bigint` crate)
+
+| Field | Value |
+|-------|-------|
+| Advisory | [RUSTSEC-2026-0387](https://rustsec.org/advisories/RUSTSEC-2026-0387.html) |
+| Crate | `crypto-bigint` 0.5.5 (transitive via `pgp` and `jsonwebtoken`, through `elliptic-curve` 0.13) |
+| Attack | Secret-dependent branches in operations meant to be constant-time |
+| NORA usage | ECDSA JWT signature **verification** (public keys only); `pgp` curves NORA never signs with |
+| Applicable | **No** — index signing is Ed25519-only: an ECDSA or Ed448 key at `signing.key_path` is refused at load, so `crypto-bigint` never operates on a secret |
+| Upstream fix | `crypto-bigint` 0.7.6; `pgp` 0.20 and `jsonwebtoken` 10 still depend on 0.5 |
 
 ### RUSTSEC-2025-0119 — Unmaintained crate
 
