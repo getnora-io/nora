@@ -205,6 +205,7 @@ impl Supervisor {
     /// The detached work reported as the task `name`: every call for one name shares its
     /// runs, so one starts only while none of that name is going.
     pub fn detached(&self, name: &'static str) -> Detached {
+        export_panic_count(name);
         let of = |runs: &[(&'static str, Arc<AtomicBool>)]| {
             runs.iter()
                 .find(|(run, _)| *run == name)
@@ -245,6 +246,7 @@ impl Supervisor {
         F: FnMut() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
+        export_panic_count(name);
         let supervisor = Arc::clone(self);
         tokio::spawn(async move {
             let timing = supervisor.timing;
@@ -354,6 +356,7 @@ impl Detached {
 /// Run `work` on the current (blocking) thread as the task `name`, ending the process if it panics:
 /// for a task that lives on a blocking thread, such as the audit writer.
 pub fn blocking<F: FnOnce()>(name: &'static str, exit: &ExitHook, work: F) {
+    export_panic_count(name);
     if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(work)) {
         report_panic(name, &panic);
         tracing::error!(
@@ -370,6 +373,13 @@ pub(crate) fn panics_counted(name: &str) -> u64 {
     crate::metrics::TASK_PANICS_TOTAL
         .with_label_values(&[name])
         .get()
+}
+
+/// Export the panic count of the task `name` from its start, at 0. A series the first panic
+/// created would come in at 1, and `increase` over it, which the `NoraTaskPanic` alert reads,
+/// would not see that panic.
+fn export_panic_count(name: &'static str) {
+    crate::metrics::TASK_PANICS_TOTAL.with_label_values(&[name]);
 }
 
 /// Every task panic: an error in the log naming the task, and the counter.
@@ -433,6 +443,41 @@ mod tests {
             again.start(async {}).is_some(),
             "the next run once the first ended"
         );
+    }
+
+    /// The panic count of `task` as `/metrics` exports it, without creating the series.
+    fn exported_panics(task: &str) -> Option<f64> {
+        prometheus::gather()
+            .iter()
+            .filter(|family| family.name() == "nora_task_panics_total")
+            .flat_map(|family| family.get_metric())
+            .find(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == "task" && label.value() == task)
+            })
+            .map(|metric| metric.get_counter().value())
+    }
+
+    /// Every task's panic series is exported from its start, at 0: an alert on `increase`
+    /// sees the first panic, which a series that the panic creates carries in as its first
+    /// sample.
+    #[tokio::test]
+    async fn a_task_has_its_panic_series_before_its_first_panic() {
+        let tasks = supervisor();
+        let task = tasks.spawn("test_series_spawned", std::future::pending::<()>);
+        let _detached = tasks.detached("test_series_detached");
+        let exit: ExitHook = Arc::new(|_| {});
+        blocking("test_series_blocking", &exit, || {});
+        for name in [
+            "test_series_spawned",
+            "test_series_detached",
+            "test_series_blocking",
+        ] {
+            assert_eq!(exported_panics(name), Some(0.0), "{name}");
+        }
+        task.abort();
     }
 
     fn timing() -> Timing {

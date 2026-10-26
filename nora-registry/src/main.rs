@@ -3903,6 +3903,8 @@ async fn run_maintenance<F, Fut>(
     Fut: std::future::Future<Output = ()>,
 {
     let deadline = tick_deadline(period, heartbeat.max_silence());
+    // Exported from the start, at 0, so that `increase` over it sees the first cut tick.
+    std::sync::LazyLock::force(&metrics::MAINTENANCE_TIMEOUTS_TOTAL);
     let mut interval = tokio::time::interval(period);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut tick_count: u64 = 0;
@@ -4339,6 +4341,27 @@ mod maintenance_loop_tests {
         });
         tokio::time::sleep(PERIOD * 30).await;
         assert_eq!(tasks.failing(), None, "a loop of cut ticks is alive");
+        task.abort();
+    }
+
+    /// `nora_maintenance_timeouts_total` is exported from the loop's start, at 0, before any
+    /// tick is cut, so an alert on its `increase` sees the first cut. The counter is the
+    /// process's: run alone (`--exact`), this test sees a series no other test created.
+    #[tokio::test(start_paused = true)]
+    async fn the_cut_counter_is_exported_before_the_first_cut() {
+        let heartbeat = Arc::new(Heartbeat::new(Duration::from_secs(90)));
+        let task = tokio::spawn(run_maintenance(
+            super::MAINTENANCE_PERIOD,
+            heartbeat,
+            |_| async {},
+        ));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            prometheus::gather()
+                .iter()
+                .any(|family| family.name() == "nora_maintenance_timeouts_total"),
+            "the counter appears only with the first cut tick"
+        );
         task.abort();
     }
 
