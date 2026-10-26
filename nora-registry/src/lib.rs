@@ -248,6 +248,12 @@ pub mod version_fuzz {
     pub use crate::pypi_files::parse_pypi_version;
 }
 
+/// Re-export the ansible and NuGet upstream-URL rewrites under the path 1.4.2 gave them: the
+/// server's own rewrites, in [`upstream_rewrite`], which the fuzz targets now use directly.
+pub mod rewrite_fuzz {
+    pub use crate::upstream_rewrite::{rewrite_ansible_urls, rewrite_registration_urls};
+}
+
 #[cfg(test)]
 mod one_implementation_tests {
     //! The fuzz targets drive the code the server runs. A function with a body in this file is
