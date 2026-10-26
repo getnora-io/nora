@@ -3910,7 +3910,8 @@ async fn run_maintenance<F, Fut>(
         interval.tick().await;
         tick_count += 1;
         // CANCEL-SAFETY: a tick cut here is dropped at whatever await it was in, which is
-        // the reachability request: it publishes its verdict only once it has one. The token
+        // the reachability request: dropped unanswered, it publishes the store unreachable
+        // (object store), or the next tick does, finding the probe still running (local disk). The token
         // flush and the size count run in tasks of their own (`MaintenanceWork`) that the
         // cut does not stop, session and lock expiry do not await, and the temp-file sweep is
         // a detached blocking task.

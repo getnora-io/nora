@@ -195,6 +195,30 @@ impl ObjectStorage {
     pub(crate) fn store(&self) -> &dyn ObjectStore {
         self.store.as_ref()
     }
+
+    /// Serve `reachable` to the probes from now on.
+    fn record_reachability(&self, reachable: bool) {
+        self.cached_reachable
+            .store(reachable, std::sync::atomic::Ordering::Relaxed);
+        // Stamp every run (success or failure): this marks the maintenance loop as alive so
+        // `health_check` can expire the cached verdict if the loop stops (#872).
+        self.last_refresh_unix.store(
+            crate::cache_ttl::now_unix(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
+/// Records the store unreachable when dropped still holding it: a reachability request
+/// dropped before the store answered, see `refresh_reachability`.
+struct Unanswered<'a>(Option<&'a ObjectStorage>);
+
+impl Drop for Unanswered<'_> {
+    fn drop(&mut self) {
+        if let Some(storage) = self.0 {
+            storage.record_reachability(false);
+        }
+    }
 }
 
 /// Encode `@` in object keys to `%40` for SeaweedFS compatibility (shared by
@@ -446,6 +470,10 @@ impl StorageBackend for ObjectStorage {
     }
 
     async fn refresh_reachability(&self) {
+        // A request dropped before the store answers, as a maintenance tick cut at its
+        // deadline drops it, records the store unreachable: one that has not answered by the
+        // deadline is not ready, and the last verdict would keep `/ready` up until it expires.
+        let mut unanswered = Unanswered(Some(self));
         // One request whatever the bucket holds: the first page of its listing (the listing
         // is fetched page by page, and only the first is asked for). An empty bucket answers
         // with an empty page, which is an answer.
@@ -455,14 +483,8 @@ impl StorageBackend for ObjectStorage {
             .next()
             .await
             .is_none_or(|first| first.is_ok());
-        self.cached_reachable
-            .store(reachable, std::sync::atomic::Ordering::Relaxed);
-        // Stamp every run (success or failure): this marks the maintenance loop as alive so
-        // `health_check` can expire the cached verdict if the loop stops (#872).
-        self.last_refresh_unix.store(
-            crate::cache_ttl::now_unix(),
-            std::sync::atomic::Ordering::Relaxed,
-        );
+        unanswered.0 = None;
+        self.record_reachability(reachable);
     }
 
     async fn refresh_total_size(&self) {
@@ -698,6 +720,46 @@ mod tests {
         .expect("one page, not the whole listing");
         assert!(storage.health_check().await);
         assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A store that does not answer within the tick's deadline is not ready: the refresh cut
+    /// there (dropped at its request, as `run_maintenance` drops a cut tick) records the store
+    /// unreachable instead of leaving the last verdict up until it expires.
+    #[tokio::test]
+    async fn a_reachability_request_cut_at_the_deadline_unreadies_the_store() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let server = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::method("GET"))
+            .respond_with(
+                wiremock::ResponseTemplate::new(200)
+                    .set_body_raw(ENDLESS_LIST_XML, "application/xml")
+                    .set_delay(std::time::Duration::from_secs(60)),
+            )
+            .mount(&server)
+            .await;
+        let storage = ObjectStorage::new(
+            &server.uri(),
+            "test-bucket",
+            "us-east-1",
+            Some("access"),
+            Some("secret"),
+            false,
+        );
+        storage.cached_reachable.store(true, Relaxed);
+        storage
+            .last_refresh_unix
+            .store(crate::cache_ttl::now_unix(), Relaxed);
+        assert!(storage.health_check().await, "ready before the store hangs");
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            storage.refresh_reachability(),
+        )
+        .await;
+        assert!(cut.is_err(), "the request waits on the store");
+        assert!(
+            !storage.health_check().await,
+            "a store that did not answer by the deadline keeps the pod ready"
+        );
     }
 
     /// Counting the size does not decide reachability: a whole listing that fails leaves the
