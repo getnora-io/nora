@@ -2,6 +2,9 @@ services:
   nora:
     image: ghcr.io/getnora-io/nora:latest
     restart: unless-stopped
+    # NORA drains requests for up to 15 s and its schedulers for up to 10 s on stop;
+    # the 10 s default kills it before the audit log and token last_used are flushed.
+    stop_grace_period: 30s
     expose:
       - "4000"
     volumes:
