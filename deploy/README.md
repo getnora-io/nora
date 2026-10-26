@@ -79,6 +79,12 @@ environment:
   - NORA_PUBLIC_URL=https://registry.example.com
 ```
 
+**npm after a change of `NORA_PUBLIC_URL`** — cached packuments name tarballs at the
+old address, so NORA fetches each one again from its upstream on the next request. While that
+upstream is unreachable, a cached packument is served without the versions it names at the old
+address (or not at all with `serve_stale` off). Bring the upstream back, or serve on the old
+address again until the packuments have been fetched anew.
+
 **PyPI index URL** — use `/simple/`, not `/pypi/simple/`:
 
 ```bash
@@ -197,6 +203,12 @@ docker compose up -d
 environment:
   - NORA_PUBLIC_URL=https://registry.example.com
 ```
+
+**npm после смены `NORA_PUBLIC_URL`** — в кэшированных packument ссылки на tarball указывают
+на старый адрес, поэтому при следующем запросе NORA заново берёт каждый у его апстрима. Пока
+апстрим недоступен, кэшированный packument отдаётся без версий со ссылками на старый адрес
+(а с выключенным `serve_stale` не отдаётся вовсе). Верните апстрим или на время, пока packument
+не будут перезапрошены, верните прежний адрес.
 
 **URL для PyPI** — используйте `/simple/`, а не `/pypi/simple/`:
 

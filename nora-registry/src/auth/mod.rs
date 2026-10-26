@@ -16,7 +16,7 @@ mod token_routes;
 pub use htpasswd::HtpasswdAuth;
 pub use namespace::{enforce_namespace_scope, NamespaceAuthority};
 pub use oidc::OidcValidator;
-pub use token_routes::{token_routes, TokenListItem, TokenListResponse};
+pub use token_routes::{token_routes, MintedTokenResponse, TokenListItem, TokenListResponse};
 
 /// Authenticated username carried in request extensions after successful auth.
 #[derive(Clone, Debug)]
@@ -29,11 +29,14 @@ pub struct AuthenticatedUser(pub String);
 pub struct AuthenticatedRole(pub crate::tokens::Role);
 
 /// The lifetime ceiling (seconds) the caller's own credential imposes on any
-/// token it mints. Inserted ONLY for OIDC identities — the provider's
-/// `max_token_lifetime_secs`, which already bounds the JWT itself. Absent for
-/// Basic and opaque (`nra_`) callers, which carry no such ceiling. A UI mint
-/// reads it to cap the new token so a short-lived federated identity cannot
-/// bootstrap a long-lived static one (#1094).
+/// token it mints. Inserted ONLY for OIDC identities: the shorter of the
+/// provider's `max_token_lifetime_secs` and what is left of the JWT until its
+/// `exp`, so a minted token never outlives the JWT that minted it (0 once the
+/// JWT has expired, inside the validator's leeway). Absent for Basic and opaque
+/// (`nra_`) callers, which carry no such ceiling. Every mint route an OIDC
+/// identity reaches (the UI and the admin route) reads it to cap the new token
+/// so a short-lived federated identity cannot bootstrap a long-lived static one
+/// (#1094).
 #[derive(Clone, Copy, Debug)]
 pub struct MintLifetimeCeiling(pub u64);
 
@@ -49,6 +52,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Instant;
 
+use crate::config::canonical_ip;
 use crate::AppState;
 
 /// Resolve the audit actor for a request-driven event (#985): the authenticated
@@ -62,63 +66,128 @@ pub fn audit_actor(user: &Option<axum::Extension<AuthenticatedUser>>) -> &str {
     }
 }
 
-/// Tracks failed authentication attempts per IP for brute-force protection.
+/// Tracks wrong passwords for brute-force protection, per account and per
+/// address.
 ///
-/// After `max_failures` consecutive failures, the IP is locked out with
-/// exponential backoff: 2^(failures - max_failures) seconds, capped at 15 minutes.
+/// An account is a username at a client address. After `max_failures`
+/// consecutive failures it is locked out of password authentication with
+/// exponential backoff: 2^(failures - max_failures) seconds, capped at
+/// `max_lockout_secs`. Guesses at one account do not lock out another behind
+/// the same address, and only a login as that username clears its count.
+///
+/// An address is also held, whatever the username, once it has sent
+/// [`ADDRESS_FAILURES_PER_ACCOUNT`] times `max_failures` wrong passwords, with
+/// the same backoff, so guessing across usernames gains nothing. A login does
+/// not clear the address count, which ends after `2 * max_lockout_secs`
+/// without a failure ([`AuthFailureTracker::cleanup`]).
+///
+/// Bearer credentials (API tokens, OIDC JWTs) cannot be guessed and are
+/// neither counted nor refused.
 pub struct AuthFailureTracker {
-    /// IP -> (consecutive failures, last failure time)
-    entries: parking_lot::Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    entries: parking_lot::Mutex<FailureCounts>,
     /// Number of failures before lockout kicks in (default: 5)
     max_failures: u32,
     /// Maximum lockout duration in seconds (default: 900 = 15 minutes)
     max_lockout_secs: u64,
 }
 
+/// How many accounts' worth of failures an address may send before it is held
+/// whatever the username. An account adds at most `max_failures` failures
+/// before its own lockout stops counting it, so the address ceiling is reached
+/// only by failing many accounts, which is guessing across usernames rather
+/// than a mistyped password; ten accounts (50 failures at the default 5) keep
+/// an office of mistyping users clear of it.
+pub const ADDRESS_FAILURES_PER_ACCOUNT: u32 = 10;
+
+/// Failure counts: (consecutive failures, last failure).
+#[derive(Default)]
+struct FailureCounts {
+    /// By address and SHA-256 of the username: a fixed-size key whatever the
+    /// username a client sends.
+    accounts: HashMap<(IpAddr, [u8; 32]), (u32, Instant)>,
+    /// By address, for every username.
+    addresses: HashMap<IpAddr, (u32, Instant)>,
+}
+
+fn account_key(ip: IpAddr, username: &str) -> (IpAddr, [u8; 32]) {
+    use sha2::{Digest, Sha256};
+    (ip, Sha256::digest(username.as_bytes()).into())
+}
+
 impl AuthFailureTracker {
     pub fn new(max_failures: u32, max_lockout_secs: u64) -> Self {
         Self {
-            entries: parking_lot::Mutex::new(HashMap::new()),
+            entries: parking_lot::Mutex::new(FailureCounts::default()),
             max_failures,
             max_lockout_secs,
         }
     }
 
-    /// Check if IP is currently locked out. Returns remaining lockout seconds if blocked.
-    pub fn check_blocked(&self, ip: &IpAddr) -> Option<u64> {
-        let entries = self.entries.lock();
-        let (failures, last_failure) = entries.get(ip)?;
-        if *failures < self.max_failures {
+    /// Seconds left of a lockout at `threshold` failures, if one is running.
+    fn lockout_left(&self, count: Option<&(u32, Instant)>, threshold: u32) -> Option<u64> {
+        let (failures, last_failure) = count?;
+        if *failures < threshold {
             return None;
         }
-        let exponent = (*failures - self.max_failures).min(20);
+        let exponent = (*failures - threshold).min(20);
         let lockout_secs = (1u64 << exponent).min(self.max_lockout_secs);
         let elapsed = last_failure.elapsed().as_secs();
-        if elapsed < lockout_secs {
-            Some(lockout_secs - elapsed)
-        } else {
-            None
+        (elapsed < lockout_secs).then(|| lockout_secs - elapsed)
+    }
+
+    /// Seconds left until `username` at `ip` may try a password again, if it
+    /// is locked out: the account itself, or the address for every username.
+    pub fn check_blocked(&self, ip: &IpAddr, username: &str) -> Option<u64> {
+        let entries = self.entries.lock();
+        let account = self.lockout_left(
+            entries.accounts.get(&account_key(*ip, username)),
+            self.max_failures,
+        );
+        let address = self.lockout_left(
+            entries.addresses.get(ip),
+            self.max_failures
+                .saturating_mul(ADDRESS_FAILURES_PER_ACCOUNT),
+        );
+        account.max(address)
+    }
+
+    /// Apply to the counts of `username` at `ip` what [`lockout_rule`]
+    /// decided an attempt does to them: the one way an attempt changes them.
+    pub(crate) fn count(&self, ip: IpAddr, username: &str, count: LockoutCount) {
+        match count {
+            LockoutCount::Nothing => {}
+            LockoutCount::Failure => self.record_failure(ip, username),
+            LockoutCount::Clear => self.record_success(&ip, username),
         }
     }
 
-    /// Record a failed auth attempt for an IP.
-    pub fn record_failure(&self, ip: IpAddr) {
+    /// Record a wrong password for `username` at `ip`.
+    fn record_failure(&self, ip: IpAddr, username: &str) {
+        let now = Instant::now();
         let mut entries = self.entries.lock();
-        let entry = entries.entry(ip).or_insert_with(|| (0, Instant::now()));
-        entry.0 += 1;
-        entry.1 = Instant::now();
+        let account = entries
+            .accounts
+            .entry(account_key(ip, username))
+            .or_insert((0, now));
+        *account = (account.0.saturating_add(1), now);
+        let address = entries.addresses.entry(ip).or_insert((0, now));
+        *address = (address.0.saturating_add(1), now);
     }
 
-    /// Clear failure count on successful auth.
-    pub fn record_success(&self, ip: &IpAddr) {
+    /// A login as `username` from `ip`: clears that account's failures, not
+    /// the address's.
+    fn record_success(&self, ip: &IpAddr, username: &str) {
         let mut entries = self.entries.lock();
-        entries.remove(ip);
+        entries.accounts.remove(&account_key(*ip, username));
     }
 
-    /// Remove entries older than max_lockout_secs (call periodically).
+    /// Remove entries older than 2 x max_lockout_secs (call periodically).
     pub fn cleanup(&self) {
+        let keep =
+            |(_, last): &(u32, Instant)| last.elapsed().as_secs() < self.max_lockout_secs * 2;
         let mut entries = self.entries.lock();
-        entries.retain(|_, (_, last)| last.elapsed().as_secs() < self.max_lockout_secs * 2);
+        entries.accounts.retain(|_, count| keep(count));
+        entries.addresses.retain(|_, count| keep(count));
     }
 }
 
@@ -171,14 +240,21 @@ fn is_admin_path(path: &str) -> bool {
 /// Extract client IP from request, honoring XFF/X-Real-IP only from trusted proxies.
 ///
 /// If the direct peer IP is not in `trusted_proxies`, XFF/X-Real-IP headers are
-/// ignored and the peer IP is returned. This prevents attackers from spoofing
-/// their IP to bypass `AuthFailureTracker` lockout.
+/// ignored (with one warning per setting) and the peer IP is returned. This
+/// prevents attackers from spoofing their IP to bypass `AuthFailureTracker`
+/// lockout. Every address is canonical: an IPv4-mapped IPv6 address
+/// (`::ffff:a.b.c.d`, an IPv4 peer of a dual-stack socket) is its IPv4
+/// address, so one client is one key whichever socket or proxy it came by.
 pub(crate) fn resolve_client_ip(
     peer: IpAddr,
     headers: &HeaderMap,
     trusted_proxies: &crate::config::TrustedProxies,
 ) -> IpAddr {
+    let peer = canonical_ip(peer);
     if !trusted_proxies.contains(peer) {
+        if headers.contains_key("x-forwarded-for") || headers.contains_key("x-real-ip") {
+            trusted_proxies.warn_untrusted_forwarding(peer);
+        }
         return peer;
     }
 
@@ -189,7 +265,7 @@ pub(crate) fn resolve_client_ip(
     if let Some(xri) = headers.get("x-real-ip") {
         if let Ok(s) = xri.to_str() {
             if let Ok(ip) = s.trim().parse::<IpAddr>() {
-                return ip;
+                return canonical_ip(ip);
             }
         }
     }
@@ -216,6 +292,7 @@ fn forwarded_for_client(
         let Some(ip) = std::str::from_utf8(entry)
             .ok()
             .and_then(|s| s.trim().parse::<IpAddr>().ok())
+            .map(canonical_ip)
         else {
             break;
         };
@@ -417,24 +494,8 @@ pub async fn auth_middleware(
     // Compute realm from public_url for WWW-Authenticate header
     let realm = state.config.server.public_url.as_deref().unwrap_or("Nora");
 
-    // Check if client IP is blocked due to too many failed attempts
+    // The client address the password lockout counts by.
     let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
-    if let Some(ip) = client_ip {
-        if let Some(retry_after) = state.auth_failures.check_blocked(&ip) {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [
-                    (header::RETRY_AFTER, retry_after.to_string()),
-                    (header::CONTENT_TYPE, "application/json".to_string()),
-                ],
-                format!(
-                    r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                    retry_after
-                ),
-            )
-                .into_response();
-        }
-    }
 
     // Extract Authorization header
     let auth_header = request
@@ -453,9 +514,6 @@ pub async fn auth_middleware(
         if let Some(ref token_store) = state.tokens {
             match token_store.verify_token(token) {
                 Ok((user, role)) => {
-                    if let Some(ip) = client_ip {
-                        state.auth_failures.record_success(&ip);
-                    }
                     if is_write_method(request.method()) && !role.can_write() {
                         return (StatusCode::FORBIDDEN, "Read-only token").into_response();
                     }
@@ -494,9 +552,6 @@ pub async fn auth_middleware(
             if oidc_validator.is_active() {
                 match oidc_validator.validate_token(token).await {
                     Ok(identity) => {
-                        if let Some(ip) = client_ip {
-                            state.auth_failures.record_success(&ip);
-                        }
                         tracing::debug!(
                             provider = %identity.provider,
                             subject = %identity.subject,
@@ -526,9 +581,15 @@ pub async fn auth_middleware(
                         // the identity — i.e. the provider that actually validated
                         // this JWT — never re-looked-up by name, since provider
                         // names are not unique (#1094 N2).
-                        request
-                            .extensions_mut()
-                            .insert(MintLifetimeCeiling(identity.max_token_lifetime_secs));
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        request.extensions_mut().insert(MintLifetimeCeiling(
+                            identity
+                                .max_token_lifetime_secs
+                                .min(identity.expires_at.saturating_sub(now)),
+                        ));
                         request
                             .extensions_mut()
                             .insert(AuthenticatedUser(identity.subject.clone()));
@@ -551,10 +612,10 @@ pub async fn auth_middleware(
             }
         }
 
-        // Both token and OIDC failed
-        if let Some(ip) = client_ip {
-            state.auth_failures.record_failure(ip);
-        }
+        // Both token and OIDC failed. A Bearer credential cannot be guessed
+        // (a random API token or a signed JWT), so a wrong one does not count
+        // toward the password lockout: a client replaying an expired token
+        // must not lock everyone behind its address out of their passwords.
         return unauthorized_response("Invalid or expired token", realm);
     }
 
@@ -563,27 +624,56 @@ pub async fn auth_middleware(
         return unauthorized_response("Basic or Bearer authentication required", realm);
     }
 
+    // The account the password lockout counts by: the username at the client
+    // address. A header that does not decode to `user:password` is refused
+    // below without being counted.
+    let encoded = &auth_header[6..];
+    let account = client_ip.zip(basic_credentials(encoded).ok().map(|(user, _)| user));
+    let locked_out = account
+        .as_ref()
+        .and_then(|(ip, user)| state.auth_failures.check_blocked(ip, user));
+
     // Verify credentials: htpasswd first, then the token store (#736, #1094);
-    // `decide_basic_auth` has the rules, this applies its decision.
-    let decision = decide_basic_auth(
-        &auth_header[6..],
-        state
-            .auth
-            .as_deref()
-            .map(|auth| move |user: &str, password: &str| auth.authenticate(user, password)),
-        state
-            .tokens
-            .as_ref()
-            .map(|store| move |password: &str| store.verify_token(password)),
-        request.method(),
-        is_admin,
+    // `decide_basic_auth` has the rules, this applies its decision. The htpasswd check is
+    // async (bcrypt runs off the async workers), so it runs here, on the credentials
+    // `decide_basic_auth` reads, and hands it the verdict.
+    let tokens = state
+        .tokens
+        .as_ref()
+        .map(|store| move |password: &str| store.verify_token(password));
+    let checked = match locked_out {
+        None => {
+            let htpasswd_match = match (state.auth.as_deref(), basic_credentials(encoded)) {
+                (Some(htpasswd), Ok((user, password))) => htpasswd.verify(&user, &password).await,
+                _ => false,
+            };
+            let htpasswd = state
+                .auth
+                .as_deref()
+                .map(|_| move |_: &str, _: &str| htpasswd_match);
+            decide_basic_auth(encoded, htpasswd, tokens, request.method(), is_admin)
+        }
+        // A locked-out account gets no password checked, so no bcrypt runs for it. An API
+        // token sent as the password cannot be guessed, so it is still verified, as over
+        // Bearer: Docker has no other way to present one.
+        Some(_) => decide_basic_auth(
+            encoded,
+            None::<fn(&str, &str) -> bool>,
+            tokens,
+            request.method(),
+            is_admin,
+        ),
+    };
+    let (decision, count) = lockout_rule(
+        locked_out,
+        checked,
+        account.as_ref().map(|(_, user)| user.as_str()),
     );
+    if let Some((ip, username)) = &account {
+        state.auth_failures.count(*ip, username, count);
+    }
     match decision {
         BasicDecision::Authenticated { user, role } => {
-            // Auth successful — clear failure counter
-            if let Some(ip) = client_ip {
-                state.auth_failures.record_success(&ip);
-            }
             // Basic-auth identities and opaque (nra_) tokens are not
             // namespace-scoped (#583 is OIDC-only).
             request
@@ -593,24 +683,11 @@ pub async fn auth_middleware(
             request.extensions_mut().insert(AuthenticatedRole(role));
             next.run(request).await
         }
-        BasicDecision::Forbidden(reason) => {
-            // Valid credentials, not authorized: the credential still counts as good.
-            if let Some(ip) = client_ip {
-                state.auth_failures.record_success(&ip);
-            }
-            (StatusCode::FORBIDDEN, reason).into_response()
-        }
-        BasicDecision::Unauthorized {
-            message,
-            record_failure,
-        } => {
-            if record_failure {
-                if let Some(ip) = client_ip {
-                    state.auth_failures.record_failure(ip);
-                }
-            }
-            unauthorized_response(message, realm)
-        }
+        // Valid credentials, not authorized: not a wrong password, so not
+        // counted.
+        BasicDecision::Forbidden(reason) => (StatusCode::FORBIDDEN, reason).into_response(),
+        BasicDecision::Unauthorized { message, .. } => unauthorized_response(message, realm),
+        BasicDecision::LockedOut(retry_after) => too_many_failed_attempts(retry_after),
         BasicDecision::ServiceUnavailable(e) => {
             tracing::error!(error = %e, "token store read failed during Basic auth fallback");
             (
@@ -626,7 +703,7 @@ pub async fn auth_middleware(
 /// What the Basic branch of [`auth_middleware`] does with a request, as
 /// decided by [`decide_basic_auth`].
 #[derive(Clone, Debug, PartialEq)]
-enum BasicDecision {
+pub(crate) enum BasicDecision {
     /// Valid credentials, authorized: run the request as `user` with `role`.
     Authenticated {
         user: String,
@@ -646,6 +723,71 @@ enum BasicDecision {
     ServiceUnavailable(String),
     /// Neither htpasswd nor a token store to check a Basic password against (401).
     NotConfigured,
+    /// The account is locked out and the credential was not one served under
+    /// a lockout (429, retry after so many seconds). Only [`lockout_rule`]
+    /// answers it.
+    LockedOut(u64),
+}
+
+/// What a password attempt does to the lockout counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LockoutCount {
+    /// Nothing: not a wrong password, or a password that was not checked.
+    Nothing,
+    /// A wrong password: one more failure for the username at the address
+    /// and one more toward the address ceiling.
+    Failure,
+    /// A login as the username: its own failures are cleared, not the
+    /// address's.
+    Clear,
+}
+
+/// The rules of the password lockout, in one place: what a request with a
+/// password is answered and what it does to the counts, from the lockout its
+/// account is under (`locked_out`, seconds left), what checking its
+/// credentials decided (`checked`) and the username it was sent for (`None`
+/// when there is no account to count, a header that does not decode or no
+/// client address).
+///
+/// - Under a lockout no password was checked: whatever did not pass is
+///   refused as locked out and counted nowhere, not for the username and not
+///   toward the address ceiling. What passes without a password, an API
+///   token sent as one, is served (or refused 403, or 503 on an outage) as
+///   without a lockout.
+/// - Only a wrong password counts as a failure. A 403, an outage, a header
+///   that does not decode and a missing store count nothing.
+/// - A login clears the failures of its own username only: an API token of
+///   another owner sent under the username clears nothing.
+pub(crate) fn lockout_rule(
+    locked_out: Option<u64>,
+    checked: BasicDecision,
+    username: Option<&str>,
+) -> (BasicDecision, LockoutCount) {
+    let served_locked_out = matches!(
+        checked,
+        BasicDecision::Authenticated { .. }
+            | BasicDecision::Forbidden(_)
+            | BasicDecision::ServiceUnavailable(_)
+    );
+    if let (Some(retry_after), false) = (locked_out, served_locked_out) {
+        return (BasicDecision::LockedOut(retry_after), LockoutCount::Nothing);
+    }
+    let count = match &checked {
+        BasicDecision::Authenticated { user, .. } if Some(user.as_str()) == username => {
+            LockoutCount::Clear
+        }
+        BasicDecision::Unauthorized {
+            record_failure: true,
+            ..
+        } => LockoutCount::Failure,
+        BasicDecision::Authenticated { .. }
+        | BasicDecision::Forbidden(_)
+        | BasicDecision::Unauthorized { .. }
+        | BasicDecision::ServiceUnavailable(_)
+        | BasicDecision::NotConfigured
+        | BasicDecision::LockedOut(_) => LockoutCount::Nothing,
+    };
+    (checked, count)
 }
 
 /// Decide a Basic-auth request from its credentials (`encoded`, the header
@@ -686,19 +828,16 @@ where
     if htpasswd.is_none() && tokens.is_none() {
         return BasicDecision::NotConfigured;
     }
-    let malformed = |message| BasicDecision::Unauthorized {
-        message,
-        record_failure: false,
+    let (username, password) = match basic_credentials(encoded) {
+        Ok(credentials) => credentials,
+        Err(message) => {
+            return BasicDecision::Unauthorized {
+                message,
+                record_failure: false,
+            }
+        }
     };
-    let Ok(decoded) = STANDARD.decode(encoded) else {
-        return malformed("Invalid credentials encoding");
-    };
-    let Ok(credentials) = String::from_utf8(decoded) else {
-        return malformed("Invalid credentials encoding");
-    };
-    let Some((username, password)) = credentials.split_once(':') else {
-        return malformed("Invalid credentials format");
-    };
+    let (username, password) = (username.as_str(), password.as_str());
 
     if htpasswd.is_some_and(|check| check(username, password)) {
         // Basic-auth carries no role, so it can never satisfy an admin path:
@@ -732,6 +871,37 @@ where
     }
 }
 
+/// The username and password of a Basic credential (`encoded`, the header
+/// value after `Basic `), or why it is malformed.
+fn basic_credentials(encoded: &str) -> Result<(String, String), &'static str> {
+    let Ok(decoded) = STANDARD.decode(encoded) else {
+        return Err("Invalid credentials encoding");
+    };
+    let Ok(credentials) = String::from_utf8(decoded) else {
+        return Err("Invalid credentials encoding");
+    };
+    let Some((username, password)) = credentials.split_once(':') else {
+        return Err("Invalid credentials format");
+    };
+    Ok((username.to_string(), password.to_string()))
+}
+
+/// The answer to a password from a locked-out account.
+pub(crate) fn too_many_failed_attempts(retry_after: u64) -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        [
+            (header::RETRY_AFTER, retry_after.to_string()),
+            (header::CONTENT_TYPE, "application/json".to_string()),
+        ],
+        format!(
+            r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
+            retry_after
+        ),
+    )
+        .into_response()
+}
+
 /// The methods a read-only identity may not use: exactly PUT, POST, DELETE and
 /// PATCH. Every other method is a read — HEAD included, which is how
 /// `docker pull` starts.
@@ -739,21 +909,15 @@ fn is_write_method(method: &Method) -> bool {
     [Method::PUT, Method::POST, Method::DELETE, Method::PATCH].contains(method)
 }
 
-/// Attempt to validate a Base64-encoded Basic auth credential against the
-/// htpasswd store. Returns the username on success, `None` on any failure.
-/// Used by the opportunistic-auth path on open web surfaces so that
-/// authenticated users get their real identity even on publicly browsable
-/// pages.
+/// The username of a Base64-encoded Basic credential that htpasswd has already accepted,
+/// `None` otherwise. Used by the opportunistic-auth path on open web surfaces so that
+/// authenticated users get their real identity even on publicly browsable pages. It runs
+/// no bcrypt: an open path has no lockout and no limiter, so a flood of Basic
+/// headers there would cost a bcrypt each. Credentials count once a gated path (where the
+/// browser is challenged) has checked them.
 fn try_basic_auth(encoded: &str, auth: Option<&HtpasswdAuth>) -> Option<String> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let decoded = String::from_utf8(STANDARD.decode(encoded).ok()?).ok()?;
-    let (username, password) = decoded.split_once(':')?;
-    let htpasswd = auth?;
-    if htpasswd.authenticate(username, password) {
-        Some(username.to_string())
-    } else {
-        None
-    }
+    let (username, password) = basic_credentials(encoded).ok()?;
+    (auth?.verified(&username, &password) == Some(true)).then_some(username)
 }
 
 fn unauthorized_response(message: &str, realm: &str) -> Response {
@@ -776,6 +940,8 @@ fn unauthorized_response(message: &str, realm: &str) -> Response {
 mod tests {
     use super::*;
 
+    /// #1094: an OIDC caller's lifetime ceiling caps the minted token; a
+    /// caller with no ceiling (Basic/opaque) is unchanged.
     #[test]
     fn audit_actor_resolves_user_or_anonymous() {
         // #985 — the audit actor is the authenticated username (whatever auth
@@ -968,6 +1134,97 @@ mod tests {
         }
     }
 
+    /// The client of a request, as a table over the peer, the forwarding
+    /// headers and `auth.trusted_proxies`: every address is canonical (an
+    /// IPv4-mapped one is its IPv4 address, any other IPv6 one is itself), and
+    /// the headers count only from a trusted peer.
+    #[test]
+    fn the_client_address_is_canonical_wherever_it_comes_from() {
+        for (trusted, peer, header, value, client) in [
+            (
+                "::a00:1/128",
+                "10.0.0.1",
+                "x-forwarded-for",
+                "1.2.3.4",
+                "10.0.0.1",
+            ),
+            (
+                "::a00:1/128",
+                "::a00:1",
+                "x-forwarded-for",
+                "1.2.3.4",
+                "1.2.3.4",
+            ),
+            ("::1/128", "::1", "x-forwarded-for", "1.2.3.4", "1.2.3.4"),
+            (
+                "::1/128",
+                "0.0.0.1",
+                "x-forwarded-for",
+                "1.2.3.4",
+                "0.0.0.1",
+            ),
+            (
+                "10.0.0.0/8",
+                "::ffff:10.0.0.9",
+                "x-forwarded-for",
+                "::ffff:1.2.3.4",
+                "1.2.3.4",
+            ),
+            (
+                "10.0.0.0/8",
+                "::ffff:10.0.0.9",
+                "x-real-ip",
+                "::ffff:5.6.7.8",
+                "5.6.7.8",
+            ),
+            (
+                "10.0.0.0/8",
+                "::ffff:10.0.0.9",
+                "x-forwarded-for",
+                "::a01:203",
+                "::a01:203",
+            ),
+            ("10.0.0.0/8", "::ffff:10.0.0.9", "x-real-ip", "::1", "::1"),
+            (
+                "10.0.0.0/8",
+                "10.0.0.9",
+                "x-forwarded-for",
+                "1.2.3.4, ::ffff:10.0.0.5",
+                "1.2.3.4",
+            ),
+            (
+                "10.0.0.0/8",
+                "10.0.0.9",
+                "x-forwarded-for",
+                "1.2.3.4, ::a00:5",
+                "::a00:5",
+            ),
+            (
+                "10.0.0.0/8",
+                "::a00:9",
+                "x-forwarded-for",
+                "1.2.3.4",
+                "::a00:9",
+            ),
+            (
+                "::ffff:10.0.0.0/104",
+                "10.0.0.9",
+                "x-forwarded-for",
+                "1.2.3.4",
+                "1.2.3.4",
+            ),
+        ] {
+            let proxies = crate::config::TrustedProxies::parse(trusted);
+            let mut headers = HeaderMap::new();
+            headers.insert(header, value.parse().unwrap());
+            assert_eq!(
+                resolve_client_ip(peer.parse().unwrap(), &headers, &proxies),
+                client.parse::<IpAddr>().unwrap(),
+                "{trusted}, peer {peer}, {header}: {value}"
+            );
+        }
+    }
+
     #[test]
     fn test_xff_untrusted_proxy_uses_peer_ip() {
         use crate::config::TrustedProxies;
@@ -1030,9 +1287,9 @@ mod tests {
         let tracker = AuthFailureTracker::new(5, 900);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..4 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "alice");
         }
-        assert!(tracker.check_blocked(&ip).is_none());
+        assert!(tracker.check_blocked(&ip, "alice").is_none());
     }
 
     #[test]
@@ -1040,9 +1297,9 @@ mod tests {
         let tracker = AuthFailureTracker::new(5, 900);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..5 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "alice");
         }
-        assert!(tracker.check_blocked(&ip).is_some());
+        assert!(tracker.check_blocked(&ip, "alice").is_some());
     }
 
     #[test]
@@ -1050,11 +1307,11 @@ mod tests {
         let tracker = AuthFailureTracker::new(5, 900);
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..10 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "alice");
         }
-        assert!(tracker.check_blocked(&ip).is_some());
-        tracker.record_success(&ip);
-        assert!(tracker.check_blocked(&ip).is_none());
+        assert!(tracker.check_blocked(&ip, "alice").is_some());
+        tracker.record_success(&ip, "alice");
+        assert!(tracker.check_blocked(&ip, "alice").is_none());
     }
 
     #[test]
@@ -1063,10 +1320,44 @@ mod tests {
         let ip1: IpAddr = "10.0.0.1".parse().unwrap();
         let ip2: IpAddr = "10.0.0.2".parse().unwrap();
         for _ in 0..3 {
-            tracker.record_failure(ip1);
+            tracker.record_failure(ip1, "alice");
         }
-        assert!(tracker.check_blocked(&ip1).is_some());
-        assert!(tracker.check_blocked(&ip2).is_none());
+        assert!(tracker.check_blocked(&ip1, "alice").is_some());
+        assert!(tracker.check_blocked(&ip2, "alice").is_none());
+    }
+
+    /// The lockout counts by the whole username: a name sharing a prefix or
+    /// a suffix with a locked-out one, differing in case or in one trailing
+    /// byte of a long name, is another account and is not held.
+    #[test]
+    fn the_lockout_keys_the_whole_username() {
+        let ip: IpAddr = "10.0.0.1".parse().unwrap();
+        let long = "ci-deploy-production-runner-01";
+        for (locked, others) in [
+            (
+                "alice",
+                &["alicia", "ali", "alice2", "Alice", "alice ", "", "xalice"][..],
+            ),
+            (
+                long,
+                &[
+                    "ci-deploy-production-runner-02",
+                    "ci-deploy-production-runner-0",
+                ][..],
+            ),
+        ] {
+            let tracker = AuthFailureTracker::new(5, 900);
+            for _ in 0..5 {
+                tracker.record_failure(ip, locked);
+            }
+            assert!(tracker.check_blocked(&ip, locked).is_some(), "{locked}");
+            for other in others {
+                assert!(
+                    tracker.check_blocked(&ip, other).is_none(),
+                    "locking out {locked:?} held {other:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1074,12 +1365,12 @@ mod tests {
         let tracker = AuthFailureTracker::new(3, 1); // 1 sec max lockout
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         for _ in 0..5 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "alice");
         }
         // Cleanup should remove entries older than 2x max_lockout_secs
         std::thread::sleep(std::time::Duration::from_secs(3));
         tracker.cleanup();
-        assert!(tracker.check_blocked(&ip).is_none());
+        assert!(tracker.check_blocked(&ip, "alice").is_none());
     }
 
     #[test]
@@ -1088,9 +1379,9 @@ mod tests {
         let ip: IpAddr = "10.0.0.1".parse().unwrap();
         // 5 failures = threshold, lockout = 2^0 = 1 sec
         for _ in 0..5 {
-            tracker.record_failure(ip);
+            tracker.record_failure(ip, "alice");
         }
-        let retry1 = tracker.check_blocked(&ip).unwrap();
+        let retry1 = tracker.check_blocked(&ip, "alice").unwrap();
         assert!(
             retry1 <= 1,
             "first lockout should be ~1 sec, got {}",
@@ -1098,8 +1389,8 @@ mod tests {
         );
 
         // 6 failures = 2^1 = 2 sec
-        tracker.record_failure(ip);
-        let retry2 = tracker.check_blocked(&ip).unwrap();
+        tracker.record_failure(ip, "alice");
+        let retry2 = tracker.check_blocked(&ip, "alice").unwrap();
         assert!(
             retry2 <= 2,
             "second lockout should be ~2 sec, got {}",
@@ -1107,8 +1398,8 @@ mod tests {
         );
 
         // 7 failures = 2^2 = 4 sec
-        tracker.record_failure(ip);
-        let retry3 = tracker.check_blocked(&ip).unwrap();
+        tracker.record_failure(ip, "alice");
+        let retry3 = tracker.check_blocked(&ip, "alice").unwrap();
         assert!(
             retry3 <= 4,
             "third lockout should be ~4 sec, got {}",
@@ -1403,6 +1694,183 @@ mod basic_decision_tests {
         rows
     }
 
+    /// The lockout rules as a table, one row per point of the rule: what a
+    /// password attempt is answered and what it does to the counts, with the
+    /// account locked out or not.
+    #[test]
+    fn lockout_rule_table() {
+        use super::{lockout_rule, LockoutCount};
+        use LockoutCount::{Clear, Failure, Nothing};
+        let alice = || ok("alice", Role::Write);
+        let bob = || ok("bob", Role::Read);
+        let forbidden = || BasicDecision::Forbidden("Read-only token");
+        let rows: Vec<(
+            &str,
+            Option<u64>,
+            BasicDecision,
+            Option<&str>,
+            BasicDecision,
+            LockoutCount,
+        )> = vec![
+            (
+                "a wrong password counts",
+                None,
+                wrong(),
+                Some("alice"),
+                wrong(),
+                Failure,
+            ),
+            (
+                "a header that does not decode counts nothing",
+                None,
+                malformed("Invalid credentials encoding"),
+                Some("alice"),
+                malformed("Invalid credentials encoding"),
+                Nothing,
+            ),
+            (
+                "a login clears its own username",
+                None,
+                alice(),
+                Some("alice"),
+                alice(),
+                Clear,
+            ),
+            (
+                "a token of another owner clears nothing",
+                None,
+                bob(),
+                Some("alice"),
+                bob(),
+                Nothing,
+            ),
+            (
+                "a 403 counts nothing",
+                None,
+                forbidden(),
+                Some("alice"),
+                forbidden(),
+                Nothing,
+            ),
+            (
+                "an outage counts nothing",
+                None,
+                unavailable(),
+                Some("alice"),
+                unavailable(),
+                Nothing,
+            ),
+            (
+                "no store counts nothing",
+                None,
+                BasicDecision::NotConfigured,
+                Some("alice"),
+                BasicDecision::NotConfigured,
+                Nothing,
+            ),
+            (
+                "a locked-out password is refused uncounted",
+                Some(30),
+                wrong(),
+                Some("alice"),
+                BasicDecision::LockedOut(30),
+                Nothing,
+            ),
+            (
+                "a locked-out header that does not decode is refused uncounted",
+                Some(30),
+                malformed("Invalid credentials format"),
+                Some("alice"),
+                BasicDecision::LockedOut(30),
+                Nothing,
+            ),
+            (
+                "a locked-out account without a store is refused",
+                Some(30),
+                BasicDecision::NotConfigured,
+                Some("alice"),
+                BasicDecision::LockedOut(30),
+                Nothing,
+            ),
+            (
+                "its own token is served under a lockout and clears it",
+                Some(30),
+                alice(),
+                Some("alice"),
+                alice(),
+                Clear,
+            ),
+            (
+                "another owner's token is served under a lockout",
+                Some(30),
+                bob(),
+                Some("alice"),
+                bob(),
+                Nothing,
+            ),
+            (
+                "a 403 under a lockout stays a 403",
+                Some(30),
+                forbidden(),
+                Some("alice"),
+                forbidden(),
+                Nothing,
+            ),
+            (
+                "an outage under a lockout stays an outage",
+                Some(30),
+                unavailable(),
+                Some("alice"),
+                unavailable(),
+                Nothing,
+            ),
+            (
+                "a login without a username clears nothing",
+                None,
+                alice(),
+                None,
+                alice(),
+                Nothing,
+            ),
+        ];
+        for (point, locked_out, checked, username, answer, count) in rows {
+            assert_eq!(
+                lockout_rule(locked_out, checked, username),
+                (answer, count),
+                "{point}"
+            );
+        }
+    }
+
+    /// The lockout counts change only through [`AuthFailureTracker::count`],
+    /// which applies what [`lockout_rule`] decided (white list): a route that
+    /// counted an attempt itself would skip the rule. Needles are built at run
+    /// time so this text does not match.
+    #[test]
+    fn the_lockout_counts_change_only_by_the_rule() {
+        let needles = [
+            [".record", "_failure("].concat(),
+            [".record", "_success("].concat(),
+        ];
+        let mut found = std::collections::BTreeMap::new();
+        for (file, source) in [
+            ("auth/mod.rs", include_str!("mod.rs")),
+            ("auth/token_routes.rs", include_str!("token_routes.rs")),
+            ("ui/mod.rs", include_str!("../ui/mod.rs")),
+            ("admin.rs", include_str!("../admin.rs")),
+        ] {
+            for (needle, functions) in crate::test_helpers::functions_containing(source, &needles) {
+                for function in functions {
+                    found.insert((file, function), needle.clone());
+                }
+            }
+        }
+        assert_eq!(
+            found.into_keys().collect::<Vec<_>>(),
+            [("auth/mod.rs", "count".to_string())]
+        );
+    }
+
     #[test]
     fn basic_auth_decision_table() {
         let rows = rows();
@@ -1452,6 +1920,8 @@ mod integration_tests {
     #[tokio::test]
     async fn test_auth_public_paths_always_pass() {
         let ctx = create_test_context_with_auth(&[("admin", "secret")]);
+        // The storage verdict the maintenance loop's first tick takes.
+        ctx.state.storage.refresh_reachability().await;
         let response = send(&ctx.app, Method::GET, "/health", "").await;
         assert_eq!(response.status(), StatusCode::OK);
         let response = send(&ctx.app, Method::GET, "/ready", "").await;
@@ -1918,6 +2388,358 @@ mod integration_tests {
         );
     }
 
+    /// bcrypt verifications the context's htpasswd provider has run.
+    fn bcrypt_runs(ctx: &crate::test_helpers::TestContext) -> usize {
+        ctx.state
+            .auth
+            .as_ref()
+            .unwrap()
+            .bcrypt_runs
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Every route path the server registers, its parameters filled in: read from the
+    /// `.route("…")` calls of the sources, so a route added later is in it as well.
+    fn every_route_path() -> Vec<String> {
+        fn sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    sources(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        sources(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let mut paths = std::collections::BTreeSet::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).unwrap();
+            for (at, _) in text.match_indices(".route(") {
+                let rest = text[at + ".route(".len()..].trim_start();
+                let Some(rest) = rest.strip_prefix('"') else {
+                    continue;
+                };
+                let template = &rest[..rest.find('"').unwrap()];
+                let mut path = String::new();
+                for segment in template.split('/').skip(1) {
+                    path.push('/');
+                    path.push_str(match segment {
+                        s if s.starts_with("{*") => "a/b",
+                        s if s.starts_with('{') => "x",
+                        s => s,
+                    });
+                }
+                paths.insert(if path.is_empty() { "/".into() } else { path });
+            }
+        }
+        paths.into_iter().collect()
+    }
+
+    /// No route served without credentials pays bcrypt for a Basic header it carries,
+    /// right or wrong: the probes, `/`, the public `/metrics`, the web surface and the
+    /// registry reads under `anonymous_read`, every method. Which routes are open is what
+    /// the server answers without credentials, not a list kept here; only the gated ones
+    /// check htpasswd credentials.
+    #[tokio::test]
+    async fn an_open_path_never_runs_bcrypt() {
+        let ctx = create_test_context_with_anonymous_read_and_config(&[("admin", "secret")], |c| {
+            c.auth.public_metrics = true
+        });
+        let routes = every_route_path();
+        assert!(routes.len() > 100, "{} routes read", routes.len());
+        let methods = [
+            Method::GET,
+            Method::HEAD,
+            Method::POST,
+            Method::PUT,
+            Method::PATCH,
+            Method::DELETE,
+        ];
+        let mut open = Vec::new();
+        for path in &routes {
+            for method in &methods {
+                let status = send(&ctx.app, method.clone(), path, Vec::new())
+                    .await
+                    .status();
+                if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+                    open.push((method.clone(), path.as_str()));
+                }
+            }
+        }
+        for served in [
+            "/",
+            "/health",
+            "/ready",
+            "/metrics",
+            "/ui/",
+            "/api/ui/dashboard",
+            "/api-docs/openapi.json",
+            "/raw/a/b",
+        ] {
+            assert!(
+                open.contains(&(Method::GET, served)),
+                "{served} is served without credentials"
+            );
+        }
+        assert_eq!(bcrypt_runs(&ctx), 0);
+        for creds in ["admin:wrong", "admin:secret"] {
+            let header_val = format!("Basic {}", STANDARD.encode(creds));
+            for (method, path) in &open {
+                let response = send_with_headers(
+                    &ctx.app,
+                    method.clone(),
+                    path,
+                    vec![("authorization", &header_val)],
+                    Vec::new(),
+                )
+                .await;
+                assert_ne!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "{method} {path}"
+                );
+            }
+            assert_eq!(bcrypt_runs(&ctx), 0, "an open path ran bcrypt ({creds})");
+        }
+        // The counter counts: a gated path checks the same header.
+        let header_val = format!("Basic {}", STANDARD.encode("admin:wrong"));
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/-/whoami",
+            vec![("authorization", &header_val)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(bcrypt_runs(&ctx), 1);
+    }
+
+    /// Under every combination of the switches that open routes without credentials
+    /// (`anonymous_read`, `public_web_ui`, `public_metrics`, `docker_anon_pull`), a route
+    /// served without credentials pays no bcrypt for a Basic header it carries, right or
+    /// wrong, whatever the method. The one exception is the Docker API under
+    /// `docker_anon_pull`, whose answer depends on who asks: credentials it is given are
+    /// checked, under the lockout. Which routes are open is what the server answers without
+    /// credentials; a gated one shows the counter counts.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn no_switch_makes_a_route_served_without_credentials_run_bcrypt() {
+        let routes = std::sync::Arc::new(every_route_path());
+        let configs = (0..16u8).map(|bits| {
+            let routes = std::sync::Arc::clone(&routes);
+            let config = tokio::spawn(async move {
+                let switches = [bits & 1 != 0, bits & 2 != 0, bits & 4 != 0, bits & 8 != 0];
+                let [anonymous_read, public_web_ui, public_metrics, docker_anon_pull] = switches;
+                let ctx = create_test_context_with_auth_and_config(&[("admin", "secret")], |c| {
+                    c.auth.anonymous_read = anonymous_read;
+                    c.auth.public_web_ui = public_web_ui;
+                    c.auth.public_metrics = public_metrics;
+                    c.auth.docker_anon_pull = docker_anon_pull;
+                });
+                let mut open = Vec::new();
+                for path in routes.iter() {
+                    if docker_anon_pull && super::is_docker_path(path) {
+                        continue;
+                    }
+                    for method in [
+                        Method::GET,
+                        Method::HEAD,
+                        Method::POST,
+                        Method::PUT,
+                        Method::PATCH,
+                        Method::DELETE,
+                    ] {
+                        let status = send(&ctx.app, method.clone(), path, Vec::new())
+                            .await
+                            .status();
+                        if status != StatusCode::UNAUTHORIZED && status != StatusCode::FORBIDDEN {
+                            open.push((method, path.clone()));
+                        }
+                    }
+                }
+                for always in ["/health", "/ready", "/"] {
+                    assert!(
+                        open.contains(&(Method::GET, always.to_owned())),
+                        "{switches:?}: {always} is served without credentials"
+                    );
+                }
+                for creds in ["admin:wrong", "admin:secret"] {
+                    let header_val = format!("Basic {}", STANDARD.encode(creds));
+                    for (method, path) in &open {
+                        send_with_headers(
+                            &ctx.app,
+                            method.clone(),
+                            path,
+                            vec![("authorization", &header_val)],
+                            Vec::new(),
+                        )
+                        .await;
+                        assert_eq!(
+                            bcrypt_runs(&ctx),
+                            0,
+                            "{switches:?}: {method} {path} ran bcrypt ({creds})"
+                        );
+                    }
+                }
+                let header_val = format!("Basic {}", STANDARD.encode("admin:wrong"));
+                let response = send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    "/npm/-/whoami",
+                    vec![("authorization", &header_val)],
+                    Vec::new(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{switches:?}");
+                assert_eq!(bcrypt_runs(&ctx), 1, "{switches:?}: the counter counts");
+            });
+            config
+        });
+        for config in futures::future::join_all(configs).await {
+            config.unwrap();
+        }
+    }
+
+    /// A CI job whose Basic username is an htpasswd user and whose password is an
+    /// API token pays bcrypt once, not on every request; it still authenticates as the
+    /// token's owner each time.
+    #[tokio::test]
+    async fn basic_with_an_api_token_pays_bcrypt_once() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let token = mint(&ctx, crate::tokens::Role::Read);
+        let header_val = basic_header("alice", &token);
+        for _ in 0..5 {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/npm/-/whoami",
+                vec![("authorization", &header_val)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let json: serde_json::Value =
+                serde_json::from_slice(&body_bytes(response).await).unwrap();
+            assert_eq!(json["username"], TOKEN_OWNER);
+        }
+        assert_eq!(bcrypt_runs(&ctx), 1);
+    }
+
+    /// The same for a valid htpasswd login: one bcrypt, then the verdict is remembered.
+    #[tokio::test]
+    async fn a_valid_htpasswd_login_pays_bcrypt_once() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let header_val = basic_header("alice", "alicepw");
+        for _ in 0..5 {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/npm/-/whoami",
+                vec![("authorization", &header_val)],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(bcrypt_runs(&ctx), 1);
+    }
+
+    /// Bcrypt does not run on an async worker. On a one-thread runtime a probe sent
+    /// while a Basic login is being checked against a slow hash answers at once, instead
+    /// of after the hash.
+    #[tokio::test]
+    async fn a_probe_is_not_held_up_by_a_bcrypt_check() {
+        use std::time::{Duration, Instant};
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("htpasswd");
+        let hash = bcrypt::hash("slowpw", 10).unwrap();
+        std::fs::write(&path, format!("slow:{hash}\n")).unwrap();
+        let started = Instant::now();
+        assert!(!bcrypt::verify("wrong", &hash).unwrap());
+        let one_check = started.elapsed();
+        assert!(one_check >= Duration::from_millis(20), "{one_check:?}");
+
+        let mut state = ctx.state.clone();
+        state.auth = Some(std::sync::Arc::new(
+            super::HtpasswdAuth::from_file(&path).unwrap(),
+        ));
+        // The probe is the open path `/` with no I/O of its own (`/health` fsyncs a probe
+        // file, which under a loaded disk takes long enough to blur the measure).
+        let routes = axum::Router::new()
+            .route("/raw/x", axum::routing::get(|| async { "x" }))
+            .route("/", axum::routing::get(|| async { "probe" }));
+        let app = crate::request_layers(routes, &state).with_state(state);
+
+        // One thread: the login is polled first. Checked on this thread, its bcrypt runs
+        // before the probe is polled at all, and the probe's time since t0 includes it.
+        let header_val = basic_header("slow", "wrong");
+        let t0 = Instant::now();
+        let (login, (probe, probe_took)) = tokio::join!(
+            send_with_headers(
+                &app,
+                Method::GET,
+                "/raw/x",
+                vec![("authorization", &header_val)],
+                Vec::new(),
+            ),
+            async {
+                let response = send_with_headers(&app, Method::GET, "/", vec![], Vec::new()).await;
+                (response.status(), t0.elapsed())
+            }
+        );
+        assert_eq!(login.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(probe, StatusCode::OK);
+        assert!(
+            probe_took < one_check / 2,
+            "the probe waited for bcrypt: {probe_took:?} (one check {one_check:?})"
+        );
+    }
+
+    /// A password sent for a locked-out username is refused unchecked, so it
+    /// is not a wrong password and counts neither for the username nor toward
+    /// the address ceiling: however many arrive, another username behind the
+    /// same address still logs in.
+    #[tokio::test]
+    async fn an_unchecked_password_counts_for_nobody() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw"), ("bob", "bobpw")]);
+        let tracker = &ctx.state.auth_failures;
+        let ip = CLIENT_IP;
+        for _ in 0..5 {
+            tracker.record_failure(ip, "alice");
+        }
+        assert!(tracker.check_blocked(&ip, "alice").is_some());
+        for _ in 0..60 {
+            let response = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/v2/",
+                vec![("authorization", &basic_header("alice", "guess"))],
+                Vec::new(),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        }
+        assert!(
+            tracker.check_blocked(&ip, "bob").is_none(),
+            "passwords refused unchecked were counted toward the address ceiling"
+        );
+        let response = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/v2/",
+            vec![("authorization", &basic_header("bob", "bobpw"))],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// Auth enabled with no htpasswd file — the OIDC-only setup (#996). The
     /// token store is there, as main.rs always creates it when auth is enabled.
     fn create_test_context_without_htpasswd() -> crate::test_helpers::TestContext {
@@ -1948,14 +2770,17 @@ mod integration_tests {
     /// The test client's address (`send_with_headers` connects from it).
     const CLIENT_IP: std::net::IpAddr = std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
 
-    /// Record failures for the test client up to one short of lockout: the
-    /// test tracker locks out at its 5th, so whether the next request counts
-    /// as a failure decides whether the client ends up blocked.
+    /// The Basic username these tests send with an API token as the password.
+    const BASIC_USER: &str = "docker";
+
+    /// Record failures for the test client's `BASIC_USER` up to one short of
+    /// lockout: the test tracker locks out at its 5th, so whether the next
+    /// request counts as a failure decides whether the account ends up blocked.
     fn one_failure_from_lockout(tracker: &super::AuthFailureTracker) {
         for _ in 0..4 {
-            tracker.record_failure(CLIENT_IP);
+            tracker.record_failure(CLIENT_IP, BASIC_USER);
         }
-        assert!(tracker.check_blocked(&CLIENT_IP).is_none());
+        assert!(tracker.check_blocked(&CLIENT_IP, BASIC_USER).is_none());
     }
 
     /// #1094: without htpasswd, an API token sent as the Basic password is
@@ -2148,9 +2973,9 @@ mod integration_tests {
 
     /// #1094: the role gate holds on the htpasswd-less Basic path — a read
     /// token reads but cannot write (403), as over Bearer and with htpasswd.
-    /// The 403 is about the request, not the credential: it clears the per-IP
-    /// failure count instead of adding to it, so a client with a valid read
-    /// token is never locked out for trying to write.
+    /// The 403 is about the request, not the credential: it is not counted as
+    /// a failure, so a client with a valid read token is never locked out for
+    /// trying to write.
     #[tokio::test]
     async fn test_basic_auth_read_only_token_cannot_write_without_htpasswd() {
         let ctx = create_test_context_without_htpasswd();
@@ -2168,8 +2993,8 @@ mod integration_tests {
         .await;
         assert_eq!(response.status(), StatusCode::OK);
 
+        one_failure_from_lockout(tracker);
         for method in [Method::PUT, Method::POST, Method::DELETE, Method::PATCH] {
-            one_failure_from_lockout(tracker);
             let response = send_with_headers(
                 &ctx.app,
                 method.clone(),
@@ -2180,7 +3005,7 @@ mod integration_tests {
             .await;
             assert_eq!(response.status(), StatusCode::FORBIDDEN, "{method}");
             assert!(
-                tracker.check_blocked(&CLIENT_IP).is_none(),
+                tracker.check_blocked(&CLIENT_IP, BASIC_USER).is_none(),
                 "{method}: a valid read token's 403 counted as a failure"
             );
         }
@@ -2278,12 +3103,17 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(ctx.state.auth_failures.check_blocked(&CLIENT_IP).is_none());
+        assert!(ctx
+            .state
+            .auth_failures
+            .check_blocked(&CLIENT_IP, BASIC_USER)
+            .is_none());
     }
 
     /// #1094: an unknown, malformed or expired token over Basic without
-    /// htpasswd answers 401 and counts toward the per-IP lockout; a valid
-    /// token clears the count, as on every other credential path.
+    /// htpasswd answers 401 and counts toward the lockout of the Basic
+    /// username; a valid token of another owner is served but does not clear
+    /// that count (it says nothing about the username's password).
     #[tokio::test]
     async fn test_basic_auth_bad_token_without_htpasswd_is_401_and_counted() {
         let ctx = create_test_context_without_htpasswd();
@@ -2313,12 +3143,14 @@ mod integration_tests {
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{password}");
             assert!(response.headers().contains_key("www-authenticate"));
             assert!(
-                tracker.check_blocked(&CLIENT_IP).is_some(),
+                tracker.check_blocked(&CLIENT_IP, BASIC_USER).is_some(),
                 "{password}: not counted as a failure"
             );
-            tracker.record_success(&CLIENT_IP);
+            tracker.record_success(&CLIENT_IP, BASIC_USER);
         }
 
+        // A valid token is served, but it is another owner's credential, not
+        // the Basic username's password: the username's failures stay.
         one_failure_from_lockout(tracker);
         let token = mint(&ctx, crate::tokens::Role::Read);
         let response = send_with_headers(
@@ -2330,10 +3162,10 @@ mod integration_tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::OK);
-        tracker.record_failure(CLIENT_IP);
+        tracker.record_failure(CLIENT_IP, BASIC_USER);
         assert!(
-            tracker.check_blocked(&CLIENT_IP).is_none(),
-            "a valid token clears the count"
+            tracker.check_blocked(&CLIENT_IP, BASIC_USER).is_some(),
+            "a token of another owner cleared the username's failures"
         );
     }
 
@@ -2364,7 +3196,10 @@ mod integration_tests {
             body_bytes(response).await.as_ref(),
             br#"{"error":"Basic auth not configured"}"#
         );
-        assert!(state.auth_failures.check_blocked(&CLIENT_IP).is_none());
+        assert!(state
+            .auth_failures
+            .check_blocked(&CLIENT_IP, BASIC_USER)
+            .is_none());
     }
 
     #[tokio::test]
@@ -2713,6 +3548,23 @@ Jd74nq6dNCjpWG4drIsyhqX+
         provider_scope: &[&str],
         main_rule_scope: Option<Vec<String>>,
     ) -> TestContext {
+        create_oidc_test_context_with(mock_issuer_url, provider_scope, main_rule_scope, |_| {})
+    }
+
+    /// Like [`create_oidc_test_context`], with `tweak` applied to the provider.
+    fn create_oidc_test_context_tweaked(
+        mock_issuer_url: &str,
+        tweak: impl FnOnce(&mut OidcProvider),
+    ) -> TestContext {
+        create_oidc_test_context_with(mock_issuer_url, &["*"], None, tweak)
+    }
+
+    fn create_oidc_test_context_with(
+        mock_issuer_url: &str,
+        provider_scope: &[&str],
+        main_rule_scope: Option<Vec<String>>,
+        tweak: impl FnOnce(&mut OidcProvider),
+    ) -> TestContext {
         let issuer = mock_issuer_url.to_string();
         let provider_scope: Vec<String> = provider_scope.iter().map(|s| s.to_string()).collect();
         let mut ctx = create_test_context_with_config(move |cfg| {
@@ -2727,6 +3579,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     issuer: issuer.clone(),
                     jwks_uri: None,
                     audience: "nora".to_string(),
+                    any_audience: false,
                     algorithms: vec!["RS256".to_string()],
                     max_token_lifetime_secs: 900,
                     namespace_scope: provider_scope.clone(),
@@ -2767,6 +3620,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     ],
                 }],
             };
+            tweak(&mut cfg.auth.oidc.providers[0]);
         });
 
         // Wire up the OidcValidator on the existing state
@@ -2795,6 +3649,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             repo_index: Arc::new(crate::repo_index::RepoIndex::new()),
             http_client: reqwest::Client::new(),
             http_client_no_redirect: reqwest::Client::new(),
+            http_client_same_origin: reqwest::Client::new(),
             hf_canonical_ids: Arc::default(),
             upload_sessions: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             publish_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -2818,6 +3673,8 @@ Jd74nq6dNCjpWG4drIsyhqX+
             pull_stats: std::sync::Arc::new(
                 crate::registry::docker::PullStatsAccumulator::default(),
             ),
+            tasks: ctx.state.tasks.clone(),
+            maintenance: ctx.state.maintenance.clone(),
         };
 
         // Rebuild router with new state
@@ -3120,7 +3977,9 @@ Jd74nq6dNCjpWG4drIsyhqX+
     /// #1094: a token minted by an OIDC identity through the UI must not outlive
     /// the provider's `max_token_lifetime_secs` (900s here). An unrestricted
     /// write identity (main-ref rule, provider `["*"]`) may mint — it is not
-    /// scope-refused — but the 3650-day request is capped to the 1-day floor.
+    /// scope-refused — but the 3650-day request is capped to the ceiling itself,
+    /// not rounded up to a day, and never outlives the JWT that minted
+    /// it: here the JWT expires in 600s, under the ceiling.
     #[tokio::test]
     async fn test_oidc_minted_token_lifetime_capped_at_provider_ceiling() {
         let mock_server = MockServer::start().await;
@@ -3166,10 +4025,243 @@ Jd74nq6dNCjpWG4drIsyhqX+
         let entries = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
         assert_eq!(entries.len(), 1, "exactly one token minted");
         let lifetime = entries[0].expires_at - entries[0].created_at;
-        assert_eq!(
-            lifetime, 86_400,
-            "an OIDC-minted token outlived the provider ceiling: {lifetime}s (want 1 day)"
+        assert!(
+            (590..=600).contains(&lifetime),
+            "an OIDC-minted token outlived the JWT that minted it: {lifetime}s (JWT 600s, ceiling 900s)"
         );
+    }
+
+    /// The admin route holds an OIDC admin to the same lifetime as the UI: a
+    /// token it mints lives no longer than what is left of the JWT (600s here,
+    /// under the 900s ceiling) whatever it asks for, and a JWT accepted only
+    /// inside the leeway mints nothing.
+    #[tokio::test]
+    async fn an_oidc_admin_mint_on_the_admin_route_never_outlives_the_jwt() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let mint = |ctx: &TestContext, jwt: String| {
+            let app = ctx.app.clone();
+            async move {
+                send_with_headers(
+                    &app,
+                    Method::POST,
+                    "/api/v1/admin/tokens",
+                    vec![
+                        ("authorization", &format!("Bearer {jwt}")),
+                        ("content-type", "application/json"),
+                    ],
+                    br#"{"username":"svc","role":"read","ttl_days":3650}"#.to_vec(),
+                )
+                .await
+                .status()
+            }
+        };
+        let subject = "repo:myorg/admin-free:ref:refs/heads/main";
+        let now = now_secs();
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let jwt = make_jwt(&mock_server.uri(), subject, "nora", now, now + 600);
+        assert_eq!(mint(&ctx, jwt).await, StatusCode::OK);
+        let entries = ctx.state.tokens.as_ref().unwrap().list_all_tokens();
+        assert_eq!(entries.len(), 1, "exactly one token minted");
+        let lifetime = entries[0].expires_at - entries[0].created_at;
+        assert!(
+            (590..=600).contains(&lifetime),
+            "an OIDC admin minted a {lifetime}s token on the admin route (JWT 600s, ceiling 900s)"
+        );
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let expired = make_jwt(&mock_server.uri(), subject, "nora", now - 630, now - 30);
+        assert_eq!(mint(&ctx, expired).await, StatusCode::FORBIDDEN);
+        assert!(
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .is_empty(),
+            "an expired JWT minted a token on the admin route"
+        );
+    }
+
+    /// The admin route answers the lifetime it granted in seconds: an OIDC admin
+    /// whose JWT has 600 s left asks for 30 days and is told what the token store
+    /// holds, which `expires_in_days` (kept as it was) rounds down to 0; an admin
+    /// holding an opaque token, with no JWT to outlive, is told the 30 days.
+    #[tokio::test]
+    async fn the_admin_route_answers_the_lifetime_granted_in_seconds() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let mint = |ctx: &TestContext, bearer: String| {
+            let app = ctx.app.clone();
+            async move {
+                let response = send_with_headers(
+                    &app,
+                    Method::POST,
+                    "/api/v1/admin/tokens",
+                    vec![
+                        ("authorization", &bearer),
+                        ("content-type", "application/json"),
+                    ],
+                    br#"{"username":"svc","role":"read","ttl_days":30}"#.to_vec(),
+                )
+                .await;
+                assert_eq!(response.status(), StatusCode::OK);
+                serde_json::from_slice::<serde_json::Value>(&body_bytes(response).await).unwrap()
+            }
+        };
+        let stored = |ctx: &TestContext| {
+            let entries = ctx.state.tokens.as_ref().unwrap().list_tokens("svc");
+            assert_eq!(entries.len(), 1, "exactly one token minted for svc");
+            entries[0].expires_at - entries[0].created_at
+        };
+        let now = now_secs();
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/admin-free:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+        let json = mint(&ctx, format!("Bearer {jwt}")).await;
+        let secs = json["expires_in_secs"].as_u64().expect("expires_in_secs");
+        assert!(secs <= 600, "the answer outlives the JWT: {json}");
+        assert_eq!(secs, stored(&ctx), "the answer is not what the store holds");
+        assert_eq!(json["expires_in_days"], 0, "{json}");
+
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let admin = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("root", 30, None, crate::tokens::Role::Admin)
+            .unwrap();
+        let json = mint(&ctx, format!("Bearer {admin}")).await;
+        assert_eq!(json["expires_in_secs"], 30 * 86_400, "{json}");
+        assert_eq!(stored(&ctx), 30 * 86_400);
+        assert_eq!(json["expires_in_days"], 30, "{json}");
+    }
+
+    /// A JWT the validator still accepts inside its leeway, though its `exp`
+    /// has passed, mints nothing: the token would outlive the credential that
+    /// minted it from its first second. Fail closed: 403, no token.
+    #[tokio::test]
+    async fn test_oidc_identity_already_expired_cannot_mint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let now = now_secs();
+        // Lifetime 600s (under the 900s ceiling), expired 30s ago, inside the
+        // 60s leeway: authentication still accepts it.
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now - 630,
+            now - 30,
+        );
+        let bearer = format!("Bearer {jwt}");
+        let read = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/raw/none.txt",
+            vec![("authorization", &bearer)],
+            Vec::new(),
+        )
+        .await;
+        assert_eq!(
+            read.status(),
+            StatusCode::NOT_FOUND,
+            "the JWT authenticates"
+        );
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &bearer),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write&ttl_days=1".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(
+            ctx.state
+                .tokens
+                .as_ref()
+                .unwrap()
+                .list_all_tokens()
+                .is_empty(),
+            "an expired JWT minted a token"
+        );
+    }
+
+    /// A JWT without `exp` is refused at authentication (the validator
+    /// requires it), so it never reaches the mint.
+    #[tokio::test]
+    async fn test_oidc_jwt_without_exp_cannot_mint() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some("test-key-1".to_string());
+        let claims = json!({
+            "iss": mock_server.uri(),
+            "sub": "repo:myorg/app:ref:refs/heads/main",
+            "aud": "nora",
+            "iat": now_secs(),
+        });
+        let key = EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_KEY.as_bytes()).unwrap();
+        let jwt = encode(&header, &claims, &key).unwrap();
+        let response = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &format!("Bearer {jwt}")),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=test&role=write&ttl_days=1".to_vec(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .list_all_tokens()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -3427,6 +4519,90 @@ Jd74nq6dNCjpWG4drIsyhqX+
         );
     }
 
+    /// The router answer to a write-role token with `aud`, against a mock
+    /// issuer whose provider gets `tweak`.
+    async fn oidc_status_for_aud(aud: &str, tweak: impl FnOnce(&mut OidcProvider)) -> StatusCode {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context_tweaked(&mock_server.uri(), tweak);
+        let now = now_secs();
+        let token = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            aud,
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {token}");
+        send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/aud/file.txt",
+            vec![("authorization", &bearer)],
+            "data",
+        )
+        .await
+        .status()
+    }
+
+    /// With an audience set, a token minted for that audience writes and one
+    /// minted for another service is refused.
+    #[tokio::test]
+    async fn test_oidc_audience_admits_only_its_own_aud() {
+        assert!(oidc_status_for_aud("nora", |_| {}).await.is_success());
+        assert_eq!(
+            oidc_status_for_aud("another-service", |_| {}).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// `any_audience = true` turns the `aud` check off: a token minted for
+    /// another service writes.
+    #[tokio::test]
+    async fn test_oidc_any_audience_admits_any_aud() {
+        let any = |p: &mut OidcProvider| {
+            p.audience = String::new();
+            p.any_audience = true;
+        };
+        assert!(oidc_status_for_aud("another-service", any)
+            .await
+            .is_success());
+        assert!(oidc_status_for_aud("nora", any).await.is_success());
+    }
+
+    /// Beside an audience, `any_audience = true` changes nothing: the audience
+    /// is still checked.
+    #[tokio::test]
+    async fn test_oidc_audience_wins_over_any_audience() {
+        let both = |p: &mut OidcProvider| p.any_audience = true;
+        assert_eq!(
+            oidc_status_for_aud("another-service", both).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(oidc_status_for_aud("nora", both).await.is_success());
+    }
+
+    /// A provider with neither an audience nor `any_audience` admits no token,
+    /// even if it reaches the validator without passing config validation.
+    #[tokio::test]
+    async fn test_oidc_provider_without_audience_admits_no_token() {
+        let none = |p: &mut OidcProvider| p.audience = String::new();
+        assert_eq!(
+            oidc_status_for_aud("another-service", none).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            oidc_status_for_aud("nora", none).await,
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
     #[tokio::test]
     async fn test_oidc_no_matching_role_rejected() {
         let mock_server = MockServer::start().await;
@@ -3463,6 +4639,49 @@ Jd74nq6dNCjpWG4drIsyhqX+
             response.status(),
             StatusCode::UNAUTHORIZED,
             "Token with no matching role should be rejected"
+        );
+    }
+
+    /// A valid OIDC JWT is served while the client address is locked out for
+    /// wrong passwords: the lockout counts passwords, not signed tokens.
+    #[tokio::test]
+    async fn test_oidc_valid_jwt_served_while_passwords_locked_out() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/.well-known/jwks.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(TEST_JWKS_JSON, "application/json"),
+            )
+            .mount(&mock_server)
+            .await;
+        let ctx = create_oidc_test_context(&mock_server.uri());
+        // Lock the address out for every username.
+        for n in 0..60 {
+            ctx.state
+                .auth_failures
+                .record_failure("127.0.0.1".parse().unwrap(), &format!("u{n}"));
+        }
+        let now = now_secs();
+        let jwt = make_jwt(
+            &mock_server.uri(),
+            "repo:myorg/app:ref:refs/heads/main",
+            "nora",
+            now,
+            now + 600,
+        );
+        let bearer = format!("Bearer {jwt}");
+        let response = send_with_headers(
+            &ctx.app,
+            Method::PUT,
+            "/raw/locked-out/a.txt",
+            vec![("authorization", &bearer)],
+            b"data".to_vec(),
+        )
+        .await;
+        assert!(
+            response.status().is_success(),
+            "a valid OIDC JWT from a locked-out address is refused: {}",
+            response.status()
         );
     }
 
@@ -3620,7 +4839,9 @@ mod web_surface_gating_tests {
                 "{p} must challenge so browsers prompt"
             );
         }
-        // Probes stay unconditionally open (LB/liveness would break).
+        // Probes stay unconditionally open (LB/liveness would break). The storage
+        // verdict is the one the maintenance loop's first tick takes.
+        ctx.state.storage.refresh_reachability().await;
         for p in ["/health", "/ready"] {
             let resp = send(&ctx.app, Method::GET, p, "").await;
             assert_eq!(resp.status(), StatusCode::OK, "{p}");
@@ -3686,18 +4907,29 @@ mod web_surface_gating_tests {
 
     // -- #934: opportunistic auth on open web surfaces --
 
-    /// try_basic_auth returns the username for valid htpasswd credentials.
-    #[test]
-    fn test_try_basic_auth_valid() {
+    /// try_basic_auth returns the username for valid htpasswd credentials once htpasswd
+    /// has checked them, and runs no bcrypt itself: before the check, the caller is
+    /// anonymous.
+    #[tokio::test]
+    async fn test_try_basic_auth_valid() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("htpasswd");
         let hash = bcrypt::hash("secret", 4).unwrap();
         std::fs::write(&path, format!("admin:{hash}\n")).unwrap();
         let htpasswd = super::HtpasswdAuth::from_file(&path).unwrap();
         let encoded = STANDARD.encode("admin:secret");
+        assert_eq!(super::try_basic_auth(&encoded, Some(&htpasswd)), None);
+        assert!(htpasswd.verify("admin", "secret").await);
         assert_eq!(
             super::try_basic_auth(&encoded, Some(&htpasswd)),
             Some("admin".to_string())
+        );
+        assert_eq!(
+            htpasswd
+                .bcrypt_runs
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the check ran bcrypt"
         );
     }
 
@@ -3726,8 +4958,8 @@ mod web_surface_gating_tests {
         assert_eq!(super::try_basic_auth("%%%not-base64%%%", None), None);
     }
 
-    /// On an open web surface (anonymous_read=true), valid Basic credentials
-    /// must produce a real AuthenticatedUser — not "anonymous". Verified via
+    /// On an open web surface (anonymous_read=true), valid Basic credentials that
+    /// htpasswd has checked must produce a real AuthenticatedUser — not "anonymous". Verified via
     /// /api/ui/dashboard: anonymous sees empty proxy_upstreams; authenticated
     /// sees the configured npm upstream.
     #[tokio::test]
@@ -3748,16 +4980,50 @@ mod web_surface_gating_tests {
             );
         }
 
-        // Valid Basic creds: proxy_upstreams populated
+        // Valid Basic creds htpasswd has not checked yet: the open path runs no bcrypt,
+        // so the caller browses as anonymous.
         let header_val = format!("Basic {}", STANDARD.encode("admin:secret"));
+        let dashboard = || {
+            send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/api/ui/dashboard",
+                vec![("authorization", &header_val)],
+                "",
+            )
+        };
+        let npm_upstreams = |json: serde_json::Value| {
+            json["mount_points"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["registry"].as_str() == Some("npm"))
+                .expect("npm mount")["proxy_upstreams"]
+                .as_array()
+                .unwrap()
+                .len()
+        };
+        let resp = dashboard().await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(
+            npm_upstreams(json),
+            0,
+            "unchecked credentials are anonymous"
+        );
+
+        // A gated page checks them (a browser sends them after its challenge); from then on
+        // the open surface knows the caller: proxy_upstreams populated.
         let resp = send_with_headers(
             &ctx.app,
             Method::GET,
-            "/api/ui/dashboard",
+            "/api/ui/tokens",
             vec![("authorization", &header_val)],
             "",
         )
         .await;
+        assert_ne!(resp.status(), StatusCode::UNAUTHORIZED);
+        let resp = dashboard().await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = body_bytes(resp).await;
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
@@ -3830,5 +5096,865 @@ mod web_surface_gating_tests {
             !npm["proxy_upstreams"].as_array().unwrap().is_empty(),
             "bearer-authenticated must see populated proxy_upstreams"
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Client address and lockout: the key the lockout and the limiters count by
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod client_address_tests {
+    use super::resolve_client_ip;
+    use crate::config::TrustedProxies;
+    use crate::test_helpers::*;
+    use axum::body::Body;
+    use axum::extract::ConnectInfo;
+    use axum::http::{HeaderMap, Method, Request, StatusCode};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::{Arc, Mutex};
+
+    /// A dual-stack socket (`NORA_HOST=::`, the image default) sees an IPv4
+    /// peer as `::ffff:a.b.c.d`.
+    const MAPPED_LOOPBACK: &str = "::ffff:127.0.0.1";
+
+    fn resolve(
+        peer: &str,
+        xff: &[&str],
+        real_ip: Option<&str>,
+        trusted: &TrustedProxies,
+    ) -> IpAddr {
+        let mut headers = HeaderMap::new();
+        for line in xff {
+            headers.append("x-forwarded-for", line.parse().unwrap());
+        }
+        if let Some(ip) = real_ip {
+            headers.insert("x-real-ip", ip.parse().unwrap());
+        }
+        resolve_client_ip(peer.parse().unwrap(), &headers, trusted)
+    }
+
+    /// Measured in kind (ingress behind the image's `::` listener): the peer, the
+    /// trusted_proxies entry and the X-Forwarded-For entries meet in IPv4 form.
+    #[test]
+    fn an_ipv4_peer_on_a_dual_stack_listener_is_the_ipv4_address() {
+        let resolve = |peer: &str, xff: Option<&str>, trusted: &str| {
+            let mut headers = HeaderMap::new();
+            if let Some(xff) = xff {
+                headers.insert("x-forwarded-for", xff.parse().unwrap());
+            }
+            let peer: IpAddr = peer.parse().unwrap();
+            resolve_client_ip(peer, &headers, &TrustedProxies::parse(trusted)).to_string()
+        };
+        // the ingress, trusted by its IPv4 address, seen on a `::` listener
+        assert_eq!(
+            resolve("::ffff:10.244.0.5", Some("10.244.0.7"), "10.244.0.5/32"),
+            "10.244.0.7"
+        );
+        assert_eq!(
+            resolve("::ffff:10.244.0.5", Some("10.244.0.7"), "10.244.0.0/16"),
+            "10.244.0.7"
+        );
+        // a trusted proxy written in the mapped form, seen as IPv4
+        assert_eq!(
+            resolve("10.244.0.5", Some("10.244.0.7"), "::ffff:10.244.0.5"),
+            "10.244.0.7"
+        );
+        // a hop that writes its peer in the mapped form is walked past
+        assert_eq!(
+            resolve(
+                "::ffff:10.244.0.5",
+                Some("10.244.0.7, ::ffff:10.244.0.6"),
+                "10.244.0.0/16"
+            ),
+            "10.244.0.7"
+        );
+        // an untrusted peer is its IPv4 address, so it shares its limits with itself only
+        assert_eq!(
+            resolve("::ffff:203.0.113.9", None, "10.0.0.0/8"),
+            "203.0.113.9"
+        );
+        // a proxy that writes the client in the mapped form names it in IPv4
+        assert_eq!(
+            resolve(
+                "::ffff:10.244.0.5",
+                Some("::ffff:10.244.0.7"),
+                "10.244.0.0/16"
+            ),
+            "10.244.0.7"
+        );
+        // the list itself, asked directly
+        let ipv4 = TrustedProxies::parse("10.0.0.0/8");
+        assert!(ipv4.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!ipv4.contains("::ffff:11.1.2.3".parse().unwrap()));
+        // a real IPv6 peer stays IPv6 and is not an IPv4 network's member
+        assert_eq!(
+            resolve("2001:db8::1", Some("10.244.0.7"), "10.0.0.0/8"),
+            "2001:db8::1"
+        );
+    }
+
+    /// An IPv4 address is one client whether it arrives over an IPv4 or a
+    /// dual-stack socket, as the peer, in X-Forwarded-For, in X-Real-IP or in
+    /// `trusted_proxies`: the resolved address is the plain IPv4 one.
+    #[test]
+    fn a_v4_mapped_address_is_its_ipv4_address() {
+        let loopback = TrustedProxies::default_loopback();
+        let pods = TrustedProxies::parse("10.0.0.0/8");
+        let mapped_pods = TrustedProxies::parse("::ffff:10.0.0.0/104");
+        let v4 = |s: &str| s.parse::<IpAddr>().unwrap();
+        let cases: [(&str, &[&str], Option<&str>, &TrustedProxies, IpAddr); 7] = [
+            // the loopback proxy over a dual-stack socket is still trusted
+            (
+                MAPPED_LOOPBACK,
+                &["198.51.100.7"],
+                None,
+                &loopback,
+                v4("198.51.100.7"),
+            ),
+            // a direct client over a dual-stack socket keys as its IPv4 address
+            (
+                "::ffff:203.0.113.5",
+                &[],
+                None,
+                &loopback,
+                v4("203.0.113.5"),
+            ),
+            // a mapped address written by a proxy
+            (
+                "127.0.0.1",
+                &["::ffff:198.51.100.7"],
+                None,
+                &loopback,
+                v4("198.51.100.7"),
+            ),
+            (
+                "127.0.0.1",
+                &[],
+                Some("::ffff:203.0.113.9"),
+                &loopback,
+                v4("203.0.113.9"),
+            ),
+            // a mapped trusted hop in the chain is walked past
+            (
+                "10.1.2.3",
+                &["198.51.100.7, ::ffff:10.0.0.5"],
+                None,
+                &pods,
+                v4("198.51.100.7"),
+            ),
+            // a pod network named in either form trusts the other
+            (
+                "::ffff:10.1.2.3",
+                &["198.51.100.7"],
+                None,
+                &pods,
+                v4("198.51.100.7"),
+            ),
+            (
+                "10.1.2.3",
+                &["198.51.100.7"],
+                None,
+                &mapped_pods,
+                v4("198.51.100.7"),
+            ),
+        ];
+        for (peer, xff, real_ip, trusted, want) in cases {
+            let got = resolve(peer, xff, real_ip, trusted);
+            assert_eq!(got, want, "peer {peer} xff {xff:?} real_ip {real_ip:?}");
+            assert!(got.is_ipv4(), "{got} is not canonical");
+        }
+        // The setting answers for a mapped address as for its IPv4 address.
+        assert!(loopback.contains(MAPPED_LOOPBACK.parse().unwrap()));
+        assert!(pods.contains("::ffff:10.1.2.3".parse().unwrap()));
+        assert!(!pods.contains("::ffff:11.0.0.1".parse().unwrap()));
+        // A real IPv6 client stays itself.
+        assert_eq!(
+            resolve("2001:db8::7", &[], None, &loopback),
+            "2001:db8::7".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The warnings `run` logs.
+    fn warnings_of(run: impl FnOnce()) -> Vec<String> {
+        use tracing_subscriber::prelude::*;
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(sink.clone()),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            // Another test's thread may have cached the callsites as
+            // uninteresting while no subscriber was installed; recount them.
+            tracing::callsite::rebuild_interest_cache();
+            run()
+        });
+        let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+        out.lines()
+            .filter(|l| l.contains("WARN"))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// X-Forwarded-For from a peer outside `trusted_proxies` is ignored, and
+    /// NORA says so once: the warning names the peer and the setting, and
+    /// never the header, which the client wrote.
+    #[test]
+    fn forwarding_from_an_untrusted_peer_is_warned_about_once() {
+        let trusted = TrustedProxies::parse("10.9.9.9");
+        let warnings = warnings_of(|| {
+            for _ in 0..3 {
+                let ip = resolve("127.0.0.1", &["203.0.113.10"], None, &trusted);
+                assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+            }
+            // a clone is the same setting (the limiters hold clones)
+            let _ = resolve("127.0.0.1", &["203.0.113.10"], None, &trusted.clone());
+        });
+        assert_eq!(warnings.len(), 1, "{warnings:#?}");
+        assert!(warnings[0].contains("127.0.0.1"), "{}", warnings[0]);
+        assert!(warnings[0].contains("trusted_proxies"), "{}", warnings[0]);
+        assert!(!warnings[0].contains("203.0.113.10"), "{}", warnings[0]);
+
+        // No warning when there is nothing to ignore.
+        let quiet = warnings_of(|| {
+            let loopback = TrustedProxies::default_loopback();
+            let _ = resolve("127.0.0.1", &["203.0.113.10"], None, &loopback);
+            let _ = resolve(MAPPED_LOOPBACK, &["203.0.113.10"], None, &loopback);
+            let _ = resolve("203.0.113.5", &[], None, &TrustedProxies::parse("10.9.9.9"));
+        });
+        assert!(quiet.is_empty(), "{quiet:#?}");
+    }
+
+    /// Each forwarding header NORA reads is ignored from a peer outside
+    /// `trusted_proxies`, sent alone or with the other, and the setting
+    /// records that it warned. Read from the setting, not from a log capture,
+    /// which other tests' threads can race; the warning's text is held by
+    /// `forwarding_from_an_untrusted_peer_is_warned_about_once`.
+    #[test]
+    fn every_forwarding_header_from_an_untrusted_peer_is_warned_about() {
+        let sent: [(&[&str], Option<&str>); 3] = [
+            (&["203.0.113.10"], None),
+            (&[], Some("203.0.113.10")),
+            (&["203.0.113.10"], Some("203.0.113.10")),
+        ];
+        for (xff, real_ip) in sent {
+            let trusted = TrustedProxies::parse("10.9.9.9");
+            let ip = resolve("127.0.0.1", xff, real_ip, &trusted);
+            assert_eq!(ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+            assert!(
+                trusted.warned_untrusted_forwarding(),
+                "xff {xff:?} real_ip {real_ip:?} ignored without a warning"
+            );
+        }
+        // Controls: nothing to ignore, nothing to warn about.
+        let untrusted = TrustedProxies::parse("10.9.9.9");
+        let _ = resolve("127.0.0.1", &[], None, &untrusted);
+        assert!(!untrusted.warned_untrusted_forwarding());
+        let loopback = TrustedProxies::default_loopback();
+        let _ = resolve(
+            "127.0.0.1",
+            &["203.0.113.10"],
+            Some("203.0.113.10"),
+            &loopback,
+        );
+        assert!(!loopback.warned_untrusted_forwarding());
+    }
+
+    /// Send a request from `peer` (the TCP address the server sees).
+    async fn send_from(
+        app: &axum::Router,
+        peer: &str,
+        method: Method,
+        uri: &str,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let mut request = builder.body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 4000)));
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    fn basic(user: &str, pass: &str) -> String {
+        format!("Basic {}", STANDARD.encode(format!("{user}:{pass}")))
+    }
+
+    /// Behind the loopback proxy on a dual-stack socket, one client's
+    /// wrong passwords lock out that client only: the same account from
+    /// another client behind the same proxy still gets in.
+    #[tokio::test]
+    async fn a_v4_mapped_proxy_keeps_its_clients_apart() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw"), ("bob", "bobpw")]);
+        let wrong = basic("bob", "wrong");
+        for _ in 0..6 {
+            let status = send_from(
+                &ctx.app,
+                MAPPED_LOOPBACK,
+                Method::GET,
+                "/v2/",
+                &[
+                    ("authorization", &wrong),
+                    ("x-forwarded-for", "203.0.113.10"),
+                ],
+            )
+            .await;
+            assert!(
+                matches!(
+                    status,
+                    StatusCode::UNAUTHORIZED | StatusCode::TOO_MANY_REQUESTS
+                ),
+                "{status}"
+            );
+        }
+        // The same account, from another client behind the same proxy.
+        let good = basic("bob", "bobpw");
+        let other = send_from(
+            &ctx.app,
+            MAPPED_LOOPBACK,
+            Method::GET,
+            "/v2/",
+            &[
+                ("authorization", &good),
+                ("x-forwarded-for", "198.51.100.7"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            other,
+            StatusCode::OK,
+            "another client behind the proxy is locked out"
+        );
+        let same = send_from(
+            &ctx.app,
+            MAPPED_LOOPBACK,
+            Method::GET,
+            "/v2/",
+            &[
+                ("authorization", &good),
+                ("x-forwarded-for", "203.0.113.10"),
+            ],
+        )
+        .await;
+        assert_eq!(
+            same,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the guessing client is not locked out"
+        );
+    }
+
+    /// The lockout counts wrong passwords: while an address is locked
+    /// out, a valid API token sent as Bearer is served, and wrong Bearer tokens
+    /// do not lock an address out at all. A password stays refused.
+    #[tokio::test]
+    async fn a_valid_bearer_token_is_served_while_passwords_are_locked_out() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        let bearer = format!("Bearer {token}");
+        let wrong = basic("alice", "wrong");
+        for _ in 0..6 {
+            let _ = send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[("authorization", &wrong)],
+            )
+            .await;
+        }
+        assert!(
+            ctx.state
+                .auth_failures
+                .check_blocked(&"127.0.0.1".parse().unwrap(), "alice")
+                .is_some(),
+            "wrong passwords did not lock the address out"
+        );
+        // Lengthen the lockout past the Argon2 check of the Bearer token
+        // below, which can outlast a lockout of a second or two under load.
+        lock_out_alice(&ctx.state.auth_failures, "127.0.0.1");
+        let good = basic("alice", "alicepw");
+        assert_eq!(
+            send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[("authorization", &good)]
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "passwords from a locked-out address are refused"
+        );
+        assert_eq!(
+            send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[("authorization", &bearer)]
+            )
+            .await,
+            StatusCode::OK,
+            "a valid Bearer token from a locked-out address is refused"
+        );
+        // The served token did not lift the lockout of passwords.
+        assert_eq!(
+            send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[("authorization", &good)]
+            )
+            .await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a Bearer token lifted the password lockout"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_bearer_tokens_do_not_lock_an_address_out() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let bad = "Bearer nra_00000000000000000000000000000000";
+        for _ in 0..8 {
+            assert_eq!(
+                send_from(
+                    &ctx.app,
+                    "127.0.0.1",
+                    Method::GET,
+                    "/v2/",
+                    &[("authorization", bad)]
+                )
+                .await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let good = basic("alice", "alicepw");
+        assert_eq!(
+            send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[("authorization", &good)]
+            )
+            .await,
+            StatusCode::OK,
+            "wrong Bearer tokens locked the address out"
+        );
+    }
+
+    /// Every client of these tests sits behind one NAT address, as a company
+    /// behind its egress does; the loopback proxy in front of NORA is trusted.
+    const NAT: &str = "198.51.100.50";
+
+    /// GET /v2/ from a client behind `xff` with Basic `user:pass`.
+    async fn login(app: &axum::Router, xff: &str, user: &str, pass: &str) -> StatusCode {
+        let auth = basic(user, pass);
+        send_from(
+            app,
+            "127.0.0.1",
+            Method::GET,
+            "/v2/",
+            &[("authorization", &auth), ("x-forwarded-for", xff)],
+        )
+        .await
+    }
+
+    /// Wrong passwords for one account lock out that account on that address,
+    /// not another account behind the same NAT.
+    #[tokio::test]
+    async fn guessing_one_accounts_password_leaves_other_accounts_alone() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw"), ("bob", "bobpw")]);
+        for _ in 0..6 {
+            let _ = login(&ctx.app, NAT, "alice", "wrong").await;
+        }
+        assert_eq!(
+            login(&ctx.app, NAT, "bob", "bobpw").await,
+            StatusCode::OK,
+            "guesses at alice locked bob out"
+        );
+        assert_eq!(
+            login(&ctx.app, NAT, "alice", "alicepw").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the guessed account is not locked out"
+        );
+    }
+
+    /// A login by one account does not clear the failures of another.
+    #[tokio::test]
+    async fn a_login_does_not_clear_another_accounts_failures() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw"), ("bob", "bobpw")]);
+        for _ in 0..4 {
+            assert_eq!(
+                login(&ctx.app, NAT, "alice", "wrong").await,
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        assert_eq!(login(&ctx.app, NAT, "bob", "bobpw").await, StatusCode::OK);
+        assert_eq!(
+            login(&ctx.app, NAT, "alice", "wrong").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            login(&ctx.app, NAT, "alice", "alicepw").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "bob's login cleared alice's failures"
+        );
+    }
+
+    /// Guessing across many usernames from one address is still held: past a
+    /// ceiling of failed passwords per address (ten accounts' worth of the
+    /// per-account threshold) the address gets no password checked, whatever
+    /// the username. Below it, the address is not held, and another address is
+    /// never held by it.
+    #[tokio::test]
+    async fn guessing_many_usernames_from_one_address_is_capped() {
+        let ctx = create_test_context_with_auth(&[("bob", "bobpw")]);
+        // 49 failures, never more than 4 for one username: no account is
+        // locked out and the address is one below its ceiling of 50.
+        for n in 0..49 {
+            let user = format!("u{}", n / 4);
+            assert_eq!(
+                login(&ctx.app, NAT, &user, "wrong").await,
+                StatusCode::UNAUTHORIZED,
+                "guess {n}"
+            );
+        }
+        assert_eq!(
+            login(&ctx.app, NAT, "bob", "bobpw").await,
+            StatusCode::OK,
+            "the address was held below its ceiling"
+        );
+        // The 50th failure, for yet another username, reaches the ceiling.
+        assert_eq!(
+            login(&ctx.app, NAT, "fresh", "wrong").await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            login(&ctx.app, NAT, "bob", "bobpw").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "guessing across usernames is not held per address"
+        );
+        assert_eq!(
+            login(&ctx.app, NAT, "other", "wrong").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "a new username escapes the address ceiling"
+        );
+        assert_eq!(
+            login(&ctx.app, "192.0.2.77", "bob", "bobpw").await,
+            StatusCode::OK,
+            "another address is held"
+        );
+    }
+
+    /// Control: an empty username is an account like any other, and a header
+    /// with no username at all (no `:`) is malformed and not counted.
+    #[tokio::test]
+    async fn an_empty_or_missing_username_is_held_like_any_other() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let mut statuses = Vec::new();
+        for _ in 0..6 {
+            statuses.push(login(&ctx.app, NAT, "", "wrong").await.as_u16());
+        }
+        assert_eq!(statuses, [401, 401, 401, 401, 401, 429], "empty username");
+        assert_eq!(
+            login(&ctx.app, NAT, "alice", "alicepw").await,
+            StatusCode::OK
+        );
+
+        let no_username = format!("Basic {}", STANDARD.encode("no-colon-here"));
+        for _ in 0..8 {
+            let status = send_from(
+                &ctx.app,
+                "127.0.0.1",
+                Method::GET,
+                "/v2/",
+                &[
+                    ("authorization", &no_username),
+                    ("x-forwarded-for", "192.0.2.80"),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a malformed header is counted"
+            );
+        }
+        assert_eq!(
+            login(&ctx.app, "192.0.2.80", "alice", "alicepw").await,
+            StatusCode::OK
+        );
+    }
+
+    /// Docker sends an API token as the Basic password, under a username CI
+    /// jobs share ("docker", "token"). A valid token is served while that
+    /// username is locked out, as over Bearer; a password is not.
+    #[tokio::test]
+    async fn a_valid_api_token_as_the_basic_password_is_served_while_locked_out() {
+        let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("ci", 30, None, crate::tokens::Role::Write)
+            .unwrap();
+        for _ in 0..6 {
+            let _ = login(
+                &ctx.app,
+                NAT,
+                "docker",
+                "nra_00000000000000000000000000000000",
+            )
+            .await;
+        }
+        assert_eq!(
+            login(&ctx.app, NAT, "docker", "not-a-token").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the username is not locked out"
+        );
+        assert_eq!(
+            login(&ctx.app, NAT, "docker", &token).await,
+            StatusCode::OK,
+            "a valid token as the Basic password is refused while locked out"
+        );
+    }
+
+    /// The routes that take a username and password in their JSON body, and
+    /// the status each answers once the password is accepted (the revoke names
+    /// a token alice does not have).
+    const TOKEN_ROUTES: [(&str, StatusCode); 3] = [
+        ("/api/tokens", StatusCode::OK),
+        ("/api/tokens/list", StatusCode::OK),
+        ("/api/tokens/revoke", StatusCode::NOT_FOUND),
+    ];
+
+    /// POST a token-route body for `alice` with `password` from `peer`.
+    async fn token_route_from(
+        app: &axum::Router,
+        peer: &str,
+        uri: &str,
+        password: &str,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
+        use tower::ServiceExt;
+        let body = format!(
+            r#"{{"username":"alice","password":"{password}","hash_prefix":"0123456789abcdef"}}"#
+        );
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-type", "application/json");
+        for (k, v) in headers {
+            builder = builder.header(*k, *v);
+        }
+        let mut request = builder.body(Body::from(body)).unwrap();
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(SocketAddr::new(peer.parse().unwrap(), 4000)));
+        app.clone().oneshot(request).await.unwrap().status()
+    }
+
+    /// Lock alice out at `ip` for half a minute (ten failures), so no test
+    /// step races the end of the lockout.
+    fn lock_out_alice(tracker: &super::AuthFailureTracker, ip: &str) {
+        for _ in 0..10 {
+            tracker.record_failure(ip.parse().unwrap(), "alice");
+        }
+    }
+
+    /// Every token route keeps the lockout as the middleware does: it counts
+    /// a wrong password, a login clears the count, and a locked-out username
+    /// gets no password checked, however the lockout was earned. Another
+    /// address is not held.
+    #[tokio::test]
+    async fn every_token_route_keeps_the_lockout() {
+        let client = "203.0.113.5";
+        let ip: IpAddr = client.parse().unwrap();
+        for (uri, served) in TOKEN_ROUTES {
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            let tracker = &ctx.state.auth_failures;
+
+            // The wrong password that reaches the threshold is counted here.
+            for _ in 0..4 {
+                tracker.record_failure(ip, "alice");
+            }
+            assert_eq!(
+                token_route_from(&ctx.app, client, uri, "wrong", &[]).await,
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+            assert!(
+                tracker.check_blocked(&ip, "alice").is_some(),
+                "{uri} does not count a wrong password"
+            );
+
+            // A login clears the account's count.
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            let tracker = &ctx.state.auth_failures;
+            for _ in 0..4 {
+                tracker.record_failure(ip, "alice");
+            }
+            assert_eq!(
+                token_route_from(&ctx.app, client, uri, "alicepw", &[]).await,
+                served,
+                "{uri}"
+            );
+            tracker.record_failure(ip, "alice");
+            assert!(
+                tracker.check_blocked(&ip, "alice").is_none(),
+                "{uri}: a login did not clear the failures"
+            );
+
+            // Locked out: the right password is refused, the address is
+            // named in no way the client chooses, another address is served.
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            lock_out_alice(&ctx.state.auth_failures, client);
+            assert_eq!(
+                token_route_from(&ctx.app, client, uri, "alicepw", &[]).await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{uri} checks the password of a locked-out username"
+            );
+            assert_eq!(
+                token_route_from(
+                    &ctx.app,
+                    client,
+                    uri,
+                    "alicepw",
+                    &[
+                        ("x-forwarded-for", "198.51.100.7"),
+                        ("x-real-ip", "198.51.100.7")
+                    ]
+                )
+                .await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{uri}: forwarding headers from an untrusted peer escape the lockout"
+            );
+            assert_eq!(
+                token_route_from(&ctx.app, "192.0.2.77", uri, "alicepw", &[]).await,
+                served,
+                "{uri}: another address is held"
+            );
+        }
+    }
+
+    /// A lockout earned on one token route holds on every other, and on the
+    /// middleware's Basic login: it is one count per account, whichever route
+    /// the guesses came by.
+    #[tokio::test]
+    async fn a_lockout_earned_on_one_token_route_holds_on_every_route() {
+        let client = "203.0.113.5";
+        for (earned_on, _) in TOKEN_ROUTES {
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            for _ in 0..4 {
+                ctx.state
+                    .auth_failures
+                    .record_failure(client.parse().unwrap(), "alice");
+            }
+            assert_eq!(
+                token_route_from(&ctx.app, client, earned_on, "wrong", &[]).await,
+                StatusCode::UNAUTHORIZED
+            );
+            assert!(
+                ctx.state
+                    .auth_failures
+                    .check_blocked(&client.parse().unwrap(), "alice")
+                    .is_some(),
+                "{earned_on} does not count a wrong password"
+            );
+            // Lengthen the lockout so no step below races its end.
+            lock_out_alice(&ctx.state.auth_failures, client);
+            for (uri, _) in TOKEN_ROUTES {
+                assert_eq!(
+                    token_route_from(&ctx.app, client, uri, "alicepw", &[]).await,
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "locked out on {earned_on}, served on {uri}"
+                );
+            }
+            let auth = basic("alice", "alicepw");
+            assert_eq!(
+                send_from(
+                    &ctx.app,
+                    client,
+                    Method::GET,
+                    "/v2/",
+                    &[("authorization", &auth)]
+                )
+                .await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "locked out on {earned_on}, served by the middleware"
+            );
+        }
+    }
+
+    /// The token routes key a client by its canonical address, as the
+    /// middleware does: `::ffff:a.b.c.d` from a dual-stack socket is the
+    /// client `a.b.c.d`, for the failures it adds and the lockout it meets.
+    #[tokio::test]
+    async fn the_token_routes_key_a_v4_mapped_peer_as_its_ipv4_address() {
+        for (uri, _) in TOKEN_ROUTES {
+            // Locked out as 203.0.113.5, refused as ::ffff:203.0.113.5.
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            lock_out_alice(&ctx.state.auth_failures, "203.0.113.5");
+            assert_eq!(
+                token_route_from(&ctx.app, "::ffff:203.0.113.5", uri, "alicepw", &[]).await,
+                StatusCode::TOO_MANY_REQUESTS,
+                "{uri}: the mapped peer is another client"
+            );
+
+            // A wrong password from ::ffff:198.51.100.9 counts for 198.51.100.9.
+            let ctx = create_test_context_with_auth(&[("alice", "alicepw")]);
+            let ip: IpAddr = "198.51.100.9".parse().unwrap();
+            for _ in 0..4 {
+                ctx.state.auth_failures.record_failure(ip, "alice");
+            }
+            assert_eq!(
+                token_route_from(&ctx.app, "::ffff:198.51.100.9", uri, "wrong", &[]).await,
+                StatusCode::UNAUTHORIZED,
+                "{uri}"
+            );
+            assert!(
+                ctx.state
+                    .auth_failures
+                    .check_blocked(&ip, "alice")
+                    .is_some(),
+                "{uri}: a failure from the mapped peer is counted elsewhere"
+            );
+        }
     }
 }

@@ -5,19 +5,20 @@
 
 use axum::{
     extract::{ConnectInfo, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use utoipa::ToSchema;
 
-use crate::tokens::Role;
+use crate::audit::AuditEntry;
+use crate::tokens::{MintLifetime, MintedToken, Role, SECS_PER_DAY};
 use crate::AppState;
 
-use super::resolve_client_ip;
+use super::{lockout_rule, resolve_client_ip, too_many_failed_attempts, BasicDecision};
 
 #[derive(Deserialize)]
 pub struct CreateTokenRequest {
@@ -38,10 +39,28 @@ fn default_ttl() -> u64 {
     30
 }
 
-#[derive(Serialize)]
-pub struct CreateTokenResponse {
+/// What a route that mints a token answers: the token and the lifetime granted,
+/// which a cap — the longest lifetime a token may have, or what is left of the
+/// credential an OIDC caller mints with — may have made shorter than asked.
+#[derive(Serialize, ToSchema)]
+#[schema(as = TokenResponse)]
+pub struct MintedTokenResponse {
+    /// Generated API token (starts with nra_)
     pub token: String,
+    /// Whole days the token lives, rounded down: 0 for a token living less than a day
     pub expires_in_days: u64,
+    /// Seconds the token lives
+    pub expires_in_secs: u64,
+}
+
+impl From<MintedToken> for MintedTokenResponse {
+    fn from(minted: MintedToken) -> Self {
+        Self {
+            token: minted.token,
+            expires_in_days: minted.ttl_secs / SECS_PER_DAY,
+            expires_in_secs: minted.ttl_secs,
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -60,6 +79,42 @@ pub struct TokenListResponse {
     pub tokens: Vec<TokenListItem>,
 }
 
+/// Check the password a token route is sent, under the password lockout
+/// ([`super::lockout_rule`]): `Err` with the answer when it does not pass.
+/// Under a lockout the password is not checked.
+async fn check_password(
+    state: &AppState,
+    client_ip: IpAddr,
+    username: &str,
+    password: &str,
+) -> Result<(), Response> {
+    let locked_out = state.auth_failures.check_blocked(&client_ip, username);
+    let wrong = || BasicDecision::Unauthorized {
+        message: "Invalid credentials",
+        record_failure: true,
+    };
+    let checked = match (locked_out, state.auth.as_ref()) {
+        (Some(_), _) => wrong(),
+        (None, None) => {
+            return Err((StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response())
+        }
+        (None, Some(auth)) if auth.verify(username, password).await => {
+            BasicDecision::Authenticated {
+                user: username.to_string(),
+                role: Role::Write,
+            }
+        }
+        (None, Some(_)) => wrong(),
+    };
+    let (decision, count) = lockout_rule(locked_out, checked, Some(username));
+    state.auth_failures.count(client_ip, username, count);
+    match decision {
+        BasicDecision::Authenticated { .. } => Ok(()),
+        BasicDecision::LockedOut(retry_after) => Err(too_many_failed_attempts(retry_after)),
+        _ => Err((StatusCode::UNAUTHORIZED, "Invalid credentials").into_response()),
+    }
+}
+
 /// Create a new API token (requires Basic auth)
 async fn create_token(
     State(state): State<AppState>,
@@ -68,30 +123,9 @@ async fn create_token(
     Json(req): Json<CreateTokenRequest>,
 ) -> Response {
     let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.to_string())],
-            format!(
-                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                retry_after
-            ),
-        )
-            .into_response();
+    if let Err(refused) = check_password(&state, client_ip, &req.username, &req.password).await {
+        return refused;
     }
-
-    // Verify user credentials first
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
-    };
-
-    if !auth.authenticate(&req.username, &req.password) {
-        state.auth_failures.record_failure(client_ip);
-        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-    }
-
-    state.auth_failures.record_success(&client_ip);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
@@ -134,12 +168,22 @@ async fn create_token(
             .into_response();
     }
 
-    match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
-        Ok(token) => Json(CreateTokenResponse {
-            token,
-            expires_in_days: req.ttl_days,
-        })
-        .into_response(),
+    match token_store.mint_token(
+        &req.username,
+        MintLifetime::days(req.ttl_days, None),
+        req.description,
+        role,
+    ) {
+        Ok(minted) => {
+            state.audit.log(AuditEntry::token_mint(
+                &req.username,
+                "api",
+                &minted.owner,
+                &minted.role,
+                minted.ttl_secs,
+            ));
+            Json(MintedTokenResponse::from(minted)).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -152,29 +196,9 @@ async fn list_tokens(
     Json(req): Json<CreateTokenRequest>,
 ) -> Response {
     let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.to_string())],
-            format!(
-                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                retry_after
-            ),
-        )
-            .into_response();
+    if let Err(refused) = check_password(&state, client_ip, &req.username, &req.password).await {
+        return refused;
     }
-
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
-    };
-
-    if !auth.authenticate(&req.username, &req.password) {
-        state.auth_failures.record_failure(client_ip);
-        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-    }
-
-    state.auth_failures.record_success(&client_ip);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
@@ -218,29 +242,9 @@ async fn revoke_token(
     Json(req): Json<RevokeRequest>,
 ) -> Response {
     let client_ip = resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
-    if let Some(retry_after) = state.auth_failures.check_blocked(&client_ip) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            [(header::RETRY_AFTER, retry_after.to_string())],
-            format!(
-                r#"{{"error":"Too many failed attempts. Retry after {} seconds."}}"#,
-                retry_after
-            ),
-        )
-            .into_response();
+    if let Err(refused) = check_password(&state, client_ip, &req.username, &req.password).await {
+        return refused;
     }
-
-    let auth = match &state.auth {
-        Some(auth) => auth,
-        None => return (StatusCode::SERVICE_UNAVAILABLE, "Auth not configured").into_response(),
-    };
-
-    if !auth.authenticate(&req.username, &req.password) {
-        state.auth_failures.record_failure(client_ip);
-        return (StatusCode::UNAUTHORIZED, "Invalid credentials").into_response();
-    }
-
-    state.auth_failures.record_success(&client_ip);
 
     let token_store = match &state.tokens {
         Some(ts) => ts,
@@ -264,7 +268,7 @@ async fn revoke_token(
         return (StatusCode::NOT_FOUND, "Token not found").into_response();
     }
 
-    match token_store.revoke_token(&req.hash_prefix) {
+    match token_store.revoke_token(&req.hash_prefix).await {
         Ok(()) => (StatusCode::OK, "Token revoked").into_response(),
         Err(e) => (StatusCode::NOT_FOUND, e.to_string()).into_response(),
     }
@@ -315,12 +319,396 @@ mod tests {
 
     #[test]
     fn test_create_token_response_serialization() {
-        let resp = CreateTokenResponse {
+        let resp = MintedTokenResponse::from(MintedToken {
             token: "nora_abc123".to_string(),
-            expires_in_days: 30,
+            owner: "ci".to_string(),
+            role: Role::Read,
+            ttl_secs: 30 * SECS_PER_DAY + 600,
+        });
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "token": "nora_abc123",
+                "expires_in_days": 30,
+                "expires_in_secs": 30 * SECS_PER_DAY + 600,
+            })
+        );
+    }
+}
+
+/// Every route that mints a token caps its lifetime the same way and leaves an
+/// audit entry naming who minted what.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod mint_tests {
+    use crate::test_helpers::*;
+    use crate::tokens::Role;
+    use axum::http::{Method, StatusCode};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+
+    const TEN_YEARS: u64 = 3650 * 86_400;
+
+    fn audited(users: &[(&str, &str)]) -> TestContext {
+        create_test_context_with_auth_and_config(users, |cfg| {
+            cfg.audit.mode = crate::audit::AuditMode::File;
+        })
+    }
+
+    /// The audit entries written so far (drains the log).
+    async fn audit_entries(ctx: &TestContext) -> Vec<serde_json::Value> {
+        let path = ctx.state.audit.path().clone();
+        ctx.state.audit.shutdown().await;
+        std::fs::read_to_string(&path)
+            .unwrap_or_default()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// The one `token_mint` entry among `entries`; a mint that logs twice
+    /// or not at all fails here.
+    fn the_one_mint(entries: &[serde_json::Value]) -> &serde_json::Value {
+        let mints: Vec<_> = entries
+            .iter()
+            .filter(|e| e["action"] == "token_mint")
+            .collect();
+        assert_eq!(mints.len(), 1, "one audit entry per mint: {entries:?}");
+        mints[0]
+    }
+
+    /// The lifetime of the one token `owner` has.
+    fn lifetime_of(ctx: &TestContext, owner: &str) -> u64 {
+        let tokens = ctx.state.tokens.as_ref().unwrap().list_tokens(owner);
+        assert_eq!(tokens.len(), 1, "{owner} has one token");
+        tokens[0].expires_at - tokens[0].created_at
+    }
+
+    async fn post_json(
+        ctx: &TestContext,
+        uri: &str,
+        auth: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let mut headers = vec![("content-type", "application/json")];
+        if let Some(auth) = auth {
+            headers.push(("authorization", auth));
+        }
+        let resp = send_with_headers(&ctx.app, Method::POST, uri, headers, body.to_string()).await;
+        let status = resp.status();
+        let body = body_bytes(resp).await;
+        (status, serde_json::from_slice(&body).unwrap_or_default())
+    }
+
+    /// A password sent to a token route for a locked-out username is refused
+    /// unchecked and counted for nobody, on every route that takes one: it
+    /// does not reach the address ceiling, and another username behind the
+    /// same address still gets through.
+    #[tokio::test]
+    async fn a_locked_out_password_on_a_token_route_counts_for_nobody() {
+        for route in ["/api/tokens", "/api/tokens/list", "/api/tokens/revoke"] {
+            let ctx = audited(&[("alice", "alicepw"), ("bob", "bobpw")]);
+            let tracker = &ctx.state.auth_failures;
+            let ip: std::net::IpAddr = [127, 0, 0, 1].into();
+            for _ in 0..5 {
+                tracker.record_failure(ip, "alice");
+            }
+            let guess =
+                r#"{"username":"alice","password":"guess","hash_prefix":"0123456789abcdef"}"#;
+            for _ in 0..60 {
+                let (status, _) = post_json(&ctx, route, None, guess).await;
+                assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{route}");
+            }
+            assert!(
+                tracker.check_blocked(&ip, "bob").is_none(),
+                "{route}: passwords refused unchecked were counted toward the address ceiling"
+            );
+            let bob = r#"{"username":"bob","password":"bobpw"}"#;
+            let (status, _) = post_json(&ctx, "/api/tokens/list", None, bob).await;
+            assert_eq!(status, StatusCode::OK, "{route}");
+        }
+    }
+
+    /// Every route that mints holds a lifetime too long to count in seconds to
+    /// the cap, instead of wrapping around to hours: the API and admin routes
+    /// answer the lifetime granted, and the token lives it.
+    #[tokio::test]
+    async fn every_mint_route_holds_an_overflowing_lifetime_to_the_cap() {
+        let last_whole = u64::MAX / 86_400;
+        for ttl_days in [last_whole, last_whole + 1, u64::MAX] {
+            let ctx = audited(&[("alice", "alicepw")]);
+            let store = ctx.state.tokens.as_ref().unwrap();
+            let admin = store.create_token("root", 30, None, Role::Admin).unwrap();
+            let (status, json) = post_json(
+                &ctx,
+                "/api/tokens",
+                None,
+                &format!(r#"{{"username":"alice","password":"alicepw","ttl_days":{ttl_days}}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "api, ttl_days={ttl_days}: {json}");
+            assert_eq!(
+                json["expires_in_secs"], TEN_YEARS,
+                "api, ttl_days={ttl_days}"
+            );
+            assert_eq!(
+                lifetime_of(&ctx, "alice"),
+                TEN_YEARS,
+                "api, ttl_days={ttl_days}"
+            );
+
+            let (status, json) = post_json(
+                &ctx,
+                "/api/v1/admin/tokens",
+                Some(&format!("Bearer {admin}")),
+                &format!(r#"{{"username":"svc","role":"read","ttl_days":{ttl_days}}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "admin, ttl_days={ttl_days}: {json}");
+            assert_eq!(
+                json["expires_in_secs"], TEN_YEARS,
+                "admin, ttl_days={ttl_days}"
+            );
+            assert_eq!(
+                lifetime_of(&ctx, "svc"),
+                TEN_YEARS,
+                "admin, ttl_days={ttl_days}"
+            );
+
+            let ui = create_test_context_with_auth(&[("bob", "bobpw")]);
+            let basic = format!("Basic {}", STANDARD.encode("bob:bobpw"));
+            let resp = send_with_headers(
+                &ui.app,
+                Method::POST,
+                "/api/ui/tokens/create",
+                vec![
+                    ("authorization", &basic),
+                    ("hx-request", "true"),
+                    ("content-type", "application/x-www-form-urlencoded"),
+                ],
+                format!("description=ci&role=write&ttl_days={ttl_days}").into_bytes(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "ui, ttl_days={ttl_days}");
+            assert_eq!(
+                lifetime_of(&ui, "bob"),
+                TEN_YEARS,
+                "ui, ttl_days={ttl_days}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn api_tokens_caps_the_lifetime_and_audits_the_mint() {
+        let ctx = audited(&[("alice", "alicepw"), ("bob", "bobpw")]);
+        for (user, ttl) in [("alice", "1000000000"), ("bob", "213503982334602")] {
+            let (status, json) = post_json(
+                &ctx,
+                "/api/tokens",
+                None,
+                &format!(r#"{{"username":"{user}","password":"{user}pw","ttl_days":{ttl},"role":"write"}}"#),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{json}");
+            assert_eq!(
+                json["expires_in_days"], 3650,
+                "the answer names the lifetime granted"
+            );
+            assert_eq!(lifetime_of(&ctx, user), TEN_YEARS, "ttl_days={ttl}");
+        }
+        let token = ctx.state.tokens.as_ref().unwrap();
+        let entries = audit_entries(&ctx).await;
+        let mints: Vec<_> = entries
+            .iter()
+            .filter(|e| e["action"] == "token_mint")
+            .collect();
+        assert_eq!(mints.len(), 2, "one audit entry per mint: {entries:?}");
+        for (mint, user) in mints.iter().zip(["alice", "bob"]) {
+            assert_eq!(mint["actor"], user);
+            assert_eq!(mint["artifact"], user);
+            assert_eq!(mint["registry"], "api");
+            assert_eq!(mint["detail"], format!("role=write ttl_secs={TEN_YEARS}"));
+        }
+        for t in token.list_all_tokens() {
+            assert!(
+                !entries.iter().any(|e| e.to_string().contains(&t.file_id)),
+                "a token id in the audit log"
+            );
+        }
+    }
+
+    /// The password route answers the lifetime granted in seconds as well, the
+    /// same field the admin route answers it in.
+    #[tokio::test]
+    async fn api_tokens_answers_the_lifetime_granted_in_seconds() {
+        let ctx = create_test_context_with_auth_and_config(&[("alice", "alicepw")], |cfg| {
+            cfg.auth.admin_users = vec!["alice".to_string()];
+        });
+        let (status, json) = post_json(
+            &ctx,
+            "/api/tokens",
+            None,
+            r#"{"username":"alice","password":"alicepw","ttl_days":30,"role":"admin"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["expires_in_secs"], 30 * 86_400, "{json}");
+        assert_eq!(json["expires_in_days"], 30, "{json}");
+        assert_eq!(lifetime_of(&ctx, "alice"), 30 * 86_400);
+    }
+
+    #[tokio::test]
+    async fn admin_mint_caps_the_lifetime_it_reports_and_audits() {
+        let ctx = audited(&[]);
+        let admin = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("root", 30, None, Role::Admin)
+            .unwrap();
+        let (status, json) = post_json(
+            &ctx,
+            "/api/v1/admin/tokens",
+            Some(&format!("Bearer {admin}")),
+            r#"{"username":"svc","role":"read","ttl_days":1000000000}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(
+            json["expires_in_days"], 3650,
+            "the answer names the lifetime granted"
+        );
+        assert_eq!(lifetime_of(&ctx, "svc"), TEN_YEARS);
+        let entries = audit_entries(&ctx).await;
+        let mint = the_one_mint(&entries);
+        assert_eq!(mint["actor"], "root");
+        assert_eq!(mint["artifact"], "svc");
+        assert_eq!(mint["registry"], "admin");
+        assert_eq!(mint["detail"], format!("role=read ttl_secs={TEN_YEARS}"));
+    }
+
+    #[tokio::test]
+    async fn ui_mint_is_audited() {
+        let ctx = audited(&[("alice", "alicepw")]);
+        let basic = format!("Basic {}", STANDARD.encode("alice:alicepw"));
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/api/ui/tokens/create",
+            vec![
+                ("authorization", &basic),
+                ("hx-request", "true"),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ],
+            b"description=ci&role=write&ttl_days=30".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(lifetime_of(&ctx, "alice"), 30 * 86_400);
+        let entries = audit_entries(&ctx).await;
+        let mint = the_one_mint(&entries);
+        assert_eq!(mint["actor"], "alice");
+        assert_eq!(mint["artifact"], "alice");
+        assert_eq!(mint["registry"], "ui");
+        assert_eq!(
+            mint["detail"],
+            format!("role=write ttl_secs={}", 30 * 86_400)
+        );
+    }
+
+    /// Each route that mints leaves exactly one `token_mint` entry per token,
+    /// and a mint it refuses leaves none.
+    #[tokio::test]
+    async fn each_mint_is_one_audit_entry_and_a_refused_one_is_none() {
+        let ctx = audited(&[("alice", "alicepw")]);
+        let admin = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("root", 30, None, Role::Admin)
+            .unwrap();
+        let admin = format!("Bearer {admin}");
+        let basic = format!("Basic {}", STANDARD.encode("alice:alicepw"));
+        let ui = |hx: bool, body: &'static str| {
+            let mut headers = vec![
+                ("authorization", basic.as_str()),
+                ("content-type", "application/x-www-form-urlencoded"),
+            ];
+            if hx {
+                headers.push(("hx-request", "true"));
+            }
+            send_with_headers(
+                &ctx.app,
+                Method::POST,
+                "/api/ui/tokens/create",
+                headers,
+                body.as_bytes().to_vec(),
+            )
         };
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("nora_abc123"));
-        assert!(json.contains("30"));
+
+        // Refused on every route: nothing minted, nothing audited.
+        let (status, _) = post_json(
+            &ctx,
+            "/api/v1/admin/tokens",
+            Some(&admin),
+            r#"{"username":"svc","role":"read","ttl_days":0}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let (status, _) = post_json(
+            &ctx,
+            "/api/tokens",
+            None,
+            r#"{"username":"alice","password":"wrong","role":"read"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        let (status, _) = post_json(
+            &ctx,
+            "/api/tokens",
+            None,
+            r#"{"username":"alice","password":"alicepw","role":"admin"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        let resp = ui(false, "description=ci&role=read&ttl_days=30").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let resp = ui(true, "description=ci&role=admin&ttl_days=30").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            ctx.state.tokens.as_ref().unwrap().list_all_tokens().len(),
+            1
+        );
+
+        // One mint on each route.
+        let (status, json) = post_json(
+            &ctx,
+            "/api/v1/admin/tokens",
+            Some(&admin),
+            r#"{"username":"svc","role":"read","ttl_days":30}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let (status, json) = post_json(
+            &ctx,
+            "/api/tokens",
+            None,
+            r#"{"username":"alice","password":"alicepw","ttl_days":30,"role":"read"}"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        let resp = ui(true, "description=ci&role=read&ttl_days=30").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let entries = audit_entries(&ctx).await;
+        let mut routes: Vec<_> = entries
+            .iter()
+            .filter(|e| e["action"] == "token_mint")
+            .map(|e| e["registry"].as_str().unwrap().to_string())
+            .collect();
+        routes.sort();
+        assert_eq!(routes, ["admin", "api", "ui"], "{entries:?}");
     }
 }

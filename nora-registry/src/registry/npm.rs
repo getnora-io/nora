@@ -9,8 +9,8 @@ use crate::config::npm_scope_of;
 use crate::metrics::{METADATA_CORRUPT_TOTAL, PACKUMENT_REBUILT_TOTAL};
 use crate::registry::{
     circuit_open_response, method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional,
-    proxy_forward_post, read_validators, validators_key, write_validators, ProxyError,
-    Revalidation, Validators,
+    proxy_fetch_hop, proxy_forward_post, read_validators, validators_key, write_validators, Hopped,
+    ProxyError, Revalidation, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -23,6 +23,10 @@ use axum::{
     Extension, Router,
 };
 use base64::Engine;
+use nora_registry::npm_links::{
+    self, github_packages_tarball, link_host, max_semver, replace_upstream_bytes, Hop, Links,
+    Placed, Refetched, TarballAsk, TarballStep, Unrewritable,
+};
 use sha2::Digest;
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,7 +115,9 @@ async fn handle_npm_post(
     // `200 {}`, which npm and yarn render as "0 vulnerabilities" (Pavel 10.10). 4xx,
     // not 5xx: pnpm retries a 5xx for about 70 s before failing anyway, and every
     // client prints the error text on a 4xx (kit npm-audit-matrix).
-    let forward_body: Vec<u8> = if !filter_active {
+    // A bulk body is always read: the names of packages published here are stripped from it
+    // whether or not a namespace filter is configured.
+    let forward_body: Vec<u8> = if !filter_active && !is_bulk {
         body.to_vec()
     } else if is_quick || is_full {
         return audit_refused(
@@ -150,14 +156,15 @@ async fn handle_npm_post(
                 )
             }
         };
-        match strip_internal_bulk(&plain, engine, &owned_scopes) {
-            Some(stripped) => stripped,
-            None => {
-                return audit_refused(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "audit body is not the expected JSON object of package versions",
-                )
-            }
+        let Some(stripped) = strip_internal_bulk(&plain, engine, &owned_scopes) else {
+            return audit_refused(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "audit body is not the expected JSON object of package versions",
+            );
+        };
+        match strip_published_bulk(&state, stripped).await {
+            Ok(stripped) => stripped,
+            Err(response) => return response,
         }
     };
 
@@ -301,102 +308,83 @@ fn strip_internal_bulk(
     }
 }
 
-/// GitHub Packages' tarball path, `download/<@scope/name>/<version>/<sha1>`: the package
-/// name and version, or `None` for any other path. It has no `/-/`, so without this it
-/// would be taken for the packument of a package named `download/…` and skip every
-/// tarball check, curation included.
-fn github_packages_tarball(path: &str) -> Option<(&str, &str)> {
-    let rest = path.strip_prefix("download/")?;
-    let mut segments = rest.split('/');
-    let (scope, name, version, sha) = (
-        segments.next()?,
-        segments.next()?,
-        segments.next()?,
-        segments.next()?,
-    );
-    if segments.next().is_some()
-        || scope.len() < 2
-        || !scope.starts_with('@')
-        || name.is_empty()
-        || version.is_empty()
-        || sha.is_empty()
-        || !sha.bytes().all(|b| b.is_ascii_hexdigit())
-    {
-        return None;
+/// The most packages a bulk audit may name: each is a listing of the store to tell whether it is
+/// published here. Lockfiles of large monorepos name a few thousand.
+const NPM_AUDIT_MAX_PACKAGES: usize = 10_000;
+
+/// Strip the packages published here from a bulk-advisories body that [`strip_internal_bulk`]
+/// returned: a published name is NORA's, and an upstream that learns it can register it. The
+/// body is forwarded unchanged when it names none. A name whose published state cannot be read
+/// refuses the audit (503): forwarding it could hand the name over, and dropping it would hide
+/// its advisories.
+async fn strip_published_bulk(state: &AppState, body: Vec<u8>) -> Result<Vec<u8>, Response> {
+    use futures::StreamExt;
+    let Ok(mut map) = serde_json::from_slice::<serde_json::Map<String, serde_json::Value>>(&body)
+    else {
+        return Err(audit_refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "audit body is not the expected JSON object of package versions",
+        ));
+    };
+    if map.len() > NPM_AUDIT_MAX_PACKAGES {
+        return Err(audit_refused(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "audit body names more packages than NORA checks (10000)",
+        ));
     }
-    Some((&rest[..scope.len() + 1 + name.len()], version))
-}
-
-/// Rewrite tarball URLs in npm metadata to point to NORA.
-///
-/// Replaces upstream registry URLs (e.g. `https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz`)
-/// with NORA URLs (e.g. `http://nora:5000/npm/lodash/-/lodash-4.17.21.tgz`).
-///
-/// Two-layer approach (#439):
-/// 1. Targeted: parse JSON, rewrite `versions.*.dist.tarball`
-/// 2. Safety net: byte-level replace of upstream URL prefix in serialized output
-fn rewrite_tarball_urls(data: &[u8], nora_base: &str, upstream_url: &str) -> Result<Vec<u8>, ()> {
-    let mut json: serde_json::Value = serde_json::from_slice(data).map_err(|e| {
-        tracing::warn!(error = %e, "npm: JSON parse failed in rewrite_tarball_urls");
-    })?;
-
-    let upstream_trimmed = upstream_url.trim_end_matches('/');
-    let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-
-    if let Some(versions) = json.get_mut("versions").and_then(|v| v.as_object_mut()) {
-        for (_ver, version_data) in versions.iter_mut() {
-            if let Some(tarball_url) = version_data
-                .get("dist")
-                .and_then(|d| d.get("tarball"))
-                .and_then(|t| t.as_str())
-                .map(|s| s.to_string())
-            {
-                let rewritten = tarball_url.replace(upstream_trimmed, &nora_npm_base);
-                if let Some(dist) = version_data.get_mut("dist") {
-                    dist["tarball"] = serde_json::Value::String(rewritten);
-                }
+    let states: Vec<(String, Published)> = futures::stream::iter(map.keys().cloned())
+        .map(|name| async move {
+            // A name that is no valid key cannot be published here.
+            let prefix = format!("npm/{name}/versions/");
+            let published = match crate::validation::validate_storage_key(
+                crate::validation::listing_key(&prefix),
+            ) {
+                Ok(()) => published_state(&state.storage, &name).await,
+                Err(_) => Published::No,
+            };
+            (name, published)
+        })
+        .buffer_unordered(32)
+        .collect()
+        .await;
+    let mut stripped = false;
+    for (name, published) in states {
+        match published {
+            Published::Yes(_) => {
+                map.remove(&name);
+                stripped = true;
+            }
+            Published::No => {}
+            Published::Unknown => {
+                return Err(crate::registry::storage_unavailable(
+                    "npm",
+                    &format!("npm/{name}/versions/"),
+                ))
             }
         }
     }
-
-    let output = serde_json::to_vec(&json).map_err(|e| {
-        tracing::warn!(error = %e, "npm: JSON serialize failed in rewrite_tarball_urls");
-    })?;
-
-    // Safety net: byte-level replace of any remaining upstream URL prefix (#439).
-    // Catches edge cases where targeted rewrite missed (e.g. new npm metadata fields).
-    Ok(replace_upstream_bytes(
-        &output,
-        upstream_trimmed,
-        &nora_npm_base,
-    ))
+    if !stripped {
+        return Ok(body);
+    }
+    serde_json::to_vec(&map).map_err(|e| {
+        tracing::error!(error = %e, "npm audit: re-serializing the stripped body failed");
+        audit_refused(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "audit body could not be re-serialized",
+        )
+    })
 }
 
-/// Byte-level replace of upstream URL prefix in response body (#439).
-///
-/// Used as safety net after targeted JSON rewrite, and as fallback when JSON
-/// parsing fails. Replaces full URL prefix (e.g. `https://registry.npmjs.org`)
-/// rather than bare hostname to avoid corrupting unrelated fields.
-fn replace_upstream_bytes(data: &[u8], upstream_url: &str, nora_npm_base: &str) -> Vec<u8> {
-    if upstream_url.is_empty() {
-        return data.to_vec();
-    }
-    let needle = upstream_url.as_bytes();
-    if memchr::memmem::find(data, needle).is_none() {
-        return data.to_vec();
-    }
-    // Replace all occurrences of the upstream URL prefix
-    let replacement = nora_npm_base.as_bytes();
-    let mut result = Vec::with_capacity(data.len());
-    let mut start = 0;
-    let finder = memchr::memmem::Finder::new(needle);
-    while let Some(pos) = finder.find(&data[start..]) {
-        result.extend_from_slice(&data[start..start + pos]);
-        result.extend_from_slice(replacement);
-        start += pos + needle.len();
-    }
-    result.extend_from_slice(&data[start..]);
-    result
+/// [`npm_links::place_document`] with the server's storage-key check.
+fn place_document(
+    data: &[u8],
+    nora_base: &str,
+    upstream_url: &str,
+    package_asked: Option<&str>,
+    links: Links,
+) -> Result<Placed, Unrewritable> {
+    let key_ok = |key: &str| crate::validation::validate_storage_key(key).is_ok();
+    npm_links::place_document(data, nora_base, upstream_url, package_asked, links, &key_ok)
 }
 
 /// npm whoami handler: returns `{"username": "..."}`
@@ -501,42 +489,39 @@ async fn handle_request(
         None
     };
 
+    // #733: an internal-namespace package is operator-owned — skip curation; the cache-hit
+    // serve below handles a locally-published tarball, and the namespace guard at the
+    // cache-miss boundary (below) blocks the upstream branch for internal names.
+    let internal = is_internal(&state, &package_name);
+
     // Curation check — tarball downloads only (metadata passes through)
-    if is_tarball {
-        // #733: an internal-namespace package is operator-owned — skip curation; the cache-hit
-        // serve below handles a locally-published tarball, and the namespace guard at the
-        // cache-miss boundary (below) blocks the upstream branch for internal names.
-        if !crate::curation::is_internal_namespace(
+    if is_tarball && !internal {
+        // Without trusted dates a release is as old as NORA's first sight of it in a
+        // packument: the cache mtime above restarts at every refetch, so a client that
+        // asks more often than the minimum age never saw its release mature. The
+        // quarantine reads neither: a version listed long ago says nothing about bytes
+        // first fetched now, so without trusted dates it counts from the first fetch. A
+        // version the ledger lacks keeps the mtime date.
+        let mut release_date = publish_date;
+        if let Some(ver) = tarball_version
+            .as_deref()
+            .filter(|_| first_seen_tracked(&state))
+        {
+            release_date =
+                first_seen_date(&state.storage, &upstream_packument_key(&package_name), ver)
+                    .await
+                    .or(publish_date);
+        }
+        if let Some(response) = crate::curation::check_download(
             &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
             crate::curation::RegistryType::Npm,
             &package_name,
+            crate::curation::RequestVersion::of_artifact(tarball_version.as_deref()),
+            release_date,
         ) {
-            // Without trusted dates a release is as old as NORA's first sight of it in a
-            // packument: the cache mtime above restarts at every refetch, so a client that
-            // asks more often than the minimum age never saw its release mature. The
-            // quarantine keeps `publish_date`: a version listed long ago says nothing about
-            // bytes first fetched now. A version the ledger lacks keeps the mtime date.
-            let mut release_date = publish_date;
-            if let Some(ver) = tarball_version
-                .as_deref()
-                .filter(|_| first_seen_tracked(&state))
-            {
-                release_date =
-                    first_seen_date(&state.storage, &upstream_packument_key(&package_name), ver)
-                        .await
-                        .or(publish_date);
-            }
-            if let Some(response) = crate::curation::check_download(
-                &state.curation().curation_engine,
-                state.bypass_token().as_deref(),
-                &headers,
-                crate::curation::RegistryType::Npm,
-                &package_name,
-                crate::curation::RequestVersion::of_artifact(tarball_version.as_deref()),
-                release_date,
-            ) {
-                return response;
-            }
+            return response;
         }
     }
 
@@ -612,35 +597,55 @@ async fn handle_request(
     // and the metadata serve (unpinned, Unpinned arm) flow the discharged bytes. The
     // .sha256 sidecar check below stays: it is the integrity check on S3 (storage
     // pins are local-only).
-    let cached = if cache_trusted {
-        state.storage.get_verified(&key).await.ok()
+    let (cached, read_failure) = if cache_trusted {
+        crate::registry::cached_read(state.storage.get_verified(&key).await)
     } else {
-        None
+        (None, None)
     };
-    if let Some(outcome) = cached {
-        use nora_registry::verified::{verified_body, GateOutcome};
-        let data = match outcome {
-            GateOutcome::Verified(blob) => verified_body(blob),
-            GateOutcome::Unpinned(blob) => blob.into_inner(),
-        };
-
-        // Tarball: integrity check if hash exists
-        let hash_key = format!("{}.sha256", key);
-        if let Ok(stored_hash) = state.storage.get(&hash_key).await {
-            let computed = hex::encode(sha2::Sha256::digest(&data));
-            let expected = String::from_utf8_lossy(&stored_hash);
-            if computed != expected.as_ref() {
-                tracing::error!(
-                    key = %key,
-                    expected = %expected,
-                    computed = %computed,
-                    "SECURITY: npm tarball integrity check FAILED — possible tampering"
-                );
-                return (StatusCode::INTERNAL_SERVER_ERROR, "Integrity check failed")
-                    .into_response();
+    let cached = match cached {
+        Some(outcome) => {
+            use nora_registry::verified::{verified_body, GateOutcome};
+            let data = match outcome {
+                GateOutcome::Verified(blob) => verified_body(blob),
+                GateOutcome::Unpinned(blob) => blob.into_inner(),
+            };
+            // Tarball: integrity check against the sidecar written with it.
+            match crate::registry::check_sidecar(&state.storage, &key, &data).await {
+                crate::registry::Sidecar::Holds => Some(data),
+                crate::registry::Sidecar::Differs { expected, computed } => {
+                    tracing::error!(
+                        key = %key,
+                        expected = %expected,
+                        computed = %computed,
+                        "SECURITY: npm tarball integrity check FAILED — possible tampering"
+                    );
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Integrity check failed")
+                        .into_response();
+                }
+                // A copy NORA owns has nowhere else to come from: unavailable, its bytes not sent.
+                // A proxied one is fetched again below and checked as on its first download.
+                crate::registry::Sidecar::Unreadable(e) => {
+                    let own = internal
+                        || state.config.npm.route(&path).is_none()
+                        || !matches!(
+                            published_state(&state.storage, &package_name).await,
+                            Published::No
+                        );
+                    if own {
+                        return crate::registry::local_copy_unreadable(
+                            "npm",
+                            &format!("{key}.sha256"),
+                            &e,
+                        );
+                    }
+                    tracing::warn!(key = %key, error = %e, "npm: tarball sidecar unreadable, fetching the tarball again");
+                    None
+                }
             }
         }
-
+        None => None,
+    };
+    if let Some(data) = cached {
         // Curation integrity verification (issue #189)
         if let Some(response) = crate::curation::verify_integrity(
             &state.curation().curation_engine,
@@ -670,7 +675,10 @@ async fn handle_request(
             &q_mode,
             q_secs,
             "cache",
-            publish_date,
+            crate::digest_quarantine::first_seen_seed(
+                state.config.server.trust_upstream_dates,
+                publish_date,
+            ),
         ) {
             return resp;
         }
@@ -679,6 +687,11 @@ async fn handle_request(
             .headers_mut()
             .insert(header::ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         return response;
+    }
+
+    // An internal package whose copy the store could not read is unavailable, not absent.
+    if let Some(e) = read_failure.as_ref().filter(|_| internal) {
+        return crate::registry::local_copy_unreadable("npm", &key, e);
     }
 
     // --- Namespace isolation: prevent proxying internal namespaces ---
@@ -693,21 +706,35 @@ async fn handle_request(
         return response;
     }
 
+    // A tarball of a published package that NORA does not store is no version of it: the upstream
+    // is not asked, so what it has under the name is neither served nor stored beside the published
+    // versions (as for cargo, #1158). The packument lists the published versions only, so only a
+    // direct or locked URL gets here. When the published versions cannot be listed NORA cannot
+    // tell whether the name is its own: unavailable (503), the upstream not asked.
+    match published_state(&state.storage, &package_name).await {
+        Published::Yes(_) => return StatusCode::NOT_FOUND.into_response(),
+        Published::Unknown => {
+            return crate::registry::storage_unavailable(
+                "npm",
+                &format!("npm/{package_name}/versions/"),
+            )
+        }
+        Published::No => {}
+    }
+
     // --- Proxy fetch path ---
     if let Some(upstream) = state.config.npm.route(&path) {
         let proxy_url = upstream.url;
-        let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
-
-        match proxy_fetch(
-            &state.http_client,
-            &url,
-            Duration::from_secs(state.config.npm.proxy_timeout),
+        let (url, fetched) = fetch_upstream_tarball(
+            &state,
+            upstream.url,
             upstream.auth,
-            &state.circuit_breaker,
-            BreakerScope::upstream(RegistryType::Npm, upstream.url),
+            &path,
+            TarballAsk::parse(&path).as_ref(),
         )
-        .await
-        {
+        .await;
+
+        match fetched {
             Ok(data) => {
                 // The allowlist's pinned integrity holds on the first download too, before anything
                 // is cached: the cache-hit branch checks the same rule.
@@ -782,7 +809,10 @@ async fn handle_request(
                         &q_mode,
                         q_secs,
                         &url,
-                        publish_date,
+                        crate::digest_quarantine::first_seen_seed(
+                            state.config.server.trust_upstream_dates,
+                            publish_date,
+                        ),
                     ) {
                         return resp;
                     }
@@ -802,6 +832,201 @@ async fn handle_request(
     }
 
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// Fetch the tarball `ask` names from `upstream` where [`npm_links::tarball_step`] decides, with
+/// the upstream's credential: only for a version the owner's trusted packument lists, that
+/// packument fetched again once when it does not (the version may be newer than the copy).
+/// Returns what the download is recorded as, with what it gave; `None` (no tarball of a version)
+/// and a version not listed are `NotFound` without a request for the tarball.
+///
+/// The credential goes as far as the upstream's origin, the redirects followed by
+/// [`fetch_following`].
+async fn fetch_upstream_tarball(
+    state: &AppState,
+    upstream: &str,
+    auth: Option<crate::config::UpstreamAuth<'_>>,
+    path: &str,
+    ask: Option<&TarballAsk<'_>>,
+) -> (String, Result<Vec<u8>, ProxyError>) {
+    let at_upstream = format!("{}/{}", upstream.trim_end_matches('/'), path);
+    let Some(ask) = ask else {
+        return (at_upstream, Err(ProxyError::NotFound));
+    };
+    let nora_npm_base = format!("{}/npm", nora_base_url(state).trim_end_matches('/'));
+    let key_ok = |key: &str| crate::validation::validate_storage_key(key).is_ok();
+    let copy = trusted_copy(state, ask.package())
+        .await
+        .and_then(|copy| copy.listed_link(ask.version()));
+    let step = |refetched| {
+        npm_links::tarball_step(
+            ask,
+            upstream,
+            &nora_npm_base,
+            copy.as_deref(),
+            refetched,
+            &key_ok,
+        )
+    };
+    let mut decided = step(None);
+    if matches!(decided, TarballStep::Refetch) {
+        let key = upstream_packument_key(ask.package());
+        let refetched = match refetch_metadata(state, ask.package(), &key, &key, true, false).await
+        {
+            Ok(doc) => Refetched::Packument(npm_links::listed_link(&doc, ask.version())),
+            Err(ProxyError::NotFound) => Refetched::NoPackument,
+            Err(e) => Refetched::Failed(e),
+        };
+        decided = step(Some(refetched));
+    }
+    let (asked, named) = match decided {
+        TarballStep::Ask { asked, named } => (asked, named),
+        TarballStep::UpstreamFailed(e) => return (at_upstream, Err(e)),
+        TarballStep::NotFound | TarballStep::Refetch => {
+            tracing::info!(
+                registry = "npm",
+                package = %ask.package(),
+                version = %ask.version(),
+                "tarball not listed by its upstream's packument, not asked for"
+            );
+            return (at_upstream, Err(ProxyError::NotFound));
+        }
+    };
+    let fetched = fetch_following(state, upstream, &asked, auth, &nora_npm_base).await;
+    (named, fetched)
+}
+
+/// Download `asked` from `upstream` with its credential, following the redirects here, one at
+/// a time: the client follows none, so the whole chain has one budget and every hop is decided
+/// by [`npm_links::next_hop`] — ten redirects pass and the eleventh is a failure (502), and the
+/// credential goes only while the chain is on `asked`'s origin. A registry keeping its files on
+/// a storage host is reached without it, and so is its origin again from there: reqwest drops
+/// the header on the hop to another host but puts it back on the next hop within that host.
+/// The chain shares one `proxy_timeout`.
+async fn fetch_following(
+    state: &AppState,
+    upstream: &str,
+    asked: &str,
+    mut auth: Option<crate::config::UpstreamAuth<'_>>,
+    nora_npm_base: &str,
+) -> Result<Vec<u8>, ProxyError> {
+    let origin = reqwest::Url::parse(asked)
+        .map_err(|e| ProxyError::Network(format!("tarball URL not readable: {e}")))?;
+    let deadline = std::time::Instant::now() + Duration::from_secs(state.config.npm.proxy_timeout);
+    let mut url = asked.to_string();
+    let mut left_origin = false;
+    let mut hop = 0;
+    loop {
+        hop += 1;
+        let next = match proxy_fetch_hop(
+            &state.http_client_no_redirect,
+            &url,
+            deadline.saturating_duration_since(std::time::Instant::now()),
+            auth,
+            &state.circuit_breaker,
+            BreakerScope::upstream(RegistryType::Npm, upstream),
+        )
+        .await?
+        {
+            Hopped::Body(body) => return Ok(body),
+            Hopped::Redirect(next) => next,
+        };
+        url = match npm_links::next_hop(hop, &origin, left_origin, &next) {
+            // The URL asked carries the upstream's userinfo, if its URL has one; the hop on
+            // its origin carries it too.
+            Hop::WithCredential => {
+                npm_links::with_userinfo_of(next.as_str(), asked).unwrap_or_else(|| next.into())
+            }
+            Hop::WithoutCredential => {
+                if !left_origin {
+                    tracing::debug!(
+                        registry = "npm",
+                        to = %link_host(next.as_str(), nora_npm_base),
+                        "tarball on another origin, fetched without the upstream's credential"
+                    );
+                }
+                left_origin = true;
+                auth = None;
+                next.into()
+            }
+            Hop::Refuse => {
+                tracing::warn!(
+                    registry = "npm",
+                    hop,
+                    to = %link_host(next.as_str(), nora_npm_base),
+                    "tarball redirect not followed: past the redirect limit or not http(s)"
+                );
+                return Err(ProxyError::Network("redirect not followed".to_string()));
+            }
+        };
+    }
+}
+
+/// The client an upstream's metadata is fetched with. An upstream bound to a scope answers from
+/// its own origin only: a redirect off it is not followed, and the fetch fails with the 3xx (a
+/// 502 to the client), so neither the scope's package names nor the credential reach another
+/// origin. The default upstream follows redirects.
+fn metadata_client(state: &AppState, scoped: bool) -> &reqwest::Client {
+    if scoped {
+        &state.http_client_same_origin
+    } else {
+        &state.http_client
+    }
+}
+
+/// The trusted cached packument of `package`: the copy under the upstream key, else an older
+/// release's upstream cache under the legacy key (reached for a package not published here),
+/// each trusted on its own provenance ([`trusted::TrustedPackument::at`]).
+async fn trusted_copy(state: &AppState, package: &str) -> Option<trusted::TrustedPackument> {
+    for key in [upstream_packument_key(package), legacy_cache_key(package)] {
+        if let Some(copy) = trusted::TrustedPackument::at(state, package, &key).await {
+            return Some(copy);
+        }
+    }
+    None
+}
+
+mod trusted {
+    use crate::AppState;
+    use nora_registry::npm_links;
+
+    /// A cached packument its owner delivered: the only copy a tarball link is taken from.
+    /// Its one constructor checks the copy's provenance at the key it is read from.
+    pub(super) struct TrustedPackument(axum::body::Bytes);
+
+    impl TrustedPackument {
+        /// The copy at `key`, if [`super::cached_copy_trusted`] trusts it and it reads.
+        pub(super) async fn at(state: &AppState, package: &str, key: &str) -> Option<Self> {
+            if !super::cached_copy_trusted(state, package, key, package, None).await {
+                return None;
+            }
+            let (Some(outcome), _) =
+                crate::registry::cached_read(state.storage.get_verified(key).await)
+            else {
+                return None;
+            };
+            use nora_registry::verified::{verified_body, GateOutcome};
+            Some(Self(match outcome {
+                GateOutcome::Verified(blob) => verified_body(blob),
+                GateOutcome::Unpinned(blob) => blob.into_inner(),
+            }))
+        }
+
+        /// The link this copy names for the tarball of `version`, if it lists that version.
+        pub(super) fn listed_link(&self, version: &str) -> Option<String> {
+            npm_links::listed_link(&self.0, version)
+        }
+    }
+}
+
+/// Whether `name` is in an internal namespace: served from its local copies only, never asked of
+/// an upstream (#68, #733).
+fn is_internal(state: &AppState, name: &str) -> bool {
+    crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Npm,
+        name,
+    )
 }
 
 /// Internal prefix holding npm cache provenance sidecars (#1055).
@@ -1027,39 +1252,35 @@ async fn cached_copy_trusted(
     let Some(owner) = state.config.npm.route(path) else {
         return false;
     };
-    let Ok(recorded) = state.storage.get(&origin_key(key)).await else {
-        return false;
-    };
-    let Some((origin, digest)) = std::str::from_utf8(&recorded)
-        .ok()
-        .and_then(|record| record.split_once('\n'))
-    else {
-        return false;
-    };
-    origin == origin_of(owner.url) && state.storage.pin(key).await.as_deref() == Some(digest)
+    let recorded = state.storage.get(&origin_key(key)).await.ok();
+    let pin = state.storage.pin(key).await;
+    npm_links::copy_is_owners(recorded.as_deref(), pin.as_deref(), owner.url)
 }
 
-/// Refetch metadata from upstream, rewrite URLs, update cache.
-/// Returns None if upstream is unavailable (caller serves stale cache).
+/// Refetch metadata from upstream, rewrite URLs, update cache. An error says why there is no
+/// document: `NotFound` for one the upstream does not have or NORA does not serve, the
+/// upstream's failure otherwise (a caller with a cached copy serves it stale).
 ///
 /// `key` is the cache written; `seed_key` holds the copy being revalidated (`key`, or what an
 /// older release cached), from which a missing first-seen ledger starts. `ledger` says whether
-/// the document is a packument, whose versions the ledger records.
+/// the document is a packument, whose versions the ledger records. `conditional` says whether the
+/// cached copy may be kept on a 304: not one holding a link past NORA.
 async fn refetch_metadata(
     state: &AppState,
     path: &str,
     key: &str,
     seed_key: &str,
     ledger: bool,
-) -> Option<Vec<u8>> {
-    let upstream = state.config.npm.route(path)?;
+    conditional: bool,
+) -> Result<Vec<u8>, ProxyError> {
+    let upstream = state.config.npm.route(path).ok_or(ProxyError::NotFound)?;
     let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
 
     // Revalidate with a conditional request when enabled and we have stored
     // validators. Empty validators ⇒ no conditional headers ⇒ always a 200,
     // which is also how the first fetch captures validators for next time (#596).
-    let validators = if state.config.npm.revalidate {
+    let validators = if state.config.npm.revalidate && conditional {
         read_validators(&state.storage, key)
             .await
             .unwrap_or_default()
@@ -1069,7 +1290,7 @@ async fn refetch_metadata(
     let had_validators = validators.is_some();
 
     match proxy_fetch_conditional(
-        &state.http_client,
+        metadata_client(state, upstream.scoped),
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -1104,7 +1325,7 @@ async fn refetch_metadata(
                     tokio::spawn(async move {
                         let _ = put_with_origin(&storage, &key_clone, &body, &origin).await;
                     });
-                    Some(cached.to_vec())
+                    Ok(cached.to_vec())
                 }
                 Err(_) => {
                     // Body gone (GC, retention, corruption). Delete the stale
@@ -1116,23 +1337,15 @@ async fn refetch_metadata(
                         key = %key,
                         "304 but cached body missing; cleared validators for full refetch"
                     );
-                    None
+                    Err(ProxyError::NotFound)
                 }
             }
         }
         // New body — rewrite, cache it, then persist the fresh validators.
         Ok(Revalidation::Modified { body, validators }) => {
-            let nora_base = nora_base_url(state);
-            let rewritten =
-                rewrite_tarball_urls(&body, &nora_base, proxy_url).unwrap_or_else(|()| {
-                    tracing::warn!(
-                        path = %path,
-                        "npm metadata refetch: JSON parse failed, using byte-level URL rewrite"
-                    );
-                    let upstream_trimmed = proxy_url.trim_end_matches('/');
-                    let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-                    replace_upstream_bytes(&body, upstream_trimmed, &nora_npm_base)
-                });
+            // A version manifest whose tarball is now outside the upstream is not cached.
+            let rewritten = rewrite_for_nora(state, &body, proxy_url, path, Links::Stored)
+                .ok_or(ProxyError::NotFound)?;
 
             // Before the cached copy is replaced: it may be the one a ledger starts from.
             if ledger {
@@ -1152,17 +1365,17 @@ async fn refetch_metadata(
                 write_validators(&storage, &key_clone, &validators).await;
             });
 
-            Some(rewritten)
+            Ok(rewritten)
         }
         // Upstream unavailable / error — fall back to the caller's serve_stale /
         // 502 path exactly as before.
-        Err(_) => {
+        Err(e) => {
             if had_validators {
                 crate::metrics::PROXY_REVALIDATION_ERRORS_TOTAL
                     .with_label_values(&["npm"])
                     .inc();
             }
-            None
+            Err(e)
         }
     }
 }
@@ -1238,14 +1451,22 @@ async fn serve_dist_tags(
     name: &str,
 ) -> Response {
     let own = match published_state(&state.storage, name).await {
-        Published::Yes(_) => assemble_packument(&state.storage, name).await,
+        // Tags derived from the versions (`latest` when no pointer names it) need them all.
+        Published::Yes(published) => match assemble_packument(&state.storage, name).await {
+            Ok(bytes) if listed_versions(&bytes).as_ref() != Some(&published) => {
+                return published_versions_unreadable(state, name, &published, &bytes).await;
+            }
+            Ok(bytes) => Some(bytes),
+            Err(unassembled) => return unassembled.response(name),
+        },
         Published::Unknown => {
             let key = published_packument_key(name);
             match state.storage.get(&key).await {
                 Ok(data) if is_assembled_by_nora(&state.storage, &key, &data).await => {
                     Some(data.to_vec())
                 }
-                _ => None,
+                // Without one NORA cannot tell whether the tags are its own.
+                _ => return crate::registry::storage_unavailable("npm", &key),
             }
         }
         Published::No => None,
@@ -1451,7 +1672,7 @@ async fn serve_metadata(
         }
         // The listing failed. A packument NORA assembled is still here: the package is published,
         // and its documents are served as they are, read only. Without one, or with an upstream copy
-        // in its place, the upstream answers this request and nothing is cached.
+        // in its place, the package is unavailable and no upstream is asked.
         Published::Unknown => {
             let key = published_packument_key(name);
             match state.storage.get(&key).await {
@@ -1459,7 +1680,10 @@ async fn serve_metadata(
                     None => packument_response(headers, data),
                     Some(spec) => published_version_manifest(state, name, spec).await,
                 },
-                _ => uncached_upstream_metadata(state, headers, path, name).await,
+                // Without one NORA cannot tell whether the package is its own: unavailable (503), as
+                // cargo answers a crate it cannot tell is published. A published name is never an
+                // upstream's to answer for.
+                _ => crate::registry::storage_unavailable("npm", &key),
             }
         }
     }
@@ -1501,20 +1725,12 @@ async fn published_packument_response(
             return packument_response(headers, data);
         }
     }
-    match assemble_packument(&state.storage, name).await.ok_or(()) {
+    match assemble_packument(&state.storage, name).await {
         // A version whose document cannot be read would silently leave the packument, and every
         // read would rebuild it again: the package is unavailable until it is repaired, and says
         // which versions keep it so.
         Ok(bytes) if listed_versions(&bytes).as_ref() != Some(published) => {
-            let assembled = listed_versions(&bytes).unwrap_or_default();
-            let unreadable: Vec<&String> = published.difference(&assembled).collect();
-            tracing::error!(
-                registry = "npm",
-                package = %name,
-                versions = ?unreadable,
-                "published versions cannot be read; packument not served"
-            );
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+            published_versions_unreadable(state, name, published, &bytes).await
         }
         Ok(bytes) => {
             PACKUMENT_REBUILT_TOTAL.with_label_values(&["npm"]).inc();
@@ -1525,29 +1741,59 @@ async fn published_packument_response(
             state.metrics.record_cache_hit("npm");
             packument_response(headers, Bytes::from(bytes))
         }
-        Err(()) => {
-            tracing::warn!(registry = "npm", package = %name, "published packument cannot be assembled");
-            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        Err(unassembled) => unassembled.response(name),
+    }
+}
+
+/// The answer for a published package whose assembled packument `bytes` left out some of its
+/// `published` versions: their documents could not be read. Each is read again and its failure
+/// says why — 500 for a copy that fails its integrity check, else 503. The package is
+/// unavailable until it is repaired, never served without the versions.
+async fn published_versions_unreadable(
+    state: &AppState,
+    name: &str,
+    published: &std::collections::BTreeSet<String>,
+    bytes: &[u8],
+) -> Response {
+    let assembled = listed_versions(bytes).unwrap_or_default();
+    let unreadable: Vec<&String> = published.difference(&assembled).collect();
+    tracing::error!(
+        registry = "npm",
+        package = %name,
+        versions = ?unreadable,
+        "published versions cannot be read; packument not served"
+    );
+    let mut failure = None;
+    for version in unreadable {
+        let key = format!("npm/{name}/versions/{version}.json");
+        match state.storage.get(&key).await {
+            Err(e @ crate::storage::StorageError::IntegrityViolation) => {
+                return crate::registry::local_copy_unreadable("npm", &key, &e);
+            }
+            Err(e) => failure = failure.or(Some((key, e))),
+            Ok(_) => {}
         }
+    }
+    match failure {
+        Some((key, e)) => crate::registry::local_copy_unreadable("npm", &key, &e),
+        None => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
 /// The manifest of one version of a published package, by version or by dist-tag, from its
-/// own keys; 404 when neither names a published version. No upstream is asked.
+/// own keys; 404 when neither names a published version. No upstream is asked. A tag or a
+/// document the store cannot read is unavailable (503, 500 for a copy that fails its integrity
+/// check), not absent.
 async fn published_version_manifest(state: &AppState, name: &str, spec: &str) -> Response {
-    let version = match state
-        .storage
-        .get(&format!("npm/{name}/dist-tags/{spec}"))
-        .await
-    {
+    use crate::storage::StorageError;
+    let tag_key = format!("npm/{name}/dist-tags/{spec}");
+    let version = match state.storage.get(&tag_key).await {
         Ok(tagged) => String::from_utf8_lossy(&tagged).trim().to_string(),
-        Err(_) => spec.to_string(),
+        Err(StorageError::NotFound | StorageError::Validation(_)) => spec.to_string(),
+        Err(e) => return crate::registry::local_copy_unreadable("npm", &tag_key, &e),
     };
-    match state
-        .storage
-        .get(&format!("npm/{name}/versions/{version}.json"))
-        .await
-    {
+    let key = format!("npm/{name}/versions/{version}.json");
+    match state.storage.get(&key).await {
         Ok(doc) => (
             StatusCode::OK,
             [(
@@ -1557,23 +1803,107 @@ async fn published_version_manifest(state: &AppState, name: &str, spec: &str) ->
             doc,
         )
             .into_response(),
-        Err(_) => StatusCode::NOT_FOUND.into_response(),
+        Err(StorageError::NotFound | StorageError::Validation(_)) => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(e) => crate::registry::local_copy_unreadable("npm", &key, &e),
     }
 }
 
-/// Rewrite an upstream document's tarball URLs to point at NORA.
-fn rewrite_for_nora(state: &AppState, data: &[u8], proxy_url: &str, path: &str) -> Vec<u8> {
+/// Rewrite an upstream document's tarball URLs to point at NORA, leaving out the versions whose
+/// tarball lies outside the upstream. `None` for a version manifest whose tarball does: no version
+/// NORA serves.
+fn rewrite_for_nora(
+    state: &AppState,
+    data: &[u8],
+    proxy_url: &str,
+    path: &str,
+    links: Links,
+) -> Option<Vec<u8>> {
+    place_for_nora(state, data, proxy_url, path, links).map(|placed| placed.body)
+}
+
+/// [`rewrite_for_nora`], saying whether a version was left out.
+fn place_for_nora(
+    state: &AppState,
+    data: &[u8],
+    proxy_url: &str,
+    path: &str,
+    links: Links,
+) -> Option<Placed> {
     let nora_base = nora_base_url(state);
-    rewrite_tarball_urls(data, &nora_base, proxy_url).unwrap_or_else(|()| {
-        tracing::warn!(path = %path, "npm metadata JSON parse failed, using byte-level URL rewrite");
-        let upstream_trimmed = proxy_url.trim_end_matches('/');
-        let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-        replace_upstream_bytes(data, upstream_trimmed, &nora_npm_base)
-    })
+    let package = match classify_metadata_path(path) {
+        MetadataPath::Packument { name } | MetadataPath::VersionManifest { name, .. } => Some(name),
+        MetadataPath::Other => None,
+    };
+    match place_document(data, &nora_base, proxy_url, package, links) {
+        Ok(placed) => Some(placed),
+        Err(Unrewritable::OffUpstream) => None,
+        Err(Unrewritable::NotJson) => {
+            tracing::warn!(path = %path, "npm metadata JSON parse failed, using byte-level URL rewrite");
+            let upstream_trimmed = proxy_url.trim_end_matches('/');
+            let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+            Some(Placed {
+                body: replace_upstream_bytes(data, upstream_trimmed, &nora_npm_base),
+                left_out: false,
+            })
+        }
+    }
+}
+
+/// Whether every tarball link of a cached document is already on NORA, as NORA writes it. Only the
+/// links are read (the rest is skipped unbuilt), so a cached document is placed again
+/// ([`served_copy`]) only when it holds a link of another form (a relative one) or one past NORA,
+/// cached by a release that kept it — or does not read as a packument or manifest at all.
+fn links_on_nora(data: &[u8], nora_base: &str) -> bool {
+    #[derive(serde::Deserialize)]
+    struct Dist {
+        tarball: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Version {
+        dist: Option<Dist>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Document {
+        versions: Option<std::collections::HashMap<String, Version>>,
+        dist: Option<Dist>,
+    }
+    let Ok(doc) = serde_json::from_slice::<Document>(data) else {
+        return false;
+    };
+    let nora = format!("{}/npm/", nora_base.trim_end_matches('/'));
+    let on_nora = |dist: &Option<Dist>| {
+        dist.as_ref()
+            .and_then(|d| d.tarball.as_deref())
+            .is_none_or(|link| link.starts_with(&nora))
+    };
+    on_nora(&doc.dist) && doc.versions.iter().flatten().all(|(_, v)| on_nora(&v.dist))
+}
+
+/// What NORA serves of an upstream document it cached: the document itself when every tarball
+/// link in it is NORA's, else the document placed again, as a fresh one is — the versions whose
+/// tarball lies outside the upstream left out. `None` for a version manifest whose tarball does.
+/// The flag says whether the copy held such a link (cached by a release that kept one).
+fn served_copy(state: &AppState, path: &str, data: Bytes) -> (Option<Bytes>, bool) {
+    if links_on_nora(&data, &nora_base_url(state)) {
+        return (Some(data), false);
+    }
+    let upstream = state
+        .config
+        .npm
+        .route(path)
+        .map(|u| u.url)
+        .unwrap_or_default();
+    match place_for_nora(state, &data, upstream, path, Links::Served) {
+        Some(placed) => (Some(Bytes::from(placed.body)), placed.left_out),
+        None => (None, true),
+    }
 }
 
 /// The document an upstream serves for `path`, for this request only: nothing is cached. Used
-/// when NORA cannot tell whether the package is published, so no guess is stored.
+/// for registry endpoints such as search, and for the dist-tags of a package NORA has not
+/// published.
 async fn uncached_upstream_metadata(
     state: &AppState,
     headers: &HeaderMap,
@@ -1592,7 +1922,7 @@ async fn uncached_upstream_metadata(
     };
     let url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
     match proxy_fetch(
-        &state.http_client,
+        metadata_client(state, upstream.scoped),
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -1601,13 +1931,22 @@ async fn uncached_upstream_metadata(
     )
     .await
     {
-        Ok(data) => packument_response(
-            headers,
-            Bytes::from(rewrite_for_nora(state, &data, upstream.url, path)),
-        ),
+        Ok(data) => match rewrite_for_nora(state, &data, upstream.url, path, Links::Served) {
+            Some(rewritten) => packument_response(headers, Bytes::from(rewritten)),
+            None => StatusCode::NOT_FOUND.into_response(),
+        },
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
+    }
+}
+
+/// [`packument_response`] for a cached upstream document, as [`served_copy`] has it; 404 for a
+/// version manifest whose tarball lies outside the upstream.
+fn served_packument(state: &AppState, headers: &HeaderMap, path: &str, data: Bytes) -> Response {
+    match served_copy(state, path, data) {
+        (Some(data), _) => packument_response(headers, data),
+        (None, _) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
@@ -1625,25 +1964,35 @@ async fn upstream_metadata(
 ) -> Response {
     let legacy_key = legacy_cache_key(path);
     let mut cached = None;
+    let mut read_failure = None;
     for key in [cache_key, legacy_key.as_str()] {
         if !cached_copy_trusted(state, path, key, name, None).await {
             continue;
         }
-        if let Ok(outcome) = state.storage.get_verified(key).await {
-            use nora_registry::verified::{verified_body, GateOutcome};
-            let data = match outcome {
-                GateOutcome::Verified(blob) => verified_body(blob),
-                GateOutcome::Unpinned(blob) => blob.into_inner(),
-            };
-            cached = Some((data, key.to_string()));
-            break;
+        match crate::registry::cached_read(state.storage.get_verified(key).await) {
+            (Some(outcome), _) => {
+                use nora_registry::verified::{verified_body, GateOutcome};
+                let data = match outcome {
+                    GateOutcome::Verified(blob) => verified_body(blob),
+                    GateOutcome::Unpinned(blob) => blob.into_inner(),
+                };
+                cached = Some((data, key.to_string()));
+                break;
+            }
+            (None, failure) => {
+                read_failure = read_failure.or_else(|| failure.map(|e| (key.to_string(), e)));
+            }
         }
     }
 
     if let Some((data, from_key)) = cached {
-        let fresh = state.storage.stat(&from_key).await.is_some_and(|meta| {
-            crate::cache_ttl::is_within_ttl(meta.modified, state.config.npm.metadata_ttl)
-        });
+        // A copy holding a link past NORA (cached by a release that kept one) is served placed
+        // again, and refetched in full whatever its age: a 304 would keep it as it is.
+        let (served, past_nora) = served_copy(state, path, data);
+        let fresh = !past_nora
+            && state.storage.stat(&from_key).await.is_some_and(|meta| {
+                crate::cache_ttl::is_within_ttl(meta.modified, state.config.npm.metadata_ttl)
+            });
         // #68 namespace isolation: an internal-namespace package is never revalidated upstream.
         if fresh
             || crate::curation::is_internal_namespace(
@@ -1652,12 +2001,16 @@ async fn upstream_metadata(
                 name,
             )
         {
-            return packument_response(headers, data);
+            return match served {
+                Some(data) => packument_response(headers, data),
+                None => StatusCode::NOT_FOUND.into_response(),
+            };
         }
         // Single-flight: a CI fleet stampeding one expired packument revalidates it once (#595).
         let refetch = || async {
-            refetch_metadata(state, path, cache_key, &from_key, packument)
+            refetch_metadata(state, path, cache_key, &from_key, packument, !past_nora)
                 .await
+                .ok()
                 .map(Bytes::from)
         };
         let refreshed = if state.config.server.proxy_coalesce {
@@ -1670,10 +2023,13 @@ async fn upstream_metadata(
             refetch().await
         };
         if let Some(refreshed) = refreshed {
-            return packument_response(headers, refreshed);
+            return served_packument(state, headers, path, refreshed);
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
+            let Some(data) = served else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
             let (stale_body, stale_type) = packument_body(headers, data);
             return (
                 StatusCode::OK,
@@ -1696,6 +2052,10 @@ async fn upstream_metadata(
         return StatusCode::BAD_GATEWAY.into_response();
     }
 
+    // An internal package whose cached copy the store could not read is unavailable, not absent.
+    if let Some((key, e)) = read_failure.as_ref().filter(|_| is_internal(state, name)) {
+        return crate::registry::local_copy_unreadable("npm", key, e);
+    }
     if let Some(response) = crate::curation::check_namespace_isolation(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Npm,
@@ -1708,7 +2068,7 @@ async fn upstream_metadata(
     };
     let url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
     match proxy_fetch(
-        &state.http_client,
+        metadata_client(state, upstream.scoped),
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -1718,7 +2078,10 @@ async fn upstream_metadata(
     .await
     {
         Ok(data) => {
-            let rewritten = rewrite_for_nora(state, &data, upstream.url, path);
+            let Some(rewritten) = rewrite_for_nora(state, &data, upstream.url, path, Links::Stored)
+            else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
             if packument {
                 record_first_seen(state, cache_key, &rewritten, None).await;
             }
@@ -1738,7 +2101,7 @@ async fn upstream_metadata(
                     tracing::error!(panic = ?panic, "npm metadata cache task panicked");
                 }
             }));
-            packument_response(headers, Bytes::from(rewritten))
+            served_packument(state, headers, path, Bytes::from(rewritten))
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -1763,6 +2126,172 @@ fn is_valid_attachment_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | '@'))
+}
+
+/// Why an npm tarball cannot be imported as a published version.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ImportedTarballError {
+    #[error("{0} is not the key of an npm tarball")]
+    NotATarball(String),
+    #[error("the tarball holds no package.json")]
+    NoManifest,
+    #[error("reading the tarball: {0}")]
+    Read(#[from] std::io::Error),
+    #[error("package.json: {0}")]
+    Manifest(#[from] serde_json::Error),
+    #[error("package.json names {found}, the tarball's key {expected}")]
+    Mismatch { found: String, expected: String },
+}
+
+/// The most bytes of `package.json` an imported tarball is read for.
+const IMPORTED_MANIFEST_MAX: u64 = 16 * 1024 * 1024;
+
+/// The package, version and file name an npm tarball key (`npm/<name>/tarballs/<file>`) names.
+fn tarball_key_parts(tarball_key: &str) -> Option<(&str, String, &str)> {
+    let (name, file) = tarball_key
+        .strip_prefix("npm/")?
+        .rsplit_once("/tarballs/")?;
+    let version = crate::curation::parse_npm_tarball_version(name, file)?;
+    Some((name, version, file))
+}
+
+/// The key of the version document that publishes the npm tarball at `tarball_key`.
+pub(crate) fn imported_version_key(tarball_key: &str) -> Option<String> {
+    let (name, version, _) = tarball_key_parts(tarball_key)?;
+    Some(format!("npm/{name}/versions/{version}.json"))
+}
+
+/// What an npm tarball imported from another registry publishes: the key of its version
+/// document, and the document — the tarball's own `package.json` with the `dist` a publish
+/// records: the tarball's URL at `public_base`, its SHA-1 (`shasum`) and SHA-512 (`integrity`).
+/// The manifest must name the package and version the key does. Once the document is stored the
+/// package is published: its packument is assembled from its own keys and never asked of an
+/// upstream (see [`published_state`]).
+pub(crate) fn imported_version_document(
+    tarball_key: &str,
+    tarball: impl std::io::Read,
+    sha1_hex: &str,
+    sha512: &[u8],
+    public_base: &str,
+) -> Result<(String, Vec<u8>), ImportedTarballError> {
+    use std::io::Read;
+    use std::path::Component;
+    let (name, version, file) = tarball_key_parts(tarball_key)
+        .ok_or_else(|| ImportedTarballError::NotATarball(tarball_key.to_string()))?;
+    let mut archive = tar::Archive::new(flate2::read::GzDecoder::new(tarball));
+    let mut manifest = None;
+    for entry in archive.entries()? {
+        let entry = entry?;
+        // `npm pack` puts the manifest at `package/package.json`; older tarballs use another
+        // top directory.
+        let at_top = {
+            let path = entry.path()?;
+            let mut parts = path.components();
+            matches!(
+                (parts.next(), parts.next(), parts.next()),
+                (Some(Component::Normal(_)), Some(Component::Normal(file)), None)
+                    if file == "package.json"
+            )
+        };
+        if at_top {
+            let mut text = Vec::new();
+            entry.take(IMPORTED_MANIFEST_MAX).read_to_end(&mut text)?;
+            manifest = Some(serde_json::from_slice::<serde_json::Value>(&text)?);
+            break;
+        }
+    }
+    let mut doc = manifest.ok_or(ImportedTarballError::NoManifest)?;
+    let found = format!(
+        "{}@{}",
+        doc.get("name").and_then(|v| v.as_str()).unwrap_or_default(),
+        doc.get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    );
+    let expected = format!("{name}@{version}");
+    let Some(obj) = doc.as_object_mut().filter(|_| found == expected) else {
+        return Err(ImportedTarballError::Mismatch { found, expected });
+    };
+    obj.insert("_id".to_string(), serde_json::Value::String(expected));
+    obj.insert(
+        "dist".to_string(),
+        serde_json::json!({
+            "tarball": format!("{}/npm/{name}/-/{file}", public_base.trim_end_matches('/')),
+            "shasum": sha1_hex,
+            "integrity": format!(
+                "sha512-{}",
+                base64::engine::general_purpose::STANDARD.encode(sha512)
+            ),
+        }),
+    );
+    Ok((
+        format!("npm/{name}/versions/{version}.json"),
+        serde_json::to_vec(&doc)?,
+    ))
+}
+
+/// Why a publish's attachments were refused.
+#[derive(Debug, thiserror::Error)]
+enum AttachmentRefused {
+    #[error("Invalid attachment filename")]
+    InvalidName,
+    #[error("attachment {0} is not the tarball of a version this publish carries")]
+    NotThisPublish(String),
+    #[error("Invalid base64 in attachment")]
+    Base64(#[from] base64::DecodeError),
+}
+
+/// The file name a publish's attachment `filename` is stored under: the tarball
+/// (`<name>-<version>.tgz`, the name with or without its scope) of one of the `versions` the
+/// payload publishes. Anything else — another version's tarball, a key beside one, a path,
+/// another scope's or another package's tarball — is refused.
+fn tarball_of_this_publish<'a>(
+    package_name: &str,
+    filename: &'a str,
+    versions: &serde_json::Map<String, serde_json::Value>,
+) -> Result<&'a str, AttachmentRefused> {
+    // A scoped package's attachment may carry its scope (`@scope/name-1.0.0.tgz`); without it
+    // the name must be flat, with no path separator to traverse with.
+    let (scope, short_name) = match package_name.split_once('/') {
+        Some((scope, name)) => (Some(scope), name),
+        None => (None, package_name),
+    };
+    let normalized_name = scope
+        .and_then(|scope| filename.strip_prefix(scope)?.strip_prefix('/'))
+        .unwrap_or(filename);
+    if !is_valid_attachment_name(normalized_name) {
+        return Err(AttachmentRefused::InvalidName);
+    }
+    if !versions
+        .keys()
+        .any(|version| normalized_name == format!("{short_name}-{version}.tgz"))
+    {
+        return Err(AttachmentRefused::NotThisPublish(
+            normalized_name.to_string(),
+        ));
+    }
+    Ok(normalized_name)
+}
+
+/// The tarballs a publish stores: each attachment decoded, under its tarball key. Every attachment,
+/// with bytes or without, must be [`tarball_of_this_publish`]; one that is not refuses the whole
+/// publish before anything is stored, so a publish cannot replace bytes clients installed or the
+/// pin they are checked against.
+fn publish_tarballs(
+    package_name: &str,
+    attachments: &serde_json::Map<String, serde_json::Value>,
+    versions: &serde_json::Map<String, serde_json::Value>,
+) -> Result<Vec<(String, Vec<u8>)>, AttachmentRefused> {
+    let mut tarballs = Vec::with_capacity(attachments.len());
+    for (filename, attachment) in attachments {
+        let tarball = tarball_of_this_publish(package_name, filename, versions)?;
+        let Some(data) = attachment.get("data").and_then(|d| d.as_str()) else {
+            continue;
+        };
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data)?;
+        tarballs.push((format!("npm/{package_name}/tarballs/{tarball}"), bytes));
+    }
+    Ok(tarballs)
 }
 
 async fn handle_publish(
@@ -1816,6 +2345,19 @@ async fn handle_publish(
     let new_versions = match payload.get("versions").and_then(|v| v.as_object()) {
         Some(v) => v,
         None => return (StatusCode::BAD_REQUEST, "Missing versions").into_response(),
+    };
+
+    // Every attachment is checked, and decoded, before anything is stored.
+    let tarballs = match publish_tarballs(&package_name, attachments, new_versions) {
+        Ok(tarballs) => tarballs,
+        Err(refused) => {
+            tracing::warn!(
+                package = %package_name,
+                reason = %refused,
+                "SECURITY: npm publish rejected — attachment refused"
+            );
+            return (StatusCode::BAD_REQUEST, refused.to_string()).into_response();
+        }
     };
 
     // Lock per package to serialize the packument regeneration within one process.
@@ -1910,47 +2452,14 @@ async fn handle_publish(
     }
 
     // Store tarballs
-    for (filename, attachment_data) in attachments {
-        // Scoped packages (e.g. @scope/name) may have attachment filenames
-        // like "@scope/name-1.0.0.tgz". Strip the scope prefix since it is
-        // already captured in the package name — the filename part must be a
-        // flat name without path separators to prevent path traversal.
-        let normalized_name = if let Some(scope_end) = package_name.find('/') {
-            let scope_prefix = &package_name[..=scope_end];
-            filename.strip_prefix(scope_prefix).unwrap_or(filename)
-        } else {
-            filename
-        };
-
-        if !is_valid_attachment_name(normalized_name) {
-            tracing::warn!(
-                filename = %filename,
-                package = %package_name,
-                "SECURITY: npm publish rejected — invalid attachment filename"
-            );
-            return (StatusCode::BAD_REQUEST, "Invalid attachment filename").into_response();
-        }
-
-        let base64_data = match attachment_data.get("data").and_then(|d| d.as_str()) {
-            Some(d) => d,
-            None => continue,
-        };
-
-        let tarball_bytes = match base64::engine::general_purpose::STANDARD.decode(base64_data) {
-            Ok(b) => b,
-            Err(_) => {
-                return (StatusCode::BAD_REQUEST, "Invalid base64 in attachment").into_response()
-            }
-        };
-
-        let tarball_key = format!("npm/{}/tarballs/{}", package_name, normalized_name);
-        if let Err(e) = state.storage.put(&tarball_key, &tarball_bytes).await {
+    for (tarball_key, tarball_bytes) in &tarballs {
+        if let Err(e) = state.storage.put(tarball_key, tarball_bytes).await {
             tracing::error!(key = %tarball_key, error = ?e, "npm publish: failed to store tarball");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
 
         // Store sha256
-        let hash = hex::encode(sha2::Sha256::digest(&tarball_bytes));
+        let hash = hex::encode(sha2::Sha256::digest(tarball_bytes));
         let hash_key = format!("{}.sha256", tarball_key);
         if let Err(e) = state.storage.put(&hash_key, hash.as_bytes()).await {
             tracing::warn!(key = %hash_key, error = ?e, "npm publish: failed to store hash sidecar");
@@ -2085,25 +2594,67 @@ pub(crate) async fn regenerate_packument(
     storage: &crate::storage::Storage,
     package_name: &str,
 ) -> Result<(), ()> {
-    let bytes = assemble_packument(storage, package_name).await.ok_or(())?;
+    let bytes = match assemble_packument(storage, package_name).await {
+        Ok(bytes) => bytes,
+        Err(unassembled) => {
+            tracing::error!(registry = "npm", package = %package_name, reason = %unassembled, "packument not regenerated");
+            return Err(());
+        }
+    };
     store_assembled_packument(storage, package_name, &bytes)
         .await
         .map_err(|_| ())
 }
 
+/// Why a published package's packument could not be assembled.
+#[derive(Debug, thiserror::Error)]
+enum Unassembled {
+    /// The store could not read this key (or list this prefix).
+    #[error("{0} cannot be read: {1}")]
+    Unreadable(String, crate::storage::StorageError),
+    /// The package fields are not a JSON object.
+    #[error("the package fields are not a JSON object")]
+    Malformed,
+    /// The assembled document could not be encoded.
+    #[error("the packument cannot be encoded: {0}")]
+    Encode(#[from] serde_json::Error),
+}
+
+impl Unassembled {
+    /// The answer for a read that needed the packument: 503, 500 for a copy that fails its
+    /// integrity check.
+    fn response(&self, name: &str) -> Response {
+        match self {
+            Unassembled::Unreadable(key, e) => {
+                crate::registry::local_copy_unreadable("npm", key, e)
+            }
+            Unassembled::Malformed | Unassembled::Encode(_) => {
+                tracing::warn!(registry = "npm", package = %name, reason = %self, "published packument cannot be assembled");
+                StatusCode::SERVICE_UNAVAILABLE.into_response()
+            }
+        }
+    }
+}
+
 /// The packument of a published package, assembled from its published keys (`versions/`,
-/// `dist-tags/`, `pkg.json`).
+/// `dist-tags/`, `pkg.json`). A key the store cannot read fails it: a document without a tag or
+/// the package fields would be served, or stored, as complete.
 async fn assemble_packument(
     storage: &crate::storage::Storage,
     package_name: &str,
-) -> Option<Vec<u8>> {
+) -> Result<Vec<u8>, Unassembled> {
+    let unreadable = |(key, e)| Unassembled::Unreadable(key, e);
     // versions map, keyed by the filename (version) without the .json suffix. Read
     // concurrently: on an object store every version is a round-trip, and this path now
     // runs on a read (#956), so a package with thousands of versions used to pay them
-    // one after another. An unreadable or unparsable key is skipped, as before.
+    // one after another. An unparsable document is skipped; the reader that compares the
+    // versions with the published ones refuses the packument.
     let versions_prefix = format!("npm/{}/versions/", package_name);
     let mut versions = serde_json::Map::new();
-    for (key, data) in super::read_keyed_blobs(storage, &versions_prefix).await {
+    for (key, data) in super::read_keyed_blobs(storage, &versions_prefix)
+        .await
+        .map_err(unreadable)?
+    {
         let Ok(vd) = serde_json::from_slice::<serde_json::Value>(&data) else {
             continue;
         };
@@ -2115,7 +2666,10 @@ async fn assemble_packument(
     // dist-tags from the pointer keys (+ derive `latest` if publish left it unset).
     let dt_prefix = format!("npm/{}/dist-tags/", package_name);
     let mut dist_tags = serde_json::Map::new();
-    for (key, data) in super::read_keyed_blobs(storage, &dt_prefix).await {
+    for (key, data) in super::read_keyed_blobs(storage, &dt_prefix)
+        .await
+        .map_err(unreadable)?
+    {
         if let (Some(tag), Ok(ver)) = (key.rsplit('/').next(), String::from_utf8(data.to_vec())) {
             dist_tags.insert(tag.to_string(), serde_json::Value::String(ver));
         }
@@ -2127,11 +2681,13 @@ async fn assemble_packument(
     }
 
     // Package-level fields + the assembled maps -> the packument.
-    let mut packument = match storage.get(&format!("npm/{}/pkg.json", package_name)).await {
+    let pkg_key = format!("npm/{}/pkg.json", package_name);
+    let mut packument = match storage.get(&pkg_key).await {
         Ok(d) => serde_json::from_slice(&d).unwrap_or_else(|_| serde_json::json!({})),
-        Err(_) => serde_json::json!({}),
+        Err(crate::storage::StorageError::NotFound) => serde_json::json!({}),
+        Err(e) => return Err(Unassembled::Unreadable(pkg_key, e)),
     };
-    let obj = packument.as_object_mut()?;
+    let obj = packument.as_object_mut().ok_or(Unassembled::Malformed)?;
     obj.insert(
         "name".to_string(),
         serde_json::Value::String(package_name.to_string()),
@@ -2142,7 +2698,7 @@ async fn assemble_packument(
     );
     obj.insert("versions".to_string(), serde_json::Value::Object(versions));
 
-    serde_json::to_vec(&packument).ok()
+    Ok(serde_json::to_vec(&packument)?)
 }
 
 /// Why retention could not bring a packument back in line with storage.
@@ -2305,21 +2861,6 @@ async fn migrate_embedded_packument(
     }
 }
 
-/// Highest version by a naive numeric semver comparison (a release outranks a prerelease at the
-/// same core). Used only as the `latest` dist-tag fallback when publish did not set one.
-fn max_semver<'a>(versions: impl Iterator<Item = &'a String>) -> Option<String> {
-    versions
-        .max_by(|a, b| semver_key(a).cmp(&semver_key(b)))
-        .cloned()
-}
-
-fn semver_key(v: &str) -> (u64, u64, u64, bool) {
-    let core = v.split(['-', '+']).next().unwrap_or(v);
-    let mut it = core.trim_start_matches('v').split('.');
-    let n = |x: Option<&str>| x.and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-    (n(it.next()), n(it.next()), n(it.next()), !v.contains('-'))
-}
-
 /// Self-prime `npm/{name}/metadata.json` so the release-age date (#748) is
 /// available on the tarball download path itself.
 ///
@@ -2364,7 +2905,7 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
     let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), package_name);
     if let Ok(data) = proxy_fetch(
-        &state.http_client,
+        metadata_client(state, upstream.scoped),
         &url,
         Duration::from_secs(state.config.npm.proxy_timeout),
         upstream.auth,
@@ -2376,17 +2917,11 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
         // Rewrite tarball URLs to point at NORA, exactly as the proxy path and
         // refetch_metadata do, so a subsequent client reading the cached
         // packument is not sent back to the upstream.
-        let nora_base = nora_base_url(state);
-        let rewritten = rewrite_tarball_urls(&data, &nora_base, proxy_url).unwrap_or_else(|()| {
-            tracing::warn!(
-                package = %package_name,
-                "npm metadata self-prime: JSON parse failed, using byte-level URL rewrite",
-            );
-            let upstream_trimmed = proxy_url.trim_end_matches('/');
-            let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
-            replace_upstream_bytes(&data, upstream_trimmed, &nora_npm_base)
-        });
-        let _ = put_with_origin(&state.storage, &key, &rewritten, &origin_of(proxy_url)).await;
+        if let Some(rewritten) =
+            rewrite_for_nora(state, &data, proxy_url, package_name, Links::Stored)
+        {
+            let _ = put_with_origin(&state.storage, &key, &rewritten, &origin_of(proxy_url)).await;
+        }
     }
 }
 
@@ -2547,6 +3082,57 @@ fn with_content_type(
         ],
         data,
     )
+}
+
+/// Rewrite tarball URLs in npm metadata to point to NORA ([`place_document`]): the body alone,
+/// as the tests read it.
+#[cfg(test)]
+fn rewrite_tarball_urls(
+    data: &[u8],
+    nora_base: &str,
+    upstream_url: &str,
+) -> Result<Vec<u8>, Unrewritable> {
+    let package = serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|doc| doc.get("name")?.as_str().map(str::to_string));
+    place_document(
+        data,
+        nora_base,
+        upstream_url,
+        package.as_deref(),
+        Links::Served,
+    )
+    .map(|placed| placed.body)
+}
+
+/// Serve at `<server>/<package>` a packument listing each `(version, at)`, its tarball at
+/// `<server>/<at>`: NORA downloads an upstream tarball only for a listed version.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+pub(crate) async fn mount_listing(
+    server: &wiremock::MockServer,
+    package: &str,
+    files: &[(&str, &str)],
+) {
+    let versions: serde_json::Map<String, serde_json::Value> = files
+        .iter()
+        .map(|(version, at)| {
+            let tarball = format!("{}/{at}", server.uri());
+            (
+                version.to_string(),
+                serde_json::json!({"dist": {"tarball": tarball}}),
+            )
+        })
+        .collect();
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path(format!("/{package}")))
+        .respond_with(
+            wiremock::ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"name": package, "versions": versions})),
+        )
+        .with_priority(1)
+        .mount(server)
+        .await;
 }
 
 #[cfg(test)]
@@ -3525,9 +4111,10 @@ mod integration_tests {
         let upstream = MockServer::start().await;
 
         // Pre-seed the packument so ensure_npm_metadata_cached early-returns.
+        let link = format!("{}/cachedpkg/-/cachedpkg-1.0.0.tgz", upstream.uri());
         let packument = serde_json::json!({
             "name": "cachedpkg",
-            "versions": { "1.0.0": { "dist": {} } },
+            "versions": { "1.0.0": { "dist": { "tarball": link } } },
             "time": { "1.0.0": "2019-05-01T00:00:00.000Z" }
         });
 
@@ -3589,6 +4176,15 @@ mod integration_tests {
                 .mount(&upstream)
                 .await;
         }
+        super::mount_listing(
+            &upstream,
+            "@fortawesome/pro-test",
+            &[
+                ("0.9.0", "@fortawesome/pro-test/-/0.9.0/pro-test-0.9.0.tgz"),
+                ("1.0.0", "@fortawesome/pro-test/-/1.0.0/pro-test-1.0.0.tgz"),
+            ],
+        )
+        .await;
         let dir = tempfile::tempdir().unwrap();
         let allowlist = dir.path().join("allowlist.json");
         std::fs::write(
@@ -3663,6 +4259,9 @@ mod integration_tests {
                 .mount(&upstream)
                 .await;
         }
+        let at = |version: &str| format!("download/@vendor/a/{version}/{SHA}");
+        let (old, new) = (at("0.9.0"), at("1.0.0"));
+        super::mount_listing(&upstream, "@vendor/a", &[("0.9.0", &old), ("1.0.0", &new)]).await;
         let dir = tempfile::tempdir().unwrap();
         let allowlist = dir.path().join("allowlist.json");
         std::fs::write(
@@ -3724,6 +4323,82 @@ mod integration_tests {
         );
     }
 
+    /// A GitHub Packages download path of a version the upstream's packument does not list is
+    /// not asked for, as for the `/-/` form: 404, no `/download/` request.
+    #[tokio::test]
+    async fn an_unlisted_github_packages_download_is_not_asked_for() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SHA: &str = "04fef883382f5a7c9b9ac2015dcc419009e2a858";
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/download/@vendor/a/0.9.0/{SHA}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UNLISTED".to_vec()))
+            .mount(&upstream)
+            .await;
+        let listed = format!("download/@vendor/a/1.0.0/{SHA}");
+        super::mount_listing(&upstream, "@vendor/a", &[("1.0.0", &listed)]).await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/npm/download/@vendor/a/0.9.0/{SHA}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let fetched = upstream.received_requests().await.unwrap();
+        assert!(
+            fetched
+                .iter()
+                .all(|r| !r.url.path().starts_with("/download/")),
+            "an unlisted tarball was fetched"
+        );
+    }
+
+    /// A GitHub Packages download path of a package whose packument the upstream does not have
+    /// (404) is not asked for either: 404, no `/download/` request, nothing cached.
+    #[tokio::test]
+    async fn a_github_packages_download_without_a_packument_upstream_is_not_asked_for() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const SHA: &str = "04fef883382f5a7c9b9ac2015dcc419009e2a858";
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!("/download/@vendor/a/1.0.0/{SHA}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UNLISTED".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/npm/download/@vendor/a/1.0.0/{SHA}"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let fetched = upstream.received_requests().await.unwrap();
+        assert!(
+            fetched
+                .iter()
+                .all(|r| !r.url.path().starts_with("/download/")),
+            "a tarball without a packument was fetched"
+        );
+        let cached = ctx.state.storage.list("npm/").await.unwrap();
+        assert!(cached.iter().all(|k| !k.contains("tarballs")), "{cached:?}");
+    }
+
     #[tokio::test]
     async fn allowlist_refuses_a_tarball_whose_version_it_cannot_read() {
         use crate::test_helpers::{create_test_context_with_config, send};
@@ -3768,9 +4443,10 @@ mod integration_tests {
         );
     }
 
-    /// In audit mode the same tarball is logged, not refused.
+    /// In audit mode the same tarball is logged, not refused; with no version to look up in the
+    /// upstream's packument it is not fetched either.
     #[tokio::test]
-    async fn audit_mode_lets_a_tarball_with_an_unread_version_through() {
+    async fn audit_mode_does_not_refuse_a_tarball_with_an_unread_version() {
         use crate::test_helpers::{create_test_context_with_config, send};
         use axum::http::{Method, StatusCode};
         use wiremock::matchers::{method, path};
@@ -3792,7 +4468,9 @@ mod integration_tests {
             cfg.curation.allowlist_path = Some(allowlist);
         });
         let resp = send(&ctx.app, Method::GET, "/npm/pkg/-/pkg.tgz", "").await;
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let asked = upstream.received_requests().await.unwrap();
+        assert!(asked.iter().all(|r| r.url.path() != "/pkg/-/pkg.tgz"));
     }
 
     /// Internal-namespace package: ensure_npm_metadata_cached must never fetch
@@ -3842,10 +4520,11 @@ mod integration_tests {
         );
     }
 
-    /// `trust_upstream_dates = false` → ensure_npm_metadata_cached is never
-    /// called (the gating `if` in handle_request is false).
+    /// `trust_upstream_dates = false`: the packument is asked once, for the listing the download
+    /// is checked against. The count is the same whether or not the self-prime ran, so this does
+    /// not tell the gate's branches apart; `upstream_dates_gate` does, by the release-age verdict.
     #[tokio::test]
-    async fn test_npm_tarball_self_prime_skipped_when_distrust_upstream_dates() {
+    async fn with_distrusted_dates_a_tarball_asks_the_packument_once_for_its_listing() {
         use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
         use axum::http::{Method, StatusCode};
         use wiremock::matchers::{method, path};
@@ -3858,12 +4537,12 @@ mod integration_tests {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(tarball.to_vec()))
             .mount(&upstream)
             .await;
-        // A packument hit would prove ensure_npm_metadata_cached ran.
-        Mock::given(method("GET"))
-            .and(path("/distrust"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("LEAKED"))
-            .mount(&upstream)
-            .await;
+        super::mount_listing(
+            &upstream,
+            "distrust",
+            &[("1.0.0", "distrust/-/distrust-1.0.0.tgz")],
+        )
+        .await;
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.npm.proxy = Some(upstream.uri());
@@ -3887,10 +4566,7 @@ mod integration_tests {
             .into_iter()
             .filter(|r| r.url.path() == "/distrust")
             .count();
-        assert_eq!(
-            packument_hits, 0,
-            "trust_upstream_dates=false must skip ensure_npm_metadata_cached"
-        );
+        assert_eq!(packument_hits, 1, "one fetch of the listing, no self-prime");
     }
 
     /// No upstream proxy configured → ensure_npm_metadata_cached early-returns
@@ -3926,7 +4602,8 @@ mod integration_tests {
 
     /// JSON-parse failure in the upstream packument falls back to byte-level URL
     /// rewrite (replace_upstream_bytes), so the cached metadata still has NORA
-    /// URLs and the body is preserved (fail-safe, not dropped).
+    /// URLs and the body is preserved (fail-safe, not dropped). A packument that does not
+    /// parse lists no version, so the tarball itself is not asked for.
     #[tokio::test]
     async fn test_npm_tarball_self_prime_byte_level_rewrite_on_invalid_json() {
         use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
@@ -3961,8 +4638,10 @@ mod integration_tests {
         });
 
         let resp = send(&ctx.app, Method::GET, "/npm/badpkg/-/badpkg-1.0.0.tgz", "").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        assert_eq!(&body_bytes(resp).await[..], tarball);
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_ne!(&body_bytes(resp).await[..], tarball);
+        let asked = upstream.received_requests().await.unwrap();
+        assert!(asked.iter().all(|r| !r.url.path().ends_with(".tgz")));
 
         let cached = ctx
             .state
@@ -5041,11 +5720,8 @@ mod spec_conformance_tests {
         // Call refetch_metadata directly — simulates the race where the handler
         // entered the cache-hit path (body was present at get_verified), TTL
         // expired, but GC deleted the body before refetch_metadata re-reads it.
-        let result = refetch_metadata(&ctx.state, "ghost-pkg", key, key, true).await;
-        assert!(
-            result.is_none(),
-            "must return None when body is missing on 304"
-        );
+        let result = refetch_metadata(&ctx.state, "ghost-pkg", key, key, true, true).await;
+        assert!(result.is_err(), "must fail when body is missing on 304");
 
         // The critical assertion: .meta must be gone after the 304 body-miss.
         // Before the fix, `.ok()?` silently returned None but left .meta intact,
@@ -5205,7 +5881,7 @@ mod spec_conformance_tests {
                 "1.0.0": {
                     "name": "corgi",
                     "version": "1.0.0",
-                    "dist": { "tarball": "http://example/corgi-1.0.0.tgz" },
+                    "dist": { "tarball": "/npm/corgi/-/corgi-1.0.0.tgz" },
                     "dependencies": { "left-pad": "^1.0.0" },
                     "engines": { "node": ">=18" },
                     "os": ["linux"],
@@ -6049,6 +6725,15 @@ mod multi_upstream_tests {
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"VENDOR-TGZ".to_vec()))
             .mount(&private)
             .await;
+        super::mount_listing(
+            &private,
+            "@vendor/a",
+            &[(
+                "1.0.0",
+                "download/@vendor/a/1.0.0/d113f588ab0b17ddabe8d0db55fa83a741df6871",
+            )],
+        )
+        .await;
         let proxies = vendor_proxies(&public.uri(), &private.uri());
         let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxies = proxies);
 
@@ -6538,6 +7223,12 @@ mod multi_upstream_tests {
             .collect();
         assert!(reqs.is_empty(), "sent upstream: {reqs:?}");
         // Legit tarball path still proxies.
+        super::mount_listing(
+            &upstream,
+            "lodash",
+            &[("4.17.21", "lodash/-/lodash-4.17.21.tgz")],
+        )
+        .await;
         let resp = send(
             &ctx.app,
             Method::GET,
@@ -7514,7 +8205,8 @@ mod published_and_upstream_keys {
         let resp = send(&ctx.app, Method::GET, "/npm/corp-lib/1.0.0", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(asked(&server, "corp-lib").await, 0);
-        // An upstream copy in its place is not taken for NORA's own: the upstream answers.
+        // An upstream copy in its place is not taken for NORA's own, and NORA cannot tell whether
+        // the package is published: unavailable, the upstream not asked.
         let copy = serde_json::to_vec(&doc("corp-lib", &["9.9.9"])).unwrap();
         put_with_origin(
             &ctx.state.storage,
@@ -7524,8 +8216,9 @@ mod published_and_upstream_keys {
         )
         .await
         .unwrap();
-        assert_eq!(versions(&ctx, "/npm/corp-lib").await, ["9.9.9"]);
-        assert!(asked(&server, "corp-lib").await > 0);
+        let resp = send(&ctx.app, Method::GET, "/npm/corp-lib", "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(asked(&server, "corp-lib").await, 0);
     }
 
     /// Round 1 fixture (M02): with the versions listing failing and the assembled packument
@@ -7740,6 +8433,7 @@ mod published_and_upstream_keys {
         )
         .await
         .unwrap();
+        // With an upstream copy in its place NORA cannot tell whether the tags are its own.
         let resp = send(
             &ctx.app,
             Method::GET,
@@ -7747,8 +8441,8 @@ mod published_and_upstream_keys {
             "",
         )
         .await;
-        let tags: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(tags["latest"], "9.9.9");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     /// R9 finding: a store that lists no versions for a published package (a local directory it
@@ -7798,10 +8492,12 @@ mod published_and_upstream_keys {
         assert_eq!(asked(&server, "corp-lib").await, 0);
     }
 
-    /// Table row 2.5: with the listing failing and no packument NORA assembled, a version
-    /// manifest is the upstream's answer to this request, and nothing is written.
+    /// Table row 2.5: with the listing failing and no packument NORA assembled, NORA cannot tell
+    /// whether the package is published: its version manifest is unavailable (503), as cargo
+    /// answers a crate it cannot tell is published. A published name is never an upstream's to
+    /// answer for, so the upstream is not asked, and nothing is cached on a guess.
     #[tokio::test]
-    async fn a_version_manifest_with_a_failed_listing_is_not_cached() {
+    async fn a_version_manifest_with_a_failed_listing_is_unavailable() {
         let server = upstream("corp-lib", &["9.9.9"]).await;
         let uri = server.uri();
         let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
@@ -7809,13 +8505,83 @@ mod published_and_upstream_keys {
             move |cfg| cfg.npm.proxy = Some(uri),
         );
         let resp = send(&ctx.app, Method::GET, "/npm/corp-lib/9.9.9", "").await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let manifest: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-        assert_eq!(manifest["version"], "9.9.9");
-        // The cache write runs in the background: give it time to land before looking.
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(server.received_requests().await.unwrap().len(), 0);
         tokio::time::sleep(Duration::from_millis(200)).await;
         let written = ctx.state.storage.list("npm/").await.unwrap();
         assert!(written.is_empty(), "nothing cached on a guess: {written:?}");
+    }
+
+    /// The same for the packument, the dist-tags and a tarball of a package whose published
+    /// versions cannot be listed.
+    #[tokio::test]
+    async fn a_failed_versions_listing_makes_the_package_unavailable() {
+        let server = upstream("left-pad", &["1.3.0"]).await;
+        Mock::given(method("GET"))
+            .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream".to_vec()))
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            faulty(true, false),
+            move |cfg| cfg.npm.proxy = Some(uri),
+        );
+        let mut wrong = Vec::new();
+        for path in [
+            "/npm/left-pad",
+            "/npm/-/package/left-pad/dist-tags",
+            "/npm/left-pad/-/left-pad-1.3.0.tgz",
+        ] {
+            let status = send(&ctx.app, Method::GET, path, "").await.status();
+            if status != StatusCode::SERVICE_UNAVAILABLE {
+                wrong.push(format!("{path} -> {status}"));
+            }
+        }
+        assert!(wrong.is_empty(), "answered other than 503: {wrong:?}");
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(asked.is_empty(), "upstream asked: {asked:?}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let written = ctx.state.storage.list("npm/").await.unwrap();
+        assert!(written.is_empty(), "nothing cached on a guess: {written:?}");
+    }
+
+    /// Second control: a package the listing shows is not published here is proxied as before.
+    #[tokio::test]
+    async fn a_package_the_listing_shows_unpublished_is_still_proxied() {
+        let server = upstream("left-pad", &["1.3.0"]).await;
+        super::mount_listing(
+            &server,
+            "left-pad",
+            &[("1.3.0", "left-pad/-/left-pad-1.3.0.tgz")],
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path("/left-pad/-/left-pad-1.3.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"upstream".to_vec()))
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            faulty(false, false),
+            move |cfg| cfg.npm.proxy = Some(uri),
+        );
+        assert_eq!(versions(&ctx, "/npm/left-pad").await, ["1.3.0"]);
+        let tarball = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/left-pad/-/left-pad-1.3.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(tarball.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(tarball).await[..], b"upstream");
     }
 
     /// Table row 3.2: dist-tags of a published package, with a listing that answers "nothing
@@ -8092,21 +8858,6 @@ mod published_and_upstream_keys {
         );
     }
 
-    #[tokio::test]
-    async fn a_failed_versions_listing_serves_the_upstream_without_caching() {
-        let server = upstream("left-pad", &["1.3.0"]).await;
-        let storage = faulty(true, false);
-        let uri = server.uri();
-        let ctx =
-            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
-                cfg.npm.proxy = Some(uri);
-            });
-        assert_eq!(versions(&ctx, "/npm/left-pad").await, ["1.3.0"]);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        let written = ctx.state.storage.list("npm/").await.unwrap();
-        assert!(written.is_empty(), "nothing cached on a guess: {written:?}");
-    }
-
     /// A publish over an upstream copy an older release cached at the published key: its
     /// versions are not imported as published ones, and do not block the publish.
     #[tokio::test]
@@ -8330,8 +9081,3223 @@ mod published_and_upstream_keys {
                 "ensure_npm_metadata_cached",
                 "handle_request",
                 "packument_key_for_reading",
+                "trusted_copy",
                 "upstream_metadata",
             ]
         );
+    }
+}
+
+/// Without trusted upstream dates the quarantine counts from NORA's own first fetch of an
+/// artifact's bytes: metadata cached a month ago says when NORA last wrote it, not when it first
+/// fetched this file, and its age would let a file first fetched now pass as mature. With trusted
+/// dates the release date seeds it (#750), so an old release is not held as new to this mirror.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod quarantine_first_seen {
+    use crate::test_helpers::{
+        create_test_context_with_config, put_written_days_ago, quarantine_7d, send, TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn serve(up: &MockServer, at: &str, body: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(up)
+            .await;
+    }
+
+    async fn status(ctx: &TestContext, uri: &str) -> StatusCode {
+        send(&ctx.app, Method::GET, uri, "").await.status()
+    }
+
+    const DOWNLOAD: &str = "/npm/oldpkg/-/oldpkg-1.0.0.tgz";
+
+    fn packument(up: &MockServer) -> Vec<u8> {
+        serde_json::json!({
+            "name": "oldpkg",
+            "versions": {"1.0.0": {"name": "oldpkg", "version": "1.0.0",
+                "dist": {"tarball": format!("{}/oldpkg/-/oldpkg-1.0.0.tgz", up.uri())}}},
+            "time": {"1.0.0": "2019-01-01T00:00:00.000Z"}
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    async fn upstream() -> MockServer {
+        let up = MockServer::start().await;
+        serve(&up, "/oldpkg", packument(&up)).await;
+        serve(&up, "/oldpkg/-/oldpkg-1.0.0.tgz", b"TGZ".to_vec()).await;
+        up
+    }
+
+    fn context(up: &MockServer, trust: bool) -> TestContext {
+        let uri = up.uri();
+        create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = trust;
+            quarantine_7d(cfg);
+        })
+    }
+
+    #[tokio::test]
+    async fn without_trusted_dates_a_cached_packument_does_not_date_the_quarantine() {
+        let up = upstream().await;
+        let ctx = context(&up, false);
+        let body = packument(&up);
+        put_written_days_ago(&ctx, "npm/oldpkg/upstream/packument.json", &body, 30).await;
+        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::FORBIDDEN);
+    }
+
+    /// A tarball cached before the quarantine recorded it is counted from now on the cache path.
+    #[tokio::test]
+    async fn a_file_cached_before_the_quarantine_saw_it_counts_from_now() {
+        let up = upstream().await;
+        let ctx = context(&up, false);
+        let body = packument(&up);
+        put_written_days_ago(&ctx, "npm/oldpkg/upstream/packument.json", &body, 30).await;
+        put_written_days_ago(&ctx, "npm/oldpkg/tarballs/oldpkg-1.0.0.tgz", b"TGZ", 30).await;
+        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::FORBIDDEN);
+        assert!(!crate::test_helpers::upstream_paths(&up)
+            .await
+            .iter()
+            .any(|p| p.ends_with(".tgz")));
+    }
+
+    #[tokio::test]
+    async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
+        let up = upstream().await;
+        let ctx = context(&up, true);
+        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
+    }
+}
+
+/// A publish stores the tarballs of the versions it publishes, and nothing else. An
+/// attachment named for another version — one already published included — or for a key beside
+/// a tarball would replace bytes clients already installed, and the pin NORA checks them against.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod publish_attachments {
+    use crate::test_helpers::{create_test_context, send, TestContext};
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use base64::Engine;
+    use sha2::Digest;
+    use std::collections::BTreeMap;
+
+    /// PUT a publish of `name` carrying `versions` and `attachments` (file name, bytes).
+    async fn publish(
+        ctx: &TestContext,
+        name: &str,
+        versions: &[&str],
+        attachments: &[(&str, &[u8])],
+    ) -> StatusCode {
+        let versions: serde_json::Map<String, serde_json::Value> = versions
+            .iter()
+            .map(|v| {
+                (
+                    v.to_string(),
+                    serde_json::json!({ "name": name, "version": v, "dist": {} }),
+                )
+            })
+            .collect();
+        let attachments: serde_json::Map<String, serde_json::Value> = attachments
+            .iter()
+            .map(|(file, data)| {
+                (
+                    file.to_string(),
+                    serde_json::json!({
+                        "data": base64::engine::general_purpose::STANDARD.encode(data)
+                    }),
+                )
+            })
+            .collect();
+        let payload = serde_json::json!({
+            "name": name,
+            "versions": versions,
+            "_attachments": attachments,
+        });
+        send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/npm/{name}"),
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await
+        .status()
+    }
+
+    /// Every object stored for `name`, and its bytes.
+    async fn stored(ctx: &TestContext, name: &str) -> BTreeMap<String, Vec<u8>> {
+        let mut objects = BTreeMap::new();
+        for key in ctx
+            .state
+            .storage
+            .list(&format!("npm/{name}/"))
+            .await
+            .unwrap()
+        {
+            let data = ctx.state.storage.get(&key).await.unwrap();
+            objects.insert(key, data.to_vec());
+        }
+        objects
+    }
+
+    #[tokio::test]
+    async fn a_publish_cannot_replace_a_published_tarball_or_its_pin() {
+        let ctx = create_test_context();
+        assert_eq!(
+            publish(&ctx, "foo", &["1.0.0"], &[("foo-1.0.0.tgz", b"good")]).await,
+            StatusCode::CREATED
+        );
+        let before = stored(&ctx, "foo").await;
+        assert_eq!(before["npm/foo/tarballs/foo-1.0.0.tgz"], b"good");
+        let evil_pin = hex::encode(sha2::Sha256::digest(b"evil"));
+        let refused: [&[(&str, &[u8])]; 6] = [
+            // The tarball of a version already published, beside the one being published.
+            &[("foo-1.0.1.tgz", b"next"), ("foo-1.0.0.tgz", b"evil")],
+            // The pin beside a published tarball.
+            &[
+                ("foo-1.0.1.tgz", b"next"),
+                ("foo-1.0.0.tgz.sha256", evil_pin.as_bytes()),
+            ],
+            // Another package's tarball.
+            &[("foo-1.0.1.tgz", b"next"), ("bar-1.0.1.tgz", b"bar")],
+            // A key beside the tarball being published.
+            &[("foo-1.0.1.tgz", b"next"), ("foo-1.0.1.tgz.sha256", b"pin")],
+            // Only a published version's tarball.
+            &[("foo-1.0.0.tgz", b"evil")],
+            // A version's tarball under another name.
+            &[("foo-1.0.1.tar.gz", b"next")],
+        ];
+        for attachments in refused {
+            let names: Vec<&str> = attachments.iter().map(|(file, _)| *file).collect();
+            assert_eq!(
+                publish(&ctx, "foo", &["1.0.1"], attachments).await,
+                StatusCode::BAD_REQUEST,
+                "{names:?}"
+            );
+            assert_eq!(
+                stored(&ctx, "foo").await,
+                before,
+                "a refused publish stored something: {names:?}"
+            );
+        }
+        // An attachment that does not decode refuses the publish before its other tarballs are
+        // stored.
+        let payload = serde_json::json!({
+            "name": "foo",
+            "versions": {
+                "1.0.1": { "name": "foo", "version": "1.0.1", "dist": {} },
+                "1.0.2": { "name": "foo", "version": "1.0.2", "dist": {} },
+            },
+            "_attachments": {
+                "foo-1.0.1.tgz": { "data": base64::engine::general_purpose::STANDARD.encode(b"next") },
+                "foo-1.0.2.tgz": { "data": "not base64!" },
+            },
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/foo",
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(stored(&ctx, "foo").await, before);
+        // The tarball of the version it publishes is all a publish needs.
+        assert_eq!(
+            publish(&ctx, "foo", &["1.0.1"], &[("foo-1.0.1.tgz", b"next")]).await,
+            StatusCode::CREATED
+        );
+        let after = stored(&ctx, "foo").await;
+        assert_eq!(after["npm/foo/tarballs/foo-1.0.0.tgz"], b"good");
+        assert_eq!(after["npm/foo/tarballs/foo-1.0.1.tgz"], b"next");
+    }
+
+    /// Which attachments a publish stores, each case with its bytes and without them: only the
+    /// tarball (`<name>-<version>.tgz`, the name with its scope or without it) of a version the
+    /// payload publishes. Anything else refuses the whole publish, whether or not it carries
+    /// bytes, and beside a tarball that would be stored.
+    #[test]
+    fn an_attachment_is_stored_only_as_a_tarball_of_this_publish() {
+        use super::publish_tarballs;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"bytes");
+        let cases: [(&str, &str, Option<&str>); 24] = [
+            (
+                "foo",
+                "foo-1.0.1.tgz",
+                Some("npm/foo/tarballs/foo-1.0.1.tgz"),
+            ),
+            (
+                "@s/pkg",
+                "@s/pkg-1.0.1.tgz",
+                Some("npm/@s/pkg/tarballs/pkg-1.0.1.tgz"),
+            ),
+            (
+                "@s/pkg",
+                "pkg-1.0.1.tgz",
+                Some("npm/@s/pkg/tarballs/pkg-1.0.1.tgz"),
+            ),
+            // Another version's tarball, or a key beside a tarball.
+            ("foo", "foo-1.0.0.tgz", None),
+            ("foo", "foo-1.0.1.tgz.sha256", None),
+            ("foo", "foo-1.0.0.tgz.sha256", None),
+            ("foo", "foo-1.0.1.tar.gz", None),
+            // Another package's tarball, under any scope or path.
+            ("foo", "bar-1.0.1.tgz", None),
+            ("foo", "@s/foo-1.0.1.tgz", None),
+            ("foo", "x/foo-1.0.1.tgz", None),
+            ("foo", "../foo-1.0.1.tgz", None),
+            ("foo", "FOO-1.0.1.tgz", None),
+            ("foo", "", None),
+            ("@s/pkg", "@other/pkg-1.0.1.tgz", None),
+            ("@s/pkg", "x/pkg-1.0.1.tgz", None),
+            ("@s/pkg", "s/pkg-1.0.1.tgz", None),
+            ("@s/pkg", "@s/x/pkg-1.0.1.tgz", None),
+            ("@s/pkg", "@s/@s/pkg-1.0.1.tgz", None),
+            ("@s/pkg", "@s/../pkg-1.0.1.tgz", None),
+            ("@s/pkg", "@spkg-1.0.1.tgz", None),
+            ("@s/pkg", "@s-pkg-1.0.1.tgz", None),
+            ("@s/pkg", "@s/pkg-1.0.0.tgz", None),
+            ("@s/pkg", "@s/pkg-1.0.1.tgz.sha256", None),
+            ("@s/pkg", "other-1.0.1.tgz", None),
+        ];
+        let versions: serde_json::Map<String, serde_json::Value> =
+            [("1.0.1".to_string(), serde_json::json!({}))]
+                .into_iter()
+                .collect();
+        let attachments = |entries: &[(&str, serde_json::Value)]| {
+            entries
+                .iter()
+                .map(|(file, attachment)| (file.to_string(), attachment.clone()))
+                .collect::<serde_json::Map<String, serde_json::Value>>()
+        };
+        let with_data = serde_json::json!({ "data": encoded });
+        let without_data = serde_json::json!({ "length": 5 });
+        for (package, file, stored_as) in cases {
+            let own = format!("{}-1.0.1.tgz", package.rsplit('/').next().unwrap());
+            for attachment in [&with_data, &without_data] {
+                let alone = publish_tarballs(
+                    package,
+                    &attachments(&[(file, attachment.clone())]),
+                    &versions,
+                );
+                let beside_own = publish_tarballs(
+                    package,
+                    &attachments(&[(&own, with_data.clone()), (file, attachment.clone())]),
+                    &versions,
+                );
+                let has_data = attachment.get("data").is_some();
+                match stored_as {
+                    Some(key) => {
+                        let expected: Vec<(String, Vec<u8>)> = if has_data {
+                            vec![(key.to_string(), b"bytes".to_vec())]
+                        } else {
+                            Vec::new()
+                        };
+                        assert_eq!(alone.unwrap(), expected, "{package}: {file:?}");
+                        assert!(beside_own.is_ok(), "{package}: {file:?} beside its own");
+                    }
+                    None => {
+                        assert!(alone.is_err(), "{package}: {file:?}, data: {has_data}");
+                        assert!(
+                            beside_own.is_err(),
+                            "{package}: {file:?} beside its own, data: {has_data}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Through the endpoint: a scoped publish carrying another scope's tarball, or a refused
+    /// attachment without bytes, is refused and stores nothing.
+    #[tokio::test]
+    async fn a_publish_with_a_foreign_attachment_stores_nothing() {
+        let ctx = create_test_context();
+        for file in [
+            "@other/pkg-1.0.0.tgz",
+            "x/pkg-1.0.0.tgz",
+            "@s/x/pkg-1.0.0.tgz",
+        ] {
+            assert_eq!(
+                publish(&ctx, "@s/pkg", &["1.0.0"], &[(file, b"evil")]).await,
+                StatusCode::BAD_REQUEST,
+                "{file}"
+            );
+            assert!(stored(&ctx, "@s/pkg").await.is_empty(), "{file} stored");
+        }
+        let payload = serde_json::json!({
+            "name": "foo",
+            "versions": { "1.0.1": { "name": "foo", "version": "1.0.1", "dist": {} } },
+            "_attachments": {
+                "foo-1.0.1.tgz": { "data": base64::engine::general_purpose::STANDARD.encode(b"next") },
+                "foo-1.0.0.tgz.sha256": { "length": 64 },
+            },
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/npm/foo",
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(stored(&ctx, "foo").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_scoped_publish_carries_its_own_tarball_only() {
+        let ctx = create_test_context();
+        assert_eq!(
+            publish(&ctx, "@s/pkg", &["1.0.0"], &[("@s/pkg-1.0.0.tgz", b"good")]).await,
+            StatusCode::CREATED
+        );
+        let before = stored(&ctx, "@s/pkg").await;
+        assert_eq!(
+            publish(
+                &ctx,
+                "@s/pkg",
+                &["1.0.1"],
+                &[("@s/pkg-1.0.1.tgz", b"next"), ("@s/pkg-1.0.0.tgz", b"evil")]
+            )
+            .await,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(stored(&ctx, "@s/pkg").await, before);
+        // The attachment may name the package with its scope or without it.
+        assert_eq!(
+            publish(&ctx, "@s/pkg", &["1.0.1"], &[("pkg-1.0.1.tgz", b"next")]).await,
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            stored(&ctx, "@s/pkg").await["npm/@s/pkg/tarballs/pkg-1.0.1.tgz"],
+            b"next"
+        );
+    }
+}
+
+/// A package published here is NORA's: its name is never an upstream's to answer for. A
+/// tarball of it that NORA does not store is no version of it — the upstream is not asked, so a
+/// squatter's bytes are neither served nor stored beside the published ones — and a bulk audit
+/// does not hand its name to the upstream.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod published_names_stay_local {
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, create_test_context_with_storage_and_config,
+        outage_storage, send, send_with_headers, TestContext,
+    };
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use base64::Engine;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const BULK: &str = "/npm/-/npm/v1/security/advisories/bulk";
+
+    async fn recording_upstream() -> MockServer {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&upstream)
+            .await;
+        upstream
+    }
+
+    async fn publish(ctx: &TestContext, name: &str, version: &str) {
+        let short = name.rsplit('/').next().unwrap();
+        let payload = serde_json::json!({
+            "name": name,
+            "versions": { version: { "name": name, "version": version, "dist": {} } },
+            "_attachments": { format!("{short}-{version}.tgz"): {
+                "data": base64::engine::general_purpose::STANDARD.encode(b"published"),
+            } },
+        });
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/npm/{name}"),
+            Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    async fn asked(upstream: &MockServer) -> Vec<String> {
+        upstream
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect()
+    }
+
+    /// A published package's tag or package fields the store cannot read are not left out: the
+    /// packument rebuilt without a stored one and the tags answer 503 (500 for a copy that fails
+    /// its integrity check) rather than a document without them — a `latest` derived from the
+    /// versions names another version than the one tagged — and a publish stores no packument
+    /// without them, so the tag is there once the store reads again.
+    #[tokio::test]
+    async fn a_published_tag_that_cannot_be_read_is_unavailable_not_left_out() {
+        use crate::test_helpers::ReadFault;
+        async fn latest(ctx: &TestContext) -> (StatusCode, serde_json::Value) {
+            let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+            let status = resp.status();
+            let doc: serde_json::Value =
+                serde_json::from_slice(&body_bytes(resp).await).unwrap_or_default();
+            (status, doc["dist-tags"]["latest"].clone())
+        }
+        let mut wrong = Vec::new();
+        for (fault, expected) in [
+            (ReadFault::Network, StatusCode::SERVICE_UNAVAILABLE),
+            (ReadFault::Tampered, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            for unreadable in ["npm/pkg/dist-tags/latest", "npm/pkg/pkg.json"] {
+                let upstream = recording_upstream().await;
+                let uri = upstream.uri();
+                let (storage, outage) = outage_storage();
+                let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+                    c.npm.proxy = Some(uri);
+                });
+                publish(&ctx, "pkg", "1.0.0").await;
+                publish(&ctx, "pkg", "1.0.1").await;
+                // The older version is the one tagged.
+                ctx.state
+                    .storage
+                    .put("npm/pkg/dist-tags/latest", b"1.0.0")
+                    .await
+                    .unwrap();
+                ctx.state
+                    .storage
+                    .delete("npm/pkg/metadata.json")
+                    .await
+                    .unwrap();
+                let (status, tagged) = latest(&ctx).await;
+                if (status, tagged.as_str()) != (StatusCode::OK, Some("1.0.0")) {
+                    wrong.push(format!("with the store up: {status} latest {tagged}"));
+                }
+                ctx.state
+                    .storage
+                    .delete("npm/pkg/metadata.json")
+                    .await
+                    .unwrap();
+                outage.fault_reads_of(unreadable, fault);
+                for path in ["/npm/pkg", "/npm/-/package/pkg/dist-tags"] {
+                    let status = send(&ctx.app, Method::GET, path, "").await.status();
+                    if status != expected {
+                        wrong.push(format!("{path}, {unreadable} {fault:?} -> {status}"));
+                    }
+                }
+                // A publish while the tag cannot be read.
+                let payload = serde_json::json!({
+                    "name": "pkg",
+                    "versions": { "1.0.2": { "name": "pkg", "version": "1.0.2", "dist": {} } },
+                    "_attachments": { "pkg-1.0.2.tgz": {
+                        "data": base64::engine::general_purpose::STANDARD.encode(b"published"),
+                    } },
+                });
+                let published = send(
+                    &ctx.app,
+                    Method::PUT,
+                    "/npm/pkg",
+                    Body::from(serde_json::to_vec(&payload).unwrap()),
+                )
+                .await
+                .status();
+                outage.end();
+                let (status, tagged) = latest(&ctx).await;
+                if (status, tagged.as_str()) != (StatusCode::OK, Some("1.0.0")) {
+                    wrong.push(format!(
+                        "after a publish ({published}) with {unreadable} {fault:?}: {status} latest {tagged}"
+                    ));
+                }
+                let asked = asked(&upstream).await;
+                if !asked.is_empty() {
+                    wrong.push(format!("upstream asked, {unreadable} {fault:?}: {asked:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A listing of a published package's tags that fails is not taken for no tags: the
+    /// packument rebuilt without a stored one answers 503 rather than a `latest` derived from
+    /// the versions.
+    #[tokio::test]
+    async fn a_published_package_whose_tags_cannot_be_listed_is_unavailable() {
+        let (storage, outage) = outage_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |_| {});
+        publish(&ctx, "pkg", "1.0.0").await;
+        publish(&ctx, "pkg", "1.0.1").await;
+        ctx.state
+            .storage
+            .put("npm/pkg/dist-tags/latest", b"1.0.0")
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .delete("npm/pkg/metadata.json")
+            .await
+            .unwrap();
+        outage.fail_listings_of("npm/pkg/dist-tags/");
+        for path in ["/npm/pkg", "/npm/-/package/pkg/dist-tags"] {
+            let status = send(&ctx.app, Method::GET, path, "").await.status();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+        outage.end();
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+        let doc: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(doc["dist-tags"]["latest"], "1.0.0");
+    }
+
+    /// A published version whose document the store cannot read is unavailable, not absent and
+    /// not left out: its manifest (by version or by tag), the packument rebuilt without a stored
+    /// one and the tags answer 503 for a store that cannot be asked and 500 for a copy that fails
+    /// its integrity check — never 404 or a document without the version — and the upstream is
+    /// not asked. Another version still reads.
+    #[tokio::test]
+    async fn a_published_version_whose_document_cannot_be_read_is_unavailable_not_absent() {
+        use crate::test_helpers::ReadFault;
+        let mut wrong = Vec::new();
+        for (fault, expected) in [
+            (ReadFault::Network, StatusCode::SERVICE_UNAVAILABLE),
+            (ReadFault::Tampered, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            for (unreadable, paths) in [
+                (
+                    "npm/pkg/versions/1.0.0.json",
+                    &["/npm/pkg/1.0.0", "/npm/pkg", "/npm/-/package/pkg/dist-tags"][..],
+                ),
+                ("npm/pkg/dist-tags/latest", &["/npm/pkg/latest"][..]),
+            ] {
+                let upstream = recording_upstream().await;
+                let uri = upstream.uri();
+                let (storage, outage) = outage_storage();
+                let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+                    c.npm.proxy = Some(uri);
+                });
+                publish(&ctx, "pkg", "1.0.0").await;
+                publish(&ctx, "pkg", "1.0.1").await;
+                // The tag a client's publish sets.
+                ctx.state
+                    .storage
+                    .put("npm/pkg/dist-tags/latest", b"1.0.1")
+                    .await
+                    .unwrap();
+                // No stored packument: it is rebuilt from the published keys.
+                ctx.state
+                    .storage
+                    .delete("npm/pkg/metadata.json")
+                    .await
+                    .unwrap();
+                for path in paths {
+                    let status = send(&ctx.app, Method::GET, path, "").await.status();
+                    if status != StatusCode::OK {
+                        wrong.push(format!("{path} with the store up -> {status}"));
+                    }
+                }
+                // Rebuilt and stored again where the reads above read the packument.
+                let _ = ctx.state.storage.delete("npm/pkg/metadata.json").await;
+                outage.fault_reads_of(unreadable, fault);
+                for path in paths {
+                    let status = send(&ctx.app, Method::GET, path, "").await.status();
+                    if status != expected {
+                        wrong.push(format!("{path}, {unreadable} {fault:?} -> {status}"));
+                    }
+                }
+                let other = send(&ctx.app, Method::GET, "/npm/pkg/1.0.1", "").await;
+                if other.status() != StatusCode::OK {
+                    wrong.push(format!(
+                        "/npm/pkg/1.0.1, {unreadable} {fault:?} -> {}",
+                        other.status()
+                    ));
+                }
+                let asked = asked(&upstream).await;
+                if !asked.is_empty() {
+                    wrong.push(format!("upstream asked, {unreadable} {fault:?}: {asked:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_tarball_a_published_package_does_not_store_is_not_fetched() {
+        let upstream = recording_upstream().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxy = Some(uri));
+        publish(&ctx, "corp-lib", "1.0.0").await;
+        publish(&ctx, "@corp/lib", "1.0.0").await;
+
+        for path in [
+            "/npm/corp-lib/-/corp-lib-9.9.9.tgz",
+            "/npm/@corp/lib/-/lib-9.9.9.tgz",
+            "/npm/download/@corp/lib/9.9.9/0123abcd",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+        let tarballs = ctx
+            .state
+            .storage
+            .list("npm/corp-lib/tarballs/")
+            .await
+            .unwrap();
+        assert!(
+            tarballs.iter().all(|key| !key.contains("9.9.9")),
+            "{tarballs:?}"
+        );
+
+        // Controls: the published version is served from its own bytes, and a package that is
+        // not published is still fetched from the upstream.
+        let own = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/corp-lib/-/corp-lib-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(own.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(own).await[..], b"published");
+        super::mount_listing(&upstream, "other", &[("1.0.0", "other/-/other-1.0.0.tgz")]).await;
+        let other = send(&ctx.app, Method::GET, "/npm/other/-/other-1.0.0.tgz", "").await;
+        assert_eq!(other.status(), StatusCode::OK);
+        assert!(asked(&upstream)
+            .await
+            .contains(&"/other/-/other-1.0.0.tgz".to_string()));
+    }
+
+    /// The JSON object the upstream received as the bulk audit body.
+    async fn forwarded(upstream: &MockServer) -> serde_json::Value {
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "one audit forwarded");
+        serde_json::from_slice(&requests[0].body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_bulk_audit_does_not_name_a_published_package_to_the_upstream() {
+        let body = serde_json::json!({
+            "corp-lib": ["1.0.0"],
+            "@corp/lib": ["1.0.0"],
+            "plain-pkg": ["1.0.0"],
+        });
+        let gzipped = {
+            use std::io::Write;
+            let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            gz.write_all(body.to_string().as_bytes()).unwrap();
+            gz.finish().unwrap()
+        };
+        // Without a namespace filter, and with one that does not cover the published names.
+        for filter in [vec![], vec!["@internal/*".to_string()]] {
+            for gzip in [false, true] {
+                let upstream = recording_upstream().await;
+                let uri = upstream.uri();
+                let namespaces = filter.clone();
+                let ctx = create_test_context_with_config(move |cfg| {
+                    cfg.npm.proxy = Some(uri);
+                    cfg.curation.internal_namespaces = namespaces;
+                });
+                publish(&ctx, "corp-lib", "1.0.0").await;
+                publish(&ctx, "@corp/lib", "1.0.0").await;
+                let resp = if gzip {
+                    send_with_headers(
+                        &ctx.app,
+                        Method::POST,
+                        BULK,
+                        vec![("content-encoding", "gzip")],
+                        gzipped.clone(),
+                    )
+                    .await
+                } else {
+                    send(&ctx.app, Method::POST, BULK, body.to_string()).await
+                };
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::OK,
+                    "filter {filter:?} gzip {gzip}"
+                );
+                assert_eq!(
+                    forwarded(&upstream).await,
+                    serde_json::json!({ "plain-pkg": ["1.0.0"] }),
+                    "filter {filter:?} gzip {gzip}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bulk_audit_naming_no_published_package_is_forwarded_as_sent() {
+        let upstream = recording_upstream().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxy = Some(uri));
+        publish(&ctx, "corp-lib", "1.0.0").await;
+        let sent = r#"{"plain-pkg":["1.0.0"],"lodash":["4.17.0"]}"#;
+        let resp = send(&ctx.app, Method::POST, BULK, sent).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let requests = upstream.received_requests().await.unwrap();
+        assert_eq!(&requests[0].body[..], sent.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_bulk_audit_is_refused_while_the_store_cannot_tell_what_is_published() {
+        let upstream = recording_upstream().await;
+        let uri = upstream.uri();
+        let (storage, outage) = outage_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.npm.proxy = Some(uri)
+        });
+        publish(&ctx, "corp-lib", "1.0.0").await;
+        outage.begin();
+        let resp = send(
+            &ctx.app,
+            Method::POST,
+            BULK,
+            r#"{"corp-lib":["1.0.0"],"plain-pkg":["1.0.0"]}"#,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(asked(&upstream).await, Vec::<String>::new());
+    }
+}
+
+/// A packument from an upstream may name its tarballs under the other scheme of the upstream's
+/// own host (an https registry behind a TLS terminator writes `http://` links). Those links are the
+/// upstream's too: left as they are, the client fetches the tarball past NORA.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod rewrite_both_schemes {
+    use super::{replace_upstream_bytes, rewrite_tarball_urls};
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn packument(links: &[(&str, &str)]) -> Vec<u8> {
+        let versions: serde_json::Map<String, serde_json::Value> = links
+            .iter()
+            .map(|(version, link)| {
+                (
+                    version.to_string(),
+                    serde_json::json!({ "version": version, "dist": { "tarball": link } }),
+                )
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({ "name": "pkg", "versions": versions })).unwrap()
+    }
+
+    fn tarballs(doc: &[u8]) -> Vec<String> {
+        let doc: serde_json::Value = serde_json::from_slice(doc).unwrap();
+        doc["versions"]
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|v| v["dist"]["tarball"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn a_link_under_either_scheme_of_the_upstream_host_is_rewritten() {
+        for (upstream, own, twin) in [
+            (
+                "https://registry.example.com",
+                "https://registry.example.com",
+                "http://registry.example.com",
+            ),
+            (
+                "http://registry.example.com",
+                "http://registry.example.com",
+                "https://registry.example.com",
+            ),
+            (
+                "https://registry.example.com/api/npm/repo/",
+                "https://registry.example.com/api/npm/repo",
+                "http://registry.example.com/api/npm/repo",
+            ),
+        ] {
+            let doc = packument(&[
+                ("1.0.0", &format!("{own}/pkg/-/pkg-1.0.0.tgz")),
+                ("1.0.1", &format!("{twin}/pkg/-/pkg-1.0.1.tgz")),
+                ("1.0.2", "http://other.example.com/pkg/-/pkg-1.0.2.tgz"),
+            ]);
+            let rewritten = rewrite_tarball_urls(&doc, "http://nora:5000", upstream).unwrap();
+            assert_eq!(
+                tarballs(&rewritten),
+                // Another host is not the upstream's to rewrite: its version is left out.
+                vec![
+                    "http://nora:5000/npm/pkg/-/pkg-1.0.0.tgz",
+                    "http://nora:5000/npm/pkg/-/pkg-1.0.1.tgz",
+                ],
+                "{upstream}"
+            );
+            // The byte-level rewrite, for a document that does not parse, does the same.
+            let raw = format!("not json {twin}/pkg/-/pkg-1.0.1.tgz {own}/pkg/-/pkg-1.0.0.tgz");
+            let rewritten = replace_upstream_bytes(
+                raw.as_bytes(),
+                upstream.trim_end_matches('/'),
+                "http://nora:5000/npm",
+            );
+            assert_eq!(
+                String::from_utf8(rewritten).unwrap(),
+                "not json http://nora:5000/npm/pkg/-/pkg-1.0.1.tgz http://nora:5000/npm/pkg/-/pkg-1.0.0.tgz",
+                "{upstream}"
+            );
+        }
+    }
+
+    /// A link is the upstream's only where the upstream URL ends: at a `/`, `?`, `#`, the end of
+    /// the JSON string, a `\` (a JSON escape such as `\/`), or the end of the text. A longer host,
+    /// a port, or credentials before another host name somewhere else, under either scheme: the
+    /// byte-level rewrite leaves them as they are, and the targeted one leaves out the version
+    /// whose tarball such a link is. A longer last path segment is still the upstream's origin:
+    /// the byte-level rewrite leaves it too, and the targeted one serves it on NORA when it is
+    /// under the upstream's own scheme.
+    #[test]
+    fn a_host_or_path_that_only_starts_like_the_upstream_is_not_rewritten() {
+        let nora = "http://nora:5000/npm";
+        for (upstream, links) in [
+            (
+                "https://registry.example.com",
+                [
+                    "https://registry.example.com.evil.org/pkg/-/pkg-1.0.0.tgz",
+                    "http://registry.example.com.evil.org/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com:8443/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com@evil.org/pkg/-/pkg-1.0.0.tgz",
+                    "http://registry.example.com-mirror.org/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.company/pkg/-/pkg-1.0.0.tgz",
+                ],
+            ),
+            (
+                "https://registry.example.com/api/npm/repo/",
+                [
+                    "https://registry.example.com/api/npm/repo-other/pkg/-/pkg-1.0.0.tgz",
+                    "http://registry.example.com/api/npm/repo2/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com/api/npm/repo.evil/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com/api/npm/repo:x/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com/api/npm/repo%2Fx/pkg/-/pkg-1.0.0.tgz",
+                    "https://registry.example.com/api/npm/repository/pkg/-/pkg-1.0.0.tgz",
+                ],
+            ),
+        ] {
+            let trimmed = upstream.trim_end_matches('/');
+            let same_origin = upstream.contains("/api/");
+            for link in links {
+                let doc = packument(&[("1.0.0", link)]);
+                let rewritten = rewrite_tarball_urls(&doc, "http://nora:5000", upstream).unwrap();
+                let expected: &[&str] = if same_origin && link.starts_with("https://") {
+                    &["http://nora:5000/npm/pkg/-/pkg-1.0.0.tgz"]
+                } else {
+                    &[]
+                };
+                assert_eq!(tarballs(&rewritten), expected, "{upstream}: {link}");
+                let raw = format!("not json {link} {link}");
+                let rewritten = replace_upstream_bytes(raw.as_bytes(), trimmed, nora);
+                assert_eq!(String::from_utf8(rewritten).unwrap(), raw, "{upstream}");
+            }
+            // The upstream's own links, wherever its URL ends, under either scheme.
+            let twin = trimmed.replacen("https://", "http://", 1);
+            for own in [trimmed, twin.as_str()] {
+                for (text, expected) in [
+                    (
+                        format!("{own}/pkg/-/pkg-1.0.0.tgz"),
+                        format!("{nora}/pkg/-/pkg-1.0.0.tgz"),
+                    ),
+                    (format!("{own}?q=pkg"), format!("{nora}?q=pkg")),
+                    (format!("{own}#pkg"), format!("{nora}#pkg")),
+                    (format!("\"{own}\""), format!("\"{nora}\"")),
+                    (format!("\\\"{own}\\\""), format!("\\\"{nora}\\\"")),
+                    (own.to_string(), nora.to_string()),
+                ] {
+                    let rewritten = replace_upstream_bytes(text.as_bytes(), trimmed, nora);
+                    assert_eq!(
+                        String::from_utf8(rewritten).unwrap(),
+                        expected,
+                        "{upstream}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_served_packument_names_no_tarball_of_the_upstream_host_under_either_scheme() {
+        let upstream = MockServer::start().await;
+        let host = upstream.uri().replacen("http://", "", 1);
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(packument(&[
+                ("1.0.0", &format!("http://{host}/pkg/-/pkg-1.0.0.tgz")),
+                ("1.0.1", &format!("https://{host}/pkg/-/pkg-1.0.1.tgz")),
+            ])))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_bytes(resp).await;
+        assert_eq!(
+            tarballs(&body),
+            vec![
+                "http://nora.example/npm/pkg/-/pkg-1.0.0.tgz",
+                "http://nora.example/npm/pkg/-/pkg-1.0.1.tgz",
+            ]
+        );
+    }
+}
+
+/// A cached tarball whose `.sha256` sidecar the store cannot read is not served unchecked. NORA's
+/// own copy (an internal or published package, or any package without an upstream) has nowhere
+/// else to come from: unavailable (503), its bytes not sent. A proxied copy is fetched again and
+/// checked as on its first download; an upstream that fails then answers as on a cache miss.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod unreadable_sidecar {
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_storage_and_config, outage_storage, send, ReadFault,
+        StorageOutage, TestContext,
+    };
+    use axum::body::Body;
+    use axum::http::{Method, StatusCode};
+    use base64::Engine;
+    use sha2::Digest;
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream(status: u16) -> MockServer {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(status).set_body_bytes(b"UPSTREAM".to_vec()))
+            .mount(&up)
+            .await;
+        up
+    }
+
+    fn context(up: Option<&MockServer>) -> (TestContext, StorageOutage) {
+        let uri = up.map(MockServer::uri);
+        let (storage, outage) = outage_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+            c.npm.proxy = uri;
+            c.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        (ctx, outage)
+    }
+
+    async fn cache(ctx: &TestContext, name: &str, bytes: &[u8]) {
+        let key = format!("npm/{name}/tarballs/{name}-1.0.0.tgz");
+        ctx.state.storage.put(&key, bytes).await.unwrap();
+        let pin = hex::encode(sha2::Sha256::digest(bytes));
+        let sidecar = format!("{key}.sha256");
+        ctx.state
+            .storage
+            .put(&sidecar, pin.as_bytes())
+            .await
+            .unwrap();
+    }
+
+    async fn publish(ctx: &TestContext, name: &str) {
+        let payload = serde_json::json!({
+            "name": name,
+            "versions": { "1.0.0": { "name": name, "version": "1.0.0", "dist": {} } },
+            "_attachments": { format!("{name}-1.0.0.tgz"): {
+                "data": base64::engine::general_purpose::STANDARD.encode(b"CACHED"),
+            } },
+        });
+        let body = Body::from(serde_json::to_vec(&payload).unwrap());
+        let resp = send(&ctx.app, Method::PUT, &format!("/npm/{name}"), body).await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    async fn get(ctx: &TestContext, name: &str) -> (StatusCode, Vec<u8>) {
+        let uri = format!("/npm/{name}/-/{name}-1.0.0.tgz");
+        let resp = send(&ctx.app, Method::GET, &uri, "").await;
+        let status = resp.status();
+        (status, body_bytes(resp).await.to_vec())
+    }
+
+    /// Tarball requests the upstream received (a tarball download may also ask for the packument,
+    /// for its release dates).
+    async fn asked(up: &MockServer) -> usize {
+        let requests = up.received_requests().await.unwrap();
+        requests
+            .iter()
+            .filter(|r| r.url.path().ends_with(".tgz"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn own_copies_whose_sidecar_cannot_be_read_are_unavailable() {
+        let up = upstream(200).await;
+        let mut wrong = Vec::new();
+        for (case, name, upstream) in [
+            ("internal", "internal-pkg", Some(&up)),
+            ("published", "pkg", Some(&up)),
+            ("no upstream", "pkg", None),
+        ] {
+            let (ctx, outage) = context(upstream);
+            if case == "published" {
+                publish(&ctx, name).await;
+            } else {
+                cache(&ctx, name, b"CACHED").await;
+            }
+            // The copy and its sidecar read: served.
+            if get(&ctx, name).await != (StatusCode::OK, b"CACHED".to_vec()) {
+                wrong.push(format!("{case}: not served with the store up"));
+            }
+            outage.fault_reads_of(".tgz.sha256", ReadFault::Network);
+            let (status, body) = get(&ctx, name).await;
+            if status != StatusCode::SERVICE_UNAVAILABLE || body.windows(6).any(|w| w == b"CACHED")
+            {
+                wrong.push(format!(
+                    "{case}: {status} {:?}",
+                    String::from_utf8_lossy(&body)
+                ));
+            }
+        }
+        assert_eq!(asked(&up).await, 0, "an own package's upstream was asked");
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    #[tokio::test]
+    async fn a_proxied_copy_whose_sidecar_cannot_be_read_is_fetched_again() {
+        let up = upstream(200).await;
+        let (ctx, outage) = context(Some(&up));
+        cache(&ctx, "pkg", b"CACHED").await;
+        assert_eq!(get(&ctx, "pkg").await, (StatusCode::OK, b"CACHED".to_vec()));
+        assert_eq!(
+            asked(&up).await,
+            0,
+            "a checked copy is served from the cache"
+        );
+        super::mount_listing(&up, "pkg", &[("1.0.0", "pkg/-/pkg-1.0.0.tgz")]).await;
+        outage.fault_reads_of(".tgz.sha256", ReadFault::Network);
+        assert_eq!(
+            get(&ctx, "pkg").await,
+            (StatusCode::OK, b"UPSTREAM".to_vec())
+        );
+        let paths: Vec<String> = up
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .filter(|p| p.ends_with(".tgz"))
+            .collect();
+        assert_eq!(paths, vec!["/pkg/-/pkg-1.0.0.tgz"]);
+    }
+
+    /// The upstream fails while the copy cannot be checked: the answer a cache miss gets, never
+    /// the unchecked bytes.
+    #[tokio::test]
+    async fn a_failing_upstream_answers_as_on_a_cache_miss() {
+        for status in [500, 404] {
+            let up = upstream(status).await;
+            let (ctx, outage) = context(Some(&up));
+            let (miss, _) = get(&ctx, "other").await;
+            cache(&ctx, "pkg", b"CACHED").await;
+            outage.fault_reads_of(".tgz.sha256", ReadFault::Network);
+            let (got, body) = get(&ctx, "pkg").await;
+            assert_eq!(got, miss, "upstream {status}");
+            assert!(
+                !body.windows(6).any(|w| w == b"CACHED"),
+                "upstream {status}"
+            );
+        }
+    }
+}
+
+/// A version whose tarball an upstream document places outside that upstream (another host, or
+/// a URL that only starts like the upstream's) is no version NORA serves: npm would download it
+/// from there, past NORA. It is left out of the packument — `versions`, `time` and the tags — and
+/// its manifest is not found; a tarball on the upstream under either scheme, on NORA or at a
+/// relative path is served as before. No document NORA serves for an upstream package sends the
+/// client anywhere but NORA, however it was cached.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod off_upstream_versions {
+    use super::rewrite_tarball_urls;
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, send, send_with_headers, LogCapture,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{header_exists, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const NORA: &str = "http://nora:5000";
+
+    /// Links outside the upstream `https://registry.example.com/repo` or NORA `http://nora:5000`.
+    const OUTSIDE: &[&str] = &[
+        "https://evil.example/pkg/-/pkg-2.0.0.tgz",
+        "https://registry.example.com.evil.example/repo/pkg/-/pkg-2.0.0.tgz",
+        "https://registry.example.com:8443/repo/pkg/-/pkg-2.0.0.tgz",
+        "https://registry.example.com@evil.example/repo/pkg/-/pkg-2.0.0.tgz",
+        // The upstream's origin, but not this package's tarball, or not a link NORA can serve.
+        "https://registry.example.com/repo-other/other/-/other-2.0.0.tgz",
+        "https://registry.example.com/pkg/-/pkg-2.0.0.tgz?token=x",
+        "HTTPS://evil.example/pkg/-/pkg-2.0.0.tgz",
+        " https://evil.example/pkg/-/pkg-2.0.0.tgz",
+        "//evil.example/pkg/-/pkg-2.0.0.tgz",
+        "/\\evil.example/pkg/-/pkg-2.0.0.tgz",
+        "\\\\evil.example/pkg/-/pkg-2.0.0.tgz",
+        "ftp://evil.example/pkg-2.0.0.tgz",
+        "http://nora:5000.evil.example/npm/pkg/-/pkg-2.0.0.tgz",
+        "http://nora:5000@evil.example/npm/pkg/-/pkg-2.0.0.tgz",
+        "http://nora:5001/npm/pkg/-/pkg-2.0.0.tgz",
+        // Another host on NORA's own scheme and port.
+        "http://evil.example:5000/npm/pkg/-/pkg-2.0.0.tgz",
+        "//evil.example:5000/npm/pkg/-/pkg-2.0.0.tgz",
+    ];
+
+    fn packument(versions: &[(&str, &str)], tags: serde_json::Value) -> Vec<u8> {
+        let mut docs = serde_json::Map::new();
+        let mut time = serde_json::Map::new();
+        time.insert("created".into(), "2020-01-01T00:00:00.000Z".into());
+        for (version, link) in versions {
+            docs.insert(
+                version.to_string(),
+                serde_json::json!({ "name": "pkg", "version": version, "dist": { "tarball": link } }),
+            );
+            time.insert(version.to_string(), "2020-01-02T00:00:00.000Z".into());
+        }
+        serde_json::to_vec(&serde_json::json!({
+            "name": "pkg", "dist-tags": tags, "versions": docs, "time": time,
+        }))
+        .unwrap()
+    }
+
+    fn served(versions_kept: &[(&str, &str)], last: (&str, &str)) -> Vec<u8> {
+        let mut all = versions_kept.to_vec();
+        all.push(last);
+        packument(
+            &all,
+            serde_json::json!({ "latest": last.0, "next": last.0, "beta": "1.1.0-beta.1" }),
+        )
+    }
+
+    fn keys(doc: &serde_json::Value, field: &str) -> Vec<String> {
+        let mut keys: Vec<String> = doc[field].as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
+    const KEPT: &[(&str, &str)] = &[
+        (
+            "1.0.0",
+            "https://registry.example.com/repo/pkg/-/pkg-1.0.0.tgz",
+        ),
+        (
+            "1.0.1",
+            "http://registry.example.com/repo/pkg/-/pkg-1.0.1.tgz",
+        ),
+        ("1.0.2", "/npm/pkg/-/pkg-1.0.2.tgz"),
+        ("1.0.3", "http://nora:5000/npm/pkg/-/pkg-1.0.3.tgz"),
+        (
+            "1.1.0-beta.1",
+            "https://registry.example.com/repo/pkg/-/pkg-1.1.0-beta.1.tgz",
+        ),
+    ];
+
+    #[test]
+    fn a_version_whose_tarball_is_outside_the_upstream_is_left_out() {
+        let mut wrong = Vec::new();
+        for link in OUTSIDE {
+            let doc = served(KEPT, ("2.0.0", link));
+            let out =
+                rewrite_tarball_urls(&doc, NORA, "https://registry.example.com/repo/").unwrap();
+            let text = String::from_utf8_lossy(&out).to_string();
+            let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let versions = keys(&doc, "versions");
+            let mut time = keys(&doc, "time");
+            time.retain(|k| k != "created");
+            let expected = ["1.0.0", "1.0.1", "1.0.2", "1.0.3", "1.1.0-beta.1"];
+            if versions != expected || time != expected {
+                wrong.push(format!("{link}: versions {versions:?} time {time:?}"));
+            }
+            // `latest` falls back to the highest release below the one left out; a tag naming
+            // only that version goes; the others stay.
+            let tags = &doc["dist-tags"];
+            if *tags != serde_json::json!({ "latest": "1.0.3", "beta": "1.1.0-beta.1" }) {
+                wrong.push(format!("{link}: tags {tags}"));
+            }
+            if text.contains("evil") || text.contains(":8443") || text.contains("2.0.0") {
+                wrong.push(format!("{link}: {text}"));
+            }
+            // The kept links: the upstream's under either scheme on NORA, the others as they were.
+            let links: Vec<&str> = expected
+                .iter()
+                .map(|v| doc["versions"][v]["dist"]["tarball"].as_str().unwrap())
+                .collect();
+            if links
+                != [
+                    "http://nora:5000/npm/pkg/-/pkg-1.0.0.tgz",
+                    "http://nora:5000/npm/pkg/-/pkg-1.0.1.tgz",
+                    "/npm/pkg/-/pkg-1.0.2.tgz",
+                    "http://nora:5000/npm/pkg/-/pkg-1.0.3.tgz",
+                    "http://nora:5000/npm/pkg/-/pkg-1.1.0-beta.1.tgz",
+                ]
+            {
+                wrong.push(format!("{link}: kept {links:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// `latest` on a version left out, with no release below it left: the tag goes.
+    #[test]
+    fn latest_without_a_release_below_it_goes() {
+        let doc = packument(
+            &[
+                ("2.0.0", "https://evil.example/pkg-2.0.0.tgz"),
+                (
+                    "3.0.0",
+                    "https://registry.example.com/repo/pkg/-/pkg-3.0.0.tgz",
+                ),
+                (
+                    "1.0.0-rc.1",
+                    "https://registry.example.com/repo/pkg/-/pkg-1.0.0-rc.1.tgz",
+                ),
+            ],
+            serde_json::json!({ "latest": "2.0.0", "next": "3.0.0" }),
+        );
+        let out = rewrite_tarball_urls(&doc, NORA, "https://registry.example.com/repo").unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(doc["dist-tags"], serde_json::json!({ "next": "3.0.0" }));
+        assert_eq!(keys(&doc, "versions"), ["1.0.0-rc.1", "3.0.0"]);
+    }
+
+    fn upstream_packument(up: &MockServer, last: &str) -> Vec<u8> {
+        let base = up.uri();
+        let link = |v: &str| format!("{base}/pkg/-/pkg-{v}.tgz");
+        packument(
+            &[
+                ("1.0.0", &link("1.0.0")),
+                ("1.1.0", &link("1.1.0")),
+                ("2.0.0", last),
+            ],
+            serde_json::json!({ "latest": "2.0.0" }),
+        )
+    }
+
+    async fn upstream() -> MockServer {
+        let up = MockServer::start().await;
+        let doc = upstream_packument(&up, "https://evil.example/pkg/-/pkg-2.0.0.tgz");
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(doc.clone()))
+            .mount(&up)
+            .await;
+        let manifest = |v: &str, link: String| {
+            serde_json::to_vec(
+                &serde_json::json!({ "name": "pkg", "version": v, "dist": { "tarball": link } }),
+            )
+            .unwrap()
+        };
+        for (spec, version, link) in [
+            (
+                "2.0.0",
+                "2.0.0",
+                "https://evil.example/pkg/-/pkg-2.0.0.tgz".to_string(),
+            ),
+            (
+                "latest",
+                "2.0.0",
+                "https://evil.example/pkg/-/pkg-2.0.0.tgz".to_string(),
+            ),
+            (
+                "1.1.0",
+                "1.1.0",
+                format!("{}/pkg/-/pkg-1.1.0.tgz", up.uri()),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pkg/{spec}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(manifest(version, link)))
+                .mount(&up)
+                .await;
+        }
+        up
+    }
+
+    #[tokio::test]
+    async fn no_served_document_sends_the_client_past_nora() {
+        let up = upstream().await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        let mut wrong = Vec::new();
+        for accept in ["application/json", "application/vnd.npm.install-v1+json"] {
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/npm/pkg",
+                vec![("accept", accept)],
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let body = body_bytes(resp).await;
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if keys(&doc, "versions") != ["1.0.0", "1.1.0"]
+                || doc["dist-tags"]["latest"] != "1.1.0"
+                || String::from_utf8_lossy(&body).contains("evil")
+            {
+                wrong.push(format!("{accept}: {}", String::from_utf8_lossy(&body)));
+            }
+        }
+        for spec in ["2.0.0", "latest"] {
+            let resp = send(&ctx.app, Method::GET, &format!("/npm/pkg/{spec}"), "").await;
+            let status = resp.status();
+            let body = body_bytes(resp).await;
+            if status != StatusCode::NOT_FOUND || String::from_utf8_lossy(&body).contains("evil") {
+                wrong.push(format!(
+                    "/npm/pkg/{spec}: {status} {}",
+                    String::from_utf8_lossy(&body)
+                ));
+            }
+        }
+        let resp = send(&ctx.app, Method::GET, "/npm/pkg/1.1.0", "").await;
+        let body = body_bytes(resp).await;
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        if doc["dist"]["tarball"] != "http://nora.example/npm/pkg/-/pkg-1.1.0.tgz" {
+            wrong.push(format!(
+                "/npm/pkg/1.1.0: {}",
+                String::from_utf8_lossy(&body)
+            ));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A packument cached with such a link (by a release that kept it) is not served with it.
+    /// It is fetched again in full whatever its age — a 304 would keep it — and, with the
+    /// upstream down, served stale without the version.
+    #[tokio::test]
+    async fn a_cached_link_past_nora_is_not_served() {
+        use crate::registry::{write_validators, Validators};
+        for (case, ttl, up_status) in [
+            ("fresh", 3600, 200),
+            ("expired", 0, 200),
+            ("upstream down", 0, 500),
+        ] {
+            let up = MockServer::start().await;
+            let fresh = upstream_packument(&up, &format!("{}/pkg/-/pkg-2.0.0.tgz", up.uri()));
+            Mock::given(method("GET"))
+                .and(header_exists("if-none-match"))
+                .respond_with(ResponseTemplate::new(304))
+                .mount(&up)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/pkg"))
+                .respond_with(ResponseTemplate::new(up_status).set_body_bytes(fresh))
+                .mount(&up)
+                .await;
+            let uri = up.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.npm.proxy = Some(uri);
+                cfg.npm.metadata_ttl = ttl;
+                cfg.npm.serve_stale = true;
+                cfg.server.public_url = Some("http://nora.example".to_string());
+            });
+            let key = "npm/pkg/upstream/packument.json";
+            let cached = packument(
+                &[
+                    ("1.0.0", "http://nora.example/npm/pkg/-/pkg-1.0.0.tgz"),
+                    ("2.0.0", "https://evil.example/pkg/-/pkg-2.0.0.tgz"),
+                ],
+                serde_json::json!({ "latest": "2.0.0" }),
+            );
+            ctx.state.storage.put(key, &cached).await.unwrap();
+            let validators = Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            };
+            write_validators(&ctx.state.storage, key, &validators).await;
+            let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{case}");
+            let body = body_bytes(resp).await;
+            let text = String::from_utf8_lossy(&body);
+            assert!(!text.contains("evil"), "{case}: {text}");
+            let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            let expected: &[&str] = if up_status == 200 {
+                &["1.0.0", "1.1.0", "2.0.0"]
+            } else {
+                &["1.0.0"]
+            };
+            assert_eq!(keys(&doc, "versions"), expected, "{case}");
+            if up_status == 200 {
+                let conditional = up
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.headers.contains_key("if-none-match"))
+                    .count();
+                assert_eq!(conditional, 0, "{case}: the copy was revalidated");
+            }
+        }
+    }
+
+    /// Each version left out is logged once, by package and version and the host only — not
+    /// the link, which may carry a token.
+    #[tokio::test]
+    async fn a_version_left_out_is_warned_about_once() {
+        let up = MockServer::start().await;
+        let doc = packument(
+            &[
+                ("1.0.0", &format!("{}/warned/-/warned-1.0.0.tgz", up.uri())),
+                (
+                    "2.0.0",
+                    "https://evil.example/secret-token/warned-2.0.0.tgz",
+                ),
+            ],
+            serde_json::json!({ "latest": "2.0.0" }),
+        );
+        let doc = String::from_utf8(doc)
+            .unwrap()
+            .replace("\"pkg\"", "\"warned\"");
+        Mock::given(method("GET"))
+            .and(path("/warned"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(doc))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.npm.metadata_ttl = 0;
+        });
+        let (log, _guard) = LogCapture::start();
+        for _ in 0..3 {
+            let resp = send(&ctx.app, Method::GET, "/npm/warned", "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+        let text = log.text();
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|l| l.contains("WARN") && l.contains("warned") && l.contains("2.0.0"))
+            .collect();
+        assert_eq!(lines.len(), 1, "{text}");
+        assert!(lines[0].contains("evil.example"), "{text}");
+        assert!(!text.contains("secret-token"), "{text}");
+    }
+}
+
+/// A tarball link on the upstream's own origin but outside its path — GitLab's instance-level
+/// npm endpoint names each tarball under the project that holds it — is the upstream's: served on
+/// NORA, and fetched by NORA from exactly that link with the upstream's credential. A link on any
+/// other origin, another upstream's included, is left out and never asked.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod upstream_origin_tarballs {
+    use super::rewrite_tarball_urls;
+    use crate::config::{NpmConfig, NpmProxyEntry};
+    use crate::secrets::ProtectedString;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{any, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TOKEN: &str = "vendor-tok";
+    const NORA: &str = "http://nora.example";
+    const NAME: &str = "@vendor/pkg";
+    const PROJECT: &str = "/api/v4/projects/7/packages/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz";
+    const ON_NORA: &str = "http://nora.example/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz";
+
+    fn instance(gitlab: &MockServer) -> String {
+        format!("{}/api/v4/packages/npm", gitlab.uri())
+    }
+
+    fn packument(name: &str, link: &str) -> String {
+        serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0": {
+                "name": name, "version": "1.0.0", "dist": { "tarball": link },
+            } },
+            "time": { "1.0.0": "2020-01-02T00:00:00.000Z" },
+        })
+        .to_string()
+    }
+
+    const VERSIONS: &[&str] = &["1.0.0", "1.1.0", "1.2.0", "1.3.0"];
+
+    /// Where the project keeps the tarball of `version`.
+    fn project(version: &str) -> String {
+        format!("/api/v4/projects/7/packages/npm/@vendor/pkg/-/@vendor/pkg-{version}.tgz")
+    }
+
+    /// What the project's tarball of `version` holds.
+    fn tgz(version: &str) -> Vec<u8> {
+        match version {
+            "1.0.0" => b"GITLAB-TGZ".to_vec(),
+            other => format!("GITLAB-TGZ {other}").into_bytes(),
+        }
+    }
+
+    fn packument_of(name: &str, links: &[(&str, String)]) -> String {
+        let versions: serde_json::Map<String, serde_json::Value> = links
+            .iter()
+            .map(|(v, link)| {
+                let doc = serde_json::json!({
+                    "name": name, "version": v, "dist": { "tarball": link },
+                });
+                (v.to_string(), doc)
+            })
+            .collect();
+        let time: serde_json::Map<String, serde_json::Value> = links
+            .iter()
+            .map(|(v, _)| (v.to_string(), "2020-01-02T00:00:00.000Z".into()))
+            .collect();
+        serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": links.last().map(|(v, _)| *v) },
+            "versions": versions,
+            "time": time,
+        })
+        .to_string()
+    }
+
+    /// A GitLab instance-level endpoint for `@vendor`, answering only with the token: the
+    /// packument and version manifests (naming each tarball on the origin `origin` gives) at the
+    /// instance level, the tarballs under the project.
+    async fn gitlab(origin: impl FnOnce(&MockServer) -> String) -> MockServer {
+        let gitlab = MockServer::start().await;
+        let origin = origin(&gitlab);
+        let links: Vec<(&str, String)> = VERSIONS
+            .iter()
+            .map(|v| (*v, format!("{origin}{}", project(v))))
+            .collect();
+        Mock::given(method("GET"))
+            .and(path("/api/v4/packages/npm/@vendor/pkg"))
+            .and(header("authorization", "Bearer vendor-tok"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument_of(NAME, &links)))
+            .mount(&gitlab)
+            .await;
+        for (version, link) in &links {
+            let manifest = serde_json::json!({
+                "name": NAME, "version": version, "dist": { "tarball": link },
+            });
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v4/packages/npm/@vendor/pkg/{version}")))
+                .and(header("authorization", "Bearer vendor-tok"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(manifest.to_string()))
+                .mount(&gitlab)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(project(version)))
+                .and(header("authorization", "Bearer vendor-tok"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(tgz(version)))
+                .mount(&gitlab)
+                .await;
+        }
+        gitlab
+    }
+
+    /// 200 to anything, so only its request log tells.
+    async fn open_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ELSEWHERE".to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn context(public: &str, private: &str) -> TestContext {
+        context_with_ttl(public, private, 3600)
+    }
+
+    fn context_with_ttl(public: &str, private: &str, ttl: i64) -> TestContext {
+        context_with(public, private, ttl, true)
+    }
+
+    /// `trust`: whether upstream release dates are trusted — then a tarball download caches its
+    /// packument first, for the date.
+    fn context_with(public: &str, private: &str, ttl: i64, trust: bool) -> TestContext {
+        let mut npm: NpmConfig = toml::from_str(&format!(
+            r#"proxies = ["{public}", {{ url = "{private}", scopes = ["@vendor"], auth_bearer_env = "NORA_NPM_VENDOR_TOKEN" }}]"#
+        ))
+        .unwrap();
+        if let NpmProxyEntry::Full(p) = &mut npm.proxies[1] {
+            p.auth_bearer = Some(ProtectedString::from(TOKEN));
+        }
+        let proxies = npm.proxies;
+        create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.npm.metadata_ttl = ttl;
+            cfg.server.trust_upstream_dates = trust;
+            cfg.server.public_url = Some(NORA.to_string());
+        })
+    }
+
+    async fn get(ctx: &TestContext, uri: &str) -> (StatusCode, Vec<u8>) {
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        let status = resp.status();
+        (status, body_bytes(resp).await.to_vec())
+    }
+
+    async fn versions(ctx: &TestContext) -> serde_json::Value {
+        let (status, body) = get(ctx, "/npm/@vendor%2fpkg").await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        doc["versions"].clone()
+    }
+
+    /// Requests a server received, by path, with whether each carried a credential.
+    async fn log(server: &MockServer) -> Vec<(String, bool)> {
+        let requests = server.received_requests().await.unwrap();
+        requests
+            .iter()
+            .map(|r| {
+                (
+                    r.url.path().to_string(),
+                    r.headers.contains_key("authorization"),
+                )
+            })
+            .collect()
+    }
+
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+
+    /// Each version's tarball from its own link, whether the packument served was fetched first
+    /// or fetched again (an expired copy).
+    #[tokio::test]
+    async fn a_tarball_on_the_upstream_origin_is_fetched_from_its_own_link() {
+        for ttl in [3600, 0] {
+            let public = open_server().await;
+            let gitlab = gitlab(MockServer::uri).await;
+            let ctx = context_with_ttl(&public.uri(), &instance(&gitlab), ttl);
+            for _ in 0..2 {
+                let versions = versions(&ctx).await;
+                assert_eq!(
+                    versions["1.0.0"]["dist"]["tarball"], ON_NORA,
+                    "{ttl}: {versions}"
+                );
+                settle().await;
+            }
+            let (status, manifest) = get(&ctx, "/npm/@vendor%2fpkg/1.0.0").await;
+            assert_eq!(status, StatusCode::OK, "{ttl}");
+            let doc: serde_json::Value = serde_json::from_slice(&manifest).unwrap();
+            assert_eq!(doc["dist"]["tarball"], ON_NORA, "{ttl}: {doc}");
+            let mut expected = Vec::new();
+            for version in VERSIONS {
+                let uri = format!("/npm/@vendor/pkg/-/@vendor/pkg-{version}.tgz");
+                let (status, body) = get(&ctx, &uri).await;
+                assert_eq!(
+                    (status, body),
+                    (StatusCode::OK, tgz(version)),
+                    "{ttl}: {version}"
+                );
+                expected.push((project(version), true));
+            }
+            let tarballs: Vec<(String, bool)> = log(&gitlab)
+                .await
+                .into_iter()
+                .filter(|(p, _)| p.ends_with(".tgz"))
+                .collect();
+            assert_eq!(tarballs, expected, "{ttl}");
+            assert!(
+                log(&public).await.is_empty(),
+                "{ttl}: {:?}",
+                log(&public).await
+            );
+        }
+    }
+
+    /// A lockfile install asks for the tarball first, with nothing cached: NORA reads the
+    /// packument to find where the upstream keeps it.
+    #[tokio::test]
+    async fn a_tarball_asked_before_its_packument_is_found_on_the_upstream_origin() {
+        for trust in [true, false] {
+            let public = open_server().await;
+            let gitlab = gitlab(MockServer::uri).await;
+            let ctx = context_with(&public.uri(), &instance(&gitlab), 3600, trust);
+            let (status, body) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+            assert_eq!(
+                (status, body.as_slice()),
+                (StatusCode::OK, b"GITLAB-TGZ".as_slice()),
+                "trust {trust}: {}",
+                String::from_utf8_lossy(&body)
+            );
+            assert!(log(&public).await.is_empty(), "{:?}", log(&public).await);
+        }
+    }
+
+    /// GitLab answers its instance-level tarball path by forwarding to the public registry (302,
+    /// measured on 19.5). A tarball asked before its packument is cached — a lockfile install, or
+    /// npm asking for it before the packument NORA just served is written — is looked up in the
+    /// packument first: neither that path nor the public registry is asked.
+    #[tokio::test]
+    async fn a_tarball_asked_first_does_not_follow_the_upstream_to_the_public_registry() {
+        let public = open_server().await;
+        let gitlab = gitlab(MockServer::uri).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/v4/packages/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz",
+            ))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "location",
+                format!("{}/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz", public.uri()).as_str(),
+            ))
+            .mount(&gitlab)
+            .await;
+        let ctx = context_with(&public.uri(), &instance(&gitlab), 3600, false);
+        let (status, body) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, b"GITLAB-TGZ".as_slice())
+        );
+        let tarballs: Vec<(String, bool)> = log(&gitlab)
+            .await
+            .into_iter()
+            .filter(|(p, _)| p.ends_with(".tgz"))
+            .collect();
+        assert_eq!(tarballs, vec![(PROJECT.to_string(), true)]);
+        assert!(log(&public).await.is_empty(), "{:?}", log(&public).await);
+    }
+
+    /// The same project path on another origin — the other upstream's, or one no upstream has —
+    /// is left out, and nothing is asked of it.
+    #[tokio::test]
+    async fn the_same_path_on_another_origin_is_left_out() {
+        let elsewhere = open_server().await;
+        for (case, on_public) in [("another upstream", true), ("no upstream", false)] {
+            let public = open_server().await;
+            let target = if on_public {
+                public.uri()
+            } else {
+                elsewhere.uri()
+            };
+            let gitlab = gitlab(|_| target.clone()).await;
+            let ctx = context(&public.uri(), &instance(&gitlab));
+            let versions = versions(&ctx).await;
+            assert!(
+                versions.as_object().unwrap().is_empty(),
+                "{case}: {versions}"
+            );
+            settle().await;
+            let (status, _) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+            assert_ne!(status, StatusCode::OK, "{case}");
+            assert!(
+                log(&public).await.is_empty(),
+                "{case}: {:?}",
+                log(&public).await
+            );
+            assert!(
+                log(&elsewhere).await.is_empty(),
+                "{case}: {:?}",
+                log(&elsewhere).await
+            );
+        }
+    }
+
+    /// The default upstream's packument naming the private upstream's origin: left out, and the
+    /// private upstream is never asked (with or without its token).
+    #[tokio::test]
+    async fn a_packument_from_one_upstream_cannot_name_the_origin_of_another() {
+        let gitlab = gitlab(MockServer::uri).await;
+        let public = MockServer::start().await;
+        let link = format!(
+            "{}/api/v4/projects/7/packages/npm/pkg/-/pkg-1.0.0.tgz",
+            gitlab.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument("pkg", &link)))
+            .mount(&public)
+            .await;
+        let ctx = context(&public.uri(), &instance(&gitlab));
+        let (status, body) = get(&ctx, "/npm/pkg").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(doc["versions"].as_object().unwrap().is_empty(), "{doc}");
+        settle().await;
+        let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_ne!(status, StatusCode::OK);
+        assert!(log(&gitlab).await.is_empty(), "{:?}", log(&gitlab).await);
+    }
+
+    /// A packument cached with the upstream's own link as it is (by the release before this
+    /// one, which kept every link it did not recognise; under the key an older release still
+    /// wrote, too) is served on NORA, and its tarball fetched from that link.
+    #[tokio::test]
+    async fn a_copy_cached_with_the_link_as_it_is_is_served_on_nora() {
+        for key in [
+            super::upstream_packument_key(NAME),
+            super::legacy_cache_key(NAME),
+        ] {
+            let public = open_server().await;
+            let gitlab = gitlab(MockServer::uri).await;
+            let upstream = instance(&gitlab);
+            let ctx = context(&public.uri(), &upstream);
+            let cached = packument(NAME, &format!("{}{PROJECT}", gitlab.uri()));
+            super::put_with_origin(
+                &ctx.state.storage,
+                &key,
+                cached.as_bytes(),
+                &super::origin_of(&upstream),
+            )
+            .await
+            .unwrap();
+            let versions = versions(&ctx).await;
+            assert_eq!(
+                versions["1.0.0"]["dist"]["tarball"], ON_NORA,
+                "{key}: {versions}"
+            );
+            let (status, body) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+            assert_eq!(
+                (status, body.as_slice()),
+                (StatusCode::OK, b"GITLAB-TGZ".as_slice()),
+                "{key}"
+            );
+            let packuments = log(&gitlab)
+                .await
+                .into_iter()
+                .filter(|(p, _)| !p.ends_with(".tgz"))
+                .count();
+            assert_eq!(packuments, 0, "{key}: a fresh copy was asked for again");
+        }
+    }
+
+    /// A copy cached as it is with the project path on another origin (by the release before
+    /// this one): a download of that tarball never asks that origin.
+    #[tokio::test]
+    async fn a_cached_link_on_another_origin_is_never_asked() {
+        let public = open_server().await;
+        let elsewhere = open_server().await;
+        let gitlab = gitlab(MockServer::uri).await;
+        let upstream = instance(&gitlab);
+        let ctx = context(&public.uri(), &upstream);
+        let cached = packument(NAME, &format!("{}{PROJECT}", elsewhere.uri()));
+        super::put_with_origin(
+            &ctx.state.storage,
+            &super::upstream_packument_key(NAME),
+            cached.as_bytes(),
+            &super::origin_of(&upstream),
+        )
+        .await
+        .unwrap();
+        let _ = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+        assert!(
+            log(&elsewhere).await.is_empty(),
+            "{:?}",
+            log(&elsewhere).await
+        );
+        assert!(log(&public).await.is_empty(), "{:?}", log(&public).await);
+    }
+
+    /// A scope's copy cached before its upstream owned it (no record of that owner) names a link
+    /// on the owner's origin: NORA does not follow it with the owner's token — it asks the owner
+    /// for the packument and follows the link that names.
+    #[tokio::test]
+    async fn a_copy_the_owner_did_not_deliver_does_not_say_where_to_fetch() {
+        for trust in [true, false] {
+            the_owner_is_asked_instead(trust).await;
+        }
+    }
+
+    async fn the_owner_is_asked_instead(trust: bool) {
+        let public = open_server().await;
+        let gitlab = gitlab(MockServer::uri).await;
+        let squatted = "/api/v4/projects/666/packages/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz";
+        Mock::given(method("GET"))
+            .and(path(squatted))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SQUATTED".to_vec()))
+            .mount(&gitlab)
+            .await;
+        let ctx = context_with(&public.uri(), &instance(&gitlab), 3600, trust);
+        let cached = packument(NAME, &format!("{}{squatted}", gitlab.uri()));
+        ctx.state
+            .storage
+            .put(&super::upstream_packument_key(NAME), cached.as_bytes())
+            .await
+            .unwrap();
+        let (status, body) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, b"GITLAB-TGZ".as_slice()),
+            "trust {trust}: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let asked: Vec<String> = log(&gitlab).await.into_iter().map(|(p, _)| p).collect();
+        assert!(
+            !asked.iter().any(|p| p == squatted),
+            "trust {trust}: {asked:?}"
+        );
+    }
+
+    /// After the upstream moved, a copy cached from the old one keeps no link to it: with the
+    /// new upstream down, the version is served stale without it, and the old origin is never
+    /// asked — the new upstream's credential does not go there.
+    #[tokio::test]
+    async fn after_the_upstream_moved_the_old_origin_is_not_asked() {
+        let old = open_server().await;
+        let moved = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&moved)
+            .await;
+        let upstream = format!("{}/api/v4/packages/npm", moved.uri());
+        let ctx = create_test_context_with_config({
+            let upstream = upstream.clone();
+            move |cfg| {
+                cfg.npm.proxy = Some(upstream);
+                cfg.npm.proxy_auth = Some(ProtectedString::from("user:pass"));
+                cfg.npm.metadata_ttl = 3600;
+                cfg.npm.serve_stale = true;
+                cfg.server.public_url = Some(NORA.to_string());
+            }
+        });
+        let cached = packument(
+            "pkg",
+            &format!(
+                "{}/api/v4/projects/7/packages/npm/pkg/-/pkg-1.0.0.tgz",
+                old.uri()
+            ),
+        );
+        ctx.state
+            .storage
+            .put(&super::upstream_packument_key("pkg"), cached.as_bytes())
+            .await
+            .unwrap();
+        let (status, body) = get(&ctx, "/npm/pkg").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(doc["versions"].as_object().unwrap().is_empty(), "{doc}");
+        let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_ne!(status, StatusCode::OK);
+        assert!(log(&old).await.is_empty(), "{:?}", log(&old).await);
+    }
+
+    /// After `NORA_PUBLIC_URL` moved, with the upstream down: a cached packument is served
+    /// without the versions it names at the old address, or not at all without `serve_stale` —
+    /// the limit the deploy guide states, with its workaround.
+    #[tokio::test]
+    async fn after_nora_moved_with_the_upstream_down_its_old_links_are_left_out() {
+        for serve_stale in [true, false] {
+            let down = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(503))
+                .mount(&down)
+                .await;
+            let uri = down.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.npm.proxy = Some(uri);
+                cfg.npm.serve_stale = serve_stale;
+                cfg.server.public_url = Some(NORA.to_string());
+            });
+            let cached = packument("pkg", "http://old-nora.example/npm/pkg/-/pkg-1.0.0.tgz");
+            ctx.state
+                .storage
+                .put(&super::upstream_packument_key("pkg"), cached.as_bytes())
+                .await
+                .unwrap();
+            let (status, body) = get(&ctx, "/npm/pkg").await;
+            if serve_stale {
+                assert_eq!(status, StatusCode::OK);
+                let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                assert!(doc["versions"].as_object().unwrap().is_empty(), "{doc}");
+            } else {
+                assert_eq!(status, StatusCode::BAD_GATEWAY);
+            }
+        }
+    }
+
+    /// An upstream whose credential is the userinfo of its URL: the link it names is asked with
+    /// the same userinfo, which is the upstream's credential (sent as Basic).
+    #[tokio::test]
+    async fn the_credential_in_the_upstream_url_goes_with_its_link() {
+        let gitlab = MockServer::start().await;
+        let basic = format!(
+            "Basic {}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "u:p")
+        );
+        let link = format!(
+            "{}/api/v4/projects/7/packages/npm/pkg/-/pkg-1.0.0.tgz",
+            gitlab.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/api/v4/packages/npm/pkg"))
+            .and(header("authorization", basic.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument("pkg", &link)))
+            .mount(&gitlab)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/7/packages/npm/pkg/-/pkg-1.0.0.tgz"))
+            .and(header("authorization", basic.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"GITLAB-TGZ".to_vec()))
+            .mount(&gitlab)
+            .await;
+        let upstream = gitlab.uri().replacen("http://", "http://u:p@", 1) + "/api/v4/packages/npm";
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(upstream);
+            cfg.server.public_url = Some(NORA.to_string());
+        });
+        let (status, body) = get(&ctx, "/npm/pkg").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            doc["versions"]["1.0.0"]["dist"]["tarball"],
+            "http://nora.example/npm/pkg/-/pkg-1.0.0.tgz"
+        );
+        settle().await;
+        let (status, body) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, b"GITLAB-TGZ".as_slice())
+        );
+    }
+
+    /// Which links on the upstream's origin are its own: an absolute link as a URL parser writes
+    /// it, without userinfo, query or fragment, on the upstream's scheme, host and port (the
+    /// credential goes there with it), naming this package and one of its tarballs. Anything
+    /// else is left out.
+    #[test]
+    fn which_links_on_the_upstream_origin_are_its_own() {
+        let upstream = "https://gitlab.example/api/v4/packages/npm";
+        let project = "/api/v4/projects/7/packages/npm";
+        let doc = |link: &str| packument(NAME, link).into_bytes();
+        let mut wrong = Vec::new();
+        for (link, served) in [
+            (format!("https://gitlab.example{PROJECT}"), Some(ON_NORA)),
+            (format!("http://gitlab.example{PROJECT}"), None),
+            (
+                format!("https://gitlab.example{project}/@vendor%2fpkg/-/@vendor/pkg-1.0.0.tgz"),
+                Some(ON_NORA),
+            ),
+            (
+                format!("https://gitlab.example{project}/@vendor/pkg/-/@vendor%2Fpkg-1.0.0.tgz"),
+                Some("http://nora.example/npm/@vendor/pkg/-/@vendor%2Fpkg-1.0.0.tgz"),
+            ),
+            (format!("https://gitlab.example:8443{PROJECT}"), None),
+            (
+                format!("https://gitlab.example.evil.example{PROJECT}"),
+                None,
+            ),
+            (format!("https://user@gitlab.example{PROJECT}"), None),
+            (format!("https://gitlab.example{PROJECT}?x=1"), None),
+            (format!("https://gitlab.example{PROJECT}#x"), None),
+            (format!("//gitlab.example{PROJECT}"), None),
+            (format!(" https://gitlab.example{PROJECT}"), None),
+            (format!("HTTPS://gitlab.example{PROJECT}"), None),
+            (
+                format!("https://gitlab.example{project}/other/-/other-1.0.0.tgz"),
+                None,
+            ),
+            (
+                format!("https://gitlab.example{project}/other/-/@vendor/pkg-1.0.0.tgz"),
+                None,
+            ),
+            (
+                format!("https://gitlab.example{project}/@vendor/pkgx/-/@vendor/pkg-1.0.0.tgz"),
+                None,
+            ),
+            (
+                format!("https://gitlab.example{project}/@vendor/pkg/-/other-1.0.0.tgz"),
+                None,
+            ),
+            (
+                format!("https://gitlab.example{project}/@vendor/pkg/-/"),
+                None,
+            ),
+            (
+                format!("https://gitlab.example{project}/@vendor/pkg/-/README.md"),
+                None,
+            ),
+            (
+                format!(
+                    "https://gitlab.example{project}/@vendor/pkg/-/../../@vendor/pkg-1.0.0.tgz"
+                ),
+                None,
+            ),
+            (
+                format!(
+                    "https://gitlab.example{project}/@vendor/pkg/-/%2e%2e/@vendor/pkg-1.0.0.tgz"
+                ),
+                None,
+            ),
+            (format!("https://gitlab.example{project}/@vendor/pkg"), None),
+            (format!("ftp://gitlab.example{PROJECT}"), None),
+        ] {
+            let out = rewrite_tarball_urls(&doc(&link), NORA, upstream).unwrap();
+            let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            let got = out["versions"]["1.0.0"]["dist"]["tarball"].as_str();
+            if got != served {
+                wrong.push(format!("{link}: {got:?}, expected {served:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A path whose last segments only end like the package — a longer name before `@`, or an
+    /// encoded `@` after one — holds another package: its link is left out.
+    #[test]
+    fn a_holder_that_only_ends_like_the_package_is_not_its_own() {
+        let upstream = "https://gitlab.example/api/v4/packages/npm";
+        for link in [
+            "https://gitlab.example/api/v4/projects/7/packages/npm/evil@vendor/pkg/-/@vendor/pkg-1.0.0.tgz",
+            "https://gitlab.example/api/v4/projects/7/packages/npm/x%40vendor/pkg/-/@vendor/pkg-1.0.0.tgz",
+            "https://gitlab.example/api/v4/projects/7/packages/npm/x%2F@vendor/pkg/-/@vendor/pkg-1.0.0.tgz",
+        ] {
+            let out =
+                rewrite_tarball_urls(packument(NAME, link).as_bytes(), NORA, upstream).unwrap();
+            let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(
+                out["versions"]["1.0.0"]["dist"]["tarball"].as_str(),
+                None,
+                "{link}"
+            );
+        }
+    }
+
+    /// An upstream with a credential in its URL and no path of its own: a link on its origin is
+    /// still fetched exactly as the packument names it, with that credential, never at
+    /// `<upstream>/<path>`.
+    #[tokio::test]
+    async fn an_upstream_with_userinfo_and_no_path_fetches_from_its_link() {
+        let gitlab = MockServer::start().await;
+        let basic = format!(
+            "Basic {}",
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, "u:p")
+        );
+        let link = format!(
+            "{}/api/v4/projects/7/packages/npm/pkg/-/pkg-1.0.0.tgz",
+            gitlab.uri()
+        );
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument("pkg", &link)))
+            .mount(&gitlab)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v4/projects/7/packages/npm/pkg/-/pkg-1.0.0.tgz"))
+            .and(header("authorization", basic.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"GITLAB-TGZ".to_vec()))
+            .mount(&gitlab)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/-/pkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ELSEWHERE".to_vec()))
+            .mount(&gitlab)
+            .await;
+        let upstream = gitlab.uri().replacen("http://", "http://u:p@", 1);
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(upstream);
+            cfg.server.public_url = Some(NORA.to_string());
+        });
+        let (status, body) = get(&ctx, "/npm/pkg").await;
+        assert_eq!(status, StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            doc["versions"]["1.0.0"]["dist"]["tarball"],
+            "http://nora.example/npm/pkg/-/pkg-1.0.0.tgz"
+        );
+        settle().await;
+        let (status, body) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_eq!(
+            (status, String::from_utf8_lossy(&body).into_owned()),
+            (StatusCode::OK, "GITLAB-TGZ".to_string())
+        );
+    }
+
+    /// A copy an older release cached under the legacy key, not delivered by the scope's owner,
+    /// does not say where to fetch either: the owner's own listing does, with its token.
+    #[tokio::test]
+    async fn a_legacy_copy_the_owner_did_not_deliver_does_not_say_where_to_fetch() {
+        let public = open_server().await;
+        let gitlab = gitlab(MockServer::uri).await;
+        let squatted = "/api/v4/projects/666/packages/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz";
+        Mock::given(method("GET"))
+            .and(path(squatted))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SQUATTED".to_vec()))
+            .mount(&gitlab)
+            .await;
+        let ctx = context_with(&public.uri(), &instance(&gitlab), 3600, false);
+        let cached = packument(NAME, &format!("{}{squatted}", gitlab.uri()));
+        ctx.state
+            .storage
+            .put(&super::legacy_cache_key(NAME), cached.as_bytes())
+            .await
+            .unwrap();
+        let (status, body) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, b"GITLAB-TGZ".as_slice()),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let asked: Vec<String> = log(&gitlab).await.into_iter().map(|(p, _)| p).collect();
+        assert!(!asked.iter().any(|p| p == squatted), "{asked:?}");
+    }
+
+    /// The public upstream at the root of the owner's host is another upstream: a copy it
+    /// delivered (its provenance names `npm:http://host:port`, a prefix of the owner's
+    /// `…/api/v4/packages/npm`) is not the owner's.
+    #[tokio::test]
+    async fn a_copy_from_an_upstream_whose_url_prefixes_the_owners_is_not_trusted() {
+        let gitlab = gitlab(MockServer::uri).await;
+        let squatted = "/api/v4/projects/666/packages/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz";
+        Mock::given(method("GET"))
+            .and(path(squatted))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"SQUATTED".to_vec()))
+            .mount(&gitlab)
+            .await;
+        let ctx = context_with(&gitlab.uri(), &instance(&gitlab), 3600, false);
+        let cached = packument(NAME, &format!("{}{squatted}", gitlab.uri()));
+        super::put_with_origin(
+            &ctx.state.storage,
+            &super::upstream_packument_key(NAME),
+            cached.as_bytes(),
+            &super::origin_of(&gitlab.uri()),
+        )
+        .await
+        .unwrap();
+        let (status, body) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, b"GITLAB-TGZ".as_slice()),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+        let asked: Vec<String> = log(&gitlab).await.into_iter().map(|(p, _)| p).collect();
+        assert!(!asked.iter().any(|p| p == squatted), "{asked:?}");
+    }
+}
+
+/// A tarball is fetched only for a version the upstream's trusted packument lists, from the link
+/// it names. A redirect on the upstream's origin is followed with the upstream's credential; one
+/// to another origin (a registry keeping its files on a storage host) is followed without it, on
+/// that hop and every later one. A version the packument does not list, even once fetched again,
+/// is not asked for at all.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tarball_redirects {
+    use crate::config::{NpmConfig, NpmProxyEntry};
+    use crate::secrets::ProtectedString;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{any, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const TARBALL: &str = "/pkg/-/pkg-1.0.0.tgz";
+    const SCOPED: &str = "/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz";
+
+    /// 200 to anything, so only its request log tells.
+    async fn open_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ELSEWHERE".to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn packument(name: &str, link: &str) -> String {
+        serde_json::json!({
+            "name": name,
+            "dist-tags": { "latest": "1.0.0" },
+            "versions": { "1.0.0": {
+                "name": name, "version": "1.0.0", "dist": { "tarball": link },
+            } },
+            "time": { "1.0.0": "2020-01-02T00:00:00.000Z" },
+        })
+        .to_string()
+    }
+
+    /// A registry at the root of its origin with `pkg` and `@vendor/pkg` 1.0.0, whose tarball
+    /// paths answer what `answer` makes of the registry.
+    async fn registry(answer: impl Fn(&MockServer) -> ResponseTemplate) -> MockServer {
+        let server = MockServer::start().await;
+        for (name, file) in [("pkg", TARBALL), ("@vendor/pkg", SCOPED)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{name}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(packument(name, &format!("{}{file}", server.uri()))),
+                )
+                .mount(&server)
+                .await;
+            let answer = answer(&server);
+            Mock::given(method("GET"))
+                .and(path(file))
+                .respond_with(answer)
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    fn redirect(to: &str) -> ResponseTemplate {
+        ResponseTemplate::new(302).insert_header("location", to)
+    }
+
+    fn port_of(server: &MockServer) -> u16 {
+        reqwest::Url::parse(&server.uri()).unwrap().port().unwrap()
+    }
+
+    /// The default upstream `public` (its URL may carry userinfo) and `@vendor`'s `private`,
+    /// with a Bearer token. The upstream's circuit breaker is on, at its default threshold.
+    fn context(public: &str, private: &str) -> TestContext {
+        let mut npm: NpmConfig = toml::from_str(&format!(
+            r#"proxies = ["{public}", {{ url = "{private}", scopes = ["@vendor"], auth_bearer_env = "NORA_NPM_VENDOR_TOKEN" }}]"#
+        ))
+        .unwrap();
+        if let NpmProxyEntry::Full(p) = &mut npm.proxies[1] {
+            p.auth_bearer = Some(ProtectedString::from("vendor-tok"));
+        }
+        let proxies = npm.proxies;
+        create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.server.public_url = Some("http://nora.example".to_string());
+            cfg.circuit_breaker.enabled = true;
+        })
+    }
+
+    fn with_userinfo(server: &MockServer) -> String {
+        server
+            .uri()
+            .replacen("http://", "http://nora-user:s3cret@", 1)
+    }
+
+    async fn get(ctx: &TestContext, uri: &str) -> (StatusCode, Vec<u8>) {
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        let status = resp.status();
+        (status, body_bytes(resp).await.to_vec())
+    }
+
+    /// Requests a server received, by path, with whether each carried a credential.
+    async fn asked(server: &MockServer) -> Vec<(String, bool)> {
+        let requests = server.received_requests().await.unwrap();
+        requests
+            .iter()
+            .map(|r| {
+                (
+                    r.url.path().to_string(),
+                    r.headers.contains_key("authorization"),
+                )
+            })
+            .collect()
+    }
+
+    async fn asks_of(server: &MockServer, file: &str) -> usize {
+        asked(server)
+            .await
+            .iter()
+            .filter(|(p, _)| p == file)
+            .count()
+    }
+
+    /// Tarballs and their digests NORA keeps.
+    async fn cached_tarballs(ctx: &TestContext) -> Vec<String> {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let keys = ctx.state.storage.list("npm/").await.unwrap();
+        keys.into_iter().filter(|k| k.contains(".tgz")).collect()
+    }
+
+    /// The tarballs cached once the background write lands, within a deadline: a full test run
+    /// can delay the spawned write past any fixed wait.
+    async fn cached_tarballs_eventually(ctx: &TestContext) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let cached = cached_tarballs(ctx).await;
+            if !cached.is_empty() || std::time::Instant::now() > deadline {
+                return cached;
+            }
+        }
+    }
+
+    /// A file storage on another origin: `/a` forwards to `/b` on the same host, which answers.
+    async fn storage_host() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/a"))
+            .respond_with(redirect(&format!("{}/b", server.uri())))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"STORED-TGZ".to_vec()))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A listed version whose upstream keeps the file on a storage host: downloaded from there,
+    /// and no hop on the storage host — the first or the one after — gets the upstream's
+    /// credential, the userinfo of the default upstream or the scope's token alike.
+    #[tokio::test]
+    async fn a_listed_tarball_on_another_origin_is_fetched_without_the_credential() {
+        for (uri, file) in [
+            ("/npm/pkg/-/pkg-1.0.0.tgz", TARBALL),
+            ("/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz", SCOPED),
+        ] {
+            let storage = storage_host().await;
+            let to = format!("{}/a", storage.uri());
+            let upstream = registry(|_| redirect(&to)).await;
+            let ctx = context(&with_userinfo(&upstream), &upstream.uri());
+            let (status, body) = get(&ctx, uri).await;
+            assert_eq!(
+                (status, String::from_utf8_lossy(&body).into_owned()),
+                (StatusCode::OK, "STORED-TGZ".to_string()),
+                "{uri}"
+            );
+            let tarball_asks: Vec<_> = asked(&upstream)
+                .await
+                .into_iter()
+                .filter(|(p, _)| p == file)
+                .collect();
+            assert_eq!(tarball_asks, vec![(file.to_string(), true)], "{uri}");
+            assert_eq!(
+                asked(&storage).await,
+                vec![("/a".to_string(), false), ("/b".to_string(), false)],
+                "{uri}"
+            );
+            assert!(!cached_tarballs_eventually(&ctx).await.is_empty(), "{uri}");
+        }
+    }
+
+    /// The same host on another port, or the same port under another scheme, is another origin:
+    /// the credential stays behind there too.
+    #[tokio::test]
+    async fn another_host_or_port_is_another_origin_for_the_credential() {
+        let storage = storage_host().await;
+        let port = port_of(&storage);
+        for to in [
+            format!("http://localhost:{port}/a"),
+            format!("http://127.0.0.1:{port}/a"),
+        ] {
+            let upstream = registry(|_| redirect(&to)).await;
+            let ctx = context(&with_userinfo(&upstream), &upstream.uri());
+            let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+            assert_eq!(status, StatusCode::OK, "{to}");
+        }
+        assert!(
+            asked(&storage)
+                .await
+                .iter()
+                .all(|(_, credential)| !credential),
+            "{:?}",
+            asked(&storage).await
+        );
+    }
+
+    /// On the upstream's own origin the credential goes along, relative Location or absolute.
+    #[tokio::test]
+    async fn a_redirect_on_the_same_origin_keeps_the_credential() {
+        for to in [
+            "/files/pkg-1.0.0.tgz".to_string(),
+            "http://127.0.0.1:{port}/files/pkg-1.0.0.tgz".to_string(),
+        ] {
+            let upstream =
+                registry(|server| redirect(&to.replace("{port}", &port_of(server).to_string())))
+                    .await;
+            Mock::given(method("GET"))
+                .and(path("/files/pkg-1.0.0.tgz"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UPSTREAM-TGZ".to_vec()))
+                .mount(&upstream)
+                .await;
+            let ctx = context(&with_userinfo(&upstream), &open_server().await.uri());
+            let (status, body) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+            assert_eq!(
+                (status, body.as_slice()),
+                (StatusCode::OK, b"UPSTREAM-TGZ".as_slice()),
+                "{to}"
+            );
+            let hop: Vec<_> = asked(&upstream)
+                .await
+                .into_iter()
+                .filter(|(p, _)| p == "/files/pkg-1.0.0.tgz")
+                .collect();
+            assert_eq!(
+                hop,
+                vec![("/files/pkg-1.0.0.tgz".to_string(), true)],
+                "{to}"
+            );
+        }
+    }
+
+    /// A walk on the origin is cut off after ten hops, as any chain of a download is.
+    #[tokio::test]
+    async fn a_walk_on_the_origin_ends() {
+        let upstream = registry(|_| redirect(TARBALL)).await;
+        let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let (status, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz"),
+        )
+        .await
+        .expect("a redirect loop never ends");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(asks_of(&upstream, TARBALL).await <= 2 * 11);
+    }
+
+    /// A version the packument does not list is not asked for, wherever its path would lead —
+    /// GitLab forwards it to the public registry (302, measured on 19.5): 404, the packument
+    /// asked once more for a version published since, nothing cached. The breaker sees no
+    /// failure, however often it is asked.
+    #[tokio::test]
+    async fn a_version_the_packument_does_not_list_is_not_asked_for() {
+        let public = open_server().await;
+        let gitlab =
+            registry(|_| ResponseTemplate::new(200).set_body_bytes(b"GITLAB-TGZ".to_vec())).await;
+        Mock::given(any())
+            .respond_with(redirect(&format!("{}/forwarded", public.uri())))
+            .mount(&gitlab)
+            .await;
+        let ctx = context(&public.uri(), &gitlab.uri());
+        let downloads = crate::config::CircuitBreakerConfig::default().failure_threshold + 1;
+        for _ in 0..downloads {
+            let (status, _) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-9.9.9.tgz").await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+        let gitlab_asks = asked(&gitlab).await;
+        assert!(
+            gitlab_asks.iter().all(|(p, _)| p == "/@vendor/pkg"),
+            "{gitlab_asks:?}"
+        );
+        assert!(
+            gitlab_asks.len() <= 2 * downloads as usize,
+            "{gitlab_asks:?}"
+        );
+        assert!(
+            asked(&public).await.is_empty(),
+            "{:?}",
+            asked(&public).await
+        );
+        assert!(cached_tarballs(&ctx).await.is_empty());
+        // The breaker is closed: the listed version still downloads.
+        let (status, _) = get(&ctx, "/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz").await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    /// A version published after the packument was cached is found in the packument fetched
+    /// again, once.
+    #[tokio::test]
+    async fn a_version_published_since_the_packument_was_cached_is_found() {
+        let upstream = MockServer::start().await;
+        let link = |v: &str| format!("{}/pkg/-/pkg-{v}.tgz", upstream.uri());
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(packument("pkg", &link("1.0.0"))),
+            )
+            .up_to_n_times(1)
+            .mount(&upstream)
+            .await;
+        let later = serde_json::json!({
+            "name": "pkg",
+            "dist-tags": { "latest": "1.1.0" },
+            "versions": {
+                "1.0.0": { "name": "pkg", "version": "1.0.0", "dist": { "tarball": link("1.0.0") } },
+                "1.1.0": { "name": "pkg", "version": "1.1.0", "dist": { "tarball": link("1.1.0") } },
+            },
+            "time": { "1.0.0": "2020-01-02T00:00:00.000Z", "1.1.0": "2020-02-02T00:00:00.000Z" },
+        });
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(later.to_string()))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/-/pkg-1.1.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"NEW-TGZ".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let (status, _) = get(&ctx, "/npm/pkg").await;
+        assert_eq!(status, StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (status, body) = get(&ctx, "/npm/pkg/-/pkg-1.1.0.tgz").await;
+        assert_eq!(
+            (status, body.as_slice()),
+            (StatusCode::OK, b"NEW-TGZ".as_slice())
+        );
+        let packument_asks = asked(&upstream)
+            .await
+            .iter()
+            .filter(|(p, _)| p == "/pkg")
+            .count();
+        assert_eq!(packument_asks, 2);
+    }
+
+    /// GitHub Packages' tarball path (`download/<@scope/name>/<version>/<sha1>`), listed and
+    /// forwarded to a storage host: downloaded from there without the scope's token.
+    #[tokio::test]
+    async fn a_github_packages_tarball_on_a_storage_host_is_fetched_without_the_token() {
+        const SHA: &str = "04fef883382f5a7c9b9ac2015dcc419009e2a858";
+        let storage = storage_host().await;
+        let ghp = MockServer::start().await;
+        let file = format!("/download/@vendor/pkg/1.0.0/{SHA}");
+        Mock::given(method("GET"))
+            .and(path("/@vendor/pkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(packument("@vendor/pkg", &format!("{}{file}", ghp.uri()))),
+            )
+            .mount(&ghp)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(file.as_str()))
+            .respond_with(redirect(&format!("{}/a", storage.uri())))
+            .mount(&ghp)
+            .await;
+        let ctx = context(&open_server().await.uri(), &ghp.uri());
+        let (status, body) = get(&ctx, &format!("/npm{file}")).await;
+        assert_eq!(
+            (status, String::from_utf8_lossy(&body).into_owned()),
+            (StatusCode::OK, "STORED-TGZ".to_string())
+        );
+        assert_eq!(
+            asked(&storage).await,
+            vec![("/a".to_string(), false), ("/b".to_string(), false)]
+        );
+        let tarball_asks: Vec<_> = asked(&ghp)
+            .await
+            .into_iter()
+            .filter(|(p, _)| *p == file)
+            .collect();
+        assert_eq!(tarball_asks, vec![(file.clone(), true)]);
+    }
+
+    /// Invariant 2: the whole redirect chain of a tarball download is bounded (≤10 hops) → 502.
+    /// 8 hops on the upstream's origin, one to a storage host, 8 more there: 17 hops in all.
+    #[tokio::test]
+    async fn a_chain_longer_than_ten_hops_across_origins_is_502() {
+        let storage = MockServer::start().await;
+        for i in 0..8 {
+            Mock::given(method("GET"))
+                .and(path(format!("/h{i}")))
+                .respond_with(redirect(&format!("{}/h{}", storage.uri(), i + 1)))
+                .mount(&storage)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/h8"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"FAR-TGZ".to_vec()))
+            .mount(&storage)
+            .await;
+        let s = storage.uri();
+        let upstream = registry(|_| redirect("/r1")).await;
+        for i in 1..8 {
+            Mock::given(method("GET"))
+                .and(path(format!("/r{i}")))
+                .respond_with(redirect(&format!("/r{}", i + 1)))
+                .mount(&upstream)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/r8"))
+            .respond_with(redirect(&format!("{s}/h0")))
+            .mount(&upstream)
+            .await;
+        let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let (status, body) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_eq!(
+            (status, String::from_utf8_lossy(&body).into_owned()),
+            (StatusCode::BAD_GATEWAY, String::new()),
+            "17 redirects were followed"
+        );
+    }
+
+    /// Invariant 2: the hops on the storage host count too — a chain that goes on there past ten
+    /// hops ends in 502, it is not walked to its end.
+    #[tokio::test]
+    async fn a_walk_on_the_storage_host_ends() {
+        let storage = MockServer::start().await;
+        for i in 0..30 {
+            Mock::given(method("GET"))
+                .and(path(format!("/h{i}")))
+                .respond_with(redirect(&format!("{}/h{}", storage.uri(), i + 1)))
+                .mount(&storage)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/h30"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"FAR-TGZ".to_vec()))
+            .mount(&storage)
+            .await;
+        let to = format!("{}/h0", storage.uri());
+        let upstream = registry(|_| redirect(&to)).await;
+        let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// A download whose first `on` redirects stay on the upstream's origin (`/r1`…) and whose
+    /// next `off` go to a storage host (`/h1`…), the last URL answering the file: what NORA
+    /// answers, with the requests each server received.
+    async fn walk(on: usize, off: usize) -> (StatusCode, Vec<(String, bool)>, Vec<(String, bool)>) {
+        let storage = MockServer::start().await;
+        let s = storage.uri();
+        let first = match (on, off) {
+            (0, 0) => ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec()),
+            (0, _) => redirect(&format!("{s}/h1")),
+            _ => redirect("/r1"),
+        };
+        let upstream = registry(|_| first.clone()).await;
+        for i in 1..=on {
+            let answer = if i < on {
+                redirect(&format!("/r{}", i + 1))
+            } else if off > 0 {
+                redirect(&format!("{s}/h1"))
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec())
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/r{i}")))
+                .respond_with(answer)
+                .mount(&upstream)
+                .await;
+        }
+        for j in 1..=off {
+            let answer = if j < off {
+                redirect(&format!("{s}/h{}", j + 1))
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec())
+            };
+            Mock::given(method("GET"))
+                .and(path(format!("/h{j}")))
+                .respond_with(answer)
+                .mount(&storage)
+                .await;
+        }
+        let ctx = context(&with_userinfo(&upstream), &open_server().await.uri());
+        let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        (status, asked(&upstream).await, asked(&storage).await)
+    }
+
+    /// Invariant 2: ten redirects of one download pass and the eleventh is 502, however the
+    /// chain is split between the upstream's origin and a storage host; the credential goes on
+    /// each hop on the origin and on none on the storage host.
+    #[tokio::test]
+    async fn ten_redirects_pass_and_the_eleventh_is_502_across_origins() {
+        for (on, off, expected) in [
+            (10, 0, StatusCode::OK),
+            (11, 0, StatusCode::BAD_GATEWAY),
+            (0, 10, StatusCode::OK),
+            (0, 11, StatusCode::BAD_GATEWAY),
+            (4, 6, StatusCode::OK),
+            (4, 7, StatusCode::BAD_GATEWAY),
+            (9, 1, StatusCode::OK),
+            (10, 1, StatusCode::BAD_GATEWAY),
+        ] {
+            let (status, upstream, storage) = walk(on, off).await;
+            assert_eq!(status, expected, "{on} on the origin, {off} off it");
+            let hops: Vec<_> = upstream
+                .iter()
+                .filter(|(p, _)| p.starts_with("/r"))
+                .collect();
+            assert!(hops.iter().all(|(_, credential)| *credential), "{hops:?}");
+            assert!(
+                storage.iter().all(|(_, credential)| !credential),
+                "{storage:?}"
+            );
+            if expected == StatusCode::BAD_GATEWAY {
+                // The eleventh redirect is not followed.
+                assert_eq!(
+                    hops.len() + storage.len(),
+                    10,
+                    "{on} {off}: {upstream:?} {storage:?}"
+                );
+            }
+        }
+    }
+
+    /// A chain that leaves the upstream's origin and comes back to it goes on without the
+    /// credential: the hop back is asked on behalf of the storage host's answer.
+    #[tokio::test]
+    async fn a_hop_back_to_the_origin_goes_without_the_credential() {
+        for (uri, file) in [
+            ("/npm/pkg/-/pkg-1.0.0.tgz", TARBALL),
+            ("/npm/@vendor/pkg/-/@vendor/pkg-1.0.0.tgz", SCOPED),
+        ] {
+            let storage = MockServer::start().await;
+            let upstream = registry(|_| redirect(&format!("{}/a", storage.uri()))).await;
+            Mock::given(method("GET"))
+                .and(path("/a"))
+                .respond_with(redirect(&format!("{}/back", upstream.uri())))
+                .mount(&storage)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/back"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"BACK-TGZ".to_vec()))
+                .mount(&upstream)
+                .await;
+            let ctx = context(&with_userinfo(&upstream), &upstream.uri());
+            let (status, body) = get(&ctx, uri).await;
+            assert_eq!(
+                (status, body.as_slice()),
+                (StatusCode::OK, b"BACK-TGZ".as_slice()),
+                "{uri}"
+            );
+            let hops: Vec<_> = asked(&upstream)
+                .await
+                .into_iter()
+                .filter(|(p, _)| p == file || p == "/back")
+                .collect();
+            assert_eq!(
+                hops,
+                vec![(file.to_string(), true), ("/back".to_string(), false)],
+                "{uri}"
+            );
+        }
+    }
+
+    /// An upstream that has no packument for the package lists no version of it: the tarball
+    /// is not asked for, 404, nothing cached.
+    #[tokio::test]
+    async fn a_package_without_a_packument_upstream_is_not_asked_for_a_tarball() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/-/pkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UNLISTED".to_vec()))
+            .mount(&upstream)
+            .await;
+        let ctx = context(&upstream.uri(), &open_server().await.uri());
+        let (status, _) = get(&ctx, "/npm/pkg/-/pkg-1.0.0.tgz").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(asks_of(&upstream, "/pkg/-/pkg-1.0.0.tgz").await, 0);
+        assert!(cached_tarballs(&ctx).await.is_empty());
+    }
+}
+
+/// An upstream bound to a scope answers that scope's metadata from its own origin only: a
+/// redirect off it is not followed — 502, nothing asked of the other origin, nothing cached —
+/// for a packument, a version manifest, any other metadata path and the packument a tarball
+/// download reads. The default upstream follows redirects as before.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod scoped_metadata_origin {
+    use crate::config::{NpmConfig, NpmProxyEntry};
+    use crate::secrets::ProtectedString;
+    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A server that sends every request to `to` + its path.
+    async fn redirecting(to: &str) -> MockServer {
+        let server = MockServer::start().await;
+        let to = to.to_string();
+        Mock::given(any())
+            .respond_with(move |req: &wiremock::Request| {
+                ResponseTemplate::new(302)
+                    .insert_header("location", format!("{to}{}", req.url.path()).as_str())
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// A server that answers anything with a packument listing `@vendor/pkg@1.0.0` and `pkg`'s.
+    async fn elsewhere() -> MockServer {
+        let server = MockServer::start().await;
+        let doc = |name: &str| {
+            serde_json::json!({
+                "name": name,
+                "versions": {"1.0.0": {"name": name, "version": "1.0.0", "dist": {}}},
+                "dist-tags": {"latest": "1.0.0"},
+            })
+        };
+        Mock::given(any())
+            .respond_with(move |req: &wiremock::Request| {
+                let name = if req.url.path().contains("@vendor") {
+                    "@vendor/pkg"
+                } else {
+                    "pkg"
+                };
+                ResponseTemplate::new(200).set_body_json(doc(name))
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn context(public: &str, private: &str) -> TestContext {
+        let mut npm: NpmConfig = toml::from_str(&format!(
+            r#"proxies = ["{public}", {{ url = "{private}", scopes = ["@vendor"], auth_bearer_env = "NORA_NPM_VENDOR_TOKEN" }}]"#
+        ))
+        .unwrap();
+        if let NpmProxyEntry::Full(p) = &mut npm.proxies[1] {
+            p.auth_bearer = Some(ProtectedString::from("vendor-tok"));
+        }
+        let proxies = npm.proxies;
+        create_test_context_with_config(move |cfg| {
+            cfg.npm.proxies = proxies;
+            cfg.server.trust_upstream_dates = true;
+        })
+    }
+
+    #[tokio::test]
+    async fn a_scoped_upstream_redirecting_metadata_elsewhere_is_502() {
+        let foreign = elsewhere().await;
+        let private = redirecting(&foreign.uri()).await;
+        let public = MockServer::start().await;
+        let ctx = context(&public.uri(), &private.uri());
+        let mut wrong = Vec::new();
+        for (uri, expected) in [
+            ("/npm/@vendor%2fpkg", StatusCode::BAD_GATEWAY),
+            ("/npm/@vendor/pkg", StatusCode::BAD_GATEWAY),
+            ("/npm/@vendor/pkg/1.0.0", StatusCode::BAD_GATEWAY),
+            ("/npm/@vendor/pkg/a/b", StatusCode::BAD_GATEWAY),
+            (
+                "/npm/-/package/@vendor/pkg/dist-tags",
+                StatusCode::BAD_GATEWAY,
+            ),
+            ("/npm/@vendor/pkg/-/pkg-1.0.0.tgz", StatusCode::BAD_GATEWAY),
+        ] {
+            let status = send(&ctx.app, Method::GET, uri, "").await.status();
+            if status != expected {
+                wrong.push(format!("{uri}: {status}, expected {expected}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        let asked = foreign.received_requests().await.unwrap();
+        assert!(asked.is_empty(), "the other origin was asked: {asked:?}");
+        assert!(public.received_requests().await.unwrap().is_empty());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let written = ctx.state.storage.list("npm/").await.unwrap();
+        assert!(written.is_empty(), "cached: {written:?}");
+    }
+
+    /// A scoped upstream that answers its packument after `hops` redirects on its own origin
+    /// (`/hop/1/…`, `/hop/2/…`, …).
+    async fn walking(hops: usize) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(move |req: &wiremock::Request| {
+                let p = req.url.path();
+                let (n, rest) = match p.strip_prefix("/hop/").and_then(|r| r.split_once('/')) {
+                    Some((n, rest)) => (n.parse::<usize>().unwrap(), format!("/{rest}")),
+                    None => (0, p.to_string()),
+                };
+                if n < hops {
+                    ResponseTemplate::new(302)
+                        .insert_header("location", format!("/hop/{}{rest}", n + 1).as_str())
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "name": "@vendor/pkg",
+                        "versions": {"1.0.0": {"name": "@vendor/pkg", "version": "1.0.0", "dist": {}}},
+                        "dist-tags": {"latest": "1.0.0"},
+                    }))
+                }
+            })
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// On its own origin a scoped upstream's metadata follows ten redirects, each with the
+    /// token, and the eleventh is 502.
+    #[tokio::test]
+    async fn a_scoped_upstreams_metadata_follows_ten_redirects_on_its_origin() {
+        for (hops, expected) in [(10, StatusCode::OK), (11, StatusCode::BAD_GATEWAY)] {
+            let private = walking(hops).await;
+            let public = MockServer::start().await;
+            let ctx = context(&public.uri(), &private.uri());
+            let status = send(&ctx.app, Method::GET, "/npm/@vendor/pkg", "")
+                .await
+                .status();
+            assert_eq!(status, expected, "{hops} redirects");
+            let asked = private.received_requests().await.unwrap();
+            assert!(
+                asked
+                    .iter()
+                    .all(|r| r.headers.contains_key("authorization")),
+                "{asked:?}"
+            );
+            if expected == StatusCode::OK {
+                assert_eq!(asked.len(), hops + 1, "{asked:?}");
+            }
+        }
+    }
+
+    /// Control: the default upstream's redirect is followed, as before.
+    #[tokio::test]
+    async fn the_default_upstream_still_follows_a_redirect() {
+        let foreign = elsewhere().await;
+        let public = redirecting(&foreign.uri()).await;
+        let private = MockServer::start().await;
+        let ctx = context(&public.uri(), &private.uri());
+        let status = send(&ctx.app, Method::GET, "/npm/pkg", "").await.status();
+        assert_eq!(status, StatusCode::OK);
+        assert!(!foreign.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The audit endpoints name no scope, so they go to the default upstream — never one bound
+    /// to a scope, whose redirects are not followed.
+    #[test]
+    fn the_audit_endpoints_go_to_the_default_upstream() {
+        let ctx = context("https://registry.example", "https://vendor.example");
+        for path in [
+            "-/npm/v1/security/advisories/bulk",
+            "-/npm/v1/security/audits/quick",
+            "-/npm/v1/security/audits",
+        ] {
+            let upstream = ctx.state.config.npm.route(path).unwrap();
+            assert_eq!(upstream.url, "https://registry.example", "{path}");
+            assert!(!upstream.scoped, "{path}");
+        }
+        assert!(ctx.state.config.npm.route("@vendor/pkg").unwrap().scoped);
+    }
+}
+
+/// `trust_upstream_dates` decides whose clock judges an upstream release: trusted, a direct
+/// tarball download reads the date in the upstream's packument, which it caches first (#748) so
+/// the date is there on the same request; untrusted, the date is NORA's own (when NORA cached
+/// the packument), never the upstream's, and a download does not fetch the packument for a date.
+/// Judged by the min-release-age verdict on the first download of a version.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod upstream_dates_gate {
+    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// An upstream listing `agepkg` 1.0.0, released in 2020, and 2.0.0, released an hour ago.
+    async fn upstream() -> MockServer {
+        let server = MockServer::start().await;
+        let fresh = (chrono::Utc::now() - chrono::Duration::hours(1))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let link = |v: &str| format!("{}/agepkg/-/agepkg-{v}.tgz", server.uri());
+        let doc = serde_json::json!({
+            "name": "agepkg",
+            "versions": {
+                "1.0.0": {"name": "agepkg", "version": "1.0.0", "dist": {"tarball": link("1.0.0")}},
+                "2.0.0": {"name": "agepkg", "version": "2.0.0", "dist": {"tarball": link("2.0.0")}},
+            },
+            "time": {"1.0.0": "2020-01-15T10:30:00.000Z", "2.0.0": fresh},
+            "dist-tags": {"latest": "2.0.0"},
+        });
+        Mock::given(method("GET"))
+            .and(path("/agepkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(doc))
+            .mount(&server)
+            .await;
+        for v in ["1.0.0", "2.0.0"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/agepkg/-/agepkg-{v}.tgz")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec()))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    /// What NORA holds of the package before its first tarball download.
+    #[derive(Clone, Copy, Debug)]
+    enum Before {
+        Nothing,
+        /// A client read the packument.
+        Packument,
+        /// A packument an older release cached.
+        OlderCopy,
+    }
+
+    fn context(server: &MockServer, trust: bool) -> TestContext {
+        let uri = server.uri();
+        create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = trust;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        })
+    }
+
+    #[tokio::test]
+    async fn whose_clock_judges_a_release_follows_the_trust_in_upstream_dates() {
+        let mut wrong = Vec::new();
+        // (trust, what NORA holds before the download, version, verdict, why)
+        for (trust, before, version, expected, why) in [
+            (
+                true,
+                Before::Nothing,
+                "1.0.0",
+                StatusCode::OK,
+                "upstream says 2020",
+            ),
+            (
+                true,
+                Before::Nothing,
+                "2.0.0",
+                StatusCode::FORBIDDEN,
+                "upstream says an hour ago",
+            ),
+            (
+                true,
+                Before::Packument,
+                "1.0.0",
+                StatusCode::OK,
+                "upstream says 2020, cached",
+            ),
+            (
+                false,
+                Before::Nothing,
+                "2.0.0",
+                StatusCode::OK,
+                "no date of NORA's own yet",
+            ),
+            (
+                false,
+                Before::Packument,
+                "1.0.0",
+                StatusCode::FORBIDDEN,
+                "NORA first saw it now",
+            ),
+            (
+                false,
+                Before::OlderCopy,
+                "1.0.0",
+                StatusCode::FORBIDDEN,
+                "NORA wrote that copy now",
+            ),
+        ] {
+            let server = upstream().await;
+            let ctx = context(&server, trust);
+            match before {
+                Before::Nothing => {}
+                Before::Packument => {
+                    let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+                    assert_eq!(resp.status(), StatusCode::OK);
+                }
+                // What an older release cached, with the upstream's dates and no first-seen
+                // ledger: a release is as old as NORA's copy, not as the upstream says.
+                Before::OlderCopy => {
+                    let doc = serde_json::json!({
+                        "name": "agepkg",
+                        "versions": {"1.0.0": {"name": "agepkg", "version": "1.0.0", "dist": {}}},
+                        "time": {"1.0.0": "2020-01-15T10:30:00.000Z"},
+                    });
+                    ctx.state
+                        .storage
+                        .put(
+                            "npm/agepkg/metadata.json",
+                            &serde_json::to_vec(&doc).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+            let uri = format!("/npm/agepkg/-/agepkg-{version}.tgz");
+            let status = send(&ctx.app, Method::GET, &uri, "").await.status();
+            if status != expected {
+                wrong.push(format!(
+                    "trust {trust}, {before:?}, {version}: {status}, expected {expected} ({why})"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

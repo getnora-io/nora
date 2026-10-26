@@ -20,6 +20,7 @@ disallowed-methods = [
   { path = "nora::storage::Storage::repin", reason = "the UI is read-only browse" },
   { path = "nora::storage::Storage::prepare", reason = "the UI is read-only browse" },
   { path = "nora::storage::Storage::health_check", reason = "the UI is read-only browse" },
+  { path = "nora::storage::Storage::refresh_reachability", reason = "the UI is read-only browse" },
   { path = "nora::storage::Storage::refresh_total_size_cache", reason = "the UI is read-only browse" },
   { path = "nora::storage::Storage::new_local", reason = "the UI is read-only browse" },
   { path = "nora::storage::Storage::new_s3", reason = "the UI is read-only browse" },

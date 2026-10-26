@@ -89,6 +89,22 @@ with `registry=~"pypi(:.*)?"`, not `registry="pypi"`.
 | `nora_gc_last_run_timestamp` | gauge | — | Unix timestamp of last GC run |
 | `nora_gc_metadata_phantoms_total` | counter | — | Metadata entries without corresponding blobs |
 
+### Background tasks
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `nora_task_panics_total` | counter | task | Panics of a long-lived background task: `maintenance` (session expiry, storage reachability), `token_flush` (token `last_used` to disk), `storage_size` (the store's size and the per-registry gauges), `pull_stats`, `cleanup` (GC and retention), `sighup` (curation reload), `audit` (audit writer). Each one is logged as `background task panicked` with the task's name. A task is restarted after a backoff; one that keeps panicking, or a maintenance loop that has not finished a tick for `server.maintenance_stall_secs`, makes `/health` answer 503 with `failing_task`. `token_flush` and `storage_size` are started by the maintenance loop, one run at a time; a panic ends only that run, and the next tick starts another. A panic of `audit` ends the process (exit 70): NORA does not serve without its audit trail. Any increase is a bug |
+| `nora_maintenance_timeouts_total` | counter | — | Maintenance ticks cut at their deadline, a third of what `server.maintenance_stall_secs` leaves after one 30 s tick (90 s by default), because the storage did not answer its reachability request (the first page of a listing on an object store, a write probe on the local disk) in time; each one is logged as `maintenance tick cut at its deadline`. The loop goes on, so this does not fail `/health`: whether the storage answers is `/ready`'s business, and a restart would not fix it. The size of the store is counted apart from the tick, so a large bucket does not cut ticks |
+
+### Health probes
+
+`/health` and `/ready` do no storage I/O, on either backend. They serve the verdict the maintenance loop took on its last 30 s tick: one request for the first page of a listing on an object store, a write probe on the local disk (create, write, fsync and remove a file in the storage directory).
+
+- A read-only remount or a full disk turns `/ready` to 503 at the next tick, within one tick period (30 s) of the change. `/health` stays 200.
+- A disk or bucket that stops answering leaves the tick's request waiting: the tick is cut at its deadline (`nora_maintenance_timeouts_total`), and `/ready` turns 503 at the next tick. On the local disk, a probe still waiting is not started again. `/health` stays 200.
+- A verdict older than 150 s (five ticks) counts as unreachable, so a maintenance loop that stops probing un-readies the instance too. Until the first tick has run, right after start, `/ready` answers 503.
+- `storage.total_size_bytes` on `/health` and `nora_storage_bytes{registry="total"}` are the size the `storage_size` task last counted, every second tick (60 s). The count walks the whole store, so on a large store it lags behind writes.
+
 ## Grafana Dashboard
 
 The included dashboard (`dist/grafana-dashboard.json`) provides:
@@ -155,6 +171,13 @@ groups:
         labels: { severity: critical }
         annotations:
           summary: "NORA refusing to serve an artifact (hash-pin integrity failure)"
+
+      - alert: NoraTaskPanic
+        expr: increase(nora_task_panics_total[15m]) > 0
+        for: 0m
+        labels: { severity: warning }
+        annotations:
+          summary: "A NORA background task panicked and was restarted"
 ```
 
 A ready-to-load version of these rules ships at [`deploy/prometheus-rules.yml`](deploy/prometheus-rules.yml); point Prometheus at it via `rule_files:`.

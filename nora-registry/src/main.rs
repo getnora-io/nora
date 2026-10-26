@@ -44,6 +44,8 @@ mod curation;
 mod dashboard_metrics;
 mod digest_quarantine;
 mod docker_key_migration;
+#[cfg(feature = "fault-injection")]
+mod fault_injection;
 mod gc;
 mod hash_pin_store;
 mod health;
@@ -61,8 +63,10 @@ mod repo_index;
 mod request_id;
 mod retention;
 mod secrets;
+mod server_conn;
 mod signing;
 mod storage;
+mod supervise;
 mod tokens;
 mod ui;
 mod validation;
@@ -75,13 +79,12 @@ mod test_helpers;
 use arc_swap::ArcSwap;
 use axum::{body::Bytes, extract::DefaultBodyLimit, http::HeaderValue, middleware, Router};
 use clap::{Parser, Subcommand};
-use log_redact::RedactUserinfo;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::signal;
 use tracing::{error, info, warn};
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{prelude::*, EnvFilter};
 
 use activity_log::ActivityLog;
 use audit::AuditLog;
@@ -91,6 +94,7 @@ use dashboard_metrics::DashboardMetrics;
 use registry_type::RegistryType;
 use repo_index::RepoIndex;
 use secrets::{expose_opt, ProtectedString};
+use server_conn::ConnLimits;
 pub use storage::Storage;
 use tokens::TokenStore;
 
@@ -390,6 +394,9 @@ pub struct AppState {
     /// The same client, except that it never follows a redirect: for a format whose answer
     /// depends on what each hop said (hf: the commit rides on the Hub's redirect).
     pub http_client_no_redirect: reqwest::Client,
+    /// The same client, except that it follows a redirect only on the origin of the URL asked
+    /// (npm tarballs: a private package's name goes to no other host).
+    pub http_client_same_origin: reqwest::Client,
     /// Canonical repo ids the Hugging Face upstream named, for curation of aliases (#579).
     pub hf_canonical_ids: Arc<registry::hf::CanonicalIds>,
     pub upload_sessions: Arc<RwLock<HashMap<String, registry::docker::UploadSession>>>,
@@ -421,6 +428,10 @@ pub struct AppState {
     /// to a `.stats.json` sidecar, so `.meta.json` is never rewritten by a pull.
     /// In-memory, rebuildable-empty after a restart.
     pub(crate) pull_stats: Arc<registry::docker::PullStatsAccumulator>,
+    /// The supervisor of the long-lived background tasks; `/health` asks it (supervise.rs).
+    pub(crate) tasks: Arc<supervise::Supervisor>,
+    /// The maintenance loop's heartbeat, which `tasks` reads.
+    pub(crate) maintenance: Arc<supervise::Heartbeat>,
 }
 
 impl AppState {
@@ -590,6 +601,35 @@ pub(crate) fn build_no_redirect_client(tls: &TlsConfig) -> reqwest::Client {
     build_http_client(tls, None, false, reqwest::redirect::Policy::none())
 }
 
+/// The client that follows a redirect only on the origin (scheme, host and port) of the URL
+/// asked, up to reqwest's default ten hops, for a format whose upstream names a private package
+/// in the path: a hop to another origin is handed back unfollowed, so that name and the request
+/// go to no host NORA was not given. Built by [`build_http_client`], here for the test context
+/// too.
+pub(crate) fn build_same_origin_client(tls: &TlsConfig) -> reqwest::Client {
+    build_http_client(tls, None, false, same_origin_redirects())
+}
+
+/// Each redirect is decided by [`nora_registry::npm_links::next_hop`]: one the credential may go
+/// along is followed, one off the origin is handed back, and past the tenth the request fails.
+pub(crate) fn same_origin_redirects() -> reqwest::redirect::Policy {
+    use nora_registry::npm_links::{self, Hop};
+    reqwest::redirect::Policy::custom(|attempt| {
+        // The previous URLs are the one asked, first, and every hop followed since: the
+        // redirect being decided is the `len()`-th.
+        let previous = attempt.previous();
+        let Some(asked) = previous.first() else {
+            return attempt.stop();
+        };
+        let left_origin = previous.iter().any(|u| !npm_links::same_origin(asked, u));
+        match npm_links::next_hop(previous.len(), asked, left_origin, attempt.url()) {
+            Hop::WithCredential => attempt.follow(),
+            Hop::WithoutCredential => attempt.stop(),
+            Hop::Refuse => attempt.error("redirect not followed"),
+        }
+    })
+}
+
 /// Build the `/health` probe URL from the configured listen host. Wildcard
 /// binds are probed over loopback — you cannot connect *to* `0.0.0.0` / `::`.
 /// Both wildcards probe `127.0.0.1`: a `::` server is dual-stack (or falls back
@@ -702,6 +742,628 @@ pub(crate) fn request_layers(router: Router<AppState>, state: &AppState) -> Rout
             state.clone(),
             auth::auth_middleware,
         ))
+        // Outermost of these, so a panic in auth, a middleware or a handler answers 500
+        // (counted by the metrics layer outside) and the panic message goes to the log only.
+        .layer(tower_http::catch_panic::CatchPanicLayer::new())
+}
+
+#[cfg(test)]
+mod panic_strategy_tests {
+    //! The shipped build unwinds: under `panic = "abort"` every `catch_unwind` guard
+    //! and the panic layer are dead code, and one panic ends the only replica. Tests always
+    //! build with unwind, whatever the profile says, so this reads the build inputs instead:
+    //! the Cargo manifests and the files that run a release build.
+    use std::path::{Path, PathBuf};
+
+    /// Lines of a build file that select the abort strategy: a profile key, a
+    /// `CARGO_PROFILE_*_PANIC` variable, `--config profile.*.panic` or `-C panic`. Compared
+    /// without whitespace, quotes or case, so each spelling of one setting is one form.
+    fn abort_switches(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .map(|line| {
+                line.chars()
+                    .filter(|c| !c.is_whitespace() && *c != '"' && *c != '\'')
+                    .collect::<String>()
+                    .to_ascii_lowercase()
+            })
+            .filter(|line| line.contains("panic=abort") || line.contains("panic:abort"))
+            .collect()
+    }
+
+    /// The manifests, Cargo configs, Dockerfiles, workflows and Makefile of the workspace.
+    fn build_inputs(root: &Path) -> Vec<PathBuf> {
+        let mut files = vec![
+            root.join("Cargo.toml"),
+            root.join("nora-registry/Cargo.toml"),
+            root.join(".cargo/config.toml"),
+            root.join(".cargo/config"),
+            root.join("Makefile"),
+        ];
+        for dir in [root.to_path_buf(), root.join(".github/workflows")] {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.starts_with("Dockerfile")
+                    || name.ends_with(".yml")
+                    || name.ends_with(".yaml")
+                {
+                    files.push(entry.path());
+                }
+            }
+        }
+        files.into_iter().filter(|f| f.is_file()).collect()
+    }
+
+    #[test]
+    fn no_build_input_selects_panic_abort() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let inputs = build_inputs(root);
+        assert!(
+            inputs.iter().any(|f| f.ends_with("Dockerfile")),
+            "the release Dockerfile is among the inputs read"
+        );
+        for file in inputs {
+            let found = abort_switches(&std::fs::read_to_string(&file).unwrap());
+            assert!(found.is_empty(), "{}: {found:?}", file.display());
+        }
+    }
+
+    /// The features `name` turns on through the manifest's `[features]`, itself included;
+    /// `dep:` and `crate/feature` entries are kept as they are written.
+    fn feature_closure(features: &toml::Table, name: &str) -> std::collections::BTreeSet<String> {
+        let mut on = std::collections::BTreeSet::new();
+        let mut next = vec![name.to_owned()];
+        while let Some(feature) = next.pop() {
+            if !on.insert(feature.clone()) {
+                continue;
+            }
+            if let Some(enables) = features.get(&feature).and_then(|f| f.as_array()) {
+                next.extend(enables.iter().filter_map(|f| f.as_str()).map(str::to_owned));
+            }
+        }
+        on
+    }
+
+    /// Lines of the build inputs that may pass `--all-features`: cargo-deny's check, which
+    /// builds nothing.
+    const ALL_FEATURES_ALLOWED: &[(&str, &str)] =
+        &[(".github/workflows/ci.yml", "arguments: --all-features")];
+
+    /// The `/__fi/` panic routes are in no shipped build: neither the default features nor any
+    /// other feature turn it on, however indirectly; no build file names it, and none builds
+    /// with `--all-features`.
+    #[test]
+    fn no_shipped_build_enables_fault_injection() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let manifest = root.join("nora-registry/Cargo.toml");
+        let doc: toml::Table = std::fs::read_to_string(&manifest).unwrap().parse().unwrap();
+        let features = doc["features"].as_table().unwrap();
+        assert!(features.contains_key("fault-injection"));
+        assert!(features.contains_key("default"));
+        for name in features.keys().filter(|name| *name != "fault-injection") {
+            let on = feature_closure(features, name);
+            assert!(
+                !on.iter().any(|f| f.contains("fault-injection")),
+                "feature {name} turns on {on:?}"
+            );
+        }
+        for file in build_inputs(root).into_iter().filter(|f| *f != manifest) {
+            let text = std::fs::read_to_string(&file).unwrap();
+            assert!(!text.contains("fault-injection"), "{}", file.display());
+            let relative = file
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            for line in text.lines().filter(|line| line.contains("--all-features")) {
+                assert!(
+                    ALL_FEATURES_ALLOWED.contains(&(relative.as_str(), line.trim())),
+                    "{relative}: {line}"
+                );
+            }
+        }
+    }
+
+    /// The manifest's features, exactly: one added, or one turning another on, is read here
+    /// first.
+    const FEATURES: &[(&str, &[&str])] = &[
+        ("default", &["mimalloc"]),
+        ("mimalloc", &["dep:mimalloc"]),
+        ("demo", &[]),
+        ("fault-injection", &[]),
+    ];
+
+    /// The tables of the crate's manifest. Not among them: `cargo-features` (a profile's
+    /// `rustflags` could pass `--cfg`), and in `[package]` neither `build` nor `links`.
+    const CRATE_TABLES: &[&str] = &[
+        "package",
+        "lib",
+        "bin",
+        "dependencies",
+        "target",
+        "dev-dependencies",
+        "bench",
+        "lints",
+        "features",
+    ];
+    const PACKAGE_KEYS: &[&str] = &[
+        "name",
+        "version",
+        "edition",
+        "license",
+        "authors",
+        "repository",
+        "homepage",
+        "description",
+        "keywords",
+        "categories",
+        "metadata",
+    ];
+
+    /// The tables of the workspace manifest and the keys of its profiles: no `rustflags`.
+    const WORKSPACE_TABLES: &[&str] = &["workspace", "profile"];
+    const PROFILE_KEYS: &[&str] = &[
+        "inherits",
+        "debug",
+        "strip",
+        "codegen-units",
+        "panic",
+        "lto",
+    ];
+
+    /// The directories of the repository, but build output, git's and npm's.
+    fn repository_dirs(dir: &Path, out: &mut Vec<PathBuf>) {
+        out.push(dir.to_path_buf());
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let name = entry.file_name();
+            if entry.path().is_dir()
+                && !["target", ".git", "node_modules"].contains(&&*name.to_string_lossy())
+            {
+                repository_dirs(&entry.path(), out);
+            }
+        }
+    }
+
+    /// What can turn a feature on without `--features` is held to the forms listed here, and
+    /// anything else fails: no package of the workspace has a build script (`build.rs`, or
+    /// `package.build`), which could print `cargo:rustc-cfg=feature="…"`; no directory of the
+    /// repository has a Cargo config (`.cargo/`), whose `rustflags` or `[env]` would reach every
+    /// build run under it; the features are [`FEATURES`]; the manifests hold only the listed
+    /// tables and profile keys.
+    #[test]
+    fn the_build_inputs_are_the_listed_ones() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let read = |file: PathBuf| -> toml::Table {
+            std::fs::read_to_string(&file).unwrap().parse().unwrap()
+        };
+        let workspace = read(root.join("Cargo.toml"));
+        let members = workspace["workspace"]["members"].as_array().unwrap();
+        assert!(members.len() >= 2, "{members:?}");
+        for member in members {
+            let dir = root.join(member.as_str().unwrap());
+            assert!(
+                !dir.join("build.rs").exists(),
+                "{}: build.rs",
+                dir.display()
+            );
+            let manifest = read(dir.join("Cargo.toml"));
+            for key in ["build", "links"] {
+                assert!(
+                    manifest["package"].get(key).is_none(),
+                    "{}: package.{key}",
+                    dir.display()
+                );
+            }
+        }
+        let mut dirs = Vec::new();
+        repository_dirs(root, &mut dirs);
+        assert!(dirs.contains(&root.join("nora-registry/src")));
+        for dir in dirs {
+            assert!(!dir.join(".cargo").exists(), "{}/.cargo", dir.display());
+        }
+
+        let manifest = read(root.join("nora-registry/Cargo.toml"));
+        let features: Vec<(String, Vec<String>)> = manifest["features"]
+            .as_table()
+            .unwrap()
+            .iter()
+            .map(|(name, on)| {
+                let on = on.as_array().unwrap().iter();
+                (
+                    name.clone(),
+                    on.map(|f| f.as_str().unwrap().to_owned()).collect(),
+                )
+            })
+            .collect();
+        let listed: Vec<(String, Vec<String>)> = FEATURES
+            .iter()
+            .map(|(name, on)| (name.to_string(), on.iter().map(|f| f.to_string()).collect()))
+            .collect();
+        let sorted = |mut v: Vec<(String, Vec<String>)>| {
+            v.sort();
+            v
+        };
+        assert_eq!(sorted(features), sorted(listed));
+        for table in manifest.keys() {
+            assert!(
+                CRATE_TABLES.contains(&table.as_str()),
+                "nora-registry: [{table}]"
+            );
+        }
+        for key in manifest["package"].as_table().unwrap().keys() {
+            assert!(
+                PACKAGE_KEYS.contains(&key.as_str()),
+                "nora-registry: package.{key}"
+            );
+        }
+        for table in workspace.keys() {
+            assert!(
+                WORKSPACE_TABLES.contains(&table.as_str()),
+                "workspace: [{table}]"
+            );
+        }
+        for (profile, keys) in workspace["profile"].as_table().unwrap() {
+            for key in keys.as_table().unwrap().keys() {
+                assert!(
+                    PROFILE_KEYS.contains(&key.as_str()),
+                    "profile.{profile}.{key}"
+                );
+            }
+        }
+    }
+
+    /// `--all-features` is found in each build file it can appear in, the release Dockerfile
+    /// first; the allowed line is the one cargo-deny runs.
+    #[test]
+    fn the_build_files_read_include_the_dockerfile_and_ci() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let inputs = build_inputs(root);
+        for (file, line) in ALL_FEATURES_ALLOWED {
+            let text = std::fs::read_to_string(root.join(file)).unwrap();
+            assert!(text.lines().any(|l| l.trim() == *line), "{file}: {line}");
+            assert!(inputs.contains(&root.join(file)), "{file}");
+        }
+        assert!(inputs.contains(&root.join("Dockerfile")));
+        assert!(inputs.contains(&root.join(".github/workflows/release.yml")));
+    }
+
+    /// The `cfg` predicates the sources may use, without whitespace. Each decides what a build
+    /// compiles; one that is not here — an `any(…)` that the default `mimalloc` would satisfy,
+    /// say — is read before it is added.
+    const CFG_PREDICATES: &[&str] = &[
+        "test",
+        "not(test)",
+        "unix",
+        "not(unix)",
+        r#"target_os="linux""#,
+        r#"not(target_os="linux")"#,
+        "kani",
+        r#"feature="mimalloc""#,
+        r#"feature="demo""#,
+        r#"not(feature="demo")"#,
+        r#"feature="fault-injection""#,
+        r#"not(feature="fault-injection")"#,
+    ];
+
+    /// The attributes a `cfg_attr` of the sources may apply: lint levels.
+    const CFG_ATTR_APPLIES: &[&str] = &["allow(", "deny(", "warn(", "expect("];
+
+    /// The macros that may name the fault-injection feature or module: the warning a
+    /// fault-injection build logs at start.
+    const NAMES_FAULT_INJECTION: &[&str] = &["warn"];
+
+    /// What decides whether code of a source file is compiled, outside the items under
+    /// `#[cfg(test)]` (in no shipped build): each `cfg` predicate, each `cfg_attr`, each
+    /// `#[path]` and `include!`, each declaration of the fault-injection module and each
+    /// macro naming it. Read with syn, so a form split over lines or written in another
+    /// spacing is the same form.
+    #[derive(Default)]
+    struct CompiledWhen {
+        /// The `cfg` predicates, `cfg_attr` conditions and `cfg!` arguments, without whitespace.
+        predicates: Vec<String>,
+        /// What a `cfg_attr` applies, without whitespace.
+        applied: Vec<String>,
+        /// `#[path]` attributes, `include!` macros and the other macros naming the feature.
+        refused: Vec<String>,
+        /// The `cfg` predicates of each `mod fault_injection`.
+        modules: Vec<Vec<String>>,
+    }
+
+    fn compact(tokens: &impl ToString) -> String {
+        tokens.to_string().split_whitespace().collect()
+    }
+
+    fn names_fault_injection(text: &str) -> bool {
+        text.contains("fault-injection") || text.contains("fault_injection")
+    }
+
+    impl CompiledWhen {
+        /// The `cfg` predicates of `attrs`, and whether one of them is exactly `test`.
+        fn cfgs(attrs: &[syn::Attribute]) -> (Vec<String>, bool) {
+            let cfgs: Vec<String> = attrs
+                .iter()
+                .filter(|a| a.path().is_ident("cfg"))
+                .map(|a| match &a.meta {
+                    syn::Meta::List(list) => compact(&list.tokens),
+                    _ => "cfg without a predicate".to_owned(),
+                })
+                .collect();
+            let test = cfgs.iter().any(|c| c == "test");
+            (cfgs, test)
+        }
+
+        fn read(text: &str) -> Self {
+            let file = syn::parse_file(text).unwrap();
+            let mut found = Self::default();
+            if !Self::cfgs(&file.attrs).1 {
+                syn::visit::Visit::visit_file(&mut found, &file);
+            }
+            found
+        }
+    }
+
+    impl<'ast> syn::visit::Visit<'ast> for CompiledWhen {
+        fn visit_item(&mut self, item: &'ast syn::Item) {
+            let attrs = match item {
+                syn::Item::Mod(m) => &m.attrs,
+                syn::Item::Fn(f) => &f.attrs,
+                syn::Item::Impl(i) => &i.attrs,
+                syn::Item::Use(u) => &u.attrs,
+                syn::Item::Const(c) => &c.attrs,
+                syn::Item::Static(s) => &s.attrs,
+                syn::Item::Struct(s) => &s.attrs,
+                syn::Item::Enum(e) => &e.attrs,
+                syn::Item::Macro(m) => &m.attrs,
+                syn::Item::Trait(t) => &t.attrs,
+                syn::Item::Type(t) => &t.attrs,
+                _ => {
+                    syn::visit::visit_item(self, item);
+                    return;
+                }
+            };
+            let (cfgs, test) = Self::cfgs(attrs);
+            if test {
+                return;
+            }
+            if let syn::Item::Mod(m) = item {
+                if names_fault_injection(&m.ident.to_string()) {
+                    self.modules.push(cfgs);
+                }
+            }
+            syn::visit::visit_item(self, item);
+        }
+
+        fn visit_impl_item(&mut self, item: &'ast syn::ImplItem) {
+            if let syn::ImplItem::Fn(f) = item {
+                if Self::cfgs(&f.attrs).1 {
+                    return;
+                }
+            }
+            syn::visit::visit_impl_item(self, item);
+        }
+
+        fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+            let path = attr.path();
+            if path.is_ident("path") {
+                self.refused.push("#[path]".to_owned());
+            }
+            let syn::Meta::List(list) = &attr.meta else {
+                return;
+            };
+            if path.is_ident("cfg") {
+                self.predicates.push(compact(&list.tokens));
+            } else if path.is_ident("cfg_attr") {
+                let all = compact(&list.tokens);
+                let (predicate, applied) = all.split_once(',').unwrap_or((&all, ""));
+                self.predicates.push(predicate.to_owned());
+                self.applied.push(applied.to_owned());
+            }
+        }
+
+        fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+            let name = mac
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            let tokens = compact(&mac.tokens);
+            if name == "cfg" {
+                self.predicates.push(tokens);
+            } else if name == "include" {
+                self.refused.push(format!("include!({tokens})"));
+            } else if names_fault_injection(&tokens)
+                && !NAMES_FAULT_INJECTION.contains(&name.as_str())
+            {
+                self.refused.push(format!("{name}!({tokens})"));
+            }
+        }
+    }
+
+    /// The source files of the crate, but the fault-injection module's own: it is what the
+    /// feature compiles.
+    fn crate_sources() -> Vec<PathBuf> {
+        fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        walk(&src, &mut files);
+        files.retain(|f| *f != src.join("fault_injection.rs"));
+        files
+    }
+
+    /// The fault-injection module is compiled only under its own feature: it is declared once,
+    /// under exactly `#[cfg(feature = "fault-injection")]`; no `#[path]` or `include!` brings
+    /// its file in under another name; every `cfg` of the sources is one of
+    /// [`CFG_PREDICATES`], so no `any(…)` lets another feature compile it; a `cfg_attr`
+    /// applies lint levels only; and no macro but the start warning names it. Anything else
+    /// that uses the module then fails to compile in the default build.
+    #[test]
+    fn fault_injection_is_compiled_only_under_its_own_feature() {
+        let mut modules = Vec::new();
+        for file in crate_sources() {
+            let found = CompiledWhen::read(&std::fs::read_to_string(&file).unwrap());
+            let place = file.display();
+            for predicate in &found.predicates {
+                assert!(
+                    CFG_PREDICATES.contains(&predicate.as_str()),
+                    "{place}: cfg({predicate})"
+                );
+            }
+            for applied in &found.applied {
+                assert!(
+                    CFG_ATTR_APPLIES.iter().any(|a| applied.starts_with(a)),
+                    "{place}: cfg_attr(…, {applied})"
+                );
+            }
+            assert!(found.refused.is_empty(), "{place}: {:?}", found.refused);
+            modules.extend(found.modules);
+        }
+        assert_eq!(
+            modules,
+            [vec![r#"feature="fault-injection""#.to_owned()]],
+            "the module is declared once, under its feature alone"
+        );
+    }
+
+    /// Each way a source could compile the module under another condition is found, in any
+    /// spacing or over several lines; what the sources do now is not.
+    #[test]
+    fn every_way_to_compile_fault_injection_otherwise_is_found() {
+        let fine = CompiledWhen::read(
+            r#"
+            #[cfg(feature = "fault-injection")]
+            mod fault_injection;
+            #[cfg(not(feature = "fault-injection"))]
+            fn quiet() {}
+            #[cfg_attr(test, allow(clippy::unwrap_used))]
+            fn f() {
+                #[cfg(feature = "fault-injection")]
+                warn!("fault-injection build: /__fi/ routes make the server panic");
+            }
+            #[cfg(test)]
+            mod tests {
+                #[cfg(any(test, feature = "fault-injection"))]
+                fn t() { assert!(text.contains("fault-injection")); }
+            }
+            "#,
+        );
+        assert!(fine
+            .predicates
+            .iter()
+            .all(|p| CFG_PREDICATES.contains(&p.as_str())));
+        assert!(fine.refused.is_empty(), "{:?}", fine.refused);
+        assert_eq!(
+            fine.modules,
+            [vec![r#"feature="fault-injection""#.to_owned()]]
+        );
+
+        for (bad, predicate) in [
+            (
+                "#[cfg(any(feature = \"mimalloc\",\n feature = \"fault-injection\"))]\nmod fault_injection;",
+                r#"any(feature="mimalloc",feature="fault-injection")"#,
+            ),
+            ("#[cfg(all())] fn f() {}", "all()"),
+            (
+                "fn f() { #[cfg(not(feature = \"demo-x\"))] let a = 1; }",
+                r#"not(feature="demo-x")"#,
+            ),
+            ("#[cfg_attr(kani_x, allow(x))] fn f() {}", "kani_x"),
+            ("fn f() { if cfg!(any(unix)) {} }", "any(unix)"),
+        ] {
+            let found = CompiledWhen::read(bad);
+            assert!(
+                found.predicates.contains(&predicate.to_owned())
+                    && !CFG_PREDICATES.contains(&predicate),
+                "{bad}: {:?}",
+                found.predicates
+            );
+        }
+        let found = CompiledWhen::read("#[cfg_attr(unix, path = \"fault_injection.rs\")] mod fi;");
+        assert!(!CFG_ATTR_APPLIES
+            .iter()
+            .any(|a| found.applied[0].starts_with(a)));
+        for bad in [
+            "#[path = \"fault_injection.rs\"]\nmod fi;",
+            "fn f() { include!(concat!(\"fault_\", \"injection.rs\")); }",
+            "fn f() { routes.merge(crate::macros::fi!(fault_injection::routes())); }",
+        ] {
+            assert!(!CompiledWhen::read(bad).refused.is_empty(), "{bad}");
+        }
+        let twice = CompiledWhen::read(
+            "#[cfg(feature = \"fault-injection\")] mod fault_injection;\n#[cfg(feature = \"fault-injection\")] mod fault_injection_b;",
+        );
+        assert_eq!(twice.modules.len(), 2);
+        let ungated = CompiledWhen::read("mod fault_injection;");
+        assert_eq!(ungated.modules, [Vec::<String>::new()]);
+    }
+
+    #[test]
+    fn every_spelling_of_abort_is_found_and_unwind_is_not() {
+        for abort in [
+            "[profile.release]\npanic = \"abort\"",
+            "release = { panic = 'abort' }",
+            "ENV CARGO_PROFILE_RELEASE_PANIC=abort",
+            "  CARGO_PROFILE_RELEASE_PANIC: abort",
+            "cargo build --release --config 'profile.release.panic=\"abort\"'",
+            "RUSTFLAGS=\"-C panic=abort\" cargo build --release",
+            "PANIC = \"ABORT\"",
+        ] {
+            assert_eq!(abort_switches(abort).len(), 1, "{abort}");
+        }
+        for fine in [
+            "[profile.release]\npanic = \"unwind\"",
+            "# panic = \"abort\" was the setting up to 1.4.2",
+            "tracing::error!(\"background cache task panicked\")",
+        ] {
+            assert!(abort_switches(fine).is_empty(), "{fine}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod panic_layer_tests {
+    //! A panic in a handler or in a middleware of `request_layers` answers that request with
+    //! 500 and leaves the router serving.
+    use crate::test_helpers::{body_bytes, create_test_context, send};
+    use axum::http::{Method, StatusCode};
+    use axum::routing::get;
+    use axum::Router;
+
+    #[tokio::test]
+    async fn a_panicking_handler_answers_500_and_the_next_request_is_served() {
+        let ctx = create_test_context();
+        let routes = Router::new()
+            .route(
+                "/boom",
+                get(|| async {
+                    panic!("secret-detail-of-the-bug");
+                    #[allow(unreachable_code)]
+                    "never"
+                }),
+            )
+            .route("/fine", get(|| async { "fine" }));
+        let app = crate::request_layers(routes, &ctx.state).with_state(ctx.state.clone());
+
+        let response = send(&app, Method::GET, "/boom", "").await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let body = body_bytes(response).await;
+        assert!(
+            !String::from_utf8_lossy(&body).contains("secret-detail"),
+            "the panic message goes to the log, not to the client"
+        );
+
+        let response = send(&app, Method::GET, "/fine", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }
 
 #[cfg(test)]
@@ -910,6 +1572,11 @@ mod shutdown_drain_tests {
                 let _ = rx.await;
             },
             drain,
+            super::ConnLimits {
+                header_read_timeout: Duration::from_secs(30),
+                keep_alive_timeout: Duration::from_secs(120),
+                max_connections: 64,
+            },
         ));
         (addr, tx, server)
     }
@@ -944,6 +1611,35 @@ mod shutdown_drain_tests {
         drop(client);
     }
 
+    /// An idle keep-alive connection is closed at the signal and does not hold serving
+    /// until the deadline.
+    #[tokio::test]
+    async fn an_idle_keep_alive_connection_does_not_hold_shutdown() {
+        let (addr, stop, server) = start(Duration::from_secs(5)).await;
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /short HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !seen.windows(5).any(|w| w == b"0\r\n\r\n") {
+            let n = client.read(&mut buf).await.unwrap();
+            assert!(n > 0, "closed before the response ended");
+            seen.extend_from_slice(&buf[..n]);
+        }
+        let signalled = Instant::now();
+        stop.send(()).unwrap();
+        // CANCEL-SAFETY: awaiting the server task's handle; a timeout fails the test.
+        let end = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(end, ServeEnd::Drained);
+        assert!(signalled.elapsed() < Duration::from_secs(2));
+    }
+
     /// A download already in flight when the signal comes, and short enough to finish
     /// within the deadline, completes whole; serving ends as drained.
     #[tokio::test]
@@ -971,6 +1667,400 @@ mod shutdown_drain_tests {
         let body_bytes = response.iter().filter(|b| matches!(b, 0..=2)).count();
         assert!(response.starts_with(b"HTTP/1.1 200"));
         assert!(body_bytes >= 3 * 1024, "the whole body arrived");
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod connection_limit_tests {
+    //! A connection whose request head does not arrive in time is closed, an idle keep-alive
+    //! connection lives longer than that, and open connections are capped.
+    use super::{serve_with_drain, ConnLimits, ServeEnd};
+    use axum::extract::ConnectInfo;
+    use axum::routing::get;
+    use axum::Router;
+    use std::net::SocketAddr;
+    use std::time::{Duration, Instant};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    const HEAD: Duration = Duration::from_millis(300);
+    const IDLE: Duration = Duration::from_millis(1500);
+    const REQUEST: &[u8] = b"GET /ok HTTP/1.1\r\nHost: x\r\n\r\n";
+
+    /// A server under test, stopped when the test drops it.
+    struct TestServer {
+        addr: SocketAddr,
+        task: tokio::task::JoinHandle<std::io::Result<ServeEnd>>,
+    }
+
+    impl Drop for TestServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+
+    async fn start(max_connections: usize) -> TestServer {
+        start_with(ConnLimits {
+            header_read_timeout: HEAD,
+            keep_alive_timeout: IDLE,
+            max_connections,
+        })
+        .await
+    }
+
+    async fn start_with(limits: ConnLimits) -> TestServer {
+        let app = Router::new().route("/ok", get(|| async { "ok" })).route(
+            "/peer",
+            get(|ConnectInfo(peer): ConnectInfo<SocketAddr>| async move { peer.ip().to_string() }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let task = tokio::spawn(serve_with_drain(
+            listener,
+            app,
+            std::future::pending(),
+            Duration::from_secs(1),
+            limits,
+        ));
+        TestServer { addr, task }
+    }
+
+    /// One response off a keep-alive connection: its head and its `content-length` body.
+    async fn read_response(stream: &mut TcpStream) -> String {
+        let mut raw = Vec::new();
+        let mut byte = [0u8; 1];
+        while !raw.ends_with(b"\r\n\r\n") {
+            assert_eq!(
+                stream.read(&mut byte).await.unwrap(),
+                1,
+                "closed mid-response"
+            );
+            raw.push(byte[0]);
+        }
+        let head = String::from_utf8(raw).unwrap();
+        let length: usize = head
+            .lines()
+            .find_map(|l| {
+                l.to_ascii_lowercase()
+                    .strip_prefix("content-length: ")
+                    .map(str::to_owned)
+            })
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let mut body = vec![0u8; length];
+        stream.read_exact(&mut body).await.unwrap();
+        head + &String::from_utf8(body).unwrap()
+    }
+
+    /// How long until the server closes `stream`, if it does within `limit`.
+    async fn closed_within(stream: &mut TcpStream, limit: Duration) -> Option<Duration> {
+        let start = Instant::now();
+        let mut buf = [0u8; 1024];
+        loop {
+            let left = limit.saturating_sub(start.elapsed());
+            // CANCEL-SAFETY: a read on the test's own socket; on timeout nothing is lost
+            // that the test still needs.
+            match tokio::time::timeout(left, stream.read(&mut buf)).await {
+                Ok(Ok(0)) | Ok(Err(_)) => return Some(start.elapsed()),
+                Ok(Ok(_)) => continue,
+                Err(_) => return None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_head_that_never_completes_is_closed() {
+        let server = start(16).await;
+        let addr = server.addr;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /ok HTTP/1.1\r\nHost: x\r\n")
+            .await
+            .unwrap();
+        let closed = closed_within(&mut client, Duration::from_secs(5)).await;
+        assert!(
+            closed.is_some_and(|d| d < HEAD * 4),
+            "an unfinished head holds the connection: {closed:?}"
+        );
+    }
+
+    /// A fresh connection that sends nothing gets the header timeout, not the idle one.
+    #[tokio::test]
+    async fn a_connection_that_sends_nothing_is_closed_at_the_header_timeout() {
+        let server = start(16).await;
+        let addr = server.addr;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let closed = closed_within(&mut client, Duration::from_secs(5)).await;
+        assert!(
+            closed.is_some_and(|d| d < HEAD * 4),
+            "a silent connection was kept: {closed:?}"
+        );
+    }
+
+    /// The first head's timeout runs from the accept: a client that waits before its first
+    /// byte has that much less time for the rest.
+    #[tokio::test]
+    async fn the_first_head_is_timed_from_the_accept() {
+        let head = Duration::from_secs(1);
+        let server = start_with(ConnLimits {
+            header_read_timeout: head,
+            keep_alive_timeout: IDLE,
+            max_connections: 16,
+        })
+        .await;
+        let addr = server.addr;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let connected = Instant::now();
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        client.write_all(b"GET /ok HTTP/1.1\r\n").await.unwrap();
+        let closed = closed_within(&mut client, Duration::from_secs(5)).await;
+        let since_connect = connected.elapsed();
+        assert!(closed.is_some(), "an unfinished head held the connection");
+        assert!(
+            since_connect < head + Duration::from_millis(400),
+            "closed {since_connect:?} after the connect"
+        );
+    }
+
+    /// A slow client sending its head a byte at a time gains nothing by it.
+    #[tokio::test]
+    async fn a_head_sent_a_byte_at_a_time_is_closed_at_the_header_timeout() {
+        let server = start(16).await;
+        let addr = server.addr;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let start = Instant::now();
+        for byte in b"GET /ok HTTP/1.1\r\nHost: x\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
+            if client.write_all(&[*byte]).await.is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let closed = closed_within(&mut client, Duration::from_secs(5)).await;
+        let total = start.elapsed();
+        assert!(closed.is_some(), "a trickled head holds the connection");
+        assert!(total < HEAD * 8, "closed after {total:?}");
+    }
+
+    /// The header timeout is not an idle timeout: a proxy reuses an idle connection after
+    /// longer than that (traefik up to 90 s), and NORA must not close it first.
+    #[tokio::test]
+    async fn an_idle_keep_alive_connection_outlives_the_header_timeout() {
+        let server = start(16).await;
+        let addr = server.addr;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(REQUEST).await.unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
+
+        tokio::time::sleep(HEAD * 3).await;
+        client.write_all(REQUEST).await.unwrap();
+        assert!(
+            read_response(&mut client).await.starts_with("HTTP/1.1 200"),
+            "the idle connection was reused"
+        );
+
+        let closed = closed_within(&mut client, IDLE * 3).await;
+        assert!(
+            closed.is_some_and(|d| d >= IDLE - HEAD),
+            "idle past the keep-alive timeout, closed after {closed:?}"
+        );
+    }
+
+    /// A later head on a keep-alive connection gets the header timeout from its first byte,
+    /// not the idle allowance.
+    #[tokio::test]
+    async fn a_later_head_is_timed_from_its_first_byte() {
+        let server = start(16).await;
+        let addr = server.addr;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(REQUEST).await.unwrap();
+        assert!(read_response(&mut client).await.starts_with("HTTP/1.1 200"));
+
+        tokio::time::sleep(HEAD).await;
+        client.write_all(b"GET /ok HTTP/1.1\r\n").await.unwrap();
+        let closed = closed_within(&mut client, IDLE * 3).await;
+        assert!(
+            closed.is_some_and(|d| d < HEAD * 2),
+            "a started head got more than the header timeout: {closed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn past_max_connections_a_new_client_waits_until_one_closes() {
+        let server = start(1).await;
+        let addr = server.addr;
+        let mut first = TcpStream::connect(addr).await.unwrap();
+        first.write_all(REQUEST).await.unwrap();
+        assert!(read_response(&mut first).await.starts_with("HTTP/1.1 200"));
+
+        let mut second = TcpStream::connect(addr).await.unwrap();
+        second.write_all(REQUEST).await.unwrap();
+        let mut byte = [0u8; 1];
+        // CANCEL-SAFETY: a read on the test's own socket, retried below.
+        let early = tokio::time::timeout(HEAD, second.read(&mut byte)).await;
+        assert!(
+            early.is_err(),
+            "the second connection was served past the cap"
+        );
+
+        drop(first);
+        // CANCEL-SAFETY: as above.
+        let response = tokio::time::timeout(Duration::from_secs(5), read_response(&mut second))
+            .await
+            .expect("served once the first connection closed");
+        assert!(response.starts_with("HTTP/1.1 200"));
+    }
+
+    /// A client speaking HTTP/2 from its first byte (prior knowledge) is served, as it
+    /// was by axum's server.
+    #[tokio::test]
+    async fn an_http2_prior_knowledge_client_is_served() {
+        let server = start(16).await;
+        let addr = server.addr;
+        let client = reqwest::Client::builder() // nosemgrep: reqwest-client-bypass
+            .http2_prior_knowledge()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("http://{addr}/peer"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.version(), reqwest::Version::HTTP_2);
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.text().await.unwrap(), "127.0.0.1");
+    }
+
+    /// The first bytes are read under the header timeout too.
+    #[tokio::test]
+    async fn a_partial_http2_preface_is_closed_at_the_header_timeout() {
+        let server = start(16).await;
+        let addr = server.addr;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client.write_all(b"PRI * HTTP/2.0\r\n").await.unwrap();
+        let closed = closed_within(&mut client, Duration::from_secs(5)).await;
+        assert!(
+            closed.is_some_and(|d| d < HEAD * 4),
+            "a partial preface held the connection: {closed:?}"
+        );
+    }
+
+    /// An HTTP/2 peer that goes silent and answers no ping is closed.
+    #[tokio::test]
+    async fn a_silent_http2_peer_is_closed_when_it_answers_no_ping() {
+        let server = start(16).await;
+        let addr = server.addr;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00")
+            .await
+            .unwrap();
+        let closed = closed_within(&mut client, IDLE * 4).await;
+        assert!(
+            closed.is_some_and(|d| d < IDLE + HEAD * 4),
+            "a silent HTTP/2 peer was kept: {closed:?}"
+        );
+    }
+
+    /// The HTTP/2 preface and an empty SETTINGS frame.
+    const H2_START: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\x00\x00\x00\x04\x00\x00\x00\x00\x00";
+
+    /// A HEADERS frame on stream 1 ending its stream: `GET http://x/`, HPACK-coded from the
+    /// static table.
+    const H2_GET: &[u8] = b"\x00\x00\x06\x01\x05\x00\x00\x00\x01\x82\x86\x84\x41\x01x";
+
+    /// Play an HTTP/2 client that is alive: acknowledge each SETTINGS, answer each PING.
+    /// Returns how long after `from` the server closed the connection, if it did within
+    /// `limit`, and when the response to stream 1 ended, if it came.
+    async fn h2_alive_until_closed(
+        stream: &mut TcpStream,
+        from: Instant,
+        limit: Duration,
+    ) -> (Option<Duration>, Option<Instant>) {
+        let mut answered = None;
+        loop {
+            let left = limit.saturating_sub(from.elapsed());
+            let mut head = [0u8; 9];
+            // CANCEL-SAFETY: a read on the test's own socket; on timeout the test ends.
+            match tokio::time::timeout(left, stream.read_exact(&mut head)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => return (Some(from.elapsed()), answered),
+                Err(_) => return (None, answered),
+            }
+            let length = u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize;
+            let mut payload = vec![0u8; length];
+            if stream.read_exact(&mut payload).await.is_err() {
+                return (Some(from.elapsed()), answered);
+            }
+            let (kind, flags, id) = (head[3], head[4], &head[5..9]);
+            let reply: Option<Vec<u8>> = match kind {
+                0x4 if flags & 1 == 0 => Some(b"\x00\x00\x00\x04\x01\x00\x00\x00\x00".to_vec()),
+                0x6 if flags & 1 == 0 => {
+                    Some([&b"\x00\x00\x08\x06\x01\x00\x00\x00\x00"[..], &payload].concat())
+                }
+                0x0 | 0x1 if flags & 1 == 1 && id == [0, 0, 0, 1] => {
+                    answered = Some(Instant::now());
+                    None
+                }
+                _ => None,
+            };
+            if let Some(reply) = reply {
+                if stream.write_all(&reply).await.is_err() {
+                    return (Some(from.elapsed()), answered);
+                }
+            }
+        }
+    }
+
+    /// An HTTP/2 client that answers every ping but opens no stream is closed as an HTTP/1
+    /// one that sends no head: at the header timeout from the accept. It does not hold a
+    /// connection, and a place under `max_connections`, for as long as it answers.
+    #[tokio::test]
+    async fn an_http2_client_that_opens_no_stream_is_closed_at_the_header_timeout() {
+        let server = start(16).await;
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        let connected = Instant::now();
+        client.write_all(H2_START).await.unwrap();
+        let (closed, _) = h2_alive_until_closed(&mut client, connected, IDLE * 4).await;
+        assert!(
+            closed.is_some_and(|d| d < HEAD * 4),
+            "an HTTP/2 client with no stream was kept: {closed:?}"
+        );
+    }
+
+    /// After its last stream an HTTP/2 connection is idle as a keep-alive one: kept at least
+    /// the keep-alive timeout (past the header timeout), and closed once that has passed,
+    /// although the client answers every ping.
+    #[tokio::test]
+    async fn an_idle_http2_connection_is_closed_at_the_keep_alive_timeout() {
+        let server = start(16).await;
+        let mut client = TcpStream::connect(server.addr).await.unwrap();
+        let connected = Instant::now();
+        client.write_all(H2_START).await.unwrap();
+        client.write_all(H2_GET).await.unwrap();
+        let (closed, answered) = h2_alive_until_closed(&mut client, connected, IDLE * 4).await;
+        let answered = answered.expect("the request on stream 1 is answered");
+        let closed = closed.map(|at| connected + at - answered);
+        assert!(
+            closed.is_some_and(|d| d >= IDLE - HEAD && d < IDLE + HEAD * 4),
+            "idle after its stream for {closed:?}, keep-alive {IDLE:?}"
+        );
+    }
+
+    /// Handlers (the lockout, token routes) still see the client's address.
+    #[tokio::test]
+    async fn a_request_carries_the_peer_address() {
+        let server = start(16).await;
+        let addr = server.addr;
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /peer HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        assert!(read_response(&mut client).await.ends_with("127.0.0.1"));
     }
 }
 
@@ -1840,71 +2930,25 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
         _ => None,
     };
 
-    match (json_format, file_writer) {
-        (true, Some((non_blocking, guard))) => {
+    // Every layer comes from `log_redact::layer`, the one that writes through the redaction:
+    // stdout always, `NORA_LOG_FILE` when set, JSON for the server and text for the commands.
+    let (file_layer, guard) = match file_writer {
+        Some((non_blocking, guard)) => {
             let file_filter =
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(
-                    fmt::layer()
-                        .json()
-                        .with_target(true)
-                        .with_writer(RedactUserinfo(std::io::stdout)),
-                )
-                .with(
-                    fmt::layer()
-                        .json()
-                        .with_target(true)
-                        .with_writer(RedactUserinfo(non_blocking))
-                        .with_filter(file_filter),
-                )
-                .init();
-            Some(guard)
+            (
+                Some(log_redact::layer(json_format, non_blocking).with_filter(file_filter)),
+                Some(guard),
+            )
         }
-        (true, None) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(
-                    fmt::layer()
-                        .json()
-                        .with_target(true)
-                        .with_writer(RedactUserinfo(std::io::stdout)),
-                )
-                .init();
-            None
-        }
-        (false, Some((non_blocking, guard))) => {
-            let file_filter =
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(
-                    fmt::layer()
-                        .with_target(false)
-                        .with_writer(RedactUserinfo(std::io::stdout)),
-                )
-                .with(
-                    fmt::layer()
-                        .with_target(false)
-                        .with_writer(RedactUserinfo(non_blocking))
-                        .with_filter(file_filter),
-                )
-                .init();
-            Some(guard)
-        }
-        (false, None) => {
-            tracing_subscriber::registry()
-                .with(env_filter)
-                .with(
-                    fmt::layer()
-                        .with_target(false)
-                        .with_writer(RedactUserinfo(std::io::stdout)),
-                )
-                .init();
-            None
-        }
-    }
+        None => (None, None),
+    };
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(log_redact::layer(json_format, std::io::stdout))
+        .with(file_layer)
+        .init();
+    guard
 }
 
 /// Open a log file for non-blocking writes. Creates parent directories as needed.
@@ -2273,6 +3317,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         reqwest::redirect::Policy::default(),
     );
     let http_client_no_redirect = build_no_redirect_client(&config.tls);
+    let http_client_same_origin = build_same_origin_client(&config.tls);
     log_outbound_proxy();
 
     // Initialize Docker auth with shared HTTP client (includes custom CA certs)
@@ -2352,6 +3397,11 @@ async fn run_server(mut config: Config, storage: Storage) {
         .merge(metrics::routes())
         .merge(ui::routes())
         .merge(openapi::routes());
+    #[cfg(feature = "fault-injection")]
+    let public_routes = {
+        warn!("fault-injection build: /__fi/ routes make the server panic, not for production");
+        public_routes.merge(fault_injection::routes())
+    };
 
     let app_routes = if rate_limit_enabled {
         let (routes, enforced) = rate_limited_routes(
@@ -2420,6 +3470,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let signer = build_signer(&config, &enabled_registries);
 
+    let (tasks, maintenance) = supervision(&config.server);
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -2435,6 +3486,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
         http_client_no_redirect,
+        http_client_same_origin,
         hf_canonical_ids: Arc::default(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -2449,6 +3501,8 @@ async fn run_server(mut config: Config, storage: Storage) {
         leak_finders,
         cancel_token: cancel_token.clone(),
         pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
+        tasks,
+        maintenance,
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
@@ -2468,10 +3522,13 @@ async fn run_server(mut config: Config, storage: Storage) {
     // every PULL_STATS_FLUSH_INTERVAL and once more on shutdown. Pushed to the
     // scheduler handles so the final flush completes within the shutdown drain,
     // keeping the stats loss to at most one interval only on a hard crash.
-    scheduler_handles.push(tokio::spawn(registry::docker::pull_stats_flush_loop(
-        state.clone(),
-        registry::docker::PULL_STATS_FLUSH_INTERVAL,
-    )));
+    let flush_state = state.clone();
+    scheduler_handles.push(state.tasks.spawn("pull_stats", move || {
+        registry::docker::pull_stats_flush_loop(
+            flush_state.clone(),
+            registry::docker::PULL_STATS_FLUSH_INTERVAL,
+        )
+    }));
 
     // Retention is pushed first: it deletes expired versions, creating the
     // orphans the GC pass then sweeps in the same cycle.
@@ -2566,11 +3623,15 @@ async fn run_server(mut config: Config, storage: Storage) {
     }
 
     if !cleanup_passes.is_empty() {
-        scheduler_handles.push(cleanup::spawn_cleanup_scheduler(
-            cleanup_passes,
-            cleanup_lock,
-            cancel_token.clone(),
-        ));
+        let passes = Arc::new(cleanup_passes);
+        let cancel = cancel_token.clone();
+        scheduler_handles.push(state.tasks.spawn("cleanup", move || {
+            cleanup::run_cleanup_scheduler(
+                Arc::clone(&passes),
+                Arc::clone(&cleanup_lock),
+                cancel.clone(),
+            )
+        }));
     }
 
     let app = Router::new()
@@ -2681,82 +3742,26 @@ async fn run_server(mut config: Config, storage: Storage) {
         "System endpoints"
     );
 
-    // Background task: flush token last_used + periodic maintenance every 30 seconds
-    let metrics_state = state.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-        let mut tick_count: u64 = 0;
-        loop {
-            interval.tick().await;
-            tick_count += 1;
-            if let Some(ref token_store) = metrics_state.tokens {
-                token_store.flush_last_used().await;
-            }
-            registry::docker::cleanup_expired_sessions(&metrics_state.upload_sessions);
-            metrics_state.auth_failures.cleanup();
-
-            // Every 60s (odd ticks — the interval's first tick fires immediately, so the
-            // boot pass runs right away: object-store reachability (#869) and the storage
-            // gauge are populated before the first readiness probe, not 30s in).
-            if !tick_count.is_multiple_of(2) {
-                metrics_state.storage.refresh_total_size_cache().await;
-                metrics::STORAGE_BYTES
-                    .with_label_values(&["total"])
-                    .set(metrics_state.storage.total_size().await as i64);
-                // Per-registry artifact counts + logical bytes from the index, plus
-                // process uptime (#446). The "total" storage_bytes label above is the
-                // full physical footprint; per-registry is summed artifact size.
-                // A panic in an index builder must not end this loop: it also flushes
-                // tokens and expires upload sessions.
-                let gauges = std::panic::AssertUnwindSafe(refresh_artifact_gauges(
-                    &metrics_state.repo_index,
-                    &metrics_state.storage,
-                    &metrics_state.enabled_registries,
-                ))
-                .catch_unwind()
-                .await;
-                if let Err(e) = gauges {
-                    tracing::error!(panic = ?e, "artifact gauge refresh panicked");
-                }
-                metrics::UPTIME_SECONDS.set(metrics_state.start_time.elapsed().as_secs() as i64);
-            }
-
-            // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
-            // + clean up stale proxy and upload temp files (#580)
-            if tick_count.is_multiple_of(10) {
-                let mut locks = metrics_state.publish_locks.lock();
-                locks.retain(|_, arc| Arc::strong_count(arc) > 1);
-                let storage_path = metrics_state.config.storage.path.clone();
-                tokio::task::spawn_blocking(move || {
-                    registry::docker::cleanup_proxy_temp_dir(&storage_path);
-                    registry::hf::cleanup_fill_temp_dir(&storage_path);
-                    // Reclaim upload temp files orphaned by a storage-write failure
-                    // without waiting for a restart. cleanup_expired_sessions only
-                    // frees temps still tracked by a live (expired) session, so an
-                    // orphan whose session entry is already gone would otherwise
-                    // survive on disk until the next boot. Age-guarded by SESSION_TTL,
-                    // so in-progress uploads are never reaped.
-                    registry::docker::cleanup_upload_temp_dir(&storage_path);
-                    registry::raw::cleanup_upload_temp_dir(&storage_path);
-                });
-            }
-        }
-    });
+    spawn_maintenance(&state, MAINTENANCE_PERIOD);
 
     // SIGHUP handler: hot-reload curation policy
     #[cfg(unix)]
     {
-        let reload_state = state.clone();
-        tokio::spawn(async move {
-            let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())
-                .expect("Failed to install SIGHUP handler");
-            loop {
-                sighup.recv().await;
-                info!("SIGHUP received — reloading curation policy");
-                match reload_curation(&reload_state) {
-                    Ok(()) => info!("Curation policy reloaded successfully"),
-                    Err(e) => {
-                        error!(error = %e, "Curation policy reload failed, keeping previous config")
+        let slot = state.reloadable.clone();
+        let held = Arc::new(HeldQuarantine::of(&state.config.curation));
+        state.tasks.spawn("sighup", move || {
+            let (slot, held) = (slot.clone(), held.clone());
+            async move {
+                let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())
+                    .expect("Failed to install SIGHUP handler");
+                loop {
+                    sighup.recv().await;
+                    info!("SIGHUP received — reloading curation policy");
+                    match reload_curation(&slot, &held, Config::path_from_env()) {
+                        Ok(()) => info!("Curation policy reloaded successfully"),
+                        Err(e) => {
+                            error!(error = %e, "Curation policy reload failed, keeping previous config")
+                        }
                     }
                 }
             }
@@ -2765,7 +3770,14 @@ async fn run_server(mut config: Config, storage: Storage) {
 
     // Graceful shutdown on SIGTERM/SIGINT, draining for at most `shutdown_timeout` (#1016)
     let drain = std::time::Duration::from_secs(state.config.server.shutdown_timeout);
-    match serve_with_drain(listener, app, shutdown_signal(), drain)
+    let limits = ConnLimits::from_config(&state.config.server);
+    info!(
+        header_read_timeout_secs = state.config.server.header_read_timeout,
+        keep_alive_timeout_secs = state.config.server.keep_alive_timeout,
+        max_connections = state.config.server.max_connections,
+        "Connection limits"
+    );
+    match serve_with_drain(listener, app, shutdown_signal(), drain, limits)
         .await
         .expect("Server error")
     {
@@ -2806,6 +3818,1028 @@ async fn run_server(mut config: Config, storage: Storage) {
     );
 }
 
+/// Cadence of the maintenance loop.
+const MAINTENANCE_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The supervisor of the server's long-lived tasks, and the maintenance loop's heartbeat it
+/// reads: stalled after `server.maintenance_stall_secs` without a completed tick.
+/// The server and the test router both get them here: the process's one
+/// ([`supervise::of_process`]).
+pub(crate) fn supervision(
+    server: &config::ServerConfig,
+) -> (Arc<supervise::Supervisor>, Arc<supervise::Heartbeat>) {
+    let stall = std::time::Duration::from_secs(server.maintenance_stall_secs);
+    #[cfg(feature = "fault-injection")]
+    let stall = fault_injection::maintenance_max_silence().unwrap_or(stall);
+    supervise::of_process(stall)
+}
+
+/// Background task: flush token last_used + periodic maintenance every `period`.
+/// Under the supervisor: a panicking tick restarts the loop, and the heartbeat fails
+/// /health when the loop stops starting ticks or every tick panics.
+fn spawn_maintenance(state: &AppState, period: std::time::Duration) {
+    let maintenance_state = state.clone();
+    // The supervisor's detached work: a run still going after a restart of the loop is not
+    // joined by a second.
+    let work = Arc::new(MaintenanceWork::new(&state.tasks));
+    state.tasks.spawn("maintenance", move || {
+        let state = maintenance_state.clone();
+        let work = Arc::clone(&work);
+        run_maintenance(period, Arc::clone(&state.maintenance), move |tick_count| {
+            let state = state.clone();
+            let work = Arc::clone(&work);
+            async move { maintenance_tick(&state, tick_count, &work).await }
+        })
+    });
+}
+
+/// The work a maintenance tick starts and does not wait for: each runs apart from the tick,
+/// one run at a time, and reports its own panics (`nora_task_panics_total{task}`).
+struct MaintenanceWork {
+    /// Token `last_used` to disk; its file rewrites must not be cut halfway.
+    token_flush: supervise::Detached,
+    /// The store's size and the per-registry gauges: a whole listing, as long as it takes.
+    storage_size: supervise::Detached,
+}
+
+impl MaintenanceWork {
+    fn new(tasks: &supervise::Supervisor) -> Self {
+        Self {
+            token_flush: tasks.detached("token_flush"),
+            storage_size: tasks.detached("storage_size"),
+        }
+    }
+}
+
+/// How long a maintenance tick may run before it is cut, for a loop ticking every `period`
+/// whose heartbeat may be silent for `max_silence`: a third of what the window leaves after
+/// one period. Between two beats then fit the wait for the next tick, a tick that panics
+/// just inside its deadline and the restarted loop's first tick cut at it, with one more
+/// deadline to spare for the restart backoff (1 s after a single panic) and scheduling. So a
+/// store that never answers, or one panic, keeps `/health` 200. With the default 300 s window
+/// that is 90 s; with the smallest, 90 s, it is 20 s. The tick waits on one cheap storage
+/// request only, so its deadline does not depend on how much the store holds.
+fn tick_deadline(
+    period: std::time::Duration,
+    max_silence: std::time::Duration,
+) -> std::time::Duration {
+    max_silence.saturating_sub(period) / 3
+}
+
+/// Run `tick` every `period`, numbering the ticks from 1, and record on `heartbeat` each one
+/// that completes or is cut at its deadline ([`tick_deadline`]). The first tick fires at once;
+/// a tick that runs past its slot delays the next to the following one. A cut tick is logged
+/// and counted, and the next starts on schedule: waiting on a store is not a dead loop, and
+/// `/ready` reports the store. A panicking tick ends the loop, which its supervisor restarts.
+/// The beats stop when ticks keep panicking or one holds its thread so that it cannot be cut,
+/// since the work they stand for (readiness refresh, starting the token flush and the size
+/// count) is no longer done.
+async fn run_maintenance<F, Fut>(
+    period: std::time::Duration,
+    heartbeat: Arc<supervise::Heartbeat>,
+    mut tick: F,
+) where
+    F: FnMut(u64) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let deadline = tick_deadline(period, heartbeat.max_silence());
+    // Exported from the start, at 0, so that `increase` over it sees the first cut tick.
+    std::sync::LazyLock::force(&metrics::MAINTENANCE_TIMEOUTS_TOTAL);
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut tick_count: u64 = 0;
+    loop {
+        interval.tick().await;
+        tick_count += 1;
+        // CANCEL-SAFETY: a tick cut here is dropped at whatever await it was in, which is
+        // the reachability request: dropped unanswered, it publishes the store unreachable
+        // (object store), or the next tick does, finding the probe still running (local disk). The token
+        // flush and the size count run in tasks of their own (`MaintenanceWork`) that the
+        // cut does not stop, session and lock expiry do not await, and the temp-file sweep is
+        // a detached blocking task.
+        if tokio::time::timeout(deadline, tick(tick_count))
+            .await
+            .is_err()
+        {
+            metrics::MAINTENANCE_TIMEOUTS_TOTAL.inc();
+            warn!(
+                tick = tick_count,
+                deadline_ms = deadline.as_millis() as u64,
+                "maintenance tick cut at its deadline: storage too slow or not answering"
+            );
+        }
+        heartbeat.beat();
+    }
+}
+
+/// One tick of the maintenance loop: start the token `last_used` flush, expire upload
+/// sessions and failure-tracker entries, and ask the store whether it answers; every second
+/// tick start the count of the store's size and gauges, every tenth evict unused publish
+/// locks and stale temp files.
+async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceWork) {
+    #[cfg(feature = "fault-injection")]
+    fault_injection::maintenance_fault().await;
+    if let Some(ref token_store) = state.tokens {
+        let token_store = token_store.clone();
+        work.token_flush
+            .start(async move { token_store.flush_last_used().await });
+    }
+    registry::docker::cleanup_expired_sessions(&state.upload_sessions);
+    state.auth_failures.cleanup();
+
+    // Every 60s (odd ticks — the interval's first tick fires immediately, so the storage
+    // gauge is counted right after boot): the store's whole size and the per-registry
+    // artifact counts and logical bytes from the index (#446). The "total" storage_bytes
+    // label is the full physical footprint; per-registry is summed artifact size. Started,
+    // not awaited: on a large bucket or directory tree the count takes longer than a tick
+    // may run, and readiness does not depend on it. Skipped while the previous count still runs.
+    if !tick_count.is_multiple_of(2) {
+        let storage = state.storage.clone();
+        let repo_index = Arc::clone(&state.repo_index);
+        let enabled = Arc::clone(&state.enabled_registries);
+        work.storage_size.start(async move {
+            storage.refresh_total_size_cache().await;
+            metrics::STORAGE_BYTES
+                .with_label_values(&["total"])
+                .set(storage.total_size().await as i64);
+            refresh_artifact_gauges(&repo_index, &storage, &enabled).await;
+        });
+        metrics::UPTIME_SECONDS.set(state.start_time.elapsed().as_secs() as i64);
+    }
+
+    // Every tick, the boot tick included so readiness is known before the first probe:
+    // one cheap request to the store (#869) — the first page of a listing, or a write probe
+    // on the local disk. The tick waits on nothing else.
+    state.storage.refresh_reachability().await;
+
+    // Every 5 minutes (tick_count % 10 == 0): evict unused publish locks
+    // + clean up stale proxy and upload temp files (#580)
+    if tick_count.is_multiple_of(10) {
+        let mut locks = state.publish_locks.lock();
+        locks.retain(|_, arc| Arc::strong_count(arc) > 1);
+        let storage_path = state.config.storage.path.clone();
+        tokio::task::spawn_blocking(move || {
+            registry::docker::cleanup_proxy_temp_dir(&storage_path);
+            registry::hf::cleanup_fill_temp_dir(&storage_path);
+            // Reclaim upload temp files orphaned by a storage-write failure
+            // without waiting for a restart. cleanup_expired_sessions only
+            // frees temps still tracked by a live (expired) session, so an
+            // orphan whose session entry is already gone would otherwise
+            // survive on disk until the next boot. Age-guarded by SESSION_TTL,
+            // so in-progress uploads are never reaped.
+            registry::docker::cleanup_upload_temp_dir(&storage_path);
+            registry::raw::cleanup_upload_temp_dir(&storage_path);
+        });
+    }
+}
+
+#[cfg(test)]
+mod background_task_tests {
+    //! Every long-lived task the server starts runs under its supervisor. `run_server` cannot
+    //! run in a test (it binds a port and waits for a signal), so this reads it, and every
+    //! function of this file it calls, from the source.
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const SOURCE: &str = include_str!("main.rs");
+
+    /// The tasks the server runs, by the name they are supervised under.
+    const SUPERVISED: [&str; 4] = ["cleanup", "maintenance", "pull_stats", "sighup"];
+
+    /// Spawns in that code that are not long-lived, by the function they are in: the task of
+    /// one connection, which ends with it, and the temp-file sweep of every tenth maintenance
+    /// tick, which ends with its sweep.
+    const SHORT_LIVED: [(&str, &str); 2] = [
+        ("serve_with_drain", "connections.spawn("),
+        ("maintenance_tick", "tokio::task::spawn_blocking("),
+    ];
+
+    /// The top-level functions of this file, by name: the lines from the one that declares
+    /// it to the closing brace at the start of a line.
+    fn functions() -> BTreeMap<String, String> {
+        let mut found = BTreeMap::new();
+        let mut current: Option<(String, Vec<&str>)> = None;
+        for line in SOURCE.lines() {
+            if let Some((name, mut body)) = current.take() {
+                body.push(line);
+                if line == "}" {
+                    found.insert(name, body.join("\n"));
+                } else {
+                    current = Some((name, body));
+                }
+                continue;
+            }
+            let declared = ["pub(crate) ", "pub "]
+                .iter()
+                .fold(line, |l, p| l.strip_prefix(p).unwrap_or(l));
+            let declared = declared.strip_prefix("async ").unwrap_or(declared);
+            if let Some(rest) = declared.strip_prefix("fn ") {
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                current = Some((name, vec![line]));
+            }
+        }
+        found
+    }
+
+    /// `run_server` and every function of this file it reaches.
+    fn server_code() -> BTreeMap<String, String> {
+        let all = functions();
+        let mut reached = BTreeMap::new();
+        let mut next = vec!["run_server".to_owned()];
+        while let Some(name) = next.pop() {
+            let Some(body) = all.get(&name) else { continue };
+            if reached.insert(name.clone(), body.clone()).is_some() {
+                continue;
+            }
+            for callee in all.keys() {
+                let called = body.match_indices(callee.as_str()).any(|(i, _)| {
+                    let before = body[..i].chars().next_back();
+                    let after = body[i + callee.len()..].trim_start();
+                    !before.is_some_and(|c| c.is_alphanumeric() || c == '_')
+                        && (after.starts_with('(') || after.starts_with("::<"))
+                });
+                if called {
+                    next.push(callee.clone());
+                }
+            }
+        }
+        reached
+    }
+
+    /// Each call in `code` whose name starts with `spawn`, written out with the path or
+    /// receiver before it (`tokio::spawn(`, `state.tasks.spawn(`), and each thread builder.
+    fn spawns(code: &str) -> Vec<String> {
+        let path = |c: char| c.is_alphanumeric() || matches!(c, '_' | ':' | '.');
+        let mut found = Vec::new();
+        for (i, _) in code.match_indices("spawn") {
+            let name_end = i + code[i..]
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(code.len() - i);
+            if !code[name_end..].trim_start().starts_with('(') {
+                continue;
+            }
+            let start = code[..i].rfind(|c: char| !path(c)).map_or(0, |s| s + 1);
+            found.push(format!("{}(", &code[start..name_end]));
+        }
+        for (i, _) in code.match_indices("thread::Builder") {
+            let start = code[..i].rfind(|c: char| !path(c)).map_or(0, |s| s + 1);
+            found.push(code[start..i + "thread::Builder".len()].to_owned());
+        }
+        found
+    }
+
+    /// The task name a supervised spawn starts, or `None` for any other call.
+    fn supervised_name<'a>(call: &str, after: &'a str) -> Option<&'a str> {
+        if call != "tasks.spawn(" && !call.ends_with(".tasks.spawn(") {
+            return None;
+        }
+        let name = after.trim_start().strip_prefix('"')?;
+        Some(&name[..name.find('"')?])
+    }
+
+    #[test]
+    fn the_server_starts_every_long_lived_task_under_its_supervisor() {
+        let code = server_code();
+        for name in ["run_server", "spawn_maintenance", "maintenance_tick"] {
+            assert!(code.contains_key(name), "{name} is read");
+        }
+        let mut supervised = BTreeSet::new();
+        for (function, body) in &code {
+            let mut rest = body.as_str();
+            for call in spawns(body) {
+                let at = rest.find(&call).unwrap() + call.len();
+                let after = &rest[at..];
+                rest = after;
+                if code.contains_key(call.trim_end_matches('(')) {
+                    // A function of this file: read on its own.
+                    continue;
+                }
+                match supervised_name(&call, after) {
+                    Some(name) => {
+                        supervised.insert(name.to_owned());
+                    }
+                    None => assert!(
+                        SHORT_LIVED.contains(&(function.as_str(), call.as_str())),
+                        "{function}: {call} starts a task past the supervisor"
+                    ),
+                }
+            }
+        }
+        assert_eq!(supervised, BTreeSet::from(SUPERVISED.map(str::to_owned)));
+    }
+
+    /// The reading finds a task started past the supervisor in each spelling, and tells a
+    /// supervised one by its name.
+    #[test]
+    fn a_spawn_past_the_supervisor_is_found() {
+        for (bad, call) in [
+            ("let t = tokio::spawn(work());", "tokio::spawn("),
+            ("tokio::task::spawn (work());", "tokio::task::spawn("),
+            ("handle.spawn(work());", "handle.spawn("),
+            (
+                "std::thread::Builder::new().spawn(work);",
+                "std::thread::Builder",
+            ),
+            ("set.spawn_local(work());", "set.spawn_local("),
+            ("let t = spawn(work());", "spawn("),
+        ] {
+            let found = spawns(bad);
+            assert!(found.contains(&call.to_owned()), "{bad}: {found:?}");
+            assert!(
+                found
+                    .iter()
+                    .all(|c| supervised_name(c, "(\"sighup\"").is_none()),
+                "{bad}"
+            );
+        }
+        let good = "state.tasks.spawn(\"sighup\", run);";
+        assert_eq!(spawns(good), ["state.tasks.spawn("]);
+        assert_eq!(
+            supervised_name("state.tasks.spawn(", "\"sighup\", run);"),
+            Some("sighup")
+        );
+        assert!(functions().len() > 20);
+    }
+}
+
+#[cfg(test)]
+mod maintenance_loop_tests {
+    //! The maintenance loop under its supervisor: a panicking tick restarts the
+    //! loop, ticks that never complete and a hung tick fail `/health`. Real time at a 20 ms
+    //! cadence: the margins are whole ticks.
+    use super::{run_maintenance, tick_deadline};
+    use crate::supervise::{Heartbeat, Supervisor, Timing};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const PERIOD: Duration = Duration::from_millis(20);
+
+    fn supervised(silence: Duration) -> (Arc<Supervisor>, Arc<Heartbeat>) {
+        let heartbeat = Arc::new(Heartbeat::new(silence));
+        let timing = Timing {
+            backoff_min: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(20),
+            stable_run: Duration::from_secs(60),
+            crash_loop: 5,
+        };
+        let tasks = Supervisor::with(vec![("maintenance", Arc::clone(&heartbeat))], timing);
+        (Arc::new(tasks), heartbeat)
+    }
+
+    #[tokio::test]
+    async fn a_panicking_tick_restarts_the_loop() {
+        let (tasks, heartbeat) = supervised(Duration::from_secs(300));
+        let runs = Arc::new(AtomicU64::new(0));
+        let completed = Arc::new(AtomicU64::new(0));
+        let (r, c, hb) = (
+            Arc::clone(&runs),
+            Arc::clone(&completed),
+            Arc::clone(&heartbeat),
+        );
+        let task = tasks.spawn("maintenance", move || {
+            let run = r.fetch_add(1, Ordering::SeqCst);
+            let c = Arc::clone(&c);
+            run_maintenance(PERIOD, Arc::clone(&hb), move |n| {
+                let c = Arc::clone(&c);
+                async move {
+                    assert!(
+                        !(run == 0 && n == 2),
+                        "a bug in the second tick of the first run"
+                    );
+                    c.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        });
+        tokio::time::sleep(PERIOD * 20).await;
+        assert!(
+            !task.is_finished(),
+            "the loop ended with the panicking tick"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "restarted once");
+        assert!(
+            completed.load(Ordering::SeqCst) >= 4,
+            "ticks after the panic complete"
+        );
+        assert!(heartbeat.silent_for() < PERIOD * 10, "the loop still beats");
+        assert_eq!(tasks.failing(), None);
+        task.abort();
+    }
+
+    /// A loop whose every tick panics never flushes tokens or refreshes readiness again,
+    /// though the supervisor keeps restarting it: that fails liveness.
+    #[tokio::test]
+    async fn a_tick_that_panics_every_time_fails_liveness() {
+        let (tasks, _heartbeat) = supervised(PERIOD * 10);
+        let hb = Arc::clone(&_heartbeat);
+        let task = tasks.spawn("maintenance", move || {
+            run_maintenance(PERIOD, Arc::clone(&hb), |_| async {
+                panic!("a bug in every tick");
+            })
+        });
+        tokio::time::sleep(PERIOD * 30).await;
+        assert!(!task.is_finished(), "the supervisor goes on restarting it");
+        assert_eq!(tasks.failing(), Some("maintenance"));
+        task.abort();
+    }
+
+    /// Ticks that each fail only after running a while — past the supervisor's stable run,
+    /// so no crash loop shows — still never complete: the heartbeat fails liveness.
+    #[tokio::test]
+    async fn ticks_that_fail_late_every_time_fail_liveness() {
+        // A window whose tick deadline (120 ms) is well past the panic.
+        let heartbeat = Arc::new(Heartbeat::new(PERIOD * 19));
+        let timing = Timing {
+            backoff_min: Duration::from_millis(5),
+            backoff_max: Duration::from_millis(5),
+            stable_run: PERIOD,
+            crash_loop: 5,
+        };
+        let tasks = Arc::new(Supervisor::with(
+            vec![("maintenance", Arc::clone(&heartbeat))],
+            timing,
+        ));
+        let hb = Arc::clone(&heartbeat);
+        let task = tasks.spawn("maintenance", move || {
+            run_maintenance(PERIOD, Arc::clone(&hb), |_| async {
+                tokio::time::sleep(PERIOD * 2).await;
+                panic!("a bug that shows after a while");
+            })
+        });
+        tokio::time::sleep(PERIOD * 30).await;
+        assert_eq!(tasks.failing(), Some("maintenance"));
+        task.abort();
+    }
+
+    /// The tick deadline leaves room in every allowed stall window for the wait for the next
+    /// tick, a tick that panics just inside the deadline, and the restarted loop's first tick
+    /// cut at it, plus the restart backoff.
+    #[test]
+    fn the_tick_deadline_fits_a_panic_and_a_cut_tick_in_the_window() {
+        let period = super::MAINTENANCE_PERIOD;
+        let backoff = Timing::default().backoff_min;
+        // 90: the smallest window the configuration accepts; 300: the default.
+        for secs in [90, 300, 3600] {
+            let window = Duration::from_secs(secs);
+            let deadline = tick_deadline(period, window);
+            assert!(
+                deadline >= Duration::from_secs(20),
+                "{secs} s: {deadline:?}"
+            );
+            assert!(
+                period + deadline * 2 + backoff < window,
+                "{secs} s: a panic and a cut tick overrun the window"
+            );
+        }
+        assert_eq!(
+            tick_deadline(period, Duration::from_secs(300)),
+            Duration::from_secs(90)
+        );
+    }
+
+    /// A tick that waits on something that never answers (a silent store) is cut at its
+    /// deadline: the loop goes on ticking on schedule, so liveness holds.
+    #[tokio::test]
+    async fn a_tick_waiting_on_a_silent_store_is_cut_and_liveness_holds() {
+        let (tasks, heartbeat) = supervised(PERIOD * 10);
+        let hb = Arc::clone(&heartbeat);
+        let last = Arc::new(AtomicU64::new(0));
+        let l = Arc::clone(&last);
+        let task = tasks.spawn("maintenance", move || {
+            let l = Arc::clone(&l);
+            run_maintenance(PERIOD, Arc::clone(&hb), move |n| {
+                l.store(n, Ordering::SeqCst);
+                async move {
+                    if n == 2 {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            })
+        });
+        tokio::time::sleep(PERIOD * 30).await;
+        assert_eq!(
+            tasks.failing(),
+            None,
+            "a tick waiting on the store is not a dead loop"
+        );
+        assert!(
+            last.load(Ordering::SeqCst) >= 10,
+            "ticks after the cut one run on schedule"
+        );
+        task.abort();
+    }
+
+    /// Every tick waiting, none ever completing: each cut tick is progress, so liveness holds.
+    #[tokio::test]
+    async fn ticks_that_all_wait_on_the_store_keep_liveness() {
+        let (tasks, heartbeat) = supervised(PERIOD * 10);
+        let hb = Arc::clone(&heartbeat);
+        let task = tasks.spawn("maintenance", move || {
+            run_maintenance(PERIOD, Arc::clone(&hb), |_| std::future::pending::<()>())
+        });
+        tokio::time::sleep(PERIOD * 30).await;
+        assert_eq!(tasks.failing(), None, "a loop of cut ticks is alive");
+        task.abort();
+    }
+
+    /// `nora_maintenance_timeouts_total` is exported from the loop's start, at 0, before any
+    /// tick is cut, so an alert on its `increase` sees the first cut. The counter is the
+    /// process's: run alone (`--exact`), this test sees a series no other test created.
+    #[tokio::test(start_paused = true)]
+    async fn the_cut_counter_is_exported_before_the_first_cut() {
+        let heartbeat = Arc::new(Heartbeat::new(Duration::from_secs(90)));
+        let task = tokio::spawn(run_maintenance(
+            super::MAINTENANCE_PERIOD,
+            heartbeat,
+            |_| async {},
+        ));
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            prometheus::gather()
+                .iter()
+                .any(|family| family.name() == "nora_maintenance_timeouts_total"),
+            "the counter appears only with the first cut tick"
+        );
+        task.abort();
+    }
+
+    /// A tick cut at its deadline is counted in `nora_maintenance_timeouts_total`, which an
+    /// alert on a store that does not answer reads. The counter is the process's, shared with
+    /// tests running beside this one, which only add to it.
+    #[tokio::test(start_paused = true)]
+    async fn a_cut_tick_is_counted() {
+        let period = super::MAINTENANCE_PERIOD;
+        let silence = Duration::from_secs(90);
+        let cuts = || super::metrics::MAINTENANCE_TIMEOUTS_TOTAL.get();
+        let before = cuts();
+        let heartbeat = Arc::new(Heartbeat::new(silence));
+        let task = tokio::spawn(run_maintenance(period, heartbeat, |n| async move {
+            if n == 1 {
+                std::future::pending::<()>().await;
+            }
+        }));
+        tokio::time::sleep(tick_deadline(period, silence) + Duration::from_secs(1)).await;
+        assert!(cuts() > before, "a cut tick is not counted");
+        task.abort();
+    }
+
+    /// After a cut tick the next one starts at its slot: the slots the cut tick overran are
+    /// skipped, not run back to back against a store that is not answering.
+    #[tokio::test]
+    async fn a_cut_tick_keeps_the_cadence() {
+        const SLOT: Duration = Duration::from_millis(50);
+        // A 150 ms deadline: tick 2 (at 50 ms) is cut at 200 ms, past the slots at 100 and 150.
+        let (tasks, heartbeat) = supervised(SLOT * 10);
+        let hb = Arc::clone(&heartbeat);
+        let (started, mut start_times) = tokio::sync::mpsc::unbounded_channel();
+        let task = tasks.spawn("maintenance", move || {
+            let started = started.clone();
+            run_maintenance(SLOT, Arc::clone(&hb), move |n| {
+                let _ = started.send(tokio::time::Instant::now());
+                async move {
+                    if n == 2 {
+                        std::future::pending::<()>().await;
+                    }
+                }
+            })
+        });
+        tokio::time::sleep(SLOT * 8).await;
+        task.abort();
+        let mut starts = Vec::new();
+        while let Ok(start) = start_times.try_recv() {
+            starts.push(start);
+        }
+        assert!(
+            starts.len() >= 4,
+            "ticks after the cut one: {}",
+            starts.len()
+        );
+        assert!(
+            starts[3] - starts[2] >= SLOT / 2,
+            "the tick after the cut one is followed by the next slot, not at once: {:?}",
+            starts[3] - starts[2]
+        );
+    }
+
+    /// A tick that holds its thread cannot be cut: the loop starts no new tick, and that
+    /// fails liveness.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tick_that_blocks_its_thread_fails_liveness() {
+        let (tasks, heartbeat) = supervised(PERIOD * 10);
+        let hb = Arc::clone(&heartbeat);
+        let task = tasks.spawn("maintenance", move || {
+            run_maintenance(PERIOD, Arc::clone(&hb), |n| async move {
+                if n == 2 {
+                    std::thread::sleep(PERIOD * 40);
+                }
+            })
+        });
+        // The test thread waits on its own clock: a blocked worker can hold up tokio's timers.
+        std::thread::sleep(PERIOD * 2);
+        assert_eq!(tasks.failing(), None, "within the silence it may keep");
+        std::thread::sleep(PERIOD * 20);
+        assert_eq!(
+            tasks.failing(),
+            Some("maintenance"),
+            "a loop that starts no tick stops the beats"
+        );
+        task.abort();
+    }
+}
+
+#[cfg(test)]
+mod server_supervision_tests {
+    //! The supervisor and the maintenance heartbeat the server runs with, as `supervision`
+    //! builds them from the server configuration, on tokio's paused clock: the windows are
+    //! whole seconds and minutes.
+    use super::{run_maintenance, supervision, MAINTENANCE_PERIOD};
+    use crate::config::ServerConfig;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    const SECOND: Duration = Duration::from_secs(1);
+
+    /// `/health` fails once no tick has completed for the whole configured window, and not a
+    /// second before: the default, the smallest the configuration accepts and longer ones.
+    #[tokio::test(start_paused = true)]
+    async fn the_stall_window_is_the_whole_configured_window() {
+        let default = ServerConfig::default().maintenance_stall_secs;
+        assert_eq!(default, 300);
+        for secs in [default, 90, 600, 3600] {
+            let server = ServerConfig {
+                maintenance_stall_secs: secs,
+                ..ServerConfig::default()
+            };
+            let (tasks, heartbeat) = supervision(&server);
+            assert_eq!(heartbeat.max_silence(), SECOND * secs as u32);
+            tokio::time::sleep(SECOND * (secs as u32 - 1)).await;
+            assert_eq!(tasks.failing(), None, "{secs} s window, 1 s before");
+            tokio::time::sleep(SECOND * 2).await;
+            assert_eq!(
+                tasks.failing(),
+                Some("maintenance"),
+                "{secs} s window, 1 s after"
+            );
+        }
+    }
+
+    /// The server's restart timing: 1 s before the first restart, doubled after each panic up
+    /// to a minute; a task panicking at every start fails `/health` at its fifth panic, not
+    /// before.
+    #[tokio::test(start_paused = true)]
+    async fn the_server_restarts_a_task_after_a_doubling_backoff_and_flags_the_fifth_panic() {
+        let (tasks, _heartbeat) = supervision(&ServerConfig::default());
+        let origin = tokio::time::Instant::now();
+        let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = Arc::clone(&starts);
+        let task = tasks.spawn("test_server_timing", move || {
+            let mut starts = s.lock().unwrap();
+            starts.push(origin.elapsed().as_secs());
+            // Past twenty runs, a restart without a pause would spin and stop the paused
+            // clock: the run then waits, so the test fails on the starts instead of hanging.
+            let spinning = starts.len() > 20;
+            async move {
+                if spinning {
+                    std::future::pending::<()>().await;
+                }
+                panic!("a bug in every run")
+            }
+        });
+        // Panics at 0, 1, 3, 7 and 15 s.
+        tokio::time::sleep(Duration::from_millis(14_500)).await;
+        assert_eq!(tasks.failing(), None, "four panics in a row");
+        tokio::time::sleep(SECOND).await;
+        assert_eq!(tasks.failing(), Some("test_server_timing"));
+        tokio::time::sleep(SECOND * 230).await;
+        task.abort();
+        assert_eq!(
+            *starts.lock().unwrap(),
+            [0, 1, 3, 7, 15, 31, 63, 123, 183, 243]
+        );
+    }
+
+    /// One panicking maintenance tick, under the supervisor and heartbeat the server runs
+    /// with, never fails `/health`: the loop restarts and its ticks go on.
+    #[tokio::test(start_paused = true)]
+    async fn one_panicking_tick_keeps_liveness_under_the_server_supervisor() {
+        let (tasks, heartbeat) = supervision(&ServerConfig::default());
+        let runs = Arc::new(AtomicU64::new(0));
+        let ticks = Arc::new(AtomicU64::new(0));
+        let (r, t, hb) = (
+            Arc::clone(&runs),
+            Arc::clone(&ticks),
+            Arc::clone(&heartbeat),
+        );
+        let task = tasks.spawn("maintenance", move || {
+            let run = r.fetch_add(1, Ordering::SeqCst);
+            let t = Arc::clone(&t);
+            run_maintenance(MAINTENANCE_PERIOD, Arc::clone(&hb), move |n| {
+                let t = Arc::clone(&t);
+                async move {
+                    assert!(!(run == 0 && n == 1), "a bug in the first tick");
+                    t.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        });
+        for _ in 0..60 {
+            tokio::time::sleep(SECOND * 10).await;
+            assert_eq!(tasks.failing(), None);
+        }
+        task.abort();
+        assert_eq!(runs.load(Ordering::SeqCst), 2, "restarted once");
+        assert!(
+            ticks.load(Ordering::SeqCst) >= 19,
+            "ticks every 30 s after the restart"
+        );
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod maintenance_storage_tests {
+    //! The server's own maintenance loop and tick over a store that is slow, silent or
+    //! large, and a tick cut at its deadline.
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_auth, create_test_context_with_storage_and_config,
+        long_count_storage, outage_storage, send, slow_listing_storage,
+    };
+    use axum::http::{Method, StatusCode};
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    /// A large bucket: the first page of its listing answers at once, the whole listing
+    /// (1.6 s) takes longer than a tick may run (633 ms with a 2 s window). Readiness comes
+    /// from that first page, so `/ready` turns 200 and stays 200; the size, counted from the
+    /// whole listing apart from the tick, shows once that listing ends.
+    #[tokio::test]
+    async fn a_large_bucket_is_ready_and_its_size_follows() {
+        let storage = slow_listing_storage(Duration::from_millis(400));
+        for i in 0..5 {
+            storage
+                .put(&format!("raw/big/{i}.bin"), &[0u8; 100])
+                .await
+                .unwrap();
+        }
+        let ctx = create_test_context_with_storage_and_config(storage, |c| {
+            c.server.maintenance_stall_secs = 2
+        });
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
+
+        let mut ready = StatusCode::SERVICE_UNAVAILABLE;
+        for _ in 0..10 {
+            ready = send(&ctx.app, Method::GET, "/ready", "").await.status();
+            if ready == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(ready, StatusCode::OK, "ready from the first page");
+
+        let mut size = 0;
+        for _ in 0..40 {
+            let ready = send(&ctx.app, Method::GET, "/ready", "").await.status();
+            assert_eq!(
+                ready,
+                StatusCode::OK,
+                "readiness does not wait for the listing"
+            );
+            let health = send(&ctx.app, Method::GET, "/health", "").await;
+            assert_eq!(health.status(), StatusCode::OK);
+            let json: serde_json::Value =
+                serde_json::from_slice(&body_bytes(health).await).unwrap();
+            size = json["storage"]["total_size_bytes"].as_u64().unwrap();
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(size >= 500, "the size of the whole listing: {size}");
+    }
+
+    /// Counting the store's size panics, late, every time: the panic is logged and counted
+    /// under `storage_size`, the next count starts again, and the loop and readiness go on.
+    #[tokio::test]
+    async fn a_panic_counting_the_size_is_reported_and_the_loop_goes_on() {
+        let panics = || {
+            super::metrics::TASK_PANICS_TOTAL
+                .with_label_values(&["storage_size"])
+                .get()
+        };
+        let before = panics();
+        let (storage, outage) = outage_storage();
+        outage.panic_counting_size();
+        let ctx = create_test_context_with_storage_and_config(storage, |c| {
+            c.server.maintenance_stall_secs = 2
+        });
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
+
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert!(
+            panics() - before >= 2,
+            "each panic counted, and the count starts again after one"
+        );
+        assert_eq!(ctx.state.tasks.failing(), None);
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await.status();
+        assert_eq!(ready, StatusCode::OK, "readiness is not the size count");
+    }
+
+    /// A tick panics once while the size count it started still runs: the loop is restarted,
+    /// and the restarted loop does not start a second count beside the first.
+    #[tokio::test]
+    async fn a_restarted_loop_does_not_start_a_second_size_count() {
+        let (storage, counts) = long_count_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |_| {});
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(50));
+        // The server's restart backoff is 1 s; the restarted loop's first tick is an odd one,
+        // which starts a count.
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            counts.probes.load(Ordering::SeqCst) >= 3,
+            "the loop runs again after the panicking tick"
+        );
+        assert_eq!(
+            counts.most_counting.load(Ordering::SeqCst),
+            1,
+            "a second count ran beside the first after the restart"
+        );
+    }
+
+    /// A store that accepted the connection and went silent: `/health` stays 200 for
+    /// twice the stall window, `/ready` is 503; once the store answers again `/ready`
+    /// turns 200 under the same loop, which never failed.
+    #[tokio::test]
+    async fn a_silent_store_fails_readiness_not_liveness() {
+        let (storage, outage) = outage_storage();
+        outage.silence();
+        let ctx = create_test_context_with_storage_and_config(storage, |c| {
+            c.server.maintenance_stall_secs = 2
+        });
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
+
+        for _ in 0..45 {
+            let health = send(&ctx.app, Method::GET, "/health", "").await;
+            assert_eq!(
+                health.status(),
+                StatusCode::OK,
+                "liveness while the store is silent"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        outage.end();
+        let mut ready = StatusCode::SERVICE_UNAVAILABLE;
+        for _ in 0..50 {
+            ready = send(&ctx.app, Method::GET, "/ready", "").await.status();
+            if ready == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(ready, StatusCode::OK, "the store answers again");
+        assert_eq!(ctx.state.tasks.failing(), None);
+    }
+
+    /// Poll `/ready` until it answers `want`, at most `polls` times 100 ms apart, asserting
+    /// `/health` 200 at every poll. Returns the last `/ready` status.
+    ///
+    /// The local-store tests below run a 6 s stall window: its 1.97 s tick deadline stays
+    /// above what an fsync usually takes on a busy test host, so only a probe that really does
+    /// not come back is cut. A tick is 100 ms; the poll budgets cover the deadline and stay far
+    /// inside the 150 s a verdict takes to expire, so only a tick's probe can turn `/ready`.
+    /// Turning 200 waits for an fsync, which a loaded host can stretch past the deadline: those
+    /// budgets are the longer ones, and a passing poll ends them early.
+    async fn ready_becomes(app: &axum::Router, want: StatusCode, polls: usize) -> StatusCode {
+        let mut ready = send(app, Method::GET, "/ready", "").await.status();
+        for _ in 0..polls {
+            if ready == want {
+                break;
+            }
+            let health = send(app, Method::GET, "/health", "").await;
+            assert_eq!(health.status(), StatusCode::OK, "liveness meanwhile");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            ready = send(app, Method::GET, "/ready", "").await.status();
+        }
+        ready
+    }
+
+    /// The local store stops taking writes (a read-only remount, a full disk): the next
+    /// tick's write probe sees it, so `/ready` turns 503 within a tick while `/health` stays
+    /// 200; writable again, `/ready` turns 200 under the same loop.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unwritable_local_store_fails_readiness_within_a_tick() {
+        use std::os::unix::fs::PermissionsExt;
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.maintenance_stall_secs = 6
+        });
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 150).await;
+        assert_eq!(ok, StatusCode::OK, "writable store");
+
+        let dir = ctx._tempdir.path();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let unwritable = ready_becomes(&ctx.app, StatusCode::SERVICE_UNAVAILABLE, 50).await;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            unwritable,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "read-only store"
+        );
+
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 150).await;
+        assert_eq!(ok, StatusCode::OK, "writable again");
+        assert_eq!(ctx.state.tasks.failing(), None);
+    }
+
+    /// Each tick, whatever its number, probes the store: the tick right after the local
+    /// store turns read-only answers `/ready` 503, the next one after it is writable again
+    /// answers 200.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn every_tick_sees_a_local_store_change() {
+        use std::os::unix::fs::PermissionsExt;
+        let ctx = crate::test_helpers::create_test_context();
+        let work = super::MaintenanceWork::new(&ctx.state.tasks);
+        let dir = ctx._tempdir.path();
+        let ready = || async { send(&ctx.app, Method::GET, "/ready", "").await.status() };
+
+        super::maintenance_tick(&ctx.state, 2, &work).await;
+        assert_eq!(ready().await, StatusCode::OK);
+        for (tick, mode, want) in [
+            (3, 0o500, StatusCode::SERVICE_UNAVAILABLE),
+            (4, 0o700, StatusCode::OK),
+            (5, 0o500, StatusCode::SERVICE_UNAVAILABLE),
+            (6, 0o700, StatusCode::OK),
+        ] {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+            super::maintenance_tick(&ctx.state, tick, &work).await;
+            let got = ready().await;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(got, want, "after tick {tick}");
+        }
+    }
+
+    /// The local disk stops answering (the write probe blocks): `/ready` turns 503 once the
+    /// tick after the cut one finds the probe still waiting, and `/health` stays 200 past the
+    /// whole stall window; when the disk answers again `/ready` turns 200, under the same loop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hung_local_disk_fails_readiness_not_liveness() {
+        let ctx = crate::test_helpers::create_test_context_with_config(|c| {
+            c.server.maintenance_stall_secs = 6
+        });
+        super::spawn_maintenance(&ctx.state, Duration::from_millis(100));
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 150).await;
+        assert_eq!(ok, StatusCode::OK, "answering disk");
+
+        let disk = crate::test_helpers::hang_health_probe(ctx._tempdir.path());
+        // The probe is cut at the 1.97 s tick deadline; the tick after finds it waiting.
+        let hung = ready_becomes(&ctx.app, StatusCode::SERVICE_UNAVAILABLE, 50).await;
+        assert_eq!(
+            hung,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "disk that does not answer"
+        );
+        for _ in 0..65 {
+            let health = send(&ctx.app, Method::GET, "/health", "").await;
+            assert_eq!(health.status(), StatusCode::OK, "liveness on a hung disk");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        disk.answer();
+        let ok = ready_becomes(&ctx.app, StatusCode::OK, 150).await;
+        assert_eq!(ok, StatusCode::OK, "the disk answers again");
+        assert_eq!(ctx.state.tasks.failing(), None);
+    }
+
+    /// A tick cut while the token `last_used` flush runs (its deadline can fall at any await)
+    /// does not cut the flush: the timestamps it took still land on disk.
+    #[tokio::test]
+    async fn a_cut_tick_finishes_its_token_flush() {
+        let ctx = create_test_context_with_auth(&[("admin", "pw")]);
+        let tokens = ctx.state.tokens.as_ref().unwrap();
+        let token = tokens
+            .create_token("admin", 30, None, super::tokens::Role::Read)
+            .unwrap();
+        tokens.verify_token(&token).unwrap();
+
+        // Polled once and dropped, wherever it was: the flush has taken the pending timestamps.
+        let work = super::MaintenanceWork::new(&ctx.state.tasks);
+        let _ = futures::FutureExt::now_or_never(super::maintenance_tick(&ctx.state, 2, &work));
+
+        let mut last_used = None;
+        for _ in 0..50 {
+            last_used = tokens.list_tokens("admin")[0].last_used;
+            if last_used.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(last_used.is_some(), "the flush ran to its end");
+    }
+}
+
 /// How serving ended after the shutdown signal.
 #[derive(Debug, PartialEq, Eq)]
 enum ServeEnd {
@@ -2817,50 +4851,101 @@ enum ServeEnd {
 
 /// Serve `app` until `shutdown` resolves, then give in-flight requests `drain` to finish.
 ///
-/// axum's graceful shutdown stops accepting at once but then waits for every open
-/// connection with no limit, so a client that stops reading a response holds it
-/// forever. Connections still open when the window passes are not awaited any more:
-/// their tasks end when the runtime shuts down at process exit, after the shutdown
-/// steps (schedulers, audit drain, token flush) have run.
+/// Each connection is served under `limits` (header and keep-alive timeouts, see
+/// [`server_conn`]); past `max_connections` open ones, no new connection is accepted until
+/// one closes. At the signal the listener closes and every connection finishes the request
+/// in flight and closes. A client that stops reading a response would hold its connection
+/// forever, so connections still open when the window passes are not waited for: they are
+/// dropped, and the shutdown steps (schedulers, audit drain, token flush) run.
 async fn serve_with_drain<F>(
     listener: tokio::net::TcpListener,
     app: Router,
     shutdown: F,
     drain: std::time::Duration,
+    limits: ConnLimits,
 ) -> std::io::Result<ServeEnd>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    let signalled = Arc::new(tokio::sync::Notify::new());
-    let notify = Arc::clone(&signalled);
-    let server = axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown(async move {
-        shutdown.await;
-        // A stored permit: the wait below sees it even if it starts afterwards.
-        notify.notify_one();
-    });
-    let server = std::future::IntoFuture::into_future(server);
-    tokio::pin!(server);
-    // CANCEL-SAFETY: both arms only poll; the server future stays pinned here and is
-    // polled again below, `notified()` holds nothing.
-    tokio::select! {
-        served = &mut server => {
-            served?;
-            return Ok(ServeEnd::Drained);
+    let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_connections));
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let mut connections = tokio::task::JoinSet::new();
+    tokio::pin!(shutdown);
+    loop {
+        // CANCEL-SAFETY: `next_connection` only waits for a permit and an accept, both
+        // cancel-safe: dropped at the signal it releases the permit it may hold and loses no
+        // accepted connection. `shutdown` stays pinned; `join_next` loses no task.
+        tokio::select! {
+            () = &mut shutdown => break,
+            (permit, stream, remote) = next_connection(&listener, &permits) => {
+                let (app, stopped) = (app.clone(), stopped.clone());
+                connections.spawn(async move {
+                    let _permit = permit;
+                    server_conn::serve_connection(stream, remote, app, limits, stopped).await;
+                });
+            }
+            Some(ended) = connections.join_next(), if !connections.is_empty() => {
+                log_connection_end(ended);
+            }
         }
-        () = signalled.notified() => {}
     }
-    // CANCEL-SAFETY: on timeout the server future is dropped; that only stops waiting
-    // for the open connections, whose tasks are owned by the runtime.
-    match tokio::time::timeout(drain, &mut server).await {
-        Ok(served) => {
-            served?;
-            Ok(ServeEnd::Drained)
+    drop(listener);
+    // Receivers are closed only by dropping them, so `send` cannot fail while the
+    // connections hold theirs; afterwards nobody needs the signal.
+    let _ = stop.send(true);
+    // CANCEL-SAFETY: on timeout the wait ends and `connections` is dropped, which drops
+    // the connections still open; nothing else is lost.
+    let drained = tokio::time::timeout(drain, async {
+        while let Some(ended) = connections.join_next().await {
+            log_connection_end(ended);
         }
-        Err(_) => Ok(ServeEnd::DeadlinePassed),
+    })
+    .await;
+    Ok(match drained {
+        Ok(()) => ServeEnd::Drained,
+        Err(_) => ServeEnd::DeadlinePassed,
+    })
+}
+
+/// The next client connection, once fewer than `max_connections` are open.
+async fn next_connection(
+    listener: &tokio::net::TcpListener,
+    permits: &Arc<tokio::sync::Semaphore>,
+) -> (
+    tokio::sync::OwnedSemaphorePermit,
+    tokio::net::TcpStream,
+    std::net::SocketAddr,
+) {
+    let permit = Arc::clone(permits)
+        .acquire_owned()
+        .await
+        .expect("the connection semaphore is never closed");
+    loop {
+        match listener.accept().await {
+            Ok((stream, remote)) => return (permit, stream, remote),
+            // One client's connection went away before it was accepted.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionRefused
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                ) => {}
+            // Out of file descriptors and the like: wait instead of spinning on it.
+            Err(e) => {
+                error!(error = %e, "accepting a connection failed, retrying in 1 s");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
+/// A connection task that panicked is logged; the server goes on.
+fn log_connection_end(ended: Result<(), tokio::task::JoinError>) {
+    if let Err(e) = ended {
+        if e.is_panic() {
+            error!(panic = ?e, "connection task panicked");
+        }
     }
 }
 
@@ -2896,25 +4981,69 @@ async fn shutdown_signal() {
     }
 }
 
-/// Reload curation policy from disk (triggered by SIGHUP).
+/// The quarantine settings NORA started with, by key. Every format reads the quarantine from
+/// the configuration NORA started with, and the start decides whether the store of first-seen
+/// digests is loaded, so a SIGHUP does not apply a change to it: the reload holds these — and
+/// nothing else of that configuration — to name what it leaves for a restart.
+pub(crate) struct HeldQuarantine(Vec<(String, String)>);
+
+impl HeldQuarantine {
+    fn of(curation: &config::CurationConfig) -> Self {
+        Self(curation.unreloaded_settings())
+    }
+
+    /// The keys whose setting in `loaded` is not the one NORA started with: set, changed or
+    /// removed, globally or in a registry's own section.
+    fn unapplied(&self, loaded: &config::CurationConfig) -> Vec<String> {
+        let loaded = loaded.unreloaded_settings();
+        self.0
+            .iter()
+            .filter(|(key, held)| {
+                loaded
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .is_none_or(|(_, value)| value != held)
+            })
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+}
+
+/// Reload curation policy from the configuration file at `path` (triggered by SIGHUP).
 ///
-/// Re-reads config.toml, rebuilds the CurationEngine with new filters,
-/// and atomically swaps the old config via ArcSwap.
-/// Storage, auth, port, and other settings are NOT reloaded — only curation.
-fn reload_curation(state: &AppState) -> Result<(), String> {
-    let config = Config::try_load()?;
+/// Re-reads the file, rebuilds the CurationEngine with new filters, and atomically swaps it,
+/// with the bypass token, into `slot`. It is handed the slot and the quarantine NORA started
+/// with, not the state: the rest of the start configuration is out of its reach, so the engine
+/// it installs is the one the file it read describes. Tests reload through this function, not
+/// a copy of it.
+/// Storage, auth, port, and other settings are NOT reloaded — only curation, and of it not the
+/// digest quarantine: a setting the file changes there is named in a warning, it waits for a
+/// restart ([`HeldQuarantine::unapplied`]).
+fn reload_curation(
+    slot: &ArcSwap<ReloadableConfig>,
+    held: &HeldQuarantine,
+    path: Option<String>,
+) -> Result<(), String> {
+    let config = Config::try_load_from(path)?;
 
     // Fail-closed: `build_curation_engine` returns Err in enforce mode if any
     // filter no longer parses, so a broken allowlist surfaces here and the
     // `?` short-circuits BEFORE the `store` below — the previous (working)
     // engine is kept and never swapped for an allow-all one (#586).
     let engine = build_curation_engine(&config)?;
+    let unreloaded = held.unapplied(&config.curation);
 
-    state.reloadable.store(Arc::new(ReloadableConfig {
+    slot.store(Arc::new(ReloadableConfig {
         curation_engine: engine,
         bypass_token: config.curation.bypass_token,
     }));
 
+    if !unreloaded.is_empty() {
+        warn!(
+            keys = ?unreloaded,
+            "Changed curation keys are not applied by a reload; they apply after a restart"
+        );
+    }
     Ok(())
 }
 
@@ -3309,6 +5438,202 @@ mod curation_reload_tests {
             assert!(err.contains("curation.npm.min_release_age"), "{err}");
             assert!(err.contains("3x"), "{err}");
         }
+    }
+
+    /// The line a reload logs about keys it leaves for a restart, if it logs one.
+    fn restart_warning(log: &str) -> Option<&str> {
+        log.lines()
+            .find(|line| line.contains("WARN") && line.contains("restart"))
+    }
+
+    /// A reload does not apply the quarantine: the handlers read it from the
+    /// configuration NORA started with. A SIGHUP that changes it says so, naming
+    /// each changed key, the global ones and a registry's own, and only those.
+    #[tokio::test]
+    async fn a_reload_that_changes_the_quarantine_warns_it_waits_for_a_restart() {
+        use crate::digest_quarantine::QuarantineMode;
+        let ctx = crate::test_helpers::create_test_context_with_config(
+            crate::test_helpers::quarantine_7d,
+        );
+        let (log, _capture) = crate::test_helpers::LogCapture::start();
+        crate::test_helpers::reload_curation(&ctx, |config| {
+            config.curation.quarantine_ttl = Some("14d".to_string());
+            config.curation.npm.quarantine = Some(QuarantineMode::Observe);
+            config.curation.pub_dart.quarantine_ttl = Some("1d".to_string());
+        });
+
+        let text = log.text();
+        let warning = restart_warning(&text)
+            .unwrap_or_else(|| panic!("no restart warning after a quarantine change:\n{text}"));
+        for key in [
+            "curation.quarantine_ttl",
+            "curation.npm.quarantine",
+            "curation.pub.quarantine_ttl",
+        ] {
+            assert!(warning.contains(&format!("\"{key}\"")), "{key}: {warning}");
+        }
+        for unchanged in ["curation.quarantine", "curation.npm.quarantine_ttl"] {
+            assert!(
+                !warning.contains(&format!("\"{unchanged}\"")),
+                "{unchanged} did not change: {warning}"
+            );
+        }
+    }
+
+    /// `min_release_age`, global or a registry's own, is in the engine a reload
+    /// builds: a SIGHUP that changes only it applies it and warns of no restart.
+    #[tokio::test]
+    async fn a_reload_that_changes_only_the_release_age_warns_of_no_restart() {
+        let ctx = crate::test_helpers::create_test_context_with_config(
+            crate::test_helpers::quarantine_7d,
+        );
+        let npm = crate::curation::RegistryType::Npm;
+        assert!(!ctx.state.curation().curation_engine.reads_release_date(npm));
+        let (log, _capture) = crate::test_helpers::LogCapture::start();
+        crate::test_helpers::reload_curation(&ctx, |config| {
+            config.curation.min_release_age = Some("3d".to_string());
+            config.curation.npm.min_release_age = Some("1d".to_string());
+        });
+
+        let text = log.text();
+        assert_eq!(restart_warning(&text), None, "{text}");
+        assert!(
+            ctx.state.curation().curation_engine.reads_release_date(npm),
+            "the reload did not install the release-age rule"
+        );
+    }
+
+    /// The settings a reload leaves for a restart, decided from the two configurations alone:
+    /// a quarantine key set, changed or removed — globally and in each registry's own
+    /// section — is named, by the key config.toml spells it with; an unchanged one, and every
+    /// key a reload applies (the engine's and the bypass token), is not.
+    #[test]
+    fn a_reload_names_each_quarantine_setting_it_leaves_for_a_restart() {
+        use crate::curation::RegistryType;
+        let curation = |text: &str| {
+            toml::from_str::<Config>(text)
+                .unwrap_or_else(|e| panic!("{text}: {e}"))
+                .curation
+        };
+        let unapplied = |started: &str, loaded: &str| {
+            super::HeldQuarantine::of(&curation(started)).unapplied(&curation(loaded))
+        };
+        let none: Vec<String> = Vec::new();
+        let plain = "[curation]\nmode = \"enforce\"\n";
+        let set = format!("{plain}quarantine = \"enforce\"\nquarantine_ttl = \"7d\"\n");
+        let other = format!("{plain}quarantine = \"observe\"\nquarantine_ttl = \"3d\"\n");
+        let both = ["curation.quarantine", "curation.quarantine_ttl"];
+        for (started, loaded, want, row) in [
+            (plain, plain.to_string(), none.clone(), "global: neither"),
+            (&set, set.clone(), none.clone(), "global: unchanged"),
+            (plain, set.clone(), both.map(String::from).to_vec(), "global: set"),
+            (&set, plain.to_string(), both.map(String::from).to_vec(), "global: removed"),
+            (&set, other.clone(), both.map(String::from).to_vec(), "global: changed"),
+            (
+                &set,
+                format!("{plain}quarantine = \"enforce\"\n"),
+                vec!["curation.quarantine_ttl".to_string()],
+                "global: ttl removed alone",
+            ),
+            (
+                plain,
+                "[curation]\nmode = \"audit\"\nallowlist_path = \"a.json\"\nblocklist_path = \"b.json\"\n\
+                 require_integrity = true\ninternal_namespaces = [\"corp/*\"]\nmin_release_age = \"1d\"\n\
+                 [curation.npm]\nmin_release_age = \"2d\"\n"
+                    .to_string(),
+                none.clone(),
+                "keys a reload applies",
+            ),
+        ] {
+            assert_eq!(unapplied(started, &loaded), want, "{row}");
+        }
+        for &rt in RegistryType::all() {
+            if curation(plain).registry_override(rt).is_none() {
+                continue;
+            }
+            let own = |body: &str| format!("{plain}[curation.{rt}]\n{body}");
+            let set = own("quarantine = \"enforce\"\nquarantine_ttl = \"7d\"\n");
+            let other = own("quarantine = \"off\"\nquarantine_ttl = \"1d\"\n");
+            let keys = vec![
+                format!("curation.{rt}.quarantine"),
+                format!("curation.{rt}.quarantine_ttl"),
+            ];
+            for (started, loaded, want, row) in [
+                (set.clone(), set.clone(), none.clone(), "unchanged"),
+                (plain.to_string(), set.clone(), keys.clone(), "set"),
+                (set.clone(), plain.to_string(), keys.clone(), "removed"),
+                (set.clone(), other.clone(), keys.clone(), "changed"),
+                (
+                    set.clone(),
+                    own("quarantine = \"enforce\"\n"),
+                    vec![format!("curation.{rt}.quarantine_ttl")],
+                    "ttl removed alone",
+                ),
+            ] {
+                assert_eq!(unapplied(&started, &loaded), want, "{rt}: {row}");
+            }
+        }
+    }
+
+    /// What a SIGHUP installs is the engine of the file it reads: a release-age rule the file
+    /// brings in applies from then on, one the file drops no longer does, and a file that does
+    /// not load leaves the running engine in place.
+    #[test]
+    fn a_reload_installs_the_engine_of_the_file_it_reads() {
+        use crate::curation::RegistryType;
+        let slot = arc_swap::ArcSwap::from_pointee(super::ReloadableConfig {
+            curation_engine: build_curation_engine(&enforce()).unwrap(),
+            bypass_token: None,
+        });
+        let reads = |slot: &arc_swap::ArcSwap<super::ReloadableConfig>| {
+            RegistryType::all()
+                .iter()
+                .filter(|&&rt| slot.load().curation_engine.reads_release_date(rt))
+                .count()
+        };
+        let all = RegistryType::all().len();
+        let held = super::HeldQuarantine::of(&enforce().curation);
+        assert_eq!(reads(&slot), 0, "started without a release-age rule");
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let file = Some(path.to_string_lossy().into_owned());
+        // The reload applies the env overrides, so no other test may change them meanwhile.
+        let _lock = crate::test_env::env_lock();
+        for (text, loads, want, why) in [
+            (
+                "[curation]\nmode = \"enforce\"\nquarantine = \"observe\"\nmin_release_age = \"1h\"\n",
+                true,
+                all,
+                "brought in",
+            ),
+            (
+                "[curation]\nmode = \"enforce\"\nquarantine = \"observe\"\n",
+                true,
+                0,
+                "dropped",
+            ),
+            (
+                "[curation]\nmode = \"enforce\"\nquarantine = \"observe\"\n[curation.npm]\nmin_release_age = \"1h\"\n",
+                true,
+                1,
+                "npm's own",
+            ),
+            (
+                "[curation\nmode = \"enforce\"\n",
+                false,
+                1,
+                "a file that does not parse keeps npm's",
+            ),
+        ] {
+            std::fs::write(&path, text).unwrap();
+            let reloaded = super::reload_curation(&slot, &held, file.clone());
+            assert_eq!(reloaded.is_ok(), loads, "{why}: {reloaded:?}");
+            assert_eq!(reads(&slot), want, "{why}");
+        }
+        assert!(slot
+            .load()
+            .curation_engine
+            .reads_release_date(RegistryType::Npm));
     }
 }
 

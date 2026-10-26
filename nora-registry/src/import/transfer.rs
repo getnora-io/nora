@@ -70,12 +70,15 @@ pub enum Outcome {
 
 /// Options threaded from the CLI into every transfer.
 #[derive(Debug, Clone, Copy)]
-pub struct TransferOpts {
+pub struct TransferOpts<'a> {
     /// Stream + hash + verify + curate, but commit nothing (rehearsal).
     pub dry_run: bool,
     /// Permit committing sha1-only artifacts (marked weak provenance). SHA-1 is
     /// collision-broken, so this is opt-in (review R8).
     pub allow_sha1: bool,
+    /// The public base URL NORA serves under: an imported npm version names its
+    /// tarball there.
+    pub public_base: &'a str,
 }
 
 /// Provenance strength derived from which source digest we can verify against.
@@ -127,7 +130,7 @@ pub async fn transfer_artifact(
     storage: &Storage,
     curation: &CurationEngine,
     temp_dir: &Path,
-    opts: TransferOpts,
+    opts: TransferOpts<'_>,
 ) -> Outcome {
     // R8: decide verifiability up front — a no-checksum or ungated sha1-only
     // artifact never even gets downloaded.
@@ -167,6 +170,7 @@ pub async fn transfer_artifact(
         mut guard,
         sha256,
         sha1,
+        sha512,
         bytes,
     } = staged;
 
@@ -213,20 +217,186 @@ pub async fn transfer_artifact(
         };
     }
 
+    // 4b. An npm tarball is published by its version document, read from the staged
+    // file before anything is committed: a tarball whose manifest does not name its package and
+    // version leaves nothing behind. Without the document NORA takes the package for an
+    // upstream's and asks the upstream for its name.
+    let npm_version = if rt == RegistryType::Npm {
+        match staged_npm_version(key, &temp_path, &sha1, sha512, opts.public_base).await {
+            Ok(document) => Some(document),
+            Err(e) => {
+                return Outcome::Failed {
+                    reason: format!("{}: {e}", artifact.path),
+                }
+            }
+        }
+    } else {
+        None
+    };
+
+    // 4c. A .nupkg is stored with its .nuspec and its record, read from the staged file before
+    // anything is committed: a package that is no zip with one .nuspec naming the id and version
+    // of its key leaves nothing behind.
+    let nuget_package = if rt == RegistryType::Nuget {
+        match staged_nuget_package(key, &temp_path).await {
+            Ok(package) => Some(package),
+            Err(e) => {
+                return Outcome::Failed {
+                    reason: format!("{}: {e}", artifact.path),
+                }
+            }
+        }
+    } else {
+        None
+    };
+    // 4d. A PyPI file's project, from the key the layout built (`pypi/<project>/<file>`).
+    let pypi_file = if rt == RegistryType::PyPI {
+        match key
+            .strip_prefix("pypi/")
+            .and_then(|rest| rest.split_once('/'))
+        {
+            Some(parts) => Some(parts),
+            None => {
+                return Outcome::Failed {
+                    reason: format!("{}: not a PyPI file key: {key}", artifact.path),
+                }
+            }
+        }
+    } else {
+        None
+    };
+
     // 5. COMMIT (unless dry-run, which has already streamed+hashed+verified).
     if opts.dry_run {
         return Outcome::Imported { bytes, sha256 }; // rehearsal — guard drops temp
     }
     let _ = provenance; // (Weak provenance is surfaced by the orchestrator's report, not here.)
-    match storage.put_from_path(key, &temp_path, Some(&sha256)).await {
-        Ok(()) => {
-            guard.disarm(); // storage moved the temp file into place
-            Outcome::Imported { bytes, sha256 }
+
+    // The name is made hosted before its first file is stored: from the moment the import stores
+    // anything of it, its name is not asked of an upstream. An import that stops after this
+    // leaves the name hosted and empty.
+    if let Some((project, _)) = pypi_file {
+        if let Err(e) = crate::registry::pypi_claim_imported_project(storage, project).await {
+            return Outcome::Failed {
+                reason: format!("{}: making project {project} hosted: {e}", artifact.path),
+            };
         }
-        Err(e) => Outcome::Failed {
-            reason: format!("commit {key}: {e}"),
-        },
     }
+    if let Some(package) = &nuget_package {
+        if let Err(e) = storage.put(&package.marker_key, b"").await {
+            return Outcome::Failed {
+                reason: format!("{}: making the package hosted: {e}", artifact.path),
+            };
+        }
+    }
+    if let Err(e) = storage.put_from_path(key, &temp_path, Some(&sha256)).await {
+        return Outcome::Failed {
+            reason: format!("commit {key}: {e}"),
+        };
+    }
+    guard.disarm(); // storage moved the temp file into place
+                    // The tarball first, as a publish writes it: a version document always names bytes that are
+                    // there. A failed document write is retried by the next run, which transfers the
+                    // tarball again: a tarball without its document is not taken for the import's.
+    if let Some((version_key, document)) = npm_version {
+        if let Err(e) = storage.put(&version_key, &document).await {
+            return Outcome::Failed {
+                reason: format!("commit {version_key}: {e}"),
+            };
+        }
+    }
+    // A PyPI file's digest is recorded as an upload records it, and then the record that makes it
+    // one of the project's own files: a record always names bytes the import stored, never what
+    // an upstream left under the same name. A failed write fails the artifact, and the next run
+    // transfers it again.
+    if let Some((project, file)) = pypi_file {
+        if let Err(e) =
+            crate::registry::pypi_record_stored_file(storage, project, file, &sha256).await
+        {
+            return Outcome::Failed {
+                reason: format!("commit {key}.sha256: {e}"),
+            };
+        }
+        if let Err(e) = crate::registry::pypi_record_own_file(storage, project, file).await {
+            return Outcome::Failed {
+                reason: format!(
+                    "{}: recording {file} as the project's own: {e}",
+                    artifact.path
+                ),
+            };
+        }
+    }
+    // The .nuspec, then the record: the record is what makes the version served, so it always
+    // names a package and a .nuspec that are there. A failed write is retried by the next run.
+    if let Some(package) = nuget_package {
+        for (stored_key, data) in [
+            (&package.nuspec_key, &package.nuspec),
+            (&package.record_key, &package.record),
+        ] {
+            if let Err(e) = storage.put(stored_key, data).await {
+                return Outcome::Failed {
+                    reason: format!("commit {stored_key}: {e}"),
+                };
+            }
+        }
+    }
+    Outcome::Imported { bytes, sha256 }
+}
+
+/// Why a .nupkg's .nuspec and record could not be read.
+#[derive(Debug, thiserror::Error)]
+pub enum NugetPackageError {
+    #[error(transparent)]
+    Package(#[from] crate::registry::NugetImportedPackageError),
+    #[error("reading the package stopped: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+/// The .nuspec and record of the .nupkg staged at `temp_path`, read off the runtime.
+async fn staged_nuget_package(
+    key: &str,
+    temp_path: &Path,
+) -> std::result::Result<crate::registry::nuget::ImportedPackage, NugetPackageError> {
+    let (key, temp_path) = (key.to_string(), temp_path.to_path_buf());
+    let package = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&temp_path)?;
+        crate::registry::nuget_imported_package(&key, std::io::BufReader::new(file))
+    })
+    .await??;
+    Ok(package)
+}
+
+/// Why an npm tarball's version document could not be written.
+#[derive(Debug, thiserror::Error)]
+pub enum NpmVersionError {
+    #[error(transparent)]
+    Tarball(#[from] crate::registry::npm::ImportedTarballError),
+    #[error("reading the tarball stopped: {0}")]
+    Join(#[from] tokio::task::JoinError),
+}
+
+/// The version document of the npm tarball staged at `temp_path`, read off the runtime.
+async fn staged_npm_version(
+    key: &str,
+    temp_path: &Path,
+    sha1: &str,
+    sha512: [u8; 64],
+    public_base: &str,
+) -> std::result::Result<(String, Vec<u8>), NpmVersionError> {
+    let (key, temp_path) = (key.to_string(), temp_path.to_path_buf());
+    let (sha1, public_base) = (sha1.to_string(), public_base.to_string());
+    let document = tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&temp_path)?;
+        crate::registry::npm::imported_version_document(
+            &key,
+            std::io::BufReader::new(file),
+            &sha1,
+            &sha512,
+            &public_base,
+        )
+    })
+    .await??;
+    Ok(document)
 }
 
 /// A staged temp file plus its incrementally-computed digests.
@@ -235,6 +405,8 @@ struct Staged {
     guard: TempFileGuard,
     sha256: String,
     sha1: String,
+    /// npm's `dist.integrity` digest.
+    sha512: [u8; 64],
     bytes: u64,
 }
 
@@ -258,6 +430,7 @@ async fn stage_to_temp(
     // behind --allow-sha1 and marked weak provenance (review R8). The commit pin
     // is always the sha256 above.
     let mut h1 = sha1::Sha1::new(); // nosemgrep: deprecated-hash-algo
+    let mut h512 = sha2::Sha512::new();
     let mut bytes: u64 = 0;
     use tokio::io::AsyncWriteExt;
     while let Some(chunk) = stream.next().await {
@@ -265,6 +438,7 @@ async fn stage_to_temp(
         let chunk = chunk?;
         h256.update(&chunk);
         h1.update(&chunk);
+        h512.update(&chunk);
         file.write_all(&chunk)
             .await
             .map_err(|e| format!("write temp: {e}"))?;
@@ -289,6 +463,7 @@ async fn stage_to_temp(
         guard,
         sha256,
         sha1,
+        sha512: h512.finalize().into(),
         bytes,
     })
 }
@@ -457,7 +632,7 @@ mod tests {
         storage: &Storage,
         curation: &CurationEngine,
         td: &std::path::Path,
-        opts: TransferOpts,
+        opts: TransferOpts<'_>,
     ) -> Outcome {
         transfer_artifact(
             src,
@@ -474,10 +649,11 @@ mod tests {
         .await
     }
 
-    fn commit_opts() -> TransferOpts {
+    fn commit_opts() -> TransferOpts<'static> {
         TransferOpts {
             dry_run: false,
             allow_sha1: false,
+            public_base: "http://nora.test",
         }
     }
 
@@ -637,6 +813,7 @@ mod tests {
             TransferOpts {
                 dry_run: true,
                 allow_sha1: false,
+                public_base: "http://nora.test",
             },
         )
         .await;
@@ -663,6 +840,7 @@ mod tests {
             TransferOpts {
                 dry_run: false,
                 allow_sha1: true,
+                public_base: "http://nora.test",
             },
         )
         .await;

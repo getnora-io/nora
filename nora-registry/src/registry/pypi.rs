@@ -139,11 +139,29 @@ async fn package_versions(
     let prefix = format!("pypi/{}/", normalized);
     let base_url = nora_base_url(&state);
 
+    // #68 namespace isolation: an internal-namespace package must never be fetched
+    // upstream (dependency confusion). Skip the upstream merge entirely; a locally
+    // published copy is still served from the local-only branch below, and an
+    // internal name with no local copy is blocked (never proxied). Computed without
+    // the `blocked` metric — the metric fires only on the actual block path below.
+    let is_internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::PyPI,
+        &normalized,
+    );
+    let upstreams = state.config.pypi.upstreams();
+    // A project imported from the operator's own registry is NORA's: neither its index nor its
+    // dates are asked of an upstream, and it lists only its own files.
+    let Some(records) = own_records(&state.storage, &normalized).await else {
+        return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized));
+    };
+    let hosted = records.hosted();
+
     // #896: for JSON (Renovate) clients, ensure upstream PEP 700 upload-times are cached
     // so the index can surface them. No-op if already cached / internal / no upstream.
     // The map is read ONCE here and threaded through to [`pep700_meta`] — re-reading
     // `dates.json` per response was a second round-trip on the hot path (#969).
-    let dates = if wants_json(&headers) {
+    let dates = if wants_json(&headers) && !hosted {
         ensure_pypi_dates_cached(&state, &normalized).await
     } else {
         serde_json::Map::new()
@@ -188,6 +206,10 @@ async fn package_versions(
             if !filename.is_empty()
                 && !ends_with_ci(filename, ".sha256")
                 && is_valid_pypi_filename(filename)
+                && match records.file(filename) {
+                    own::File::Proxied | own::File::Own => true,
+                    own::File::Foreign => false,
+                }
             {
                 let sha256 = match markers.get(filename).map(Vec::as_slice) {
                     Some([sha256]) => Some((*sha256).to_string()),
@@ -195,12 +217,18 @@ async fn package_versions(
                         if markers_listed {
                             backfill.push(filename.to_string());
                         }
-                        state
-                            .storage
-                            .get(&format!("{}.sha256", key))
-                            .await
-                            .ok()
-                            .and_then(|d| String::from_utf8(d.to_vec()).ok())
+                        // A file without a sidecar is listed without a digest; one whose
+                        // sidecar the store cannot read is not listed as if it had none.
+                        let sidecar = format!("{}.sha256", key);
+                        match state.storage.get(&sidecar).await {
+                            Ok(d) => String::from_utf8(d.to_vec()).ok(),
+                            Err(crate::storage::StorageError::NotFound) => None,
+                            Err(e) => {
+                                return crate::registry::local_copy_unreadable(
+                                    "pypi", &sidecar, &e,
+                                );
+                            }
+                        }
                     }
                 };
                 local_sizes.insert(filename.to_string(), meta.size);
@@ -237,21 +265,9 @@ async fn package_versions(
     // the upstream order: the first upstream that lists a file wins (local files
     // win over all upstreams). One upstream's failure or open breaker must not
     // sink the others — skip it and serve the merge of what answered.
-    // #68 namespace isolation: an internal-namespace package must never be fetched
-    // upstream (dependency confusion). Skip the upstream merge entirely; a locally
-    // published copy is still served from the local-only branch below, and an
-    // internal name with no local copy is blocked (never proxied). Computed without
-    // the `blocked` metric — the metric fires only on the actual block path below.
-    let is_internal = crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::PyPI,
-        &normalized,
-    );
-
-    let upstreams = state.config.pypi.upstreams();
     let mut circuit_open = false;
     let mut miss = UpstreamMiss::default();
-    if !is_internal && !upstreams.is_empty() {
+    if !is_internal && !hosted && !upstreams.is_empty() {
         let mut upstream_files: Vec<FileEntry> = Vec::new();
         for up in &upstreams {
             let url = format!("{}/{}/", up.url().trim_end_matches('/'), normalized);
@@ -302,6 +318,11 @@ async fn package_versions(
         };
     }
 
+    // A hosted project with no file left lists nothing; the upstream was not asked.
+    if hosted {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
     // #68: an internal-namespace package with no local copy is blocked, never
     // proxied — return the namespace 403 (the only pypi metadata path that
     // increments the blocked metric).
@@ -350,12 +371,28 @@ async fn download_file(
     // Curation check — before storage access
     let version = crate::curation::parse_pypi_version(&normalized, &filename);
 
-    let key = format!("pypi/{}/{}", normalized, filename);
+    let key = storage_key(&normalized, &filename);
+
+    // A hosted project serves its own files only: a file NORA holds under its name without a
+    // record — one an upstream served before the import — is no file of it, and neither is one
+    // NORA does not hold; the upstream is not asked.
+    let Some(records) = own_records(&state.storage, &normalized).await else {
+        return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized));
+    };
+    let hosted = match records.file(&filename) {
+        own::File::Own => true,
+        own::File::Foreign => return StatusCode::NOT_FOUND.into_response(),
+        own::File::Proxied => false,
+    };
 
     // The release date of this file, for min-release-age and to seed the digest-quarantine
     // first-seen clock so a provably-old release is not held as "new to this mirror"
-    // (#748/#750). Obtained here whatever index the client read.
-    let publish_date = pypi_publish_date(&state, &normalized, &filename, &key).await;
+    // (#748/#750). Obtained here whatever index the client read. An own file of a hosted project
+    // has no upstream release, and an upstream's listing cached before the import does not date it.
+    let publish_date = match hosted {
+        true => None,
+        false => pypi_publish_date(&state, &normalized, &filename, &key).await,
+    };
 
     // #733 serve-local: an internal-namespace package is operator-owned — skip curation
     // and serve any local copy below; the upstream branch is blocked separately (never proxy).
@@ -434,7 +471,9 @@ async fn download_file(
 
     // Try local storage first. get_verified discharges the integrity witness at
     // the serve site (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -470,7 +509,10 @@ async fn download_file(
             &q_mode,
             q_secs,
             "cache",
-            publish_date,
+            crate::digest_quarantine::first_seen_seed(
+                state.config.server.trust_upstream_dates,
+                publish_date,
+            ),
         ) {
             return resp;
         }
@@ -490,12 +532,24 @@ async fn download_file(
 
     // #733: an internal-namespace package with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("pypi", &key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::PyPI,
             &normalized,
         )
         .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
+    }
+
+    // An own file of a hosted project that NORA cannot read is unavailable, not absent; one it
+    // no longer holds is not asked of the upstream either.
+    if hosted {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("pypi", &key, e);
+        }
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     // Try each configured upstream in order; the first whose index lists the file
@@ -530,10 +584,11 @@ async fn download_file(
         };
 
         // The file may live on a later upstream — keep walking the list.
-        let Some(file_url) = find_file_url(&html, &filename, &page_url) else {
+        let Some(indexed) = find_file_url(&html, &filename, &page_url) else {
             miss.answered();
             continue;
         };
+        let file_url = indexed.url;
 
         // The upstream's credential goes to the upstream's own origin only: an index may name its
         // files on another host, which must not receive it (pip scopes a credential the same way).
@@ -553,6 +608,23 @@ async fn download_file(
         .await
         {
             Ok(data) => {
+                // The bytes are the file the index named only when they have the digest it
+                // gave: pip checks the same digest, and a cached file would be listed with
+                // NORA's own instead, so wrong bytes are refused before anything is stored.
+                let hash = hex::encode(sha2::Sha256::digest(&data));
+                if indexed.sha256.as_ref().is_some_and(|want| *want != hash) {
+                    tracing::warn!(
+                        package = %normalized,
+                        filename = %filename,
+                        upstream = %up.url(),
+                        "PyPI upstream file does not match the index sha256, refusing it"
+                    );
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        "upstream file does not match the sha256 its index gives",
+                    )
+                        .into_response();
+                }
                 // The allowlist's pinned integrity holds on the first download too, before anything
                 // is cached: the cache-hit branch checks the same rule.
                 if let Some(response) = crate::curation::verify_integrity(
@@ -585,7 +657,6 @@ async fn download_file(
                 let repo_index = Arc::clone(&state.repo_index);
                 tokio::spawn(async move {
                     if storage.put(&key_clone, &data_clone).await.is_ok() {
-                        let hash = hex::encode(sha2::Sha256::digest(&data_clone));
                         let _ = storage
                             .put(&format!("{}.sha256", key_clone), hash.as_bytes())
                             .await;
@@ -601,7 +672,10 @@ async fn download_file(
                     &q_mode,
                     q_secs,
                     &file_url,
-                    publish_date,
+                    crate::digest_quarantine::first_seen_seed(
+                        state.config.server.trust_upstream_dates,
+                        publish_date,
+                    ),
                 ) {
                     return resp;
                 }
@@ -736,17 +810,28 @@ async fn upload(
     }
 
     // TOCTOU protection: lock per file to prevent concurrent uploads
-    let file_key = format!("pypi/{}/{}", normalized, filename);
+    let file_key = storage_key(&normalized, &filename);
     let lock = state.publish_lock(&file_key);
     let _guard = lock.lock().await;
 
-    // Check immutability (same filename = already exists)
+    // Check immutability (same filename = already exists). In a hosted project a file NORA holds
+    // without a record is not one of its files — an upstream served it before the import — and
+    // the upload replaces it.
     if state.storage.stat(&file_key).await.is_some() {
-        return (
-            StatusCode::CONFLICT,
-            format!("File {} already exists", filename),
-        )
-            .into_response();
+        let Some(records) = own_records(&state.storage, &normalized).await else {
+            return crate::registry::storage_unavailable("pypi", &own_prefix(&normalized));
+        };
+        let replaceable = match records.file(&filename) {
+            own::File::Foreign => true,
+            own::File::Own | own::File::Proxied => false,
+        };
+        if !replaceable {
+            return (
+                StatusCode::CONFLICT,
+                format!("File {} already exists", filename),
+            )
+                .into_response();
+        }
     }
 
     // Store file
@@ -762,6 +847,13 @@ async fn upload(
 
     // Hash marker: the simple index reads every digest from one listing.
     put_hash_marker(&state.storage, &normalized, &filename, &computed_hash).await;
+
+    // The record last: in a hosted project a file is listed once it is recorded, so a record
+    // always names the bytes this upload stored, never a file an upstream left under the name.
+    if let Err(e) = record_own_file(&state.storage, &normalized, &filename).await {
+        tracing::warn!(key = %file_key, error = %e, "pypi: failed to record an uploaded file");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
 
     state.metrics.record_upload("pypi");
     let artifact = format!("{}-{}", name, version);
@@ -980,14 +1072,6 @@ fn versions_html_response(normalized: &str, files: &[FileEntry], base_url: &str)
 /// With untrusted dates a missing listing is fetched on a cold miss only: that request goes
 /// upstream anyway, while a cache hit (a hosted package above all) must not start asking an
 /// upstream on every download.
-/// Whether a release-age rule reads a PyPI download's date: curation is on and
-/// `min_release_age` is set globally or for PyPI.
-fn release_age_applies(state: &AppState) -> bool {
-    let curation = &state.config.curation;
-    state.curation().curation_engine.is_active()
-        && (curation.min_release_age.is_some() || curation.pypi.min_release_age.is_some())
-}
-
 async fn pypi_publish_date(
     state: &AppState,
     normalized: &str,
@@ -1002,7 +1086,8 @@ async fn pypi_publish_date(
         // Without trusted dates the listing is asked for only when a release-age rule reads
         // the date: otherwise nothing uses it, and the download asks the upstream nothing more.
         Err(_)
-            if release_age_applies(state) && state.storage.stat(artifact_key).await.is_none() =>
+            if crate::registry::release_date_read(state, RegistryType::PyPI)
+                && state.storage.stat(artifact_key).await.is_none() =>
         {
             ensure_pypi_dates_cached(state, normalized).await
         }
@@ -1036,12 +1121,16 @@ async fn ensure_pypi_dates_cached(
     if let Ok(data) = state.storage.get(&key).await {
         return serde_json::from_slice(&data).unwrap_or_default();
     }
-    // #68: never fetch an internal-namespace package's metadata upstream.
+    // #68: never fetch an internal-namespace package's metadata upstream, nor a hosted
+    // project's — nor one whose hosted state the store cannot tell.
     if crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
         crate::curation::RegistryType::PyPI,
         normalized,
-    ) {
+    ) || own_records(&state.storage, normalized)
+        .await
+        .is_none_or(|records| records.hosted())
+    {
         return serde_json::Map::new();
     }
     let mut map = serde_json::Map::new();
@@ -1109,6 +1198,163 @@ async fn ensure_pypi_dates_cached(
 /// (`curation::pep503_normalize`): lowercase, every run of `-`, `_` and `.` one `-`.
 fn normalize_name(name: &str) -> String {
     crate::curation::pep503_normalize(name)
+}
+
+/// The key of distribution file `filename` of project `normalized` (PEP 503): the one an upload
+/// writes and a download reads. `nora import` writes the same key (contract
+/// `import-key-format-equals-handler-key-format`).
+pub(crate) fn storage_key(normalized: &str, filename: &str) -> String {
+    format!("pypi/{normalized}/{filename}")
+}
+
+/// Storage prefix of what NORA records of the projects it owns: `pypi-own/<project>/`.
+///
+/// - `pypi-own/<project>/files/<filename>` — a file of the project that is NORA's own: an upload
+///   or an import writes it with the file.
+/// - `pypi-own/<project>/imported` — the project is hosted: `nora import` writes it when it
+///   brings in a file of the project from the operator's own registry. From then on neither the
+///   project's index, its dates nor a file of it is asked of an upstream, and only its own files
+///   are listed and served: a file an upstream served under the name before the import is not.
+///
+/// One listing of the prefix answers both. The records live outside `pypi/`, so the listings of
+/// `pypi/` that retention, the web UI and the simple index read never take one for a
+/// distribution file.
+pub(crate) const OWN_PREFIX: &str = "pypi-own/";
+
+/// The prefix of project `normalized`'s records.
+fn own_prefix(normalized: &str) -> String {
+    format!("{OWN_PREFIX}{normalized}/")
+}
+
+/// The record that file `filename` of project `normalized` is NORA's own.
+pub(crate) fn own_file_key(normalized: &str, filename: &str) -> String {
+    format!("{OWN_PREFIX}{normalized}/files/{filename}")
+}
+
+/// What a project's records say of it and of each of its files, read from one listing of them.
+/// What a file is, is asked of [`own::Records::file`] alone: the records themselves are private
+/// to the module, so no handler decides by them otherwise.
+mod own {
+    use std::collections::HashSet;
+
+    /// What one file of a project is.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum File {
+        /// The project is not hosted: the file is what storage and the upstreams hold.
+        Proxied,
+        /// The project is hosted and the file is one of its own: listed and served, never asked
+        /// of an upstream.
+        Own,
+        /// The project is hosted and the file is not one of its own: what an upstream served
+        /// under the name before the import, or a file NORA does not hold. Neither listed nor
+        /// served, nor asked of an upstream; an upload replaces it.
+        Foreign,
+    }
+
+    /// The records of one project.
+    pub(super) struct Records {
+        hosted: bool,
+        files: HashSet<String>,
+    }
+
+    impl Records {
+        /// A project nothing is recorded of.
+        pub(super) fn none() -> Self {
+            Self {
+                hosted: false,
+                files: HashSet::new(),
+            }
+        }
+
+        /// The records `names` name: the keys under the project's prefix, without it. The marker
+        /// `imported` makes the project hosted, and `files/<filename>` records a file of it.
+        pub(super) fn from_listing<'a>(names: impl IntoIterator<Item = &'a str>) -> Self {
+            let mut records = Self::none();
+            for name in names {
+                if name == "imported" {
+                    records.hosted = true;
+                } else if let Some(file) = name.strip_prefix("files/") {
+                    records.files.insert(file.to_owned());
+                }
+            }
+            records
+        }
+
+        /// Whether the project is hosted: neither its index nor its dates are asked of an
+        /// upstream.
+        pub(super) fn hosted(&self) -> bool {
+            self.hosted
+        }
+
+        /// What file `filename` of the project is. A hosted project without a record of the file
+        /// — the marker is written first, so a record write that failed or a process that stopped
+        /// leaves none — does not own it.
+        pub(super) fn file(&self, filename: &str) -> File {
+            match (self.hosted, self.files.contains(filename)) {
+                (false, _) => File::Proxied,
+                (true, true) => File::Own,
+                (true, false) => File::Foreign,
+            }
+        }
+    }
+}
+
+/// The records of project `normalized`, or `None` when the listing failed: nothing is decided on
+/// a guess.
+async fn own_records(storage: &crate::storage::Storage, normalized: &str) -> Option<own::Records> {
+    let prefix = own_prefix(normalized);
+    if crate::validation::validate_storage_key(crate::validation::listing_key(&prefix)).is_err() {
+        return Some(own::Records::none());
+    }
+    match storage.list(&prefix).await {
+        Ok(keys) => Some(own::Records::from_listing(
+            keys.iter().filter_map(|k| k.strip_prefix(&prefix)),
+        )),
+        Err(e) => {
+            tracing::warn!(registry = "pypi", project = %normalized, error = %e, "pypi: own records not listed");
+            None
+        }
+    }
+}
+
+/// Make project `normalized` hosted. Written before the first file of it is stored, so from the
+/// moment an import stores anything of the project its name is no longer asked of an upstream.
+pub(crate) async fn claim_imported_project(
+    storage: &crate::storage::Storage,
+    normalized: &str,
+) -> crate::storage::Result<()> {
+    storage
+        .put(&format!("{}imported", own_prefix(normalized)), b"")
+        .await
+}
+
+/// Record file `filename` of project `normalized` as NORA's own. Written after the file and its
+/// digest are stored: a hosted project lists a file only once it is recorded, so a record always
+/// names bytes NORA stored, never what an upstream left under the same name.
+pub(crate) async fn record_own_file(
+    storage: &crate::storage::Storage,
+    normalized: &str,
+    filename: &str,
+) -> crate::storage::Result<()> {
+    storage.put(&own_file_key(normalized, filename), b"").await
+}
+
+/// Record the SHA-256 of a distribution file stored at `storage_key(project, filename)`, as an
+/// upload records it: the `.sha256` sidecar the index serves the digest from, then the hash
+/// marker. A failed sidecar write is returned; a failed marker write is logged, and the index
+/// serves the digest from the sidecar.
+pub(crate) async fn record_stored_file(
+    storage: &crate::storage::Storage,
+    normalized: &str,
+    filename: &str,
+    sha256: &str,
+) -> crate::storage::Result<()> {
+    let file_key = storage_key(normalized, filename);
+    storage
+        .put(&format!("{file_key}.sha256"), sha256.as_bytes())
+        .await?;
+    put_hash_marker(storage, normalized, filename, sha256).await;
+    Ok(())
 }
 
 /// Check Accept header for PEP 691 JSON.
@@ -1304,7 +1550,15 @@ fn same_origin(a: &str, b: &str) -> bool {
     }
 }
 
-fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<String> {
+/// A file the upstream index names: where to fetch it, and the sha256 its href carries
+/// (`#sha256=<hex>`, PEP 503) — the digest pip checks the bytes against.
+#[derive(Debug, PartialEq)]
+struct IndexedFile {
+    url: String,
+    sha256: Option<String>,
+}
+
+fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<IndexedFile> {
     let mut remaining = html;
 
     while let Some(href_start) = remaining.find("href=\"") {
@@ -1320,16 +1574,20 @@ fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<St
                 // unchanged — it must stay encoded to fetch from the upstream (#664).
                 let decoded = percent_encoding::percent_decode_str(filename).decode_utf8_lossy();
                 if decoded.as_ref() == target_filename {
-                    let raw = url.split('#').next().unwrap_or(url).to_string();
+                    let (raw, fragment) = url.split_once('#').unwrap_or((url, ""));
+                    let sha256 = fragment
+                        .strip_prefix("sha256=")
+                        .map(|digest| digest.to_ascii_lowercase());
                     // Resolve relative URLs against the page URL (#877).
-                    if raw.starts_with("http://") || raw.starts_with("https://") {
-                        return Some(raw);
-                    }
-                    return reqwest::Url::parse(page_url)
-                        .ok()
-                        .and_then(|base| base.join(&raw).ok())
-                        .map(|u| u.to_string())
-                        .or(Some(raw));
+                    let url = if raw.starts_with("http://") || raw.starts_with("https://") {
+                        raw.to_string()
+                    } else {
+                        reqwest::Url::parse(page_url)
+                            .ok()
+                            .and_then(|base| base.join(raw).ok())
+                            .map_or_else(|| raw.to_string(), |u| u.to_string())
+                    };
+                    return Some(IndexedFile { url, sha256 });
                 }
             }
 
@@ -1349,6 +1607,65 @@ fn find_file_url(html: &str, target_filename: &str, page_url: &str) -> Option<St
 mod tests {
     use super::*;
     use proptest::prelude::*;
+
+    /// What a project's records say of one of its files. A hosted project owns only the files it
+    /// has a record of: with the marker and no record at all it owns none, so a file an upstream
+    /// served under the name is neither listed nor served. Without the marker nothing is decided
+    /// by the records.
+    #[test]
+    fn a_hosted_project_owns_only_the_files_it_records() {
+        use super::own::{File, Records};
+        let rows: [(&[&str], bool, &str, File); 11] = [
+            (&[], false, "a-1.0.whl", File::Proxied),
+            (&["imported"], true, "a-1.0.whl", File::Foreign),
+            (
+                &["imported", "files/a-1.0.whl"],
+                true,
+                "a-1.0.whl",
+                File::Own,
+            ),
+            (
+                &["imported", "files/a-1.0.whl"],
+                true,
+                "a-2.0.whl",
+                File::Foreign,
+            ),
+            (&["files/a-1.0.whl"], false, "a-1.0.whl", File::Proxied),
+            (&["files/a-1.0.whl"], false, "a-2.0.whl", File::Proxied),
+            (
+                &["importedx", "files/a-1.0.whl"],
+                false,
+                "a-2.0.whl",
+                File::Proxied,
+            ),
+            (
+                &["imported/x", "x/imported"],
+                false,
+                "a-1.0.whl",
+                File::Proxied,
+            ),
+            (
+                &["imported", "files/A-1.0.whl"],
+                true,
+                "a-1.0.whl",
+                File::Foreign,
+            ),
+            (
+                &["imported", "files/a-1.0.whl.sha256"],
+                true,
+                "a-1.0.whl",
+                File::Foreign,
+            ),
+            (&["imported", "a-1.0.whl"], true, "a-1.0.whl", File::Foreign),
+        ];
+        for (names, hosted, file, want) in rows {
+            let records = Records::from_listing(names.iter().copied());
+            assert_eq!(records.hosted(), hosted, "{names:?}");
+            assert_eq!(records.file(file), want, "{names:?} {file}");
+        }
+        assert!(!Records::none().hosted());
+        assert_eq!(Records::none().file("a-1.0.whl"), File::Proxied);
+    }
 
     proptest! {
         #[test]
@@ -1464,7 +1781,7 @@ mod tests {
             r#"torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl</a>"#,
         );
         assert_eq!(
-            find_file_url(html, "torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl", "https://pypi.org/simple/torch/").as_deref(),
+            find_file_url(html, "torch-2.4.0+cu124-cp310-cp310-linux_x86_64.whl", "https://pypi.org/simple/torch/").map(|f| f.url).as_deref(),
             Some(
                 "https://download.pytorch.org/whl/cu124/torch-2.4.0%2Bcu124-cp310-cp310-linux_x86_64.whl"
             )
@@ -1477,6 +1794,7 @@ mod tests {
                 "torch-0.1.10-cp36-cp36m-macosx.whl",
                 "https://pypi.org/simple/torch/"
             )
+            .map(|f| f.url)
             .as_deref(),
             Some("https://x/torch-0.1.10-cp36-cp36m-macosx.whl")
         );
@@ -1572,7 +1890,8 @@ mod tests {
     #[test]
     fn test_find_file_url_found() {
         let html = r#"<a href="https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz#sha256=abc">flask-2.0.tar.gz</a>"#;
-        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/");
+        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/")
+            .map(|f| f.url);
         assert_eq!(
             result,
             Some("https://files.pythonhosted.org/packages/aa/bb/flask-2.0.tar.gz".to_string())
@@ -1582,7 +1901,8 @@ mod tests {
     #[test]
     fn test_find_file_url_not_found() {
         let html = r#"<a href="https://example.com/other-1.0.tar.gz">other</a>"#;
-        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/");
+        let result = find_file_url(html, "flask-2.0.tar.gz", "https://pypi.org/simple/flask/")
+            .map(|f| f.url);
         assert_eq!(result, None);
     }
 
@@ -1590,7 +1910,13 @@ mod tests {
     fn test_find_file_url_strips_hash() {
         let html = r#"<a href="https://example.com/pkg-1.0.whl#sha256=deadbeef">pkg</a>"#;
         let result = find_file_url(html, "pkg-1.0.whl", "https://pypi.org/simple/pkg/");
-        assert_eq!(result, Some("https://example.com/pkg-1.0.whl".to_string()));
+        assert_eq!(
+            result,
+            Some(IndexedFile {
+                url: "https://example.com/pkg-1.0.whl".to_string(),
+                sha256: Some("deadbeef".to_string()),
+            })
+        );
     }
 
     // -- #877: relative URL resolution --
@@ -1602,7 +1928,8 @@ mod tests {
             html,
             "torch-2.4.0.whl",
             "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/torch/",
-        );
+        )
+        .map(|f| f.url);
         assert_eq!(
             result,
             Some(
@@ -1619,7 +1946,8 @@ mod tests {
             html,
             "pkg-1.0.whl",
             "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple/pkg/",
-        );
+        )
+        .map(|f| f.url);
         assert_eq!(
             result,
             Some("https://files.pythonhosted.org/packages/ab/cd/pkg-1.0.whl".to_string())
@@ -1629,7 +1957,8 @@ mod tests {
     #[test]
     fn test_find_file_url_path_only() {
         let html = r#"<a href="/packages/pkg-1.0.whl#sha256=ff">pkg-1.0.whl</a>"#;
-        let result = find_file_url(html, "pkg-1.0.whl", "https://pypi.example.com/simple/pkg/");
+        let result = find_file_url(html, "pkg-1.0.whl", "https://pypi.example.com/simple/pkg/")
+            .map(|f| f.url);
         assert_eq!(
             result,
             Some("https://pypi.example.com/packages/pkg-1.0.whl".to_string())
@@ -3732,6 +4061,51 @@ mod hash_marker_tests {
         )
         .await;
     }
+
+    /// A file whose digest comes from its `.sha256` sidecar (no marker yet) is never listed
+    /// without it because the sidecar could not be read: a client would install it unchecked.
+    /// The project's index answers 503, 500 for a sidecar that fails its integrity check. A file
+    /// that has no sidecar at all is listed without a digest, as before.
+    #[tokio::test]
+    async fn a_digest_the_store_cannot_read_is_not_left_out_of_the_index() {
+        use crate::test_helpers::{outage_storage, ReadFault};
+        let filename = "sidecar-1.0.tar.gz";
+        let sha = digest(b"sdist");
+        for (fault, expected) in [
+            (ReadFault::Network, StatusCode::SERVICE_UNAVAILABLE),
+            (ReadFault::Tampered, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let (storage, outage) = outage_storage();
+            let ctx = create_test_context_with_storage(storage);
+            let key = format!("pypi/sidecar/{filename}");
+            ctx.state.storage.put(&key, b"sdist").await.unwrap();
+            ctx.state
+                .storage
+                .put(&format!("{key}.sha256"), sha.as_bytes())
+                .await
+                .unwrap();
+            ctx.state
+                .storage
+                .put("pypi/sidecar/bare-1.0.tar.gz", b"bare")
+                .await
+                .unwrap();
+            let body = html_index(&ctx, "sidecar").await;
+            assert!(body.contains(&format!("{filename}#sha256={sha}")), "{body}");
+            assert!(body.contains("bare-1.0.tar.gz"), "{body}");
+            outage.fault_reads_of(&format!("{key}.sha256"), fault);
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/simple/sidecar/",
+                vec![("Accept", "text/html")],
+                "",
+            )
+            .await;
+            let status = resp.status();
+            let body = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+            assert_eq!(status, expected, "{fault:?}: {body}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -4185,7 +4559,9 @@ mod release_age_without_the_json_index {
     use super::PEP691_JSON;
     use crate::digest_quarantine::QuarantineMode;
     use crate::test_helpers::TestContext;
-    use crate::test_helpers::{create_test_context_with_config, send, send_with_headers};
+    use crate::test_helpers::{
+        create_test_context_with_config, reload_curation, send, send_with_headers,
+    };
     use axum::http::{Method, StatusCode};
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -4356,6 +4732,51 @@ mod release_age_without_the_json_index {
         }
     }
 
+    /// A release-age rule a reload brings in reads the dates from then on: the engine the reload
+    /// installs decides, not the configuration NORA started with — the global rule and PyPI's own
+    /// alike.
+    #[tokio::test]
+    async fn a_release_age_rule_a_reload_brings_in_asks_for_the_dates() {
+        type Setup = fn(&mut crate::config::Config);
+        // A release-age rule on a proxy needs a quarantine: a reload without one is refused.
+        fn observe(cfg: &mut crate::config::Config) {
+            cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+        }
+        let rules: [(&str, Setup); 2] = [
+            ("global", |cfg| {
+                min_age(cfg);
+                observe(cfg);
+            }),
+            ("PyPI's own", |cfg| {
+                cfg.curation.pypi.min_release_age = Some("3d".to_string());
+                observe(cfg);
+            }),
+        ];
+        for (rule, add) in rules {
+            let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
+            let ctx = context(&up, false, |_| {});
+            reload_curation(&ctx, add);
+            let index = send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/simple/foo/",
+                vec![("Accept", PIP_HTML)],
+                "",
+            )
+            .await;
+            assert_eq!(index.status(), StatusCode::OK);
+            let before = json_listings(&up).await;
+            assert_eq!(
+                send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "")
+                    .await
+                    .status(),
+                StatusCode::FORBIDDEN,
+                "{rule}: a file NORA first saw just now is younger than 3d on its own clock"
+            );
+            assert_eq!(json_listings(&up).await - before, 1, "{rule}");
+        }
+    }
+
     #[tokio::test]
     async fn an_html_client_gets_a_file_nora_listed_long_ago() {
         let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
@@ -4389,11 +4810,11 @@ mod release_age_without_the_json_index {
         );
     }
 
-    /// The cached listing dates only the files it names. A release that came after it was
-    /// never seen by NORA at that time: dating it by the listing's age would let the
-    /// quarantine record it as first seen a month ago.
+    /// Without trusted dates the quarantine counts from NORA's first fetch of a file, whether
+    /// or not a cached listing names it: the listing's age says when NORA wrote it, not when it
+    /// first fetched these bytes.
     #[tokio::test]
-    async fn a_release_after_the_cached_listing_is_not_dated_by_it() {
+    async fn without_trusted_dates_a_cached_listing_does_not_date_the_quarantine() {
         let up = upstream(
             &[
                 ("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z")),
@@ -4407,15 +4828,53 @@ mod release_age_without_the_json_index {
             cfg.curation.quarantine_ttl = Some("7d".to_string());
         });
         cached_listing(&ctx, r#"{"foo-1.0.tar.gz":"2019-01-01T00:00:00Z"}"#, 30).await;
+        for file in ["foo-2.0.tar.gz", "foo-1.0.tar.gz"] {
+            assert_eq!(
+                index_then_download(&ctx, PIP_HTML, file).await,
+                StatusCode::FORBIDDEN,
+                "{file}: first fetched now, held for 7d whatever the listing's age"
+            );
+        }
+    }
+
+    /// A file cached before the quarantine recorded it is counted from now on the cache path.
+    #[tokio::test]
+    async fn a_file_cached_before_the_quarantine_saw_it_counts_from_now() {
+        let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
+        let ctx = context(&up, false, |cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".to_string());
+        });
+        cached_listing(&ctx, r#"{"foo-1.0.tar.gz":"2019-01-01T00:00:00Z"}"#, 30).await;
+        ctx.state
+            .storage
+            .put("pypi/foo/foo-1.0.tar.gz", b"BYTES foo-1.0.tar.gz")
+            .await
+            .unwrap();
         assert_eq!(
-            index_then_download(&ctx, PIP_HTML, "foo-2.0.tar.gz").await,
-            StatusCode::FORBIDDEN,
-            "a file first seen now is held for 7d"
+            send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "")
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
         );
+        assert!(!crate::test_helpers::upstream_paths(&up)
+            .await
+            .iter()
+            .any(|p| p.starts_with("/files/")));
+    }
+
+    /// With trusted dates the upload time seeds the quarantine (#750): a file uploaded years
+    /// ago is not held as new to this mirror.
+    #[tokio::test]
+    async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
+        let up = upstream(&[("foo-1.0.tar.gz", Some("2019-01-01T00:00:00Z"))], true).await;
+        let ctx = context(&up, true, |cfg| {
+            cfg.curation.quarantine = Some(QuarantineMode::Enforce);
+            cfg.curation.quarantine_ttl = Some("7d".to_string());
+        });
         assert_eq!(
             index_then_download(&ctx, PIP_HTML, "foo-1.0.tar.gz").await,
-            StatusCode::OK,
-            "a file NORA saw listed 30 days ago has matured"
+            StatusCode::OK
         );
     }
 
@@ -4466,5 +4925,152 @@ mod release_age_without_the_json_index {
         let resp = send(&ctx.app, Method::GET, "/simple/foo/foo-1.0.tar.gz", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(up.received_requests().await.unwrap().is_empty());
+    }
+}
+
+/// A file the upstream index names with `#sha256=` is served only when its bytes have that
+/// digest: pip checks it against the index NORA serves, and once NORA cached the file its own
+/// digest would stand in for the upstream's, so wrong bytes would pass on the next install.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod upstream_index_digest {
+    use crate::test_helpers::{
+        background_writes_done, body_bytes, create_test_context_with_config, send, TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FILE: &str = "hm-1.0-py3-none-any.whl";
+
+    fn sha256(bytes: &[u8]) -> String {
+        hex::encode(sha2::Sha256::digest(bytes))
+    }
+
+    /// An upstream whose index names `FILE` with `fragment` and whose file host answers `bytes`.
+    async fn upstream(fragment: &str, bytes: &[u8]) -> MockServer {
+        let up = MockServer::start().await;
+        let uri = up.uri();
+        Mock::given(method("GET"))
+            .and(path("/hm/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"<html><body><a href="{uri}/files/{FILE}{fragment}">{FILE}</a></body></html>"#
+            )))
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/files/{FILE}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+            .mount(&up)
+            .await;
+        up
+    }
+
+    fn context(up: &MockServer) -> TestContext {
+        let uri = up.uri();
+        create_test_context_with_config(move |cfg| cfg.pypi.proxy = Some(uri))
+    }
+
+    async fn download(ctx: &TestContext) -> (StatusCode, Vec<u8>) {
+        let resp = send(&ctx.app, Method::GET, &format!("/simple/hm/{FILE}"), "").await;
+        let status = resp.status();
+        (status, body_bytes(resp).await.to_vec())
+    }
+
+    #[tokio::test]
+    async fn bytes_that_do_not_match_the_index_digest_are_refused_and_not_cached() {
+        let up = upstream(&format!("#sha256={}", sha256(b"genuine")), b"tampered").await;
+        let ctx = context(&up);
+        for attempt in 1..=2 {
+            let (status, body) = download(&ctx).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "attempt {attempt}");
+            assert_ne!(body, b"tampered", "attempt {attempt}");
+        }
+        assert!(
+            ctx.state
+                .storage
+                .stat(&format!("pypi/hm/{FILE}"))
+                .await
+                .is_none(),
+            "refused bytes are not cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn bytes_that_match_the_index_digest_are_served() {
+        // The digest as the index writes it, any case.
+        for digest in [sha256(b"genuine"), sha256(b"genuine").to_uppercase()] {
+            let up = upstream(&format!("#sha256={digest}"), b"genuine").await;
+            let ctx = context(&up);
+            assert_eq!(
+                download(&ctx).await,
+                (StatusCode::OK, b"genuine".to_vec()),
+                "{digest}"
+            );
+        }
+    }
+
+    /// An index that publishes no sha256 for the file leaves nothing to check it against.
+    #[tokio::test]
+    async fn a_file_the_index_gives_no_sha256_for_is_served() {
+        for fragment in ["", "#md5=0123456789abcdef0123456789abcdef"] {
+            let up = upstream(fragment, b"bytes").await;
+            let ctx = context(&up);
+            assert_eq!(download(&ctx).await.0, StatusCode::OK, "{fragment:?}");
+        }
+    }
+
+    /// Every key the store holds that names the file — the file, its digest, its hash marker —
+    /// once no work the downloads so far started is still running.
+    async fn stored_under_file(ctx: &TestContext, holders: usize) -> Vec<String> {
+        background_writes_done(&ctx.state.storage, holders).await;
+        let keys = ctx.state.storage.list("").await.unwrap();
+        keys.into_iter().filter(|k| k.contains(FILE)).collect()
+    }
+
+    /// A digest is the whole sha256 the index gives: an empty, shortened or lengthened one, or
+    /// any part of the bytes' own, matches nothing — the bytes are refused and not cached.
+    #[tokio::test]
+    async fn only_the_whole_index_digest_matches() {
+        let own = sha256(b"tampered");
+        for fragment in [
+            "#sha256=".to_string(),
+            format!("#sha256={}", &own[..8]),
+            format!("#sha256={}", &own[..63]),
+            format!("#sha256={}", &own[1..]),
+            format!("#sha256={own}00"),
+        ] {
+            let up = upstream(&fragment, b"tampered").await;
+            let ctx = context(&up);
+            let holders = ctx.state.storage.holders();
+            let (status, body) = download(&ctx).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{fragment}");
+            assert_ne!(body, b"tampered", "{fragment}");
+            let stored = stored_under_file(&ctx, holders).await;
+            assert!(stored.is_empty(), "{fragment}: {stored:?}");
+        }
+    }
+
+    /// Refused bytes are written nowhere: not by the request, nor by any work it leaves running.
+    /// The control: bytes that match are written by that same background work, which the wait
+    /// sees through.
+    #[tokio::test]
+    async fn refused_bytes_leave_nothing_in_the_store() {
+        let up = upstream(&format!("#sha256={}", sha256(b"genuine")), b"tampered").await;
+        let ctx = context(&up);
+        let holders = ctx.state.storage.holders();
+        assert_eq!(download(&ctx).await.0, StatusCode::BAD_GATEWAY);
+        let stored = stored_under_file(&ctx, holders).await;
+        assert!(stored.is_empty(), "refused bytes stored: {stored:?}");
+
+        let up = upstream(&format!("#sha256={}", sha256(b"genuine")), b"genuine").await;
+        let ctx = context(&up);
+        let holders = ctx.state.storage.holders();
+        assert_eq!(download(&ctx).await.0, StatusCode::OK);
+        let stored = stored_under_file(&ctx, holders).await;
+        for key in [format!("pypi/hm/{FILE}"), format!("pypi/hm/{FILE}.sha256")] {
+            assert!(stored.contains(&key), "control: {key} not in {stored:?}");
+        }
     }
 }

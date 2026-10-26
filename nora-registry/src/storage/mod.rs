@@ -35,6 +35,13 @@ pub(crate) fn is_reserved_signing_key(key: &str) -> bool {
     key.starts_with(SIGNING_KEY_PREFIX)
 }
 
+/// A storage verdict (reachable, writable) older than this is treated as unknown →
+/// unreachable. Five 30 s maintenance ticks: tolerates missed refreshes + jitter without
+/// flapping, but a stalled or dead maintenance loop un-readies the pod within the window
+/// instead of pinning a stale `true` (#872). Shared by every backend whose `health_check`
+/// serves a verdict the maintenance loop took.
+pub(crate) const HEALTH_MAX_STALE_SECS: i64 = 150;
+
 /// File metadata
 #[derive(Debug, Clone)]
 pub struct FileMeta {
@@ -141,7 +148,13 @@ pub trait StorageBackend: Send + Sync {
     /// Total size of all stored artifacts in bytes
     async fn total_size(&self) -> u64;
     fn backend_name(&self) -> &'static str;
-    /// Refresh any cached size data. No-op for backends without caching.
+    /// Ask the store whether it answers, with one cheap request (the object store: the first
+    /// page of its listing; the local disk: a write probe), and keep the outcome for
+    /// `health_check`, so a probe never waits on the store. No-op for backends whose
+    /// `health_check` asks the store itself.
+    async fn refresh_reachability(&self) {}
+    /// Refresh any cached size data. No-op for backends without caching. It may take as
+    /// long as listing the whole store, and does not say whether the store answers.
     async fn refresh_total_size(&self) {}
     /// Housekeeping at server start, before serving. The local backend opens this
     /// instance's staging directory and removes what dead instances left there; a
@@ -265,6 +278,13 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn from_backend(inner: Arc<dyn StorageBackend>) -> Self {
         Self { inner }
+    }
+
+    /// Test-only: how many handles share this store. Every clone is one, so a task that may
+    /// still write to the store is counted until it ends.
+    #[cfg(test)]
+    pub(crate) fn holders(&self) -> usize {
+        Arc::strong_count(&self.inner)
     }
 
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -605,7 +625,12 @@ impl Storage {
         Ok(RepinOutcome::Updated { old, new: expected })
     }
 
-    /// Refresh cached total_size. No-op for local storage, computes for S3.
+    /// See [`StorageBackend::refresh_reachability`].
+    pub async fn refresh_reachability(&self) {
+        self.inner.refresh_reachability().await;
+    }
+
+    /// Recount the size `total_size` serves, walking the whole store.
     pub async fn refresh_total_size_cache(&self) {
         self.inner.refresh_total_size().await;
     }

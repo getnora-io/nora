@@ -15,7 +15,7 @@ use axum::{Json, Router};
 use utoipa::OpenApi;
 
 use crate::activity_log::ActivityEntry;
-use crate::auth::{TokenListItem, TokenListResponse};
+use crate::auth::{MintedTokenResponse, TokenListItem, TokenListResponse};
 use crate::health::StorageHealth;
 use crate::ui::api::{DashboardResponse, GlobalStats, MountPoint, RegistryCardStats};
 use crate::AppState;
@@ -162,7 +162,7 @@ use crate::AppState;
             DockerCatalog,
             DockerTags,
             TokenRequest,
-            TokenResponse,
+            MintedTokenResponse,
             TokenListResponse,
             TokenListItem,
             ErrorResponse
@@ -245,14 +245,6 @@ pub struct TokenRequest {
 
 fn default_ttl() -> u32 {
     30
-}
-
-#[derive(Serialize, ToSchema)]
-pub struct TokenResponse {
-    /// Generated API token (starts with nra_)
-    pub token: String,
-    /// Token expiration in days
-    pub expires_in_days: u32,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1373,7 +1365,7 @@ pub async fn hf_datasets() {}
     tag = "auth",
     request_body = TokenRequest,
     responses(
-        (status = 200, description = "Token created", body = TokenResponse),
+        (status = 200, description = "Token created", body = MintedTokenResponse),
         (status = 401, description = "Invalid credentials", body = ErrorResponse),
         (status = 422, description = "Missing required fields", body = ErrorResponse),
         (status = 429, description = "Rate limit exceeded. Retry-After header indicates wait time"),
@@ -1529,7 +1521,7 @@ pub fn routes() -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
-    use super::ApiDoc;
+    use super::{ApiDoc, MintedTokenResponse};
     use utoipa::OpenApi;
 
     /// Swagger UI comes from the files in `ui/static/swagger-ui/`, embedded in the binary,
@@ -1717,6 +1709,39 @@ mod tests {
         assert!(
             registries["additionalProperties"].is_object(),
             "`registries` must be an open string map (additionalProperties): {registries}",
+        );
+    }
+
+    /// The documented answer of a token mint has the fields a mint answers, the
+    /// lifetime in seconds among them, and `/api/tokens` documents that answer.
+    #[test]
+    fn openapi_token_response_is_what_a_mint_answers() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize openapi");
+        let schema = &doc["components"]["schemas"]["TokenResponse"];
+        let documented: std::collections::BTreeSet<&str> = schema["properties"]
+            .as_object()
+            .unwrap_or_else(|| panic!("TokenResponse has no properties: {schema}"))
+            .keys()
+            .map(String::as_str)
+            .collect();
+        let answer = serde_json::to_value(MintedTokenResponse {
+            token: "nra_x".to_string(),
+            expires_in_days: 0,
+            expires_in_secs: 600,
+        })
+        .unwrap();
+        let answered: std::collections::BTreeSet<&str> = answer
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(documented, answered);
+        assert!(documented.contains("expires_in_secs"), "{schema}");
+        assert_eq!(
+            doc["paths"]["/api/tokens"]["post"]["responses"]["200"]["content"]["application/json"]
+                ["schema"]["$ref"],
+            "#/components/schemas/TokenResponse"
         );
     }
 }

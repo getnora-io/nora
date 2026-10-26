@@ -54,7 +54,12 @@ governor = "0.10"
 parking_lot = "0.12"
 zeroize = { version = "1.8", features = ["derive"] }
 argon2 = { version = "0.5", features = ["std", "rand"] }
-tower-http = { version = "0.6", features = ["set-header"] }
+tower-http = { version = "0.6", features = ["set-header", "catch-panic"] }
+# The HTTP/1 and HTTP/2 server under axum, driven directly for the header and keep-alive
+# timeouts axum::serve does not set; all three already in the tree through axum.
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["http1", "http2", "server-graceful", "tokio"] }
+tower = { version = "0.5", features = ["util"] }
 percent-encoding = "2"
 subtle = "2"
 tokio-util = "0.7"
@@ -81,17 +86,19 @@ mimalloc = { version = "0.1", features = ["no_thp"], optional = true }
 rustix = { version = "1", default-features = false, features = ["std", "fs"] }
 
 [dev-dependencies]
+# Paused clock for the tests of timers measured in seconds and minutes.
+tokio = { workspace = true, features = ["test-util"] }
 # Tests build real .rpm fixtures; payload+gzip stay out of the release binary.
 rpm = { version = "0.25", default-features = false, features = ["payload", "gzip-compression"] }
 proptest = "1"
 tempfile = "3"
 wiremock = "0.6"
 criterion = { version = "0.8", features = ["html_reports"] }
-tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 insta = { version = "1", features = ["json"] }
-# Reads `impl Storage` for the list test of the UI storage boundary (already in the lock).
-syn = { version = "2", default-features = false, features = ["full", "parsing"] }
+# Reads `impl Storage` for the list test of the UI storage boundary, and every `cfg` of the
+# sources for the test that no shipped build compiles fault-injection (already in the lock).
+syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
 
 [[bench]]
 name = "parsing"
@@ -109,3 +116,6 @@ default = ["mimalloc"]
 # system allocator (musl's malloc on the static build).
 mimalloc = ["dep:mimalloc"]
 demo = []
+# `/__fi/` routes that make a handler, a background task or the maintenance loop panic or
+# hang, for `scripts/release-panic-check.sh`. Never in a shipped build.
+fault-injection = []

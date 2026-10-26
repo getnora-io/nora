@@ -468,7 +468,7 @@ async fn download(
     }
 
     // Read the cached artifact eagerly — kept for the freshness check and the stale-on-error fallback.
-    let cached = state.storage.get(&key).await.ok();
+    let (cached, read_failure) = crate::registry::cached_read(state.storage.get(&key).await);
 
     // maven-metadata.xml and SNAPSHOT artifacts are MUTABLE (rewritten as versions deploy); a
     // proxied mutable path must be revalidated against upstream unless within a positive
@@ -566,6 +566,9 @@ async fn download(
                 state.metrics.record_cache_hit("maven");
                 return with_content_type(&path, data.clone()).into_response();
             }
+            if let Some(e) = &read_failure {
+                return crate::registry::local_copy_unreadable("maven", &key, e);
+            }
             return crate::curation::check_namespace_isolation(
                 &state.curation().curation_engine,
                 crate::curation::RegistryType::Maven,
@@ -582,6 +585,9 @@ async fn download(
             state.metrics.record_download("maven");
             state.metrics.record_cache_hit("maven");
             return with_content_type(&path, data.clone()).into_response();
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("maven", &key, e);
         }
         if let Some((ref maven_name, _)) = curation_coords {
             return crate::curation::check_namespace_isolation(

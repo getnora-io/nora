@@ -48,8 +48,17 @@ pub use npm::routes as npm_routes;
 pub(crate) use maven::storage_key as maven_storage_key;
 pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
+pub(crate) use nuget::{
+    imported_package as nuget_imported_package, package_key as nuget_package_key,
+    ImportedPackageError as NugetImportedPackageError,
+};
 pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;
+pub(crate) use pypi::{
+    claim_imported_project as pypi_claim_imported_project, own_file_key as pypi_own_file_key,
+    record_own_file as pypi_record_own_file, record_stored_file as pypi_record_stored_file,
+    storage_key as pypi_storage_key, OWN_PREFIX as PYPI_OWN_PREFIX,
+};
 // Retention retires a PyPI file's hash markers together with the file.
 pub(crate) use pypi::HASH_MARKER_PREFIX as PYPI_HASH_MARKER_PREFIX;
 pub use raw::routes as raw_routes;
@@ -134,32 +143,35 @@ pub(crate) async fn read_json_sidecars<T: serde::de::DeserializeOwned>(
         .await
 }
 
-/// Read every key under `prefix` concurrently, returning the pairs that came back.
+/// Read every key under `prefix` concurrently, returning each key and its bytes.
 ///
-/// [`read_json_sidecars`] drops the key and fails the whole batch on the first bad
-/// entry, which suits an index rebuild that parses records. A packument rebuild needs
-/// neither: the key *is* the version, and one unreadable version must not turn a
-/// partial packument into no packument — the sequential loop this replaces skipped
-/// such a key and carried on. Same concurrency, same reason: on an object store each
-/// read is a network round-trip, and a package with a few thousand versions paid them
-/// one at a time.
+/// [`read_json_sidecars`] drops the key and parses each record; a packument rebuild keeps the
+/// key, which *is* the version or the tag. A key that cannot be read fails the whole read with
+/// that key and its error — leaving it out would assemble a document without it, and a tag left
+/// out of a packument moves `latest` — while a key gone since the listing is passed over. Same
+/// concurrency, same reason: on an object store each read is a network round-trip, and a package
+/// with a few thousand versions paid them one at a time.
 pub(crate) async fn read_keyed_blobs(
     storage: &crate::storage::Storage,
     prefix: &str,
-) -> Vec<(String, axum::body::Bytes)> {
-    use futures::StreamExt;
-    let Ok(keys) = storage.list(prefix).await else {
-        return Vec::new();
-    };
-    futures::stream::iter(keys)
+) -> Result<Vec<(String, axum::body::Bytes)>, (String, crate::storage::StorageError)> {
+    use futures::TryStreamExt;
+    let keys = storage
+        .list(prefix)
+        .await
+        .map_err(|e| (prefix.to_string(), e))?;
+    let read: Vec<Option<(String, axum::body::Bytes)>> = futures::stream::iter(keys)
         .map(|key| async move {
-            let data = storage.get(&key).await.ok()?;
-            Some((key, data))
+            match storage.get(&key).await {
+                Ok(data) => Ok(Some((key, data))),
+                Err(crate::storage::StorageError::NotFound) => Ok(None),
+                Err(e) => Err((key, e)),
+            }
         })
         .buffer_unordered(SIDECAR_READ_CONCURRENCY)
-        .filter_map(|pair| async move { pair })
-        .collect()
-        .await
+        .try_collect()
+        .await?;
+    Ok(read.into_iter().flatten().collect())
 }
 
 /// 409 for a write against a pull-through repo (rpm/deb `proxies` entry) —
@@ -173,26 +185,7 @@ pub(crate) fn proxied_repo_conflict() -> Response {
         .into_response()
 }
 
-/// Replace `from`→`to` in raw JSON text, matching BOTH the plain form and the
-/// JSON slash-escaped form (`\/`) of `from`.
-///
-/// Raw-text registry rewrites (ansible, nuget) `.replace()` on the unparsed
-/// upstream response. A valid JSON escaping that many origins emit —
-/// `"https:\/\/host\/path"` — dodges a plain `https://host/path` needle, so the
-/// upstream URL survives the rewrite and leaks the host once the client's JSON
-/// parser unescapes `\/`→`/` (#385, class of #377/#379/#380/#381). Handling the
-/// `\/` form here closes that. NB: `\uXXXX`-escaped separators are a documented
-/// residual — see `rewrite-drops-upstream-host` — caught by the runtime
-/// `UPSTREAM_URL_LEAK_TOTAL` detector, not by this string pass.
-pub(crate) fn replace_url_escape_aware(text: &str, from: &str, to: &str) -> String {
-    let plain = text.replace(from, to);
-    let esc_from = from.replace('/', "\\/");
-    if !plain.contains(&esc_from) {
-        return plain;
-    }
-    let esc_to = to.replace('/', "\\/");
-    plain.replace(&esc_from, &esc_to)
-}
+pub(crate) use nora_registry::upstream_url::ends as upstream_url_ends;
 
 /// Build NORA base URL from config (for URL rewriting).
 ///
@@ -293,6 +286,97 @@ impl UpstreamMiss {
     }
 }
 
+/// A read of a stored copy split into what it found and why it failed: `(Some, None)` the copy,
+/// `(None, None)` nothing stored there, `(None, Some)` the store failed and says nothing either
+/// way. A cache read may treat the last two alike; a package served only from local copies may
+/// not (see [`local_copy_unreadable`]).
+pub(crate) fn cached_read<T>(
+    read: Result<T, crate::storage::StorageError>,
+) -> (Option<T>, Option<crate::storage::StorageError>) {
+    match read {
+        Ok(found) => (Some(found), None),
+        Err(crate::storage::StorageError::NotFound) => (None, None),
+        Err(e) => (None, Some(e)),
+    }
+}
+
+/// What the `.sha256` sidecar written beside a cached copy says of the copy's bytes.
+pub(crate) enum Sidecar {
+    /// It names these bytes, or none was written (a copy cached before sidecars were, or whose
+    /// sidecar write failed): nothing contradicts the copy.
+    Holds,
+    /// It names other bytes: the copy is not the one cached.
+    Differs { expected: String, computed: String },
+    /// The store could not read it: the copy cannot be checked, and is not served unchecked. A
+    /// copy NORA owns is unavailable; a proxied one is fetched again, as on a cache miss.
+    Unreadable(crate::storage::StorageError),
+}
+
+/// Check the cached copy `data` of `key` against the `.sha256` sidecar written beside it.
+pub(crate) async fn check_sidecar(storage: &crate::Storage, key: &str, data: &[u8]) -> Sidecar {
+    use sha2::Digest;
+    match storage.get(&format!("{key}.sha256")).await {
+        Ok(stored) => {
+            let computed = hex::encode(sha2::Sha256::digest(data));
+            let expected = String::from_utf8_lossy(&stored).into_owned();
+            if computed == expected {
+                Sidecar::Holds
+            } else {
+                Sidecar::Differs { expected, computed }
+            }
+        }
+        Err(crate::storage::StorageError::NotFound) => Sidecar::Holds,
+        Err(e) => Sidecar::Unreadable(e),
+    }
+}
+
+/// Whether anything reads the release date of a proxied download of `rt`: the running curation's
+/// release-age rule (global or `rt`'s own), or the quarantine of `rt` when upstream dates are
+/// trusted — only a trusted date seeds its first-seen. A format asks an upstream for a date only
+/// when this holds.
+pub(crate) fn release_date_read(state: &AppState, rt: crate::registry_type::RegistryType) -> bool {
+    state.curation().curation_engine.reads_release_date(rt)
+        || (state.config.server.trust_upstream_dates
+            && state.config.quarantine_mode_for(rt)
+                != crate::digest_quarantine::QuarantineMode::Off)
+}
+
+/// 503 for a package served only from local copies (one in an internal namespace) whose copy the
+/// store could not be asked about. The package is unavailable, not absent: a 403 or a 404 here
+/// sends a client with several feeds to look for the name in the next one.
+pub(crate) fn storage_unavailable(registry: &str, key: &str) -> Response {
+    tracing::warn!(
+        registry,
+        key,
+        "storage cannot be read for a package served only from local copies, returning 503"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("retry-after", "30")],
+        "storage temporarily unavailable",
+    )
+        .into_response()
+}
+
+/// The answer for a package served only from local copies when the store failed to read its copy
+/// at `key`: 500 for a copy that failed its integrity check, else [`storage_unavailable`].
+pub(crate) fn local_copy_unreadable(
+    registry: &str,
+    key: &str,
+    error: &crate::storage::StorageError,
+) -> Response {
+    if matches!(error, crate::storage::StorageError::IntegrityViolation) {
+        tracing::error!(registry, key, "stored copy failed its integrity check");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stored copy failed its integrity check",
+        )
+            .into_response();
+    }
+    tracing::warn!(registry, key, error = %error, "storage read failed");
+    storage_unavailable(registry, key)
+}
+
 /// 503 response for circuit breaker open state with Retry-After header.
 pub(crate) fn circuit_open_response(registry: &str) -> Response {
     (
@@ -319,7 +403,51 @@ fn policy_block_reason(headers: &reqwest::header::HeaderMap) -> Option<&'static 
     Some(if is_geo { "geo" } else { "waf" })
 }
 
-/// Core fetch logic with retry. Callers provide a response extractor.
+/// Where a redirect the client handed back unfollowed points, resolved against the URL that
+/// answered: `None` for one pointing nowhere readable.
+fn unfollowed_redirect(response: &reqwest::Response) -> Option<reqwest::Url> {
+    response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| response.url().join(v).ok())
+}
+
+/// What one request of a redirect chain NORA walks itself gave, with a client that follows no
+/// redirect (`build_no_redirect_client`).
+#[derive(Debug)]
+pub(crate) enum Hopped {
+    /// The body.
+    Body(Vec<u8>),
+    /// A redirect, to this URL, not followed: the caller decides on the next hop.
+    Redirect(reqwest::Url),
+}
+
+/// [`proxy_fetch`] of one URL of a redirect chain: a redirect the client hands back is the
+/// answer, [`Hopped::Redirect`].
+pub(crate) async fn proxy_fetch_hop(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<Hopped, ProxyError> {
+    proxy_fetch_core_with(
+        client,
+        url,
+        timeout,
+        auth,
+        None,
+        (
+            |r: reqwest::Response| async { r.bytes().await.map(|b| Hopped::Body(b.to_vec())) },
+            |r: &reqwest::Response| unfollowed_redirect(r).map(Hopped::Redirect),
+        ),
+        (cb, scope.into()),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_fetch_core<T, F, Fut>(
     client: &reqwest::Client,
@@ -335,8 +463,36 @@ where
     F: Fn(reqwest::Response) -> Fut + Copy,
     Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
 {
+    proxy_fetch_core_with(
+        client,
+        url,
+        timeout,
+        auth,
+        extra_headers,
+        (extract, |_: &reqwest::Response| None),
+        (cb, scope.into()),
+    )
+    .await
+}
+
+/// [`proxy_fetch_core`] reading a response with `(extract, redirected)`: a redirect handed back
+/// unfollowed is answered by `redirected` when it makes something of it, else an `Upstream`
+/// error of its status.
+async fn proxy_fetch_core_with<T, F, Fut, R>(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    extra_headers: Option<(&str, &str)>,
+    (extract, redirected): (F, R),
+    (cb, scope): (&CircuitBreakerRegistry, BreakerScope<'_>),
+) -> Result<T, ProxyError>
+where
+    F: Fn(reqwest::Response) -> Fut + Copy,
+    Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
+    R: Fn(&reqwest::Response) -> Option<T>,
+{
     let auth_header = upstream_auth_header(auth)?;
-    let scope = scope.into();
     let registry_str = scope.registry().as_str();
     let cb_key = scope.key();
     let probe = cb.check(&cb_key)?;
@@ -371,6 +527,15 @@ where
                     return result;
                 }
                 let status = response.status().as_u16();
+                if response.status().is_redirection() {
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry_str, "3xx"])
+                        .observe(elapsed);
+                    // The upstream answered, and pointed elsewhere: not asked again, and alive
+                    // to the breaker. What follows is the caller's.
+                    cb.record_alive(&cb_key, probe);
+                    return redirected(&response).ok_or(ProxyError::Upstream(status));
+                }
                 if (400..500).contains(&status) {
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "4xx"])
@@ -1006,6 +1171,12 @@ pub(crate) async fn proxy_fetch_conditional(
                 // real failure tally, consistent with proxy_fetch_core (#606).
                 cb.record_alive(&cb_key, probe);
                 return Err(ProxyError::NotFound);
+            }
+            if status.is_redirection() {
+                // A redirect the client did not follow (off the upstream's origin): the
+                // upstream answered, as in proxy_fetch_core.
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(code));
             }
             cb.record_failure(&cb_key, probe);
             Err(ProxyError::Upstream(code))
@@ -1693,6 +1864,12 @@ mod first_download_integrity {
     #[tokio::test]
     async fn npm() {
         let s = upstream().await;
+        crate::registry::npm::mount_listing(
+            &s,
+            "corp-lib",
+            &[("1.0.0", "corp-lib/-/corp-lib-1.0.0.tgz")],
+        )
+        .await;
         let uri = "/npm/corp-lib/-/corp-lib-1.0.0.tgz";
         refused(&s, "npm", "corp-lib", "1.0.0", uri, |c, u| {
             c.npm.proxy = Some(u);
@@ -2354,12 +2531,22 @@ mod proxy_off_means_off {
         Seeded,
     }
 
+    /// Every option that has a format ask an upstream for more than the request itself: trusted
+    /// dates, and a release-age rule and the quarantine that read them — both only observing, so
+    /// the answer stays the stored copy or 404.
+    fn read_dates(c: &mut Config) {
+        c.server.trust_upstream_dates = true;
+        c.curation.mode = crate::config::CurationMode::Audit;
+        c.curation.min_release_age = Some("1h".to_string());
+        c.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+    }
+
     /// Every route of a format with its upstream switched off, over an empty store and over one
     /// holding stale copies and the upstream addresses an earlier configuration stored: no request
     /// leaves NORA, whatever host a handler meant to ask (the client goes through a recording proxy
-    /// without idle connections, so each request is seen), and the answer is the stored copy (200)
-    /// or 404. The control, per address: with the public default upstream on and nothing stored,
-    /// every address not marked local reaches the upstream.
+    /// without idle connections, so each request is seen) — a date for a release included — and
+    /// the answer is the stored copy (200) or 404. The control, per address: with the public
+    /// default upstream on and nothing stored, every address not marked local reaches the upstream.
     async fn no_egress(
         format: &str,
         uris: &[(&str, Reach)],
@@ -2370,8 +2557,10 @@ mod proxy_off_means_off {
         for mode in [Mode::Off, Mode::Blank, Mode::On] {
             let upstream_on = mode == Mode::On;
             let recorder = EgressRecorder::start().await;
-            let ctx =
-                create_test_context_with_egress_proxy(&recorder.url, move |c| configure(c, mode));
+            let ctx = create_test_context_with_egress_proxy(&recorder.url, move |c| {
+                configure(c, mode);
+                read_dates(c);
+            });
             for seeded in [false, true] {
                 if seeded {
                     for (key, body) in seeds {
@@ -3050,6 +3239,206 @@ mod upstream_failure_matrix {
 /// and rules are looked up by that label, so a handler passing another registry's would
 /// apply another registry's settings (#1098). In the code of `registry/<format>.rs`
 /// (before its test module) the only `RegistryType::` variant is its own.
+#[cfg(test)]
+mod release_date_read {
+    use crate::config::{Config, CurationMode};
+    use crate::digest_quarantine::QuarantineMode;
+    use crate::registry_type::RegistryType;
+    use crate::test_helpers::{create_test_context_with_config, reload_curation, reload_file};
+
+    /// Apply `set` to every registry.
+    fn each_section(c: &mut Config, set: fn(&mut Config, RegistryType)) {
+        for &rt in RegistryType::all() {
+            set(c, rt);
+        }
+    }
+
+    /// A release-age rule of `rt`'s own, when it has a section.
+    fn rule(c: &mut Config, rt: RegistryType) {
+        if let Some(own) = c.curation.registry_override_mut(rt) {
+            own.min_release_age = Some("1h".to_string());
+        }
+    }
+
+    /// A quarantine of `rt`'s own, when it has a section.
+    fn quarantine(c: &mut Config, rt: RegistryType) {
+        if let Some(own) = c.curation.registry_override_mut(rt) {
+            own.quarantine = Some(QuarantineMode::Enforce);
+        }
+    }
+
+    /// The quarantine a reloaded release-age rule needs on a proxy, else the reload is refused.
+    /// A reload does not install it, and without trusted dates it reads no date.
+    fn observe(c: &mut Config) {
+        c.curation.quarantine = Some(QuarantineMode::Observe);
+    }
+
+    /// Whether a download's release date is read, for every registry: by a release-age rule
+    /// while curation is on, or, with trusted dates only, by the quarantine the registry is held
+    /// to.
+    #[tokio::test]
+    async fn a_date_is_read_by_a_running_release_age_rule_or_a_trusting_quarantine() {
+        type Setup = fn(&mut Config);
+        // (row, trusted dates, the configuration NORA starts with) -> read for a registry with a
+        // section of its own / for one without (Raw, Hugging Face)
+        let rows: [(&str, bool, Setup, bool, bool); 9] = [
+            ("nothing", true, |_| {}, false, false),
+            (
+                "global rule",
+                false,
+                |c| c.curation.min_release_age = Some("1h".into()),
+                true,
+                true,
+            ),
+            ("own rule", false, |c| each_section(c, rule), true, false),
+            (
+                "own rule, curation off",
+                false,
+                |c| {
+                    c.curation.mode = CurationMode::Off;
+                    each_section(c, rule);
+                },
+                false,
+                false,
+            ),
+            (
+                "trusted, global quarantine",
+                true,
+                |c| c.curation.quarantine = Some(QuarantineMode::Observe),
+                true,
+                false,
+            ),
+            (
+                "trusted, own quarantine",
+                true,
+                |c| each_section(c, quarantine),
+                true,
+                false,
+            ),
+            (
+                "trusted, own quarantine off",
+                true,
+                |c| {
+                    c.curation.quarantine = Some(QuarantineMode::Enforce);
+                    each_section(c, |c, rt| {
+                        if let Some(own) = c.curation.registry_override_mut(rt) {
+                            own.quarantine = Some(QuarantineMode::Off);
+                        }
+                    });
+                },
+                false,
+                false,
+            ),
+            (
+                "untrusted, global quarantine",
+                false,
+                |c| c.curation.quarantine = Some(QuarantineMode::Enforce),
+                false,
+                false,
+            ),
+            (
+                "untrusted, own quarantine",
+                false,
+                |c| each_section(c, quarantine),
+                false,
+                false,
+            ),
+        ];
+        for (row, trust, start) in rows.iter().map(|r| (r.0, r.1, r.2)) {
+            let ctx = create_test_context_with_config(move |c| {
+                c.server.trust_upstream_dates = trust;
+                c.curation.mode = CurationMode::Enforce;
+                start(c);
+            });
+            let (_, _, _, with_section, without_section) =
+                *rows.iter().find(|r| r.0 == row).unwrap();
+            for &rt in RegistryType::all() {
+                let want = match ctx.state.config.curation.registry_override(rt) {
+                    Some(_) => with_section,
+                    None => without_section,
+                };
+                assert_eq!(
+                    super::release_date_read(&ctx.state, rt),
+                    want,
+                    "{rt}: {row}"
+                );
+            }
+        }
+    }
+
+    /// A release-age rule a reload brings in is read from then on: a global one by every
+    /// registry, a registry's own by that registry alone. The server refuses a reload whose
+    /// own rule cannot apply — rpm and deb downloads are not checked by name or date, cpan's
+    /// carry none — and the running engine stays.
+    #[tokio::test]
+    async fn a_release_age_rule_a_reload_brings_in_is_read() {
+        let start = || {
+            create_test_context_with_config(|c| {
+                // Untrusted: the quarantine reads no date, the rules alone do.
+                c.server.trust_upstream_dates = false;
+                c.curation.mode = CurationMode::Enforce;
+                observe(c);
+            })
+        };
+        let ctx = start();
+        reload_curation(&ctx, |c| c.curation.min_release_age = Some("1h".into()));
+        for &rt in RegistryType::all() {
+            assert!(
+                super::release_date_read(&ctx.state, rt),
+                "{rt}: global rule"
+            );
+        }
+        let refused = [RegistryType::Rpm, RegistryType::Deb, RegistryType::Cpan];
+        for &target in RegistryType::all() {
+            let ctx = start();
+            if ctx
+                .state
+                .config
+                .curation
+                .registry_override(target)
+                .is_none()
+            {
+                continue;
+            }
+            let (_dir, file) = reload_file(&ctx, move |c| rule(c, target));
+            let reloaded = {
+                let _lock = crate::test_env::env_lock();
+                let held = crate::HeldQuarantine::of(&ctx.state.config.curation);
+                crate::reload_curation(&ctx.state.reloadable, &held, Some(file))
+            };
+            assert_eq!(
+                reloaded.is_err(),
+                refused.contains(&target),
+                "{target}: {reloaded:?}"
+            );
+            for &rt in RegistryType::all() {
+                assert_eq!(
+                    super::release_date_read(&ctx.state, rt),
+                    rt == target && reloaded.is_ok(),
+                    "{rt}: {target}'s own rule"
+                );
+            }
+        }
+    }
+
+    /// Another registry's rule or quarantine reads no date of the registries that ask for one.
+    #[tokio::test]
+    async fn another_registry_s_policy_reads_no_date() {
+        for target in [RegistryType::Nuget, RegistryType::PyPI] {
+            let ctx = create_test_context_with_config(move |c| {
+                c.server.trust_upstream_dates = true;
+                c.curation.mode = CurationMode::Enforce;
+                each_section(c, rule);
+                each_section(c, quarantine);
+                let own = c.curation.registry_override_mut(target).unwrap();
+                own.min_release_age = None;
+                own.quarantine = None;
+            });
+            assert!(!super::release_date_read(&ctx.state, target), "{target}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod curation_label_whitelist {
     use crate::registry_type::RegistryType;

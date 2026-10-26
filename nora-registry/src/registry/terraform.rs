@@ -200,7 +200,8 @@ async fn provider_versions(
     let storage_key = format!("terraform/providers/{}/{}/versions.json", ns, ptype);
 
     // Read cache eagerly — preserve for serve-stale fallback (#532)
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
 
     // TTL cache — serve fresh if within TTL
     if let Some(ref data) = cached_data {
@@ -221,6 +222,9 @@ async fn provider_versions(
             state.metrics.record_download("terraform");
             state.metrics.record_cache_hit("terraform");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
         }
         return tf_isolation_refusal(&state, &provider);
     }
@@ -314,12 +318,9 @@ async fn provider_download_meta(
 
     // Read cache eagerly — preserve for serve-stale fallback (#532).
     // Strip internal fields now so stale response is client-safe.
-    let cached_data = state
-        .storage
-        .get(&storage_key)
-        .await
-        .ok()
-        .map(|d| Bytes::from(strip_nora_internal_fields(&d)));
+    let (cached_raw, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    let cached_data = cached_raw.map(|d| Bytes::from(strip_nora_internal_fields(&d)));
 
     // TTL cache — serve fresh if within TTL
     if let Some(ref data) = cached_data {
@@ -338,6 +339,9 @@ async fn provider_download_meta(
             state.metrics.record_download("terraform");
             state.metrics.record_cache_hit("terraform");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
         }
         return tf_isolation_refusal(&state, &provider);
     }
@@ -434,7 +438,9 @@ async fn provider_download_binary(
 
     // Immutable: if cached, serve directly. get_verified discharges the integrity
     // witness at serve (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -489,6 +495,9 @@ async fn provider_download_binary(
     // #733: an internal provider's file that is not cached is refused, whatever URL metadata
     // cached before the namespace became internal names.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
+        }
         return tf_isolation_refusal(&state, &provider);
     }
 
@@ -585,7 +594,8 @@ async fn module_versions(
     );
 
     // Read cache eagerly — preserve for serve-stale fallback (#532)
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
 
     // TTL cache — serve fresh if within TTL
     if let Some(ref data) = cached_data {
@@ -606,6 +616,9 @@ async fn module_versions(
             state.metrics.record_download("terraform");
             state.metrics.record_cache_hit("terraform");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
         }
         return tf_isolation_refusal(&state, &module);
     }
@@ -691,7 +704,9 @@ async fn module_download(
         "terraform/modules/{}/{}/{}/{}/_source_url",
         ns, name, provider, ver
     );
-    if let Ok(data) = state.storage.get(&source_url_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get(&source_url_key).await);
+    if let Some(data) = cached {
         let original_url = String::from_utf8_lossy(&data);
         let rewritten =
             rewrite_module_source_url(&original_url, &base_url, &ns, &name, &provider, &ver);
@@ -705,6 +720,9 @@ async fn module_download(
     }
 
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &source_url_key, e);
+        }
         return tf_isolation_refusal(&state, &module);
     }
 
@@ -812,7 +830,9 @@ async fn module_source_download(
 
     // Immutable: if cached, serve directly. get_verified discharges the integrity
     // witness at serve (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -854,6 +874,9 @@ async fn module_source_download(
     }
 
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("terraform", &storage_key, e);
+        }
         return tf_isolation_refusal(&state, &module);
     }
     // With the upstream switched off, a source URL stored while it was on is not followed: the
@@ -1057,6 +1080,7 @@ async fn mirror_provider_version(
 
     let mut archives = serde_json::Map::new();
     let mut incomplete = false;
+    let mut unreadable: Option<Box<Response>> = None;
     for (os, arch, res) in results {
         match res {
             // Fail-closed (SEC #1): only serve an archive that carries an integrity
@@ -1071,8 +1095,14 @@ async fn mirror_provider_version(
             // A platform the upstream failed to describe (not one it answered 4xx for):
             // the list would be incomplete, and a client on that platform would read
             // "not supported" from an outage.
-            Err(e) => incomplete |= UpstreamMiss::of(&e).status() == StatusCode::BAD_GATEWAY,
+            Err(ArchiveMiss::Upstream(e)) => {
+                incomplete |= UpstreamMiss::of(&e).status() == StatusCode::BAD_GATEWAY
+            }
+            Err(ArchiveMiss::Unreadable(response)) => unreadable = Some(response),
         }
+    }
+    if let Some(response) = unreadable {
+        return *response;
     }
     if incomplete {
         tracing::warn!(registry = "terraform", %ns, %ptype, %ver, "upstream failed for a platform, returning 502");
@@ -1097,7 +1127,8 @@ async fn mirror_fetch_versions(
     internal: bool,
 ) -> Result<serde_json::Value, Box<Response>> {
     let storage_key = format!("terraform/providers/{}/{}/versions.json", ns, ptype);
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
 
     // TTL cache — serve fresh if within TTL.
     if let Some(ref data) = cached_data {
@@ -1115,6 +1146,13 @@ async fn mirror_fetch_versions(
         if let Some(ref data) = cached_data {
             state.metrics.record_cache_hit("terraform");
             return parse_json(data);
+        }
+        if let Some(e) = &read_failure {
+            return Err(Box::new(crate::registry::local_copy_unreadable(
+                "terraform",
+                &storage_key,
+                e,
+            )));
         }
         return Err(Box::new(tf_isolation_refusal(
             state,
@@ -1181,7 +1219,7 @@ async fn mirror_fetch_archive(
     ver: &str,
     (os, arch): (&str, &str),
     internal: bool,
-) -> Result<Option<(String, Option<String>)>, ProxyError> {
+) -> Result<Option<(String, Option<String>)>, ArchiveMiss> {
     if !is_valid_name(os) || !is_valid_name(arch) {
         return Ok(None);
     }
@@ -1192,9 +1230,20 @@ async fn mirror_fetch_archive(
 
     // Cached metadata already carries the NORA-rewritten download_url; reuse it. An internal
     // provider's platform without it is not listed: its metadata is never fetched (#68/#733).
-    let meta_text = match state.storage.get(&storage_key).await.ok() {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    let meta_text = match cached {
         Some(data) => String::from_utf8_lossy(&data).to_string(),
-        None if internal => return Ok(None),
+        // An internal provider's platform whose metadata the store could not read is unavailable:
+        // dropped from the list, it would read as "not supported on this platform".
+        None if internal => {
+            return match read_failure {
+                Some(e) => Err(ArchiveMiss::Unreadable(Box::new(
+                    crate::registry::local_copy_unreadable("terraform", &storage_key, &e),
+                ))),
+                None => Ok(None),
+            }
+        }
         None => {
             // No upstream when the operator switched it off: the archive is not listed.
             let Some(proxy_url) = upstream_url(state) else {
@@ -1218,7 +1267,8 @@ async fn mirror_fetch_archive(
                 &state.circuit_breaker,
                 RegistryType::Terraform,
             )
-            .await?;
+            .await
+            .map_err(ArchiveMiss::Upstream)?;
             let rewritten = rewrite_download_url(&text, base_url, ns, ptype, ver);
             state.spawn_cache("terraform", storage_key, Bytes::from(rewritten.clone()));
             rewritten
@@ -1236,6 +1286,14 @@ async fn mirror_fetch_archive(
         .and_then(|v| v.as_str())
         .map(String::from);
     Ok(Some((url.to_string(), shasum)))
+}
+
+/// Why a platform's archive could not be listed by the network mirror.
+enum ArchiveMiss {
+    /// The upstream failed, or answered no.
+    Upstream(ProxyError),
+    /// The store could not read an internal provider's cached metadata: the answer to give.
+    Unreadable(Box<Response>),
 }
 
 /// Reshape Registry-Protocol `{"versions":[{"version":"X",..}]}` into the network

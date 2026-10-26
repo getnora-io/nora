@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::config::{OidcConfig, OidcProvider, ScopeEnforcement};
+use crate::config::{AudienceCheck, OidcConfig, OidcProvider, ScopeEnforcement};
 use crate::tokens::Role;
 
 /// Result of a successful OIDC authentication.
@@ -55,6 +55,9 @@ pub struct OidcIdentity {
     /// re-looking-up the provider by name — provider names are not unique, so a
     /// disabled same-name provider would mislead a by-name lookup (#1094 N2).
     pub max_token_lifetime_secs: u64,
+    /// The JWT's `exp` (Unix seconds). The validator requires it; a token
+    /// minted by this identity must not outlive it.
+    pub expires_at: u64,
 }
 
 /// Standard JWT claims we extract.
@@ -269,10 +272,17 @@ impl OidcValidator {
         validation.set_issuer(&[&provider.issuer]);
         validation.leeway = self.config.leeway_secs;
 
-        if !provider.audience.is_empty() {
-            validation.set_audience(&[&provider.audience]);
-        } else {
-            validation.validate_aud = false;
+        match provider.audience_check() {
+            AudienceCheck::Expect(audience) => validation.set_audience(&[audience]),
+            AudienceCheck::Any => validation.validate_aud = false,
+            // Config validation refuses such a provider; one that reaches the
+            // validator anyway admits nothing rather than any audience.
+            AudienceCheck::Missing => {
+                return Err(format!(
+                    "Provider {} has no audience: set audience or any_audience",
+                    provider.name
+                ));
+            }
         }
 
         let token_data: TokenData<Claims> = decode(token, &decoding_key, &validation)
@@ -309,6 +319,9 @@ impl OidcValidator {
             rule_namespace_scope: rule_scope,
             namespace_scope_enforcement: provider.namespace_scope_enforcement,
             max_token_lifetime_secs: provider.max_token_lifetime_secs,
+            // Required by the validation above; 0 if absent, which leaves a
+            // mint no lifetime at all (fail closed).
+            expires_at: claims.exp.unwrap_or(0),
         })
     }
 
@@ -717,6 +730,7 @@ mod tests {
             issuer: "https://test".to_string(),
             jwks_uri: None,
             audience: "nora".to_string(),
+            any_audience: false,
             algorithms: vec!["RS256".to_string()],
             max_token_lifetime_secs: 900,
             namespace_scope: vec!["*".to_string()],
@@ -791,6 +805,7 @@ mod tests {
                 issuer: issuer.clone(),
                 jwks_uri: jwks_uri.map(|p| format!("{issuer}{p}")),
                 audience: "nora".to_string(),
+                any_audience: false,
                 algorithms: vec!["RS256".to_string()],
                 max_token_lifetime_secs: 900,
                 namespace_scope: vec!["*".to_string()],
@@ -840,6 +855,7 @@ mod tests {
             issuer: "https://disabled.invalid".to_string(),
             jwks_uri: None,
             audience: "nora".to_string(),
+            any_audience: false,
             algorithms: vec!["RS256".to_string()],
             max_token_lifetime_secs: 99_999_999,
             namespace_scope: vec!["*".to_string()],

@@ -45,7 +45,9 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
 debug = false
 strip = true
 codegen-units = 4
-panic = "abort"
+# Unwind, so a panic ends the request or task it happened in, not the process: the
+# `catch_unwind` guards and the panic layer only work under unwind.
+panic = "unwind"
 lto = "thin"
 
 # Maximum optimization for GitHub Releases and published binaries

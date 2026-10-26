@@ -206,7 +206,8 @@ async fn recipe_latest(
     let storage_key = format!("conan/{}/latest.json", ref_str);
 
     // Eager cache read — preserve data for serve-stale fallback
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
@@ -229,6 +230,9 @@ async fn recipe_latest(
             state.metrics.record_download("conan");
             state.metrics.record_cache_hit("conan");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -262,7 +266,8 @@ async fn recipe_revisions(
     let ref_str = format!("{}/{}/{}/{}", name, ver, user, chan);
     let storage_key = format!("conan/{}/revisions.json", ref_str);
 
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
@@ -285,6 +290,9 @@ async fn recipe_revisions(
             state.metrics.record_download("conan");
             state.metrics.record_cache_hit("conan");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -324,14 +332,26 @@ async fn recipe_file_list(
     let storage_key = format!("conan/{}/revisions/{}/files.json", ref_str, rrev);
 
     // Immutable: if cached, serve directly
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    if let Some(data) = cached {
         state.metrics.record_download("conan");
         state.metrics.record_cache_hit("conan");
         return with_json(data.to_vec());
     }
 
     // #68 namespace isolation: a cached internal recipe's file list was served above;
-    // an internal name with no local copy must not be fetched upstream.
+    // an internal name with no local copy must not be fetched upstream, and one whose copy the
+    // store could not read is unavailable, not absent.
+    if let Some(e) = read_failure.as_ref().filter(|_| {
+        crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Conan,
+            &name,
+        )
+    }) {
+        return crate::registry::local_copy_unreadable("conan", &storage_key, e);
+    }
     if let Some(response) = crate::curation::check_namespace_isolation(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Conan,
@@ -415,7 +435,9 @@ async fn recipe_file_download(
 
     // Immutable cache. get_verified discharges the integrity witness at serve
     // (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -453,7 +475,10 @@ async fn recipe_file_download(
             &q_mode,
             q_secs,
             "cache",
-            publish_date,
+            crate::digest_quarantine::first_seen_seed(
+                state.config.server.trust_upstream_dates,
+                publish_date,
+            ),
         ) {
             return resp;
         }
@@ -491,6 +516,9 @@ async fn recipe_file_download(
 
     // #733: an internal-namespace recipe with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Conan,
@@ -568,7 +596,10 @@ async fn recipe_file_download(
                 &q_mode,
                 q_secs,
                 &url,
-                publish_date,
+                crate::digest_quarantine::first_seen_seed(
+                    state.config.server.trust_upstream_dates,
+                    publish_date,
+                ),
             ) {
                 return resp;
             }
@@ -612,7 +643,8 @@ async fn package_latest(
         ref_str, rrev, pkg_id
     );
 
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
@@ -635,6 +667,9 @@ async fn package_latest(
             state.metrics.record_download("conan");
             state.metrics.record_cache_hit("conan");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -686,7 +721,8 @@ async fn package_revisions(
         ref_str, rrev, pkg_id
     );
 
-    let cached_data = state.storage.get(&storage_key).await.ok();
+    let (cached_data, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
     if let Some(ref data) = cached_data {
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.conan.metadata_ttl) {
@@ -709,6 +745,9 @@ async fn package_revisions(
             state.metrics.record_download("conan");
             state.metrics.record_cache_hit("conan");
             return with_json(data.to_vec());
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
         }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -763,14 +802,26 @@ async fn package_file_list(
     );
 
     // Immutable
-    if let Ok(data) = state.storage.get(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get(&storage_key).await);
+    if let Some(data) = cached {
         state.metrics.record_download("conan");
         state.metrics.record_cache_hit("conan");
         return with_json(data.to_vec());
     }
 
     // #68 namespace isolation: a cached internal package's file list was served above;
-    // an internal name with no local copy must not be fetched upstream.
+    // an internal name with no local copy must not be fetched upstream, and one whose copy the
+    // store could not read is unavailable, not absent.
+    if let Some(e) = read_failure.as_ref().filter(|_| {
+        crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Conan,
+            &name,
+        )
+    }) {
+        return crate::registry::local_copy_unreadable("conan", &storage_key, e);
+    }
     if let Some(response) = crate::curation::check_namespace_isolation(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Conan,
@@ -863,7 +914,9 @@ async fn package_file_download(
 
     // Immutable cache. get_verified discharges the integrity witness at serve
     // (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -901,7 +954,10 @@ async fn package_file_download(
             &q_mode,
             q_secs,
             "cache",
-            publish_date,
+            crate::digest_quarantine::first_seen_seed(
+                state.config.server.trust_upstream_dates,
+                publish_date,
+            ),
         ) {
             return resp;
         }
@@ -939,6 +995,9 @@ async fn package_file_download(
 
     // #733: an internal-namespace package with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("conan", &storage_key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Conan,
@@ -1018,7 +1077,10 @@ async fn package_file_download(
                 &q_mode,
                 q_secs,
                 &url,
-                publish_date,
+                crate::digest_quarantine::first_seen_seed(
+                    state.config.server.trust_upstream_dates,
+                    publish_date,
+                ),
             ) {
                 return resp;
             }
@@ -2079,5 +2141,124 @@ mod per_conan_client {
         }
         let sent = upstream_paths(&up).await;
         assert!(sent.iter().all(|path| !is_file(path)), "{sent:?}");
+    }
+}
+
+/// Without trusted upstream dates the quarantine counts from NORA's own first fetch of an
+/// artifact's bytes: metadata cached a month ago says when NORA last wrote it, not when it first
+/// fetched this file, and its age would let a file first fetched now pass as mature. With trusted
+/// dates the release date seeds it (#750), so an old release is not held as new to this mirror.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod quarantine_first_seen {
+    use crate::test_helpers::{
+        create_test_context_with_config, put_written_days_ago, quarantine_7d, send, TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn serve(up: &MockServer, at: &str, body: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(up)
+            .await;
+    }
+
+    async fn status(ctx: &TestContext, uri: &str) -> StatusCode {
+        send(&ctx.app, Method::GET, uri, "").await.status()
+    }
+
+    const REV: &str = "0123456789abcdef0123456789abcdef";
+    const LATEST: &[u8] =
+        br#"{"revision":"0123456789abcdef0123456789abcdef","time":"2019-01-01T00:00:00.000+0000"}"#;
+
+    fn recipe_file() -> String {
+        format!("/conan/v2/conans/oldlib/1.0/_/_/revisions/{REV}/files/conan_export.tgz")
+    }
+
+    fn package_file() -> String {
+        format!(
+            "/conan/v2/conans/oldlib/1.0/_/_/revisions/{REV}/packages/{REV}/revisions/{REV}/files/conan_package.tgz"
+        )
+    }
+
+    async fn context(trust: bool) -> (MockServer, TestContext) {
+        let up = MockServer::start().await;
+        serve(
+            &up,
+            &format!("/v2/conans/oldlib/1.0/_/_/revisions/{REV}/files/conan_export.tgz"),
+            b"RECIPE".to_vec(),
+        )
+        .await;
+        serve(
+            &up,
+            &format!("/v2/conans/oldlib/1.0/_/_/revisions/{REV}/packages/{REV}/revisions/{REV}/files/conan_package.tgz"),
+            b"PACKAGE".to_vec(),
+        )
+        .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.conan.enabled = true;
+            cfg.conan.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = trust;
+            quarantine_7d(cfg);
+        });
+        put_written_days_ago(&ctx, "conan/oldlib/1.0/_/_/latest.json", LATEST, 30).await;
+        (up, ctx)
+    }
+
+    #[tokio::test]
+    async fn without_trusted_dates_a_cached_latest_does_not_date_the_quarantine() {
+        let (_up, ctx) = context(false).await;
+        assert_eq!(
+            status(&ctx, &recipe_file()).await,
+            StatusCode::FORBIDDEN,
+            "recipe"
+        );
+        assert_eq!(
+            status(&ctx, &package_file()).await,
+            StatusCode::FORBIDDEN,
+            "package"
+        );
+    }
+
+    /// Files cached before the quarantine recorded them are counted from now on the cache path.
+    #[tokio::test]
+    async fn a_file_cached_before_the_quarantine_saw_it_counts_from_now() {
+        let (up, ctx) = context(false).await;
+        let base = format!("conan/oldlib/1.0/_/_/revisions/{REV}");
+        put_written_days_ago(
+            &ctx,
+            &format!("{base}/files/conan_export.tgz"),
+            b"RECIPE",
+            30,
+        )
+        .await;
+        let package = format!("{base}/packages/{REV}/revisions/{REV}/files/conan_package.tgz");
+        put_written_days_ago(&ctx, &package, b"PACKAGE", 30).await;
+        assert_eq!(
+            status(&ctx, &recipe_file()).await,
+            StatusCode::FORBIDDEN,
+            "recipe"
+        );
+        assert_eq!(
+            status(&ctx, &package_file()).await,
+            StatusCode::FORBIDDEN,
+            "package"
+        );
+        assert!(crate::test_helpers::upstream_paths(&up).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
+        let (_up, ctx) = context(true).await;
+        assert_eq!(status(&ctx, &recipe_file()).await, StatusCode::OK, "recipe");
+        assert_eq!(
+            status(&ctx, &package_file()).await,
+            StatusCode::OK,
+            "package"
+        );
     }
 }

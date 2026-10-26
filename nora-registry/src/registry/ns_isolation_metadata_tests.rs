@@ -512,6 +512,41 @@ async fn nuget_internal_registration_index_served_local() {
 }
 
 #[tokio::test]
+async fn nuget_internal_nuspec_served_local_and_miss_blocked() {
+    let ctx = create_test_context_with_config(|c| {
+        c.nuget.enabled = true;
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.nuget.proxy = Some(BLACKHOLE.to_string());
+    });
+    ctx.state
+        .storage
+        .put(
+            "nuget/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
+            b"<package/>",
+        )
+        .await
+        .unwrap();
+    let served = send(
+        &ctx.app,
+        Method::GET,
+        "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
+        "",
+    )
+    .await;
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(served).await[..], b"<package/>");
+    // No local copy: refused as the package itself is, never asked of the upstream.
+    let missing = send(
+        &ctx.app,
+        Method::GET,
+        "/nuget/v3/flatcontainer/internalpkg/2.0.0/internalpkg.nuspec",
+        "",
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn pubdart_internal_listing_served_local() {
     let ctx = create_test_context_with_config(|c| {
         c.pub_dart.enabled = true;
@@ -810,7 +845,7 @@ async fn pypi_internal_refusal_increments_isolation_refused_metric() {
 // request; each internal path has a public twin that must reach it, so no path passes for
 // being dead.
 
-const INTERNAL_PATHS: [&str; 34] = [
+const INTERNAL_PATHS: [&str; 35] = [
     "/npm/internalpkg",
     "/npm/internalpkg/-/internalpkg-1.0.0.tgz",
     "/simple/internalpkg/",
@@ -823,6 +858,7 @@ const INTERNAL_PATHS: [&str; 34] = [
     "/gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
     "/nuget/v3/flatcontainer/internalpkg/index.json",
     "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+    "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
     "/go/internal.corp/lib/@v/list",
     "/go/internal.corp/lib/@v/v1.0.0.info",
     "/go/internal.corp/lib/@v/v1.0.0.zip",
@@ -996,4 +1032,765 @@ async fn a_hierarchical_namespace_isolates_pypi_projects_under_it() {
         1,
         "a project outside the namespace reaches the upstream"
     );
+}
+
+// ── A store that cannot be read: an internal package is unavailable, not absent ──
+//
+// An internal-namespace package is served from its local copy only. When the store fails to
+// read that copy (an outage, not a missing key), the package is unavailable: 503. A 403 or a
+// 404 tells a client with several feeds to look for the internal name in the next one, and no
+// upstream is asked either way.
+
+/// Each internal path, and the key its local copy lives under.
+const INTERNAL_STORED: [(&str, &str); 11] = [
+    (
+        "/npm/internalpkg/-/internalpkg-1.0.0.tgz",
+        "npm/internalpkg/tarballs/internalpkg-1.0.0.tgz",
+    ),
+    ("/npm/internalpkg", "npm/internalpkg/versions/1.0.0.json"),
+    (
+        "/npm/-/package/internalpkg/dist-tags",
+        "npm/internalpkg/versions/1.0.0.json",
+    ),
+    (
+        "/npm/internalpkg/1.0.0",
+        "npm/internalpkg/versions/1.0.0.json",
+    ),
+    (
+        "/simple/internalpkg/internalpkg-1.0.tar.gz",
+        "pypi/internalpkg/internalpkg-1.0.tar.gz",
+    ),
+    (
+        "/simple/internalpkg/",
+        "pypi/internalpkg/internalpkg-1.0.tar.gz",
+    ),
+    (
+        "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+        "nuget/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+    ),
+    (
+        "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
+        "nuget/flatcontainer/internalpkg/1.0.0/internalpkg.nuspec",
+    ),
+    (
+        "/nuget/v3/flatcontainer/internalpkg/index.json",
+        "nuget/flatcontainer/internalpkg/index.json",
+    ),
+    (
+        "/nuget/v3/registration/internalpkg/index.json",
+        "nuget/registration/internalpkg/index.json",
+    ),
+    (
+        "/nuget/v3/registration/internalpkg/page/1.0.0/1.0.0.json",
+        "nuget/registration/internalpkg/page/1.0.0/1.0.0.json",
+    ),
+];
+
+/// The bytes stored under an [`INTERNAL_STORED`] key.
+fn internal_stored_body(key: &str) -> Vec<u8> {
+    if key.starts_with("npm/") && key.ends_with(".json") {
+        br#"{"name":"internalpkg","version":"1.0.0"}"#.to_vec()
+    } else if key.ends_with(".json") {
+        br#"{"count":0,"items":[],"versions":["1.0.0"]}"#.to_vec()
+    } else {
+        b"local copy".to_vec()
+    }
+}
+
+#[tokio::test]
+async fn an_internal_package_on_a_store_that_cannot_be_read_is_unavailable_not_absent() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(uri.clone());
+        c.pypi.proxy = Some(uri.clone());
+        c.nuget.enabled = true;
+        c.nuget.proxy = Some(uri);
+    });
+    for (_, key) in INTERNAL_STORED {
+        ctx.state
+            .storage
+            .put(key, &internal_stored_body(key))
+            .await
+            .unwrap();
+    }
+    // The store up: each is served from its local copy.
+    for (path, _) in INTERNAL_STORED {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path} with the store up");
+    }
+
+    outage.begin();
+    let mut wrong = Vec::new();
+    for (path, _) in INTERNAL_STORED {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            wrong.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "internal packages answered other than 503 with the store down: {wrong:#?}"
+    );
+    let asked = upstream_paths(&upstream).await;
+    assert!(
+        asked.is_empty(),
+        "upstream asked during the outage: {asked:?}"
+    );
+
+    // A package outside the internal namespaces is not handed to its upstream either: a store
+    // that cannot list a package's published versions (npm) or its imported ones (NuGet, PyPI)
+    // leaves NORA unable to tell whether the name is NORA's own: 503, as for cargo. With
+    // listings answering, a public package still goes to its upstream (the test below).
+    for path in [
+        "/nuget/v3/flatcontainer/publicpkg/1.0.0/publicpkg.1.0.0.nupkg",
+        "/npm/publicpkg/-/publicpkg-1.0.0.tgz",
+        "/simple/publicpkg/",
+    ] {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path} during the outage"
+        );
+    }
+    assert_eq!(upstream_paths(&upstream).await, Vec::<String>::new());
+}
+
+/// The same when only object reads fail and listings still answer (a store throttling its GETs):
+/// a package that is not published but was cached before its name became internal included.
+#[tokio::test]
+async fn an_internal_package_whose_copy_cannot_be_read_is_unavailable_not_absent() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(uri.clone());
+        c.pypi.proxy = Some(uri.clone());
+        c.nuget.enabled = true;
+        c.nuget.proxy = Some(uri);
+    });
+    let stored = [
+        (
+            "/npm/internalpkg/-/internalpkg-1.0.0.tgz",
+            "npm/internalpkg/tarballs/internalpkg-1.0.0.tgz",
+        ),
+        (
+            "/npm/internalcache",
+            "npm/internalcache/upstream/packument.json",
+        ),
+        (
+            "/simple/internalpkg/internalpkg-1.0.tar.gz",
+            "pypi/internalpkg/internalpkg-1.0.tar.gz",
+        ),
+        (
+            "/nuget/v3/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+            "nuget/flatcontainer/internalpkg/1.0.0/internalpkg.1.0.0.nupkg",
+        ),
+        (
+            "/nuget/v3/flatcontainer/internalpkg/index.json",
+            "nuget/flatcontainer/internalpkg/index.json",
+        ),
+    ];
+    for (_, key) in stored {
+        let body = if key.ends_with(".json") {
+            br#"{"name":"internalcache","versions":{},"dist-tags":{}}"#.to_vec()
+        } else {
+            b"local copy".to_vec()
+        };
+        ctx.state.storage.put(key, &body).await.unwrap();
+    }
+    for (path, _) in stored {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{path} with the store up");
+    }
+
+    outage.fail_reads();
+    let mut wrong = Vec::new();
+    for (path, _) in stored {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            wrong.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "internal packages answered other than 503 with reads failing: {wrong:#?}"
+    );
+    let asked = upstream_paths(&upstream).await;
+    assert!(
+        asked.is_empty(),
+        "upstream asked while reads fail: {asked:?}"
+    );
+
+    // Control: listings still answer, so NORA can tell a public package is not its own, and its
+    // upstream answers for it.
+    for path in [
+        "/nuget/v3/flatcontainer/publicpkg/1.0.0/publicpkg.1.0.0.nupkg",
+        "/simple/publicpkg/",
+    ] {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        assert_ne!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{path} while reads fail"
+        );
+    }
+    let asked = upstream_paths(&upstream).await;
+    assert!(
+        asked.iter().any(|p| p.contains("/publicpkg/1.0.0/"))
+            && asked.iter().any(|p| p.ends_with("/publicpkg/"))
+            && asked.iter().all(|p| p.contains("publicpkg")),
+        "{asked:?}"
+    );
+}
+
+/// Each internal download of the other formats, and the key its local copy lives under.
+const INTERNAL_STORED_ELSEWHERE: [(&str, &str); 17] = [
+    (
+        "/gems/gems/internalpkg-1.0.0.gem",
+        "gems/gems/internalpkg-1.0.0.gem",
+    ),
+    (
+        "/gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
+        "gems/quick/Marshal.4.8/internalpkg-1.0.0.gemspec.rz",
+    ),
+    (
+        "/maven2/internalpkg/lib/1.0/lib-1.0.jar",
+        "maven/internalpkg/lib/1.0/lib-1.0.jar",
+    ),
+    (
+        "/maven2/internalpkg/lib/maven-metadata.xml",
+        "maven/internalpkg/lib/maven-metadata.xml",
+    ),
+    (
+        "/pub/packages/internalpkg/versions/1.0.0.tar.gz",
+        "pub/packages/internalpkg/versions/1.0.0.tar.gz",
+    ),
+    (
+        "/ansible/download/internalns-coll-1.0.0.tar.gz",
+        "ansible/download/internalns-coll-1.0.0.tar.gz",
+    ),
+    (
+        "/go/internal.corp/lib/@v/v1.0.0.zip",
+        "go/internal.corp/lib/@v/v1.0.0.zip",
+    ),
+    (
+        "/cargo/api/v1/crates/internalpkg/1.0.0/download",
+        "cargo/internalpkg/1.0.0/internalpkg-1.0.0.crate",
+    ),
+    (
+        "/cpan/authors/id/I/IN/INTERNAL/internalpkg-1.0.tar.gz",
+        "cpan/authors/id/I/IN/INTERNAL/internalpkg-1.0.tar.gz",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/latest",
+        "conan/internalpkg/1.0/_/_/latest.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions",
+        "conan/internalpkg/1.0/_/_/revisions.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/files",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/files.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/files/conanfile.py",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/files/conanfile.py",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/latest",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/latest.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files.json",
+    ),
+    (
+        "/conan/v2/conans/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files/conaninfo.txt",
+        "conan/internalpkg/1.0/_/_/revisions/abc1/packages/pid1/revisions/def2/files/conaninfo.txt",
+    ),
+];
+
+/// A context serving [`INTERNAL_STORED_ELSEWHERE`] from `storage`, its formats turned on.
+fn other_formats_context(storage: crate::Storage) -> crate::test_helpers::TestContext {
+    crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.gems.enabled = true;
+        c.pub_dart.enabled = true;
+        c.ansible.enabled = true;
+        c.cpan.enabled = true;
+        c.conan.enabled = true;
+    })
+}
+
+/// The same for the other formats' downloads: an internal package's copy that the store could
+/// not read answers 503, never 403 or 404.
+#[tokio::test]
+async fn an_internal_download_of_every_other_format_on_a_store_that_cannot_be_read_is_503() {
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let ctx = other_formats_context(storage);
+    let stored = INTERNAL_STORED_ELSEWHERE;
+    for (_, key) in stored {
+        ctx.state.storage.put(key, b"local copy").await.unwrap();
+    }
+    let mut up = Vec::new();
+    for (path, _) in stored {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::OK {
+            up.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        up.is_empty(),
+        "internal packages not served from their local copy with the store up: {up:#?}"
+    );
+    outage.begin();
+    let mut wrong = Vec::new();
+    for (path, _) in stored {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            wrong.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "internal packages answered other than 503 with the store down: {wrong:#?}"
+    );
+}
+
+/// A CPAN distribution can be internal by its author path, not only by its name: such a
+/// distribution is served from its local copy, and without one it is refused and never fetched.
+#[tokio::test]
+async fn a_cpan_distribution_internal_by_its_author_path_stays_local() {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UPSTREAM".to_vec()))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let ctx = create_test_context_with_config(move |c| {
+        c.curation.internal_namespaces = vec!["I/IN/INTERNAL/**".to_string()];
+        c.cpan.enabled = true;
+        c.cpan.proxy = Some(uri);
+    });
+    ctx.state
+        .storage
+        .put(
+            "cpan/authors/id/I/IN/INTERNAL/Corp-Lib-1.0.tar.gz",
+            b"local copy",
+        )
+        .await
+        .unwrap();
+    let served = send(
+        &ctx.app,
+        Method::GET,
+        "/cpan/authors/id/I/IN/INTERNAL/Corp-Lib-1.0.tar.gz",
+        "",
+    )
+    .await;
+    assert_eq!(served.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(served).await[..], b"local copy");
+    let missing = send(
+        &ctx.app,
+        Method::GET,
+        "/cpan/authors/id/I/IN/INTERNAL/Corp-Lib-2.0.tar.gz",
+        "",
+    )
+    .await;
+    assert_eq!(missing.status(), StatusCode::FORBIDDEN);
+    assert_eq!(upstream_paths(&upstream).await, Vec::<String>::new());
+    // Control: another author's distribution is fetched.
+    let other = send(
+        &ctx.app,
+        Method::GET,
+        "/cpan/authors/id/P/PU/PUBLIC/Corp-Lib-2.0.tar.gz",
+        "",
+    )
+    .await;
+    assert_eq!(other.status(), StatusCode::OK);
+}
+
+/// An internal terraform provider and module: each stored key and its bytes, and each path they
+/// are served from with its status with the store up.
+/// Each stored key of [`internal_terraform`] and its bytes.
+type StoredObjects = Vec<(String, Vec<u8>)>;
+
+fn internal_terraform() -> (StoredObjects, [(String, StatusCode); 8]) {
+    let zip = "terraform-provider-infra_1.0.0_linux_amd64.zip";
+    let stored: Vec<(String, Vec<u8>)> = vec![
+        (
+            "terraform/providers/internalns/infra/versions.json".into(),
+            br#"{"versions":[{"version":"1.0.0","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"}]}]}"#.to_vec(),
+        ),
+        (
+            "terraform/providers/internalns/infra/1.0.0/linux_amd64.json".into(),
+            format!(r#"{{"os":"linux","arch":"amd64","filename":"{zip}","download_url":"http://nora/terraform/v1/providers/download/internalns/infra/1.0.0/{zip}","shasum":"00ff"}}"#).into_bytes(),
+        ),
+        (format!("terraform/download/internalns/infra/1.0.0/{zip}"), b"zip".to_vec()),
+        (
+            "terraform/modules/internalns/vpc/aws/versions.json".into(),
+            br#"{"modules":[{"versions":[{"version":"1.0.0"}]}]}"#.to_vec(),
+        ),
+        (
+            "terraform/modules/internalns/vpc/aws/1.0.0/_source_url".into(),
+            b"https://modules.example/vpc-1.0.0.tar.gz".to_vec(),
+        ),
+        (
+            "terraform/modules/internalns/vpc/aws/1.0.0/source.tar.gz".into(),
+            b"tgz".to_vec(),
+        ),
+    ];
+    let paths = [
+        (
+            "/terraform/v1/providers/internalns/infra/versions".to_string(),
+            StatusCode::OK,
+        ),
+        (
+            "/terraform/v1/providers/internalns/infra/1.0.0/download/linux/amd64".to_string(),
+            StatusCode::OK,
+        ),
+        (
+            format!("/terraform/v1/providers/download/internalns/infra/1.0.0/{zip}"),
+            StatusCode::OK,
+        ),
+        (
+            "/terraform/v1/modules/internalns/vpc/aws/versions".to_string(),
+            StatusCode::OK,
+        ),
+        (
+            "/terraform/v1/modules/internalns/vpc/aws/1.0.0/download".to_string(),
+            StatusCode::NO_CONTENT,
+        ),
+        (
+            "/terraform/v1/modules/download/internalns/vpc/aws/1.0.0/source".to_string(),
+            StatusCode::OK,
+        ),
+        (
+            "/terraform/registry.terraform.io/internalns/infra/index.json".to_string(),
+            StatusCode::OK,
+        ),
+        (
+            "/terraform/registry.terraform.io/internalns/infra/1.0.0.json".to_string(),
+            StatusCode::OK,
+        ),
+    ];
+    (stored, paths)
+}
+
+/// A context serving [`internal_terraform`] from `storage`, seeded.
+async fn internal_terraform_context(storage: crate::Storage) -> crate::test_helpers::TestContext {
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.terraform.enabled = true;
+        c.terraform.proxy = Some(BLACKHOLE.to_string());
+    });
+    for (key, body) in internal_terraform().0 {
+        ctx.state.storage.put(&key, &body).await.unwrap();
+    }
+    ctx
+}
+
+/// Terraform: every path an internal provider or module is served from — the registry protocol,
+/// its file downloads and the provider network mirror — answers 503 when the store cannot read
+/// the local copy.
+#[tokio::test]
+async fn an_internal_terraform_provider_or_module_on_a_store_that_cannot_be_read_is_503() {
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let ctx = internal_terraform_context(storage).await;
+    let (_, paths) = internal_terraform();
+    let mut up = Vec::new();
+    for (path, expected) in &paths {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != *expected {
+            up.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        up.is_empty(),
+        "internal terraform objects not served from their local copy with the store up: {up:#?}"
+    );
+    outage.begin();
+    let mut wrong = Vec::new();
+    for (path, _) in &paths {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            wrong.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "internal terraform objects answered other than 503 with the store down: {wrong:#?}"
+    );
+}
+
+/// The network mirror lists every platform of an internal provider's version from its cached
+/// metadata: a platform whose metadata the store cannot read makes the answer 503, never a list
+/// that silently leaves the platform out.
+#[tokio::test]
+async fn an_internal_mirror_platform_whose_metadata_cannot_be_read_is_503_not_left_out() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.terraform.enabled = true;
+        c.terraform.proxy = Some(BLACKHOLE.to_string());
+    });
+    ctx.state
+        .storage
+        .put(
+            "terraform/providers/internalns/infra/versions.json",
+            br#"{"versions":[{"version":"1.0.0","platforms":[{"os":"linux","arch":"amd64"},{"os":"darwin","arch":"arm64"}]}]}"#,
+        )
+        .await
+        .unwrap();
+    for platform in ["linux_amd64", "darwin_arm64"] {
+        ctx.state
+            .storage
+            .put(
+                &format!("terraform/providers/internalns/infra/1.0.0/{platform}.json"),
+                format!(r#"{{"download_url":"http://nora/{platform}.zip","shasum":"00ff"}}"#)
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+    }
+    let path = "/terraform/registry.terraform.io/internalns/infra/1.0.0.json";
+    let both = send(&ctx.app, Method::GET, path, "").await;
+    assert_eq!(both.status(), StatusCode::OK);
+    let listed: serde_json::Value = serde_json::from_slice(&body_bytes(both).await).unwrap();
+    assert_eq!(listed["archives"].as_object().unwrap().len(), 2);
+    outage.fail_reads_of("/darwin_arm64.json");
+    let resp = send(&ctx.app, Method::GET, path, "").await;
+    assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+}
+
+/// A local copy that fails its integrity check (changed on disk) is neither served nor taken for
+/// absent: 500, never 403/404 and not the 503 of an outage, and no upstream is asked — in every
+/// format, for each key on its own.
+#[tokio::test]
+async fn an_internal_package_whose_copy_fails_its_integrity_check_is_500_in_every_format() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    use crate::test_helpers::{ReadFault, StorageOutage, TestContext};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Each path answered with its key's copy changed on disk, where the answer is not 500.
+    async fn not_500(
+        ctx: &TestContext,
+        outage: &StorageOutage,
+        stored: &[(&str, &str)],
+    ) -> Vec<String> {
+        let mut wrong = Vec::new();
+        for (path, key) in stored {
+            outage.end();
+            outage.fault_reads_of(key, ReadFault::Tampered);
+            let status = send(&ctx.app, Method::GET, path, "").await.status();
+            if status != StatusCode::INTERNAL_SERVER_ERROR {
+                wrong.push(format!("{path} ({key}) -> {status}"));
+            }
+        }
+        outage.end();
+        wrong
+    }
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    let uri = upstream.uri();
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+        c.curation.internal_namespaces = vec!["internal*".to_string()];
+        c.npm.proxy = Some(uri.clone());
+        c.pypi.proxy = Some(uri.clone());
+        c.nuget.enabled = true;
+        c.nuget.proxy = Some(uri);
+    });
+    for (_, key) in INTERNAL_STORED {
+        ctx.state
+            .storage
+            .put(key, &internal_stored_body(key))
+            .await
+            .unwrap();
+    }
+    // The project listing names its files from the store's listing and reads no copy of them.
+    let reads_its_copy: Vec<(&str, &str)> = INTERNAL_STORED
+        .into_iter()
+        .filter(|(path, _)| *path != "/simple/internalpkg/")
+        .collect();
+    let mut wrong = not_500(&ctx, &outage, &reads_its_copy).await;
+    let asked = upstream_paths(&upstream).await;
+    assert!(
+        asked.is_empty(),
+        "upstream asked for a tampered copy: {asked:?}"
+    );
+
+    let (storage, outage) = outage_storage();
+    let ctx = other_formats_context(storage);
+    for (_, key) in INTERNAL_STORED_ELSEWHERE {
+        ctx.state.storage.put(key, b"local copy").await.unwrap();
+    }
+    wrong.extend(not_500(&ctx, &outage, &INTERNAL_STORED_ELSEWHERE).await);
+
+    // Terraform: a path reads several keys, so every key is changed at once.
+    let (storage, outage) = outage_storage();
+    let ctx = internal_terraform_context(storage).await;
+    let (stored, paths) = internal_terraform();
+    for (key, _) in &stored {
+        outage.fault_reads_of(key, ReadFault::Tampered);
+    }
+    for (path, _) in &paths {
+        let status = send(&ctx.app, Method::GET, path, "").await.status();
+        if status != StatusCode::INTERNAL_SERVER_ERROR {
+            wrong.push(format!("{path} -> {status}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "internal packages whose copy fails its integrity check answered other than 500: {wrong:#?}"
+    );
+}
+
+/// A Go module path with capitals travels encoded (`!c` for `C`); the namespace it belongs to is
+/// read from the decoded path. An internal module spelled with capitals is served from its copy,
+/// refused without one, and unavailable (503) when the copy cannot be read — on every endpoint.
+#[tokio::test]
+async fn an_internal_go_module_with_capitals_is_internal_on_every_path() {
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    let (storage, outage) = outage_storage();
+    let ctx = create_test_context_with_storage_and_config(storage, |c| {
+        c.curation.internal_namespaces = vec!["Corp.example/*".to_string()];
+        c.go.proxy = Some(BLACKHOLE.to_string());
+    });
+    let files = [
+        "@v/v1.0.0.zip",
+        "@v/v1.0.0.info",
+        "@v/v1.0.0.mod",
+        "@v/list",
+        "@latest",
+    ];
+    for file in files {
+        ctx.state
+            .storage
+            .put(&format!("go/!corp.example/!lib/{file}"), b"local copy")
+            .await
+            .unwrap();
+    }
+    let mut wrong = Vec::new();
+    for file in files {
+        let path = format!("/go/!corp.example/!lib/{file}");
+        let status = send(&ctx.app, Method::GET, &path, "").await.status();
+        if status != StatusCode::OK {
+            wrong.push(format!("{path} with the store up -> {status}"));
+        }
+        let missing = format!("/go/!corp.example/!other/{file}");
+        let status = send(&ctx.app, Method::GET, &missing, "").await.status();
+        if status != StatusCode::FORBIDDEN {
+            wrong.push(format!("{missing} without a copy -> {status}"));
+        }
+    }
+    outage.fail_reads();
+    for file in files {
+        let path = format!("/go/!corp.example/!lib/{file}");
+        let status = send(&ctx.app, Method::GET, &path, "").await.status();
+        if status != StatusCode::SERVICE_UNAVAILABLE {
+            wrong.push(format!("{path} with reads failing -> {status}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// An internal npm package's packument or version manifest cached from an upstream lives under
+/// its `upstream/` key, or — cached by a release before 1.4.0 — under the legacy
+/// `<path>/metadata.json`. Whichever key holds the copy, a read of it that fails leaves the
+/// package unavailable (503), not absent, and the upstream is not asked.
+#[tokio::test]
+async fn an_internal_npm_document_whose_cached_copy_cannot_be_read_is_503_under_either_key() {
+    use crate::test_helpers::ReadFault;
+    use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let upstream = MockServer::start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&upstream)
+        .await;
+    let cases = [
+        (
+            "/npm/internalcache",
+            "npm/internalcache/upstream/packument.json",
+        ),
+        ("/npm/internalcache", "npm/internalcache/metadata.json"),
+        (
+            "/npm/internalcache/1.0.0",
+            "npm/internalcache/upstream/manifests/1.0.0.json",
+        ),
+        (
+            "/npm/internalcache/1.0.0",
+            "npm/internalcache/1.0.0/metadata.json",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (path, key) in cases {
+        for (fault, expected) in [
+            (ReadFault::Network, StatusCode::SERVICE_UNAVAILABLE),
+            (ReadFault::Tampered, StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let uri = upstream.uri();
+            let (storage, outage) = outage_storage();
+            let ctx = create_test_context_with_storage_and_config(storage, move |c| {
+                c.curation.internal_namespaces = vec!["internal*".to_string()];
+                c.npm.proxy = Some(uri);
+            });
+            ctx.state
+                .storage
+                .put(
+                    key,
+                    br#"{"name":"internalcache","version":"1.0.0","versions":{},"dist-tags":{}}"#,
+                )
+                .await
+                .unwrap();
+            let status = send(&ctx.app, Method::GET, path, "").await.status();
+            if status != StatusCode::OK {
+                wrong.push(format!("{path} from {key} with the store up -> {status}"));
+            }
+            outage.fault_reads_of(key, fault);
+            let status = send(&ctx.app, Method::GET, path, "").await.status();
+            if status != expected {
+                wrong.push(format!("{path} from {key}, {fault:?} -> {status}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    let asked = upstream_paths(&upstream).await;
+    assert!(asked.is_empty(), "upstream asked: {asked:?}");
 }

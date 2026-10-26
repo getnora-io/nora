@@ -21,6 +21,9 @@ pub struct HealthStatus {
     /// reachable. Read from cached in-memory state only — the `/health` path
     /// never performs a live upstream probe (#468).
     pub upstreams: HashMap<String, UpstreamHealth>,
+    /// The background task that fails liveness, when one does (supervise.rs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failing_task: Option<&'static str>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -37,10 +40,15 @@ pub fn routes() -> Router<AppState> {
 }
 
 async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<HealthStatus>) {
+    // Read when the probe arrives. The storage fields below are cached verdicts and counts
+    // the maintenance loop took: a probe does no storage I/O.
+    let failing_task = state.tasks.failing();
     let storage_reachable = check_storage_reachable(&state).await;
     let total_size = state.storage.total_size().await;
 
-    let status = if storage_reachable {
+    let status = if failing_task.is_some() {
+        "unhealthy"
+    } else if storage_reachable {
         "healthy"
     } else {
         "degraded"
@@ -67,13 +75,21 @@ async fn health_check(State(state): State<AppState>) -> (StatusCode, Json<Health
         },
         registries,
         upstreams,
+        failing_task,
     };
 
-    // Always 200: /health is a liveness signal — the process is up and serving.
-    // Storage reachability is informational (`status: degraded`); gating liveness
-    // or the LB on it turns a storage blip into a restart loop / full 502 outage
-    // for every route, storage-backed or not (#869). Readiness (`/ready`) is the
-    // storage gate.
+    // /health is a liveness signal — the process is up and serving. Storage
+    // reachability is informational (`status: degraded`); gating liveness or the LB
+    // on it turns a storage blip into a restart loop / full 502 outage for every
+    // route, storage-backed or not (#869). Readiness (`/ready`) is the storage gate.
+    // A background task that stopped making progress or keeps panicking (see
+    // supervise.rs) is the process's own fault, which a restart clears: that one fails
+    // liveness. A maintenance tick waiting on the store is cut at its deadline and is
+    // progress (main.rs `run_maintenance`), so a silent store stays a readiness matter.
+    if let Some(task) = failing_task {
+        tracing::warn!(task, "background task failing, failing liveness");
+        return (StatusCode::SERVICE_UNAVAILABLE, Json(health));
+    }
     (StatusCode::OK, Json(health))
 }
 
@@ -128,19 +144,87 @@ fn build_upstreams(state: &AppState) -> HashMap<String, UpstreamHealth> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use crate::supervise::{Heartbeat, Supervisor};
     use crate::test_helpers::{
         body_bytes, create_test_context, create_test_context_with_config, send,
     };
     use axum::http::{Method, StatusCode};
+    use axum::Router;
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// `/ready` answers the last storage verdict and does no storage I/O: a root moved away
+    /// after the probe leaves it ready until the next tick.
+    #[tokio::test]
+    async fn ready_answers_the_last_verdict_without_touching_storage() {
+        let ctx = create_test_context();
+        ctx.state.storage.refresh_reachability().await;
+        let root = std::path::PathBuf::from(&ctx.state.config.storage.path);
+        let moved = root.with_extension("moved");
+        std::fs::rename(&root, &moved).unwrap();
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+        std::fs::rename(&moved, &root).unwrap();
+        assert_eq!(
+            ready.status(),
+            StatusCode::OK,
+            "/ready looked at the storage root"
+        );
+    }
 
     #[tokio::test]
     async fn test_health_returns_200() {
         let ctx = create_test_context();
+        ctx.state.storage.refresh_reachability().await;
         let response = send(&ctx.app, Method::GET, "/health", "").await;
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_bytes(response).await;
         let body_str = std::str::from_utf8(&body).unwrap();
         assert!(body_str.contains("healthy"));
+    }
+
+    /// A maintenance loop that stopped ticking fails liveness: `/health` answers 503
+    /// once the loop has been silent longer than it may be, and 200 again after a tick.
+    #[tokio::test]
+    async fn health_is_503_while_the_maintenance_loop_is_silent_too_long() {
+        let silence = Duration::from_secs(2);
+        let ctx = create_test_context();
+        let mut state = ctx.state.clone();
+        state.maintenance = Arc::new(Heartbeat::new(silence));
+        state.tasks = Arc::new(Supervisor::new(vec![(
+            "maintenance",
+            Arc::clone(&state.maintenance),
+        )]));
+        let app = Router::new()
+            .merge(super::routes())
+            .with_state(state.clone());
+
+        state.maintenance.beat();
+        let response = send(&app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        tokio::time::sleep(silence + Duration::from_millis(500)).await;
+        let response = send(&app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+        assert_eq!(json["status"], "unhealthy");
+        assert_eq!(json["failing_task"], "maintenance");
+
+        state.maintenance.beat();
+        let response = send(&app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// The silence `/health` tolerates is `server.maintenance_stall_secs`: with a 1 s window
+    /// and no tick completing, the probe fails after it; with the default it does not.
+    #[tokio::test]
+    async fn the_stall_window_is_the_configured_one() {
+        let short = create_test_context_with_config(|c| c.server.maintenance_stall_secs = 1);
+        let default = create_test_context();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let response = send(&short.app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = send(&default.app, Method::GET, "/health", "").await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -163,6 +247,7 @@ mod tests {
             .put("test/artifact", b"hello world")
             .await
             .unwrap();
+        ctx.state.storage.refresh_total_size_cache().await;
 
         let response = send(&ctx.app, Method::GET, "/health", "").await;
         assert_eq!(response.status(), StatusCode::OK);
@@ -199,6 +284,8 @@ mod tests {
         let mut perms = std::fs::metadata(dir).unwrap().permissions();
         perms.set_mode(0o500);
         std::fs::set_permissions(dir, perms).unwrap();
+        // The next tick's write probe.
+        ctx.state.storage.refresh_reachability().await;
 
         let health = send(&ctx.app, Method::GET, "/health", "").await;
         assert_eq!(health.status(), StatusCode::OK);
@@ -214,9 +301,82 @@ mod tests {
         std::fs::set_permissions(dir, perms).unwrap();
     }
 
+    /// The modification time of the storage directory, which changes when a file is
+    /// created or removed in it.
+    fn dir_mtime(dir: &std::path::Path) -> std::time::SystemTime {
+        std::fs::metadata(dir).unwrap().modified().unwrap()
+    }
+
+    /// Probes on the local backend do no storage I/O: after the maintenance loop's refresh,
+    /// any number of `/health` and `/ready` requests leave the storage directory as it was
+    /// (a write probe creates and removes a file in it, which moves its modification time).
+    #[tokio::test]
+    async fn probes_on_local_storage_touch_no_file() {
+        let ctx = create_test_context();
+        let dir = ctx._tempdir.path();
+        ctx.state.storage.refresh_reachability().await;
+        ctx.state.storage.refresh_total_size_cache().await;
+        // Past the file system's timestamp granularity, so any change would show.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = dir_mtime(dir);
+        let entries = std::fs::read_dir(dir).unwrap().count();
+
+        for _ in 0..10 {
+            let health = send(&ctx.app, Method::GET, "/health", "").await;
+            assert_eq!(health.status(), StatusCode::OK);
+            let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+            assert_eq!(ready.status(), StatusCode::OK);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        assert_eq!(dir_mtime(dir), before, "a probe created or removed a file");
+        assert_eq!(std::fs::read_dir(dir).unwrap().count(), entries);
+    }
+
+    /// The size on `/health` is the one the size task counted, not a walk of the tree per
+    /// request: bytes written since stay out of it until the next count.
+    #[tokio::test]
+    async fn the_size_on_health_is_the_counted_one() {
+        let ctx = create_test_context();
+        ctx.state.storage.refresh_total_size_cache().await;
+        let dir = ctx._tempdir.path().join("raw");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("late.bin"), [0u8; 1000]).unwrap();
+
+        let size = |json: serde_json::Value| json["storage"]["total_size_bytes"].as_u64().unwrap();
+        for _ in 0..5 {
+            let health = send(&ctx.app, Method::GET, "/health", "").await;
+            let json = serde_json::from_slice(&body_bytes(health).await).unwrap();
+            assert_eq!(size(json), 0, "the size counted before the write");
+        }
+
+        ctx.state.storage.refresh_total_size_cache().await;
+        let health = send(&ctx.app, Method::GET, "/health", "").await;
+        let json = serde_json::from_slice(&body_bytes(health).await).unwrap();
+        assert_eq!(size(json), 1000, "the next count sees the write");
+    }
+
+    /// Until the maintenance loop has looked at the local store, readiness has no verdict
+    /// and gates, as on an object store: `/ready` 503, `/health` 200 and `degraded`.
+    #[tokio::test]
+    async fn readiness_waits_for_the_first_storage_verdict() {
+        let ctx = create_test_context();
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let health = send(&ctx.app, Method::GET, "/health", "").await;
+        assert_eq!(health.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(health).await).unwrap();
+        assert_eq!(json["status"], "degraded");
+
+        ctx.state.storage.refresh_reachability().await;
+        let ready = send(&ctx.app, Method::GET, "/ready", "").await;
+        assert_eq!(ready.status(), StatusCode::OK);
+    }
+
     #[tokio::test]
     async fn test_ready_returns_200() {
         let ctx = create_test_context();
+        ctx.state.storage.refresh_reachability().await;
         let response = send(&ctx.app, Method::GET, "/ready", "").await;
         assert_eq!(response.status(), StatusCode::OK);
     }

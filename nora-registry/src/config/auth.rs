@@ -5,14 +5,23 @@
 
 use serde::{Deserialize, Serialize};
 use std::env;
+use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// CIDR-aware trusted proxy list for X-Forwarded-For validation.
 ///
 /// Only connections from trusted proxies have their XFF/X-Real-IP headers
 /// honored. Untrusted sources always use the peer (TCP) IP address.
+///
+/// An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`, how a dual-stack socket sees
+/// an IPv4 peer) is its IPv4 address, in an entry and in an address checked.
 #[derive(Debug, Clone)]
 pub struct TrustedProxies {
     entries: Vec<(std::net::IpAddr, u8)>, // (network address, prefix length)
+    /// Set once forwarding headers from an untrusted peer have been warned
+    /// about; shared by the clones the limiters and the middleware hold.
+    untrusted_forwarding_warned: Arc<AtomicBool>,
 }
 
 impl TrustedProxies {
@@ -31,6 +40,7 @@ impl TrustedProxies {
                 ) {
                     let max_prefix = if addr.is_ipv4() { 32 } else { 128 };
                     if prefix <= max_prefix {
+                        let (addr, prefix) = canonical_network(addr, prefix);
                         if prefix == 0 {
                             tracing::warn!(
                                 value = %item,
@@ -46,27 +56,32 @@ impl TrustedProxies {
                     tracing::warn!(value = %item, "Cannot parse CIDR, skipping");
                 }
             } else if let Ok(addr) = item.parse::<std::net::IpAddr>() {
-                let prefix = if addr.is_ipv4() { 32 } else { 128 };
-                entries.push((addr, prefix));
+                entries.push(canonical_network(addr, full_prefix(addr)));
             } else {
                 tracing::warn!(value = %item, "Cannot parse IP address, skipping");
             }
         }
-        Self { entries }
+        Self::from_entries(entries)
+    }
+
+    fn from_entries(entries: Vec<(IpAddr, u8)>) -> Self {
+        Self {
+            entries,
+            untrusted_forwarding_warned: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Default: loopback only (127.0.0.1 and ::1).
     pub fn default_loopback() -> Self {
-        Self {
-            entries: vec![
-                (std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 32),
-                (std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 128),
-            ],
-        }
+        Self::from_entries(vec![
+            (std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 32),
+            (std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 128),
+        ])
     }
 
     /// Check if an IP address is within the trusted proxy list.
     pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        let ip = canonical_ip(ip);
         self.entries.iter().any(|(network, prefix)| {
             match (network, ip) {
                 (std::net::IpAddr::V4(net), std::net::IpAddr::V4(addr)) => {
@@ -106,6 +121,81 @@ impl TrustedProxies {
     pub fn has_prefix_zero(&self) -> bool {
         self.entries.iter().any(|(_, prefix)| *prefix == 0)
     }
+
+    /// Warn, once for this setting, that `peer` sent forwarding headers that
+    /// are ignored because it is not a trusted proxy: every client behind such
+    /// a proxy is then one address to the lockout and the rate limits. Names
+    /// the peer and the setting, never the headers, which the client wrote.
+    pub fn warn_untrusted_forwarding(&self, peer: IpAddr) {
+        if self
+            .untrusted_forwarding_warned
+            .swap(true, Ordering::Relaxed)
+        {
+            return;
+        }
+        tracing::warn!(
+            peer = %peer,
+            trusted_proxies = %self.listed(),
+            "X-Forwarded-For from a peer outside auth.trusted_proxies is ignored: the lockout and \
+             the rate limits count every client behind this peer as the peer itself. If NORA runs \
+             behind a proxy, add the proxy to auth.trusted_proxies (NORA_AUTH_TRUSTED_PROXIES)"
+        );
+    }
+
+    /// Whether forwarding headers from an untrusted peer have been warned about.
+    #[cfg(test)]
+    pub(crate) fn warned_untrusted_forwarding(&self) -> bool {
+        self.untrusted_forwarding_warned.load(Ordering::Relaxed)
+    }
+
+    /// The entries as the comma-separated list the setting is written in.
+    fn listed(&self) -> String {
+        let parts: Vec<String> = self
+            .entries
+            .iter()
+            .map(|(addr, prefix)| {
+                let max = if addr.is_ipv4() { 32 } else { 128 };
+                if *prefix == max {
+                    addr.to_string()
+                } else {
+                    format!("{}/{}", addr, prefix)
+                }
+            })
+            .collect();
+        parts.join(",")
+    }
+}
+
+/// The address a client is known by, whichever way it came: an IPv4-mapped
+/// IPv6 address (`::ffff:a.b.c.d`, how a dual-stack socket sees an IPv4 peer)
+/// is its IPv4 address, and every other address is itself, the IPv4-compatible
+/// form `::a.b.c.d` and the IPv6 loopback included. The peer, the forwarding
+/// headers and `auth.trusted_proxies` all go through here
+/// ([`canonical_network`]).
+pub(crate) fn canonical_ip(ip: IpAddr) -> IpAddr {
+    canonical_network(ip, full_prefix(ip)).0
+}
+
+/// The prefix of a network of one address.
+fn full_prefix(addr: IpAddr) -> u8 {
+    if addr.is_ipv4() {
+        32
+    } else {
+        128
+    }
+}
+
+/// A network given as an IPv4-mapped IPv6 address that covers only mapped
+/// addresses (prefix 96 or longer) is that IPv4 network; any other network is
+/// itself. The one place an IPv6 address becomes an IPv4 one.
+fn canonical_network(addr: IpAddr, prefix: u8) -> (IpAddr, u8) {
+    match addr {
+        IpAddr::V6(v6) if prefix >= 96 => match v6.to_ipv4_mapped() {
+            Some(v4) => (IpAddr::V4(v4), prefix - 96),
+            None => (addr, prefix),
+        },
+        _ => (addr, prefix),
+    }
 }
 
 impl Default for TrustedProxies {
@@ -121,19 +211,7 @@ impl Serialize for TrustedProxies {
         &self,
         serializer: S,
     ) -> std::result::Result<S::Ok, S::Error> {
-        let parts: Vec<String> = self
-            .entries
-            .iter()
-            .map(|(addr, prefix)| {
-                let max = if addr.is_ipv4() { 32 } else { 128 };
-                if *prefix == max {
-                    addr.to_string()
-                } else {
-                    format!("{}/{}", addr, prefix)
-                }
-            })
-            .collect();
-        parts.join(",").serialize(serializer)
+        self.listed().serialize(serializer)
     }
 }
 
@@ -236,6 +314,9 @@ pub struct AuthConfig {
 /// [[auth.oidc.providers]]
 /// name = "github-actions"
 /// issuer = "https://token.actions.githubusercontent.com"
+/// # Required: the `aud` the jobs request. Without it a token GitHub minted for
+/// # any other service would be accepted, so NORA refuses to start. To accept
+/// # any `aud` instead, set `any_audience = true` (warned about at start).
 /// audience = "nora"
 /// algorithms = ["RS256", "ES256"]
 /// max_token_lifetime_secs = 900
@@ -337,9 +418,16 @@ pub struct OidcProvider {
     /// JWKS endpoint doesn't follow the standard `/.well-known/jwks.json` path.
     #[serde(default)]
     pub jwks_uri: Option<String>,
-    /// Expected audience (`aud` claim). If empty, audience is not validated.
+    /// Expected audience (`aud` claim): the value the CI jobs request, e.g.
+    /// `nora`. Required unless `any_audience` is set — a shared issuer such as
+    /// GitHub Actions mints tokens for every repository on the host, and
+    /// without this check a token minted for another service is accepted.
     #[serde(default)]
     pub audience: String,
+    /// Accept a token whatever its `aud` claim, in place of `audience`. NORA
+    /// warns at start for every provider that sets it.
+    #[serde(default)]
+    pub any_audience: bool,
     /// Allowed JWT algorithms (default: RS256, ES256). Reject all others.
     #[serde(default = "default_oidc_algorithms")]
     pub algorithms: Vec<String>,
@@ -368,6 +456,34 @@ pub struct OidcProvider {
     /// First match wins. No match = deny.
     #[serde(default)]
     pub role_rules: Vec<OidcRoleRule>,
+}
+
+/// How a provider checks the `aud` claim of a token, read from `audience` and
+/// `any_audience`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudienceCheck<'a> {
+    /// The `aud` claim must name this value. An `audience` is checked even
+    /// beside `any_audience = true`.
+    Expect(&'a str),
+    /// `any_audience = true` and no `audience`: the claim is not checked.
+    Any,
+    /// Neither is set. Config validation refuses it, and the validator admits
+    /// no token through such a provider.
+    Missing,
+}
+
+impl OidcProvider {
+    /// How this provider checks the `aud` claim. Config validation and the
+    /// token validator both read it, so they cannot disagree.
+    pub fn audience_check(&self) -> AudienceCheck<'_> {
+        if !self.audience.is_empty() {
+            AudienceCheck::Expect(&self.audience)
+        } else if self.any_audience {
+            AudienceCheck::Any
+        } else {
+            AudienceCheck::Missing
+        }
+    }
 }
 
 /// Maps a subject pattern to a NORA role.
@@ -503,6 +619,121 @@ impl AuthConfig {
 mod tests {
     use super::*;
 
+    /// Which networks are IPv4 ones: only the IPv4-mapped form `::ffff:a.b.c.d`
+    /// with a prefix that covers mapped addresses only (96 or longer) is the
+    /// IPv4 network it maps. The IPv4-compatible form `::a.b.c.d`, the IPv6
+    /// loopback and the unspecified address stay the IPv6 networks they name.
+    #[test]
+    fn only_a_mapped_network_is_an_ipv4_one() {
+        for (network, prefix, want, want_prefix) in [
+            ("::ffff:10.0.0.1", 128, "10.0.0.1", 32),
+            ("::ffff:a00:1", 128, "10.0.0.1", 32),
+            ("::ffff:10.1.0.0", 112, "10.1.0.0", 16),
+            ("::ffff:0.0.0.0", 96, "0.0.0.0", 0),
+            ("::ffff:0.0.0.0", 95, "::ffff:0.0.0.0", 95),
+            ("::a00:1", 128, "::a00:1", 128),
+            ("::a00:0", 104, "::a00:0", 104),
+            ("::1", 128, "::1", 128),
+            ("::", 128, "::", 128),
+            ("2001:db8::1", 128, "2001:db8::1", 128),
+            ("10.0.0.1", 32, "10.0.0.1", 32),
+            ("10.0.0.0", 8, "10.0.0.0", 8),
+        ] {
+            let got = canonical_network(network.parse().unwrap(), prefix);
+            assert_eq!(
+                got,
+                (want.parse().unwrap(), want_prefix),
+                "{network}/{prefix}"
+            );
+        }
+    }
+
+    /// The address of one client, as a table: a mapped address is its IPv4
+    /// address, any other is itself.
+    #[test]
+    fn only_a_mapped_address_is_an_ipv4_one() {
+        for (address, want) in [
+            ("::ffff:10.0.0.1", "10.0.0.1"),
+            ("::ffff:0.0.0.1", "0.0.0.1"),
+            ("::a00:1", "::a00:1"),
+            ("::1", "::1"),
+            ("::", "::"),
+            ("2001:db8::1", "2001:db8::1"),
+            ("10.0.0.1", "10.0.0.1"),
+        ] {
+            assert_eq!(
+                canonical_ip(address.parse().unwrap()),
+                want.parse::<IpAddr>().unwrap(),
+                "{address}"
+            );
+        }
+    }
+
+    /// An IPv6 address becomes an IPv4 one only in [`canonical_network`]
+    /// (white list): the peer, the forwarding headers, the limiters and the
+    /// entries take it from there, so no place keys a client by a rule of its
+    /// own. Needles are built at run time so this text does not match.
+    #[test]
+    fn only_canonical_network_turns_an_address_into_ipv4() {
+        let needles = [
+            ["to_canonical", "("].concat(),
+            ["to_ipv4", "("].concat(),
+            ["to_ipv4", "_mapped("].concat(),
+            ["Ipv4Addr::", "from(u32"].concat(),
+        ];
+        for (file, source) in [
+            ("config/auth.rs", include_str!("auth.rs")),
+            ("auth/mod.rs", include_str!("../auth/mod.rs")),
+            (
+                "auth/token_routes.rs",
+                include_str!("../auth/token_routes.rs"),
+            ),
+            ("rate_limit.rs", include_str!("../rate_limit.rs")),
+        ] {
+            for (needle, functions) in crate::test_helpers::functions_containing(source, &needles) {
+                for function in functions {
+                    assert!(
+                        (file, function.as_str()) == ("config/auth.rs", "canonical_network"),
+                        "{file}: {function} turns an address into IPv4 ({needle})"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The same networks written in `auth.trusted_proxies`, read the way the
+    /// configuration file is: which addresses each one trusts.
+    #[test]
+    fn trusted_proxies_from_the_file_trust_only_their_own_family() {
+        for (setting, address, trusted) in [
+            ("::a00:1/128", "10.0.0.1", false),
+            ("::a00:1/128", "::ffff:10.0.0.1", false),
+            ("::a00:1/128", "::a00:1", true),
+            ("::a00:1", "10.0.0.1", false),
+            ("::1/128", "::1", true),
+            ("::1/128", "0.0.0.1", false),
+            ("::1", "::1", true),
+            ("::1", "0.0.0.1", false),
+            ("::ffff:10.0.0.1/128", "10.0.0.1", true),
+            ("::ffff:10.0.0.1/128", "::ffff:10.0.0.1", true),
+            ("::ffff:10.0.0.1", "10.0.0.1", true),
+            ("::ffff:10.0.0.0/120", "10.0.0.7", true),
+            ("::ffff:10.0.0.0/120", "10.0.1.7", false),
+            ("10.0.0.0/8", "::ffff:10.2.3.4", true),
+            ("10.0.0.0/8", "::a02:304", false),
+            ("2001:db8::/32", "2001:db8::5", true),
+            ("2001:db8::/32", "10.0.0.1", false),
+        ] {
+            let auth: AuthConfig =
+                toml::from_str(&format!("trusted_proxies = {setting:?}")).unwrap();
+            assert_eq!(
+                auth.trusted_proxies.contains(address.parse().unwrap()),
+                trusted,
+                "{setting} trusting {address}"
+            );
+        }
+    }
+
     #[test]
     fn oidc_config_is_active_only_with_enabled_and_a_provider() {
         // #996 — is_active decides whether a missing htpasswd is the intended
@@ -524,5 +755,53 @@ mod tests {
             with_provider.is_active(),
             "enabled with a provider must be active"
         );
+    }
+
+    /// A network written in the IPv4-mapped form at prefix 96 or longer is the
+    /// IPv4 network under it, at every such prefix: `::ffff:0.0.0.0/96` is all
+    /// of IPv4, `::ffff:a.b.c.d/128` is the one address. Both forms of every
+    /// address are judged alike.
+    #[test]
+    fn a_mapped_network_is_its_ipv4_network_at_every_prefix() {
+        let addresses: Vec<IpAddr> = [
+            "203.0.113.0",
+            "203.0.113.1",
+            "203.0.113.128",
+            "203.0.113.255",
+            "203.0.112.255",
+            "203.0.114.0",
+            "10.0.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+        ]
+        .iter()
+        .map(|a| a.parse().unwrap())
+        .collect();
+        for prefix in 96..=128u8 {
+            let mapped = TrustedProxies::parse(&format!("::ffff:203.0.113.0/{prefix}"));
+            let ipv4 = TrustedProxies::parse(&format!("203.0.113.0/{}", prefix - 96));
+            for &addr in &addresses {
+                let IpAddr::V4(v4) = addr else { unreachable!() };
+                let as_mapped = IpAddr::V6(v4.to_ipv6_mapped());
+                assert_eq!(
+                    mapped.contains(addr),
+                    ipv4.contains(addr),
+                    "/{prefix}: {addr}"
+                );
+                assert_eq!(
+                    mapped.contains(as_mapped),
+                    ipv4.contains(addr),
+                    "/{prefix}: {as_mapped}"
+                );
+            }
+        }
+        let all_of_ipv4 = TrustedProxies::parse("::ffff:0.0.0.0/96");
+        for addr in &addresses {
+            assert!(all_of_ipv4.contains(*addr), "{addr}");
+        }
+        assert!(!all_of_ipv4.contains("2001:db8::1".parse().unwrap()));
+        let one = TrustedProxies::parse("::ffff:203.0.113.1/128");
+        assert!(one.contains("203.0.113.1".parse().unwrap()));
+        assert!(!one.contains("203.0.113.0".parse().unwrap()));
     }
 }

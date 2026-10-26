@@ -4,8 +4,10 @@
 //! (a `.nora-` prefix, filtered out of `list`/GC like `.nora-pins.ndjson`):
 //!
 //! - **`<repo>.done`** — written atomically (`tmp → fsync → rename → fsync dir`)
-//!   only after a repo is fully walked. A `.done` repo is skipped whole on
-//!   restart, without touching the journal (fast-path; no per-object S3 HEAD).
+//!   only after a repo is fully walked, recording the import layout it was walked
+//!   under. A `.done` repo is skipped whole on restart, without touching the
+//!   journal (fast-path; no per-object S3 HEAD) — unless that layout skipped its
+//!   format, when the orchestrator walks it again.
 //! - **`<repo>.progress`** — an append-only NDJSON journal, one line per
 //!   committed artifact. On resume it rebuilds an in-memory `HashSet` of
 //!   committed keys (rebuildable-from-disk invariant). A torn last line from a
@@ -55,9 +57,26 @@ impl ResumeStore {
         self.dir.join(format!("{}.progress", repo_stem(repo)))
     }
 
-    /// Has this repo been fully imported in a prior run?
-    pub fn is_repo_done(&self, repo: &str) -> bool {
-        self.done_path(repo).exists()
+    /// The import layout a prior run finished `repo` under, or `None` when no run finished it.
+    /// A marker that records no layout was written by a release that recorded none: layout 1.
+    /// A marker that cannot be read is no marker — the repo is walked again, which the journal
+    /// keeps idempotent.
+    pub async fn done_layout(&self, repo: &str) -> Option<u32> {
+        let path = self.done_path(repo);
+        match tokio::fs::read(&path).await {
+            Ok(marker) => Some(
+                serde_json::from_slice::<serde_json::Value>(&marker)
+                    .ok()
+                    .and_then(|v| v.get("layout")?.as_u64())
+                    .and_then(|layout| u32::try_from(layout).ok())
+                    .unwrap_or(1),
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                tracing::warn!(marker = %path.display(), error = %e, "import: .done marker not readable, walking the repo again");
+                None
+            }
+        }
     }
 
     /// Load (or start) the append journal for `repo`, rebuilding the set of
@@ -89,17 +108,17 @@ impl ResumeStore {
         })
     }
 
-    /// Atomically publish the `.done` marker for `repo` (tmp → fsync → rename →
-    /// fsync dir). MUST be called only after the repo's cursor is exhausted and
-    /// the journal's final `sync()` has returned.
-    pub async fn mark_repo_done(&self, repo: &str) -> Result<()> {
+    /// Atomically publish the `.done` marker for `repo`, walked under import `layout` (tmp →
+    /// fsync → rename → fsync dir). MUST be called only after the repo's cursor is exhausted
+    /// and the journal's final `sync()` has returned.
+    pub async fn mark_repo_done(&self, repo: &str, layout: u32) -> Result<()> {
         let dest = self.done_path(repo);
         let tmp = dest.with_extension("done.tmp");
         {
             let mut f = tokio::fs::File::create(&tmp)
                 .await
                 .map_err(|e| format!("create done tmp: {e}"))?;
-            f.write_all(b"done\n")
+            f.write_all(format!("{}\n", serde_json::json!({ "layout": layout })).as_bytes())
                 .await
                 .map_err(|e| format!("write done: {e}"))?;
             f.sync_all().await.map_err(|e| format!("fsync done: {e}"))?;
@@ -109,6 +128,17 @@ impl ResumeStore {
             .map_err(|e| format!("rename done: {e}"))?;
         sync_dir(&self.dir).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl ResumeStore {
+    /// Mark `repo` finished as releases up to 1.4.2 did: a marker that says `done` and nothing
+    /// else.
+    pub(crate) async fn mark_repo_done_as_layout_1(&self, repo: &str) {
+        tokio::fs::write(self.done_path(repo), b"done\n")
+            .await
+            .unwrap();
     }
 }
 
@@ -230,13 +260,22 @@ mod tests {
     async fn done_marker_is_persistent() {
         let tmp = tempfile::tempdir().unwrap();
         let store = ResumeStore::open(tmp.path(), "nexus.local").await.unwrap();
-        assert!(!store.is_repo_done("maven-releases"));
-        store.mark_repo_done("maven-releases").await.unwrap();
-        assert!(store.is_repo_done("maven-releases"));
+        assert_eq!(store.done_layout("maven-releases").await, None);
+        store.mark_repo_done("maven-releases", 7).await.unwrap();
+        assert_eq!(store.done_layout("maven-releases").await, Some(7));
 
         // A fresh store over the same root still sees it done.
         let store2 = ResumeStore::open(tmp.path(), "nexus.local").await.unwrap();
-        assert!(store2.is_repo_done("maven-releases"));
+        assert_eq!(store2.done_layout("maven-releases").await, Some(7));
+    }
+
+    /// A marker an earlier release wrote records no layout: it was walked under layout 1.
+    #[tokio::test]
+    async fn a_marker_without_a_layout_is_layout_1() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = ResumeStore::open(tmp.path(), "h").await.unwrap();
+        store.mark_repo_done_as_layout_1("pypi-local").await;
+        assert_eq!(store.done_layout("pypi-local").await, Some(1));
     }
 
     #[tokio::test]

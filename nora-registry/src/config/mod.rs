@@ -24,9 +24,11 @@ mod storage;
 pub use self::audit_cfg::AuditConfig;
 pub use self::signing_cfg::SigningConfig;
 // Re-exports maintain API surface: `crate::config::OidcRoleRule` etc. used by test code in auth/, circuit_breaker/
+pub(crate) use self::auth::canonical_ip;
 #[allow(unused_imports)]
 pub use self::auth::{
-    AuthConfig, OidcConfig, OidcProvider, OidcRoleRule, ScopeEnforcement, TrustedProxies,
+    AudienceCheck, AuthConfig, OidcConfig, OidcProvider, OidcRoleRule, ScopeEnforcement,
+    TrustedProxies,
 };
 #[allow(unused_imports)]
 pub use self::circuit_breaker::{CircuitBreakerConfig, CircuitBreakerOverride};
@@ -292,16 +294,10 @@ const _: fn() = || {
     let _ = <UpstreamAuth<'static> as AmbiguousIfDebug<_>>::some_item;
 };
 
-/// Path component of a URL (`https://host/prefix/` → `/prefix/`), or `""` when
-/// there is no path. The scheme is optional — a bare path is returned unchanged.
-/// Does not trim a trailing slash (callers that want it trimmed do so). Single
-/// source of truth for "drop scheme + authority, keep path"; used by
-/// [`ServerConfig::base_path`](server::ServerConfig::base_path) and the ansible
-/// metadata rewriter so the two cannot drift.
-pub(crate) fn url_path_component(url: &str) -> &str {
-    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
-    after_scheme.find('/').map_or("", |i| &after_scheme[i..])
-}
+/// Path component of a URL ([`nora_registry::upstream_rewrite::url_path_component`]): one
+/// definition for [`ServerConfig::base_path`](server::ServerConfig::base_path) and the ansible
+/// metadata rewrite, so the two cannot drift.
+pub(crate) use nora_registry::upstream_rewrite::url_path_component;
 
 /// Parse an env var value into `target`, warning on failure (#537).
 ///
@@ -735,7 +731,10 @@ impl Config {
     /// `Raw` has no curation override and no quarantine-enforcing path → always
     /// `Off` (counting it would be a phantom control: `any_quarantine_active`
     /// true while nothing enforces).
-    fn quarantine_mode_for(&self, rt: RegistryType) -> crate::digest_quarantine::QuarantineMode {
+    pub(crate) fn quarantine_mode_for(
+        &self,
+        rt: RegistryType,
+    ) -> crate::digest_quarantine::QuarantineMode {
         use crate::digest_quarantine::QuarantineMode;
         let global = self.curation.quarantine.as_ref();
         let per = match rt {
@@ -1063,6 +1062,39 @@ impl Config {
             errors.push("server.port must not be 0".to_string());
         }
 
+        // 1a. Connection limits: a zero would close every connection at once or accept none.
+        for (key, value) in [
+            (
+                "server.header_read_timeout",
+                self.server.header_read_timeout,
+            ),
+            ("server.keep_alive_timeout", self.server.keep_alive_timeout),
+            ("server.max_connections", self.server.max_connections as u64),
+        ] {
+            if value == 0 {
+                errors.push(format!("{key} must not be 0"));
+            }
+        }
+
+        let keep_alive = self.server.keep_alive_timeout;
+        if (1..=server::PROXY_IDLE_SECS).contains(&keep_alive) {
+            warnings.push(format!(
+                "server.keep_alive_timeout is {keep_alive} s, not above the {} s a reverse proxy \
+                 such as traefik keeps an idle connection to NORA: the proxy may send a request \
+                 into a connection NORA is closing and answer 502. Set it above {} (default 120)",
+                server::PROXY_IDLE_SECS,
+                server::PROXY_IDLE_SECS
+            ));
+        }
+
+        if self.server.maintenance_stall_secs < server::MIN_MAINTENANCE_STALL_SECS {
+            errors.push(format!(
+                "server.maintenance_stall_secs must be at least {} (three maintenance ticks), got {}",
+                server::MIN_MAINTENANCE_STALL_SECS,
+                self.server.maintenance_stall_secs
+            ));
+        }
+
         // 1b. Wildcard host requires public_url (non-routable address → broken client URLs)
         {
             let host = &self.server.host;
@@ -1195,6 +1227,36 @@ impl Config {
                  X-Forwarded-For will be honored from any source, disabling IP-based brute-force protection"
                     .to_string(),
             );
+        }
+
+        // 7b. An OIDC provider without an audience would accept a token its
+        // issuer minted for any other service — on a shared issuer such as
+        // GitHub Actions, any repository on the host. It is refused; turning
+        // the check off takes `any_audience = true`, which is warned about.
+        if self.auth.oidc.enabled {
+            for provider in self.auth.oidc.providers.iter().filter(|p| p.enabled) {
+                match provider.audience_check() {
+                    AudienceCheck::Missing => errors.push(format!(
+                        "auth.oidc provider \"{}\" has no audience, so a token its issuer \
+                         minted for any other service would be accepted. Set audience = \"<the aud \
+                         your CI jobs request>\" (e.g. audience = \"nora\"), or any_audience = true \
+                         to accept a token for any audience",
+                        provider.name
+                    )),
+                    AudienceCheck::Any => warnings.push(format!(
+                        "auth.oidc provider \"{}\" has any_audience = true — the `aud` claim is \
+                         not checked, so a token its issuer minted for any other service is \
+                         accepted",
+                        provider.name
+                    )),
+                    AudienceCheck::Expect(_) if provider.any_audience => warnings.push(format!(
+                        "auth.oidc provider \"{}\" sets both audience and any_audience — \
+                         any_audience is ignored and the audience is checked",
+                        provider.name
+                    )),
+                    AudienceCheck::Expect(_) => {}
+                }
+            }
         }
 
         // 8. "Enabled but empty" — subsystems that silently do nothing
@@ -1452,7 +1514,7 @@ impl Config {
     /// exit on with [`EXIT_CONFIG`].
     pub fn load() -> Result<Self, ConfigLoadError> {
         let (config, _unknown_keys) = Self::load_from(
-            env::var("NORA_CONFIG_PATH").ok(),
+            Self::path_from_env(),
             DEFAULT_CONFIG_FILE,
             config_strict_from_env(),
         )?;
@@ -1535,16 +1597,24 @@ impl Config {
         Ok(self)
     }
 
-    /// Non-panicking config reload for SIGHUP handler.
-    /// Returns Err on invalid file/TOML/validation instead of panicking.
-    pub fn try_load() -> Result<Self, String> {
-        let file = match env::var("NORA_CONFIG_PATH") {
-            Ok(path) => {
+    /// The configuration file `NORA_CONFIG_PATH` names; `None` reads `config.toml` of the
+    /// working directory when there is one. Start and SIGHUP read the same file.
+    pub fn path_from_env() -> Option<String> {
+        env::var("NORA_CONFIG_PATH").ok()
+    }
+
+    /// Non-panicking config reload for SIGHUP handler, of the file at `path` (see
+    /// [`Config::path_from_env`]), passed in so a test reloads a file of its own without
+    /// setting process-wide state. Returns Err on invalid file/TOML/validation instead of
+    /// panicking.
+    pub fn try_load_from(path: Option<String>) -> Result<Self, String> {
+        let file = match path {
+            Some(path) => {
                 let content = fs::read_to_string(&path)
                     .map_err(|e| format!("Cannot read {}: {}", path, e))?;
                 Some((path, content))
             }
-            Err(_) => fs::read_to_string(DEFAULT_CONFIG_FILE)
+            None => fs::read_to_string(DEFAULT_CONFIG_FILE)
                 .ok()
                 .map(|content| (DEFAULT_CONFIG_FILE.to_string(), content)),
         };
@@ -3137,6 +3207,107 @@ proxies = [
         ));
     }
 
+    /// OIDC config text with a provider `gh` (extra keys appended) and a
+    /// provider `gl` that names its audience.
+    fn oidc_config_with(gh_keys: &str) -> String {
+        format!(
+            "[auth]\nenabled = true\n[auth.oidc]\nenabled = true\n\
+             [[auth.oidc.providers]]\nname = \"gh\"\nissuer = \"https://gh.example\"\n{gh_keys}\n\
+             [[auth.oidc.providers]]\nname = \"gl\"\nissuer = \"https://gl.example\"\naudience = \"nora\"\n"
+        )
+    }
+
+    /// The messages that speak about the `aud` check.
+    fn about_audience(msgs: &[String]) -> Vec<String> {
+        msgs.iter()
+            .filter(|m| m.contains("audience"))
+            .cloned()
+            .collect()
+    }
+
+    /// An enabled OIDC provider without an audience would accept a token its
+    /// issuer minted for any other service: NORA refuses to start, naming the
+    /// provider and both ways to fix it, in default and strict mode alike.
+    #[test]
+    fn an_oidc_provider_without_audience_refuses_to_start() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("oidc.toml").to_string_lossy().into_owned();
+        std::fs::write(&path, oidc_config_with("")).unwrap();
+        for strict in [false, true] {
+            let err = Config::load_from(Some(path.clone()), "", strict)
+                .expect_err("a provider without an audience must refuse to start");
+            let ConfigLoadError::Invalid(errors) = &err else {
+                panic!("expected a validation error, got {err}");
+            };
+            let refused = about_audience(errors);
+            assert_eq!(refused.len(), 1, "{errors:#?}");
+            assert!(refused[0].contains("\"gh\""), "{}", refused[0]);
+            assert!(!refused[0].contains("\"gl\""), "{}", refused[0]);
+            assert!(refused[0].contains("audience = \""), "{}", refused[0]);
+            assert!(refused[0].contains("any_audience = true"), "{}", refused[0]);
+        }
+
+        // A disabled provider, or OIDC switched off, validates no token.
+        let mut config: Config = toml::from_str(&oidc_config_with("enabled = false")).unwrap();
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(about_audience(&errors).is_empty(), "{errors:#?}");
+        assert!(about_audience(&warnings).is_empty(), "{warnings:#?}");
+        config.auth.oidc.providers[0].enabled = true;
+        config.auth.oidc.enabled = false;
+        assert!(about_audience(&config.validate_with_config_path(None).1).is_empty());
+    }
+
+    /// `any_audience = true` is the explicit way to run a provider without the
+    /// `aud` check: NORA starts and warns naming the provider.
+    #[test]
+    fn any_audience_starts_with_a_warning() {
+        let _lock = env_lock();
+        std::env::remove_var("NORA_CONFIG_STRICT");
+        let config: Config = toml::from_str(&oidc_config_with("any_audience = true")).unwrap();
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(about_audience(&errors).is_empty(), "{errors:#?}");
+        let warned = about_audience(&warnings);
+        assert_eq!(warned.len(), 1, "{warnings:#?}");
+        assert!(warned[0].contains("\"gh\""), "{}", warned[0]);
+        assert!(warned[0].contains("any_audience"), "{}", warned[0]);
+    }
+
+    /// `any_audience = true` beside an `audience` does nothing: the audience is
+    /// checked. NORA starts and says the key is ignored.
+    #[test]
+    fn any_audience_beside_an_audience_is_reported_unused() {
+        let _lock = env_lock();
+        let config: Config = toml::from_str(&oidc_config_with(
+            "audience = \"nora\"\nany_audience = true",
+        ))
+        .unwrap();
+        let (warnings, errors) = config.validate_with_config_path(None);
+        assert!(about_audience(&errors).is_empty(), "{errors:#?}");
+        let warned = about_audience(&warnings);
+        assert_eq!(warned.len(), 1, "{warnings:#?}");
+        assert!(warned[0].contains("\"gh\""), "{}", warned[0]);
+        assert!(warned[0].contains("ignored"), "{}", warned[0]);
+    }
+
+    /// A SIGHUP reload whose file has a provider without an audience is refused,
+    /// so the running configuration stays.
+    #[test]
+    fn reload_refuses_an_oidc_provider_without_audience() {
+        let _lock = env_lock();
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("oidc.toml").to_string_lossy().into_owned();
+        std::fs::write(&path, oidc_config_with("")).unwrap();
+        std::env::set_var("NORA_CONFIG_PATH", &path);
+        let refused = Config::try_load_from(Config::path_from_env());
+        std::fs::write(&path, oidc_config_with("any_audience = true")).unwrap();
+        let opted_out = Config::try_load_from(Config::path_from_env());
+        std::env::remove_var("NORA_CONFIG_PATH");
+        let err = refused.expect_err("a reload without an audience must be refused");
+        assert!(err.contains("\"gh\"") && err.contains("audience"), "{err}");
+        assert!(opted_out.is_ok(), "{:?}", opted_out.err());
+    }
+
     /// `NORA_CONFIG_STRICT` follows the other boolean switches: `true` (any case) or `1`.
     #[test]
     fn config_strict_reads_its_env_switch() {
@@ -3189,9 +3360,9 @@ proxies = [
         std::fs::write(&typo, "[curation]\nmdoe = \"enforce\"\n").unwrap();
         std::env::set_var("NORA_CONFIG_PATH", &typo);
         std::env::set_var("NORA_CONFIG_STRICT", "true");
-        let strict = Config::try_load();
+        let strict = Config::try_load_from(Config::path_from_env());
         std::env::remove_var("NORA_CONFIG_STRICT");
-        let lenient = Config::try_load();
+        let lenient = Config::try_load_from(Config::path_from_env());
         std::env::remove_var("NORA_CONFIG_PATH");
         let err = strict.expect_err("strict reload must refuse unknown keys");
         assert!(err.contains("curation.mdoe"), "{err}");
@@ -3382,6 +3553,66 @@ proxies = [
         assert!(errors.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("body_limit_mb"));
+    }
+
+    /// A zero connection limit would close every connection at once or accept none.
+    #[test]
+    fn test_validate_connection_limits_zero() {
+        let _lock = env_lock();
+        for key in [
+            "header_read_timeout",
+            "keep_alive_timeout",
+            "max_connections",
+        ] {
+            let mut config = Config::default();
+            match key {
+                "header_read_timeout" => config.server.header_read_timeout = 0,
+                "keep_alive_timeout" => config.server.keep_alive_timeout = 0,
+                _ => config.server.max_connections = 0,
+            }
+            let (_, errors) = config.validate();
+            assert_eq!(errors, vec![format!("server.{key} must not be 0")]);
+        }
+    }
+
+    /// An idle keep-alive not above the 90 s traefik keeps an idle backend connection is
+    /// warned about, not refused: the proxy may send a request into a connection NORA is
+    /// closing and answer 502. Above it, the default included, nothing is said.
+    #[test]
+    fn a_keep_alive_not_above_the_proxy_idle_timeout_is_warned_about() {
+        let _lock = env_lock();
+        let warned = |secs: u64| {
+            let mut config = Config::default();
+            config.server.keep_alive_timeout = secs;
+            let (warnings, errors) = config.validate();
+            assert!(errors.is_empty(), "{secs}: {errors:?}");
+            warnings
+                .iter()
+                .filter(|w| w.contains("server.keep_alive_timeout"))
+                .count()
+        };
+        for secs in [1, 5, 30, 89, 90] {
+            assert_eq!(warned(secs), 1, "{secs} s");
+        }
+        for secs in [91, 120, 3600] {
+            assert_eq!(warned(secs), 0, "{secs} s");
+        }
+        assert_eq!(warned(Config::default().server.keep_alive_timeout), 0);
+    }
+
+    /// Below three maintenance ticks one failing tick would fail liveness.
+    #[test]
+    fn test_validate_maintenance_stall_floor() {
+        let _lock = env_lock();
+        let mut config = Config::default();
+        config.server.maintenance_stall_secs = 89;
+        let (_, errors) = config.validate();
+        assert_eq!(
+            errors,
+            vec!["server.maintenance_stall_secs must be at least 90 (three maintenance ticks), got 89"]
+        );
+        config.server.maintenance_stall_secs = 90;
+        assert!(config.validate().1.is_empty());
     }
 
     #[test]
@@ -4630,9 +4861,9 @@ proxies = [
         std::fs::write(&path, "[curation.docker]\nmin_release_age = \"3d\"\n").unwrap();
         std::env::set_var("NORA_CONFIG_PATH", &path);
         std::env::set_var("NORA_REGISTRIES_ENABLE", "raw");
-        let off = Config::try_load();
+        let off = Config::try_load_from(Config::path_from_env());
         std::env::set_var("NORA_REGISTRIES_ENABLE", "docker");
-        let on = Config::try_load();
+        let on = Config::try_load_from(Config::path_from_env());
         std::env::remove_var("NORA_REGISTRIES_ENABLE");
         std::env::remove_var("NORA_CONFIG_PATH");
         assert!(off.is_ok(), "docker is not mounted: {:?}", off.err());
