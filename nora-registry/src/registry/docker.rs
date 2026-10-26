@@ -7480,6 +7480,25 @@ mod integration_tests {
         assert_eq!(del.status(), StatusCode::ACCEPTED);
     }
 
+    /// The binary's default Docker upstream, keeping its namespace, at a fixture that answers
+    /// every request `404`, as Docker Hub answers for a name it does not hold: a name without a
+    /// prefix gets the upstream's namespace as under a shipped config, and a miss is asked of the
+    /// fixture. Asked of Docker Hub, its 5xx or silence turned the miss into a `502`.
+    async fn default_upstream_fixture() -> (wiremock::MockServer, Vec<crate::config::DockerUpstream>)
+    {
+        let hub = wiremock::MockServer::start().await;
+        wiremock::Mock::given(wiremock::matchers::any())
+            .respond_with(wiremock::ResponseTemplate::new(404))
+            .mount(&hub)
+            .await;
+        let mut upstreams = crate::config::DockerConfig::default().upstreams;
+        for upstream in &mut upstreams {
+            upstream.namespace = Some(upstream.resolved_namespace());
+            upstream.url = hub.uri();
+        }
+        (hub, upstreams)
+    }
+
     /// A delete removes the manifest on every backend. An object store answers a delete of an
     /// absent key with success, so a delete that falls back to the second copy only on "not
     /// found" never reaches it there: with the default upstream a pushed name gets a namespace,
@@ -7496,12 +7515,13 @@ mod integration_tests {
             },
             "layers": []
         });
+        let (_hub, upstreams) = default_upstream_fixture().await;
         for object in [false, true] {
             // The binary's default upstream, which the test context leaves out: with it a name
             // without a prefix gets the upstream's namespace, and the delete has two keys.
-            let default_upstream = |cfg: &mut crate::config::Config| {
-                cfg.docker.upstreams = crate::config::DockerConfig::default().upstreams
-            };
+            let upstreams = upstreams.clone();
+            let default_upstream =
+                move |cfg: &mut crate::config::Config| cfg.docker.upstreams = upstreams;
             let ctx = if object {
                 crate::test_helpers::create_test_context_with_storage_and_config(
                     crate::storage::Storage::from_backend(std::sync::Arc::new(
@@ -7575,10 +7595,11 @@ mod integration_tests {
     async fn a_delete_removes_both_copies_of_a_manifest() {
         let body = b"{\"schemaVersion\":2}".to_vec();
         let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&body)));
+        let (_hub, upstreams) = default_upstream_fixture().await;
         for object in [false, true] {
-            let default_upstream = |cfg: &mut crate::config::Config| {
-                cfg.docker.upstreams = crate::config::DockerConfig::default().upstreams
-            };
+            let upstreams = upstreams.clone();
+            let default_upstream =
+                move |cfg: &mut crate::config::Config| cfg.docker.upstreams = upstreams;
             let ctx = if object {
                 crate::test_helpers::create_test_context_with_storage_and_config(
                     crate::storage::Storage::from_backend(std::sync::Arc::new(
