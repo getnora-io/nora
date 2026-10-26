@@ -1,14 +1,14 @@
 # Production Docker Compose for NORA Registry
-# Usage: NORA_VERSION=1.4.2 docker compose -f deploy/docker-compose.prod.yml up -d
+# Usage: NORA_VERSION=1.4.3 docker compose -f deploy/docker-compose.prod.yml up -d
 #
 # Required env vars (set in .env or shell):
-#   NORA_VERSION        — image tag (default: 1.4.2)
+#   NORA_VERSION        — image tag (default: 1.4.3)
 #   NORA_PUBLIC_URL     — external URL for download links
 #   NORA_AUTH_ENABLED   — enable authentication (default: true)
 
 services:
   nora:
-    image: ghcr.io/getnora-io/nora:${NORA_VERSION:-1.4.2}
+    image: ghcr.io/getnora-io/nora:${NORA_VERSION:-1.4.3}
     restart: unless-stopped
     # NORA drains requests for up to 15 s and its schedulers for up to 10 s on stop;
     # the 10 s default kills it before the audit log and token last_used are flushed.
