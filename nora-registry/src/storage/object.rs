@@ -118,8 +118,10 @@ impl ObjectStorage {
     /// `GOOGLE_APPLICATION_CREDENTIALS`, ...), then the instance metadata
     /// server — so GKE Workload Identity and GCE service accounts work with no
     /// key material at all. `base_url` overrides the endpoint for emulators
-    /// (fake-gcs-server) or private access endpoints; an `http://` base_url
-    /// also skips request signing (emulators don't verify signatures).
+    /// or private access endpoints; an `http://` base_url also skips request
+    /// signing (emulators don't verify signatures). object_store still asks the
+    /// credential provider for a token on writes, so an emulator needs a key
+    /// file with `"disable_oauth": true` (see `StorageConfig::gcs_base_url`).
     pub fn new_gcs(
         bucket: &str,
         service_account_path: Option<&str>,
