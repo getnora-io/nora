@@ -33,7 +33,10 @@ sha1 = "0.11"
 md-5 = "0.11"
 async-trait.workspace = true
 hex.workspace = true
-object_store = { version = "0.13", features = ["aws", "gcp"] }
+object_store = { version = "0.14", default-features = false, features = ["aws-base", "gcp-base", "reqwest", "ring"] }
+# object_store's reqwest without its aws-lc-rs provider; storage/object.rs installs ring.
+reqwest13 = { package = "reqwest", version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 futures = "0.3"
 toml = "1.1"
 # Lists config keys no field reads, so a typo is reported instead of ignored.
@@ -108,7 +111,7 @@ harness = false
 workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["md-5"]
+ignored = ["md-5", "reqwest13"]
 
 [features]
 default = ["mimalloc"]
