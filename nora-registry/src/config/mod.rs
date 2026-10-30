@@ -1437,8 +1437,7 @@ impl Config {
 
         // 9. Docker upstream prefix validation
         {
-            const RESERVED_PREFIXES: &[&str] =
-                &["blobs", "manifests", "tags", "uploads", "_catalog", "v2"];
+            use registry::RESERVED_DOCKER_SEGMENTS as RESERVED_PREFIXES;
             let mut seen_prefixes = std::collections::HashSet::new();
             for (i, upstream) in self.docker.upstreams.iter().enumerate() {
                 if let Some(ref prefix) = upstream.prefix {
@@ -1472,16 +1471,29 @@ impl Config {
             }
         }
 
-        // 9b. Docker default_action=deny without any prefixed upstream is a no-op trap
+        // 9b. Docker default_action=deny without any prefixed or bound upstream is a no-op trap
         if self.docker.default_action == DefaultAction::Deny
             && self.docker.enabled
-            && !self.docker.upstreams.iter().any(|u| u.prefix.is_some())
+            && !self
+                .docker
+                .upstreams
+                .iter()
+                .any(|u| u.prefix.is_some() || u.is_bound())
         {
             warnings.push(
-                "docker.default_action=\"deny\" but no upstream has a prefix configured — \
-                 all requests will be denied. Add prefix= to at least one [[docker.upstreams]]"
+                "docker.default_action=\"deny\" but no upstream has a prefix or namespaces configured — \
+                 all requests will be denied. Add prefix= or namespaces= to at least one [[docker.upstreams]]"
                     .to_string(),
             );
+        }
+
+        // 9b'. Docker upstream namespaces (#1188): one owner per name, no pattern in prefix
+        {
+            let (w, e) = self
+                .docker
+                .namespaces_problems(&self.curation.internal_namespaces);
+            warnings.extend(w);
+            errors.extend(e);
         }
 
         // 9c. npm multi-upstream (#1055): scope ownership, one default, credentials
@@ -2809,6 +2821,20 @@ proxies = [
         assert!(invalid.to_string().contains("storage.path"), "{invalid}");
     }
 
+    /// A typo in a Docker upstream refuses the file instead of being listed and ignored (#1188):
+    /// a misspelt `namespaces` leaves a private registry in the fallback chain, where a public
+    /// upstream answers its names.
+    #[test]
+    fn a_typo_in_a_docker_upstream_refuses_the_file() {
+        for key in ["namespace_s = [\"team-*\"]", "auht = \"user:pass\""] {
+            let content =
+                format!("[[docker.upstreams]]\nurl = \"https://harbor.example\"\n{key}\n");
+            let err = parse_config(&content).expect_err(&content).to_string();
+            let field = key.split(' ').next().unwrap();
+            assert!(err.contains(field), "{err}");
+        }
+    }
+
     /// Paths of the unknown keys of `content`, sorted; panics if it does not parse.
     fn unknown_keys(content: &str) -> Vec<String> {
         let (_, mut keys) = parse_config(content).unwrap_or_else(|e| panic!("{e}\n{content}"));
@@ -2826,9 +2852,10 @@ proxies = [
             [curation]
             mdoe = "enforce"
 
-            [[docker.upstreams]]
-            url = "https://registry-1.docker.io"
-            auht = "user:pass"
+            [[auth.oidc.providers]]
+            name = "gh"
+            issuer = "https://gh.example"
+            aduience = "nora"
 
             [unknwon_section]
             a = 1
@@ -2837,8 +2864,8 @@ proxies = [
         assert_eq!(
             unknown_keys(content),
             [
+                "auth.oidc.providers.0.aduience",
                 "curation.mdoe",
-                "docker.upstreams.0.auht",
                 "typo_top",
                 "unknwon_section"
             ]
@@ -2851,7 +2878,8 @@ proxies = [
     /// A typo in any table of the config is listed — derived from the serialized default
     /// config, so a new section or nested table is covered without editing this test.
     /// Tables whose keys are names (maps) cannot hold an unknown key; they are pinned
-    /// below, so a struct table cannot hide among them.
+    /// below, so a struct table cannot hide among them. A struct with `deny_unknown_fields`
+    /// refuses the file instead of listing the key, and is pinned separately.
     #[test]
     fn a_typo_in_any_table_is_listed() {
         fn strip_nulls(v: &mut serde_json::Value) {
@@ -2899,6 +2927,7 @@ proxies = [
         assert!(all.len() > 25, "the walk stopped seeing tables: {all:?}");
 
         let mut maps = Vec::new();
+        let mut refused = Vec::new();
         for table in &all {
             let mut doc = default.clone();
             insert_typo(&mut doc, table);
@@ -2913,6 +2942,8 @@ proxies = [
                     };
                     assert_eq!(keys, [want], "typo in [{dotted}]");
                 }
+                // a struct with deny_unknown_fields refuses the file and names the key
+                Err(e) if e.to_string().contains("unknown field `zz_typo`") => refused.push(dotted),
                 Err(_) => maps.push(dotted),
             }
         }
@@ -2920,6 +2951,11 @@ proxies = [
             maps,
             ["circuit_breaker.overrides", "deb.proxies", "rpm.proxies"],
             "only name-keyed maps may refuse a typo key; a struct here hides its typos"
+        );
+        assert_eq!(
+            refused,
+            ["docker.upstreams.0"],
+            "a struct that refuses must name the key"
         );
     }
 
@@ -3747,6 +3783,180 @@ proxies = [
             !warnings.iter().any(|w| w.contains("token_storage")),
             "should not warn about absolute token_storage"
         );
+    }
+
+    /// One `[[docker.upstreams]]` entry as `(prefix, namespaces)`.
+    type Entry<'a> = (Option<&'a str>, &'a [&'a str]);
+
+    /// `docker` config whose upstreams are `(prefix, namespaces)` pairs, through the production
+    /// validation; returns (warnings, errors) that mention docker.
+    fn docker_problems(
+        entries: &[Entry<'_>],
+        action: DefaultAction,
+        internal: &[&str],
+    ) -> (Vec<String>, Vec<String>) {
+        let mut config = Config::default();
+        config.docker.default_action = action;
+        config.curation.internal_namespaces = internal.iter().map(|p| p.to_string()).collect();
+        config.docker.upstreams = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (prefix, masks))| DockerUpstream {
+                url: format!("https://r{i}.example"),
+                auth: None,
+                namespace: None,
+                prefix: prefix.map(str::to_string),
+                namespaces: masks.iter().map(|m| m.to_string()).collect(),
+            })
+            .collect();
+        let (warnings, errors) = config.validate();
+        let docker = |v: Vec<String>| v.into_iter().filter(|m| m.contains("docker")).collect();
+        (docker(warnings), docker(errors))
+    }
+
+    /// #1188: a name has one owner, a pattern lives in `namespaces` and nowhere else, and an
+    /// entry must be a first path segment or one followed by `*`.
+    #[test]
+    fn docker_namespaces_are_refused_unless_every_name_has_one_owner() {
+        let allow = DefaultAction::Allow;
+        #[rustfmt::skip]
+        let refused: &[(&[Entry], &str)] = &[
+            (&[(None, &["team-*"]), (None, &["te*"])],         "overlaps \"te*\""),
+            (&[(None, &["team-a"]), (None, &["team-*"])],      "overlaps \"team-*\""),
+            (&[(None, &["ops"]), (None, &["ops"])],            "overlaps \"ops\""),
+            (&[(Some("team-a"), &[]), (None, &["team-*"])],    "holds for prefix \"team-a\""),
+            (&[(Some("hub"), &["hub"])],                       "holds for prefix \"hub\""),
+            (&[(Some("*"), &[]), (None, &[])],                 "matched literally"),
+            (&[(Some("team-?"), &[])],                         "matched literally"),
+            (&[(None, &["v*"])],                               "reserved"),
+            (&[(None, &["blob*"])],                            "reserved"),
+        ];
+        for (entries, want) in refused {
+            let (_, errors) = docker_problems(entries, allow, &[]);
+            assert!(
+                errors.iter().any(|e| e.contains(want)),
+                "{entries:?}: {errors:?}"
+            );
+        }
+        for mask in [
+            "",
+            "*",
+            "Team-a",
+            "team/a",
+            "team.example",
+            "team**",
+            "*-a",
+            "te*m",
+            "-team",
+            "team-a ",
+        ] {
+            let (_, errors) = docker_problems(&[(None, &[mask])], allow, &[]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("is not a first path segment")),
+                "{mask:?}: {errors:?}"
+            );
+        }
+        #[rustfmt::skip]
+        let accepted: &[&[Entry]] = &[
+            &[(None, &["team-*", "ops"]), (None, &[])],
+            &[(None, &["team-a*"]), (None, &["team-b*"]), (None, &[])],
+            &[(Some("ghcr"), &[]), (None, &["team-*"]), (None, &[])],
+            // one entry may repeat itself, and may also be reached by its own prefix
+            &[(Some("harbor"), &["team-*", "team-a"]), (None, &[])],
+            &[(None, &["a_b", "x1-*"]), (None, &[])],
+        ];
+        for entries in accepted {
+            let (_, errors) = docker_problems(entries, allow, &[]);
+            assert!(errors.is_empty(), "{entries:?}: {errors:?}");
+        }
+    }
+
+    /// #1188 warnings: deny with only bound upstreams is not a deny-everything trap; every entry
+    /// bound leaves public names local; a namespace curation calls internal is never proxied.
+    #[test]
+    fn docker_namespaces_warn_where_the_config_does_not_say_what_it_seems() {
+        let (warnings, _) = docker_problems(
+            &[(None, &["team-*"]), (None, &[])],
+            DefaultAction::Deny,
+            &[],
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("all requests will be denied")),
+            "{warnings:?}"
+        );
+        let (warnings, _) = docker_problems(&[(None, &[])], DefaultAction::Deny, &[]);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("all requests will be denied")),
+            "{warnings:?}"
+        );
+
+        let (warnings, _) = docker_problems(&[(None, &["team-*"])], DefaultAction::Allow, &[]);
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("every entry has namespaces")),
+            "{warnings:?}"
+        );
+        let (warnings, _) = docker_problems(
+            &[(None, &["team-*"]), (None, &[])],
+            DefaultAction::Allow,
+            &[],
+        );
+        assert!(
+            !warnings
+                .iter()
+                .any(|w| w.contains("every entry has namespaces")),
+            "{warnings:?}"
+        );
+
+        for (pattern, meets) in [
+            ("*", true),
+            ("*-internal", true),
+            ("team-a/**", true),
+            ("team-a/secret", true),
+            ("team-a/*", true),
+            ("te*", true),
+            ("team-b*", true),
+            ("other/**", false),
+            ("teamx*", false),
+            ("team-a", false),
+            ("com.corp.**", false),
+        ] {
+            let (warnings, _) = docker_problems(
+                &[(None, &["team-*"]), (None, &[])],
+                DefaultAction::Allow,
+                &[pattern],
+            );
+            let warned = warnings.iter().any(|w| w.contains("internal_namespaces"));
+            assert_eq!(warned, meets, "{pattern}: {warnings:?}");
+        }
+    }
+
+    #[test]
+    fn test_env_override_docker_proxies_namespaces_field() {
+        let _lock = env_lock();
+        std::env::remove_var("NORA_DOCKER_UPSTREAMS");
+        std::env::set_var(
+            "NORA_DOCKER_PROXIES",
+            "https://harbor.example|robot:pw||team-*;ops,https://registry-1.docker.io,https://ghcr.io||ghcr",
+        );
+        let mut config = Config::default();
+        config.apply_env_overrides().unwrap();
+        std::env::remove_var("NORA_DOCKER_PROXIES");
+        let u = &config.docker.upstreams;
+        assert_eq!(u.len(), 3);
+        assert_eq!(u[0].namespaces, ["team-*", "ops"]);
+        assert_eq!(u[0].prefix, None);
+        assert_eq!(crate::secrets::expose_opt(&u[0].auth), Some("robot:pw"));
+        assert!(u[1].namespaces.is_empty());
+        assert_eq!(u[2].prefix.as_deref(), Some("ghcr"));
+        assert!(u[2].namespaces.is_empty());
     }
 
     #[test]

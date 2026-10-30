@@ -633,6 +633,7 @@ async fn docker_internal_manifest_miss_get_404_not_403() {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         }];
     });
     // A tag that does not exist yet in a hosted internal namespace (docker push pre-flight).
@@ -666,6 +667,7 @@ async fn docker_internal_manifest_miss_head_404_not_403() {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         }];
     });
     // The HEAD probe docker issues before pushing a new tag — 403 here is fatal to the client.
@@ -693,6 +695,7 @@ async fn docker_internal_referrers_tag_miss_head_404() {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         }];
     });
     // OCI referrers fallback tag (sha256-<digest>) for a hosted image with no attestations:
@@ -721,6 +724,7 @@ async fn docker_internal_blob_miss_get_404_and_head_agrees() {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         }];
     });
     let digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
@@ -939,6 +943,7 @@ async fn an_internal_name_never_reaches_a_recording_upstream_dates_included() {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         }];
     });
     // Terraform metadata cached before the namespace became internal still names an upstream

@@ -107,15 +107,16 @@ pub(crate) struct Canonical {
 impl Canonical {
     /// Get the list of upstreams to try for fetching this image.
     ///
-    /// If a specific upstream was matched by prefix, returns only that one.
-    /// Otherwise returns all configured upstreams (fallback chain).
+    /// If a specific upstream was matched (prefix, namespaces or hostname), returns only
+    /// that one. Otherwise returns the fallback chain: every upstream that does not own
+    /// namespaces, in config order — a private registry is never asked for a public name.
     pub fn upstreams_to_try<'a>(
         &self,
         upstreams: &'a [crate::config::DockerUpstream],
     ) -> Vec<&'a crate::config::DockerUpstream> {
         match self.matched_upstream_idx {
             Some(idx) => vec![&upstreams[idx]],
-            None => upstreams.iter().collect(),
+            None => upstreams.iter().filter(|u| !u.is_bound()).collect(),
         }
     }
 
@@ -153,15 +154,25 @@ impl Canonical {
 ///
 /// Resolution order (early-return):
 /// 1. Prefix match — first path segment matches a configured upstream prefix
-/// 2. Hostname detection — first segment contains a dot (FQDN like `docker.io`)
-/// 3. Fallback — if `default_action = deny`, mark as denied; otherwise use
-///    the first configured upstream
+/// 2. Namespace binding — first segment of a multi-segment name is owned by an upstream's
+///    `namespaces` (#1188): the name is kept whole, and that upstream is the only one asked,
+///    under either `default_action`
+/// 3. Hostname detection — first segment contains a dot (FQDN like `docker.io`)
+/// 4. Fallback — if `default_action = deny`, mark as denied; otherwise use
+///    the first upstream that owns no namespaces
 pub(crate) fn canonicalize(
     raw_name: &str,
     docker_config: &crate::config::DockerConfig,
 ) -> Canonical {
     let upstreams = &docker_config.upstreams;
     let deny_mode = docker_config.default_action == crate::config::DefaultAction::Deny;
+    // Copies served by the fallback chain are stored under its first upstream's namespace.
+    let fallback_ns = || {
+        upstreams
+            .iter()
+            .find(|u| !u.is_bound())
+            .map(|u| u.resolved_namespace())
+    };
 
     // Step 1: Check for prefix-based routing
     if let Some((first_segment, rest)) = raw_name.split_once('/') {
@@ -185,7 +196,23 @@ pub(crate) fn canonicalize(
             }
         }
 
-        // Step 2: Hostname detection (dot in first segment = FQDN)
+        // Step 2: Namespace binding — the owner gets the whole name; its answer is final
+        if let Some(idx) = upstreams.iter().position(|u| u.binds(first_segment)) {
+            tracing::debug!(
+                upstream = %upstreams[idx].url,
+                name = %raw_name,
+                routing = "namespaces",
+                "Docker namespace-bound upstream routing"
+            );
+            return Canonical {
+                name: raw_name.to_string(),
+                namespace: Some(upstreams[idx].resolved_namespace()),
+                matched_upstream_idx: Some(idx),
+                denied: false,
+            };
+        }
+
+        // Step 3: Hostname detection (dot in first segment = FQDN)
         if first_segment.contains('.') && !rest.is_empty() {
             // Check if it matches a known upstream's namespace
             for (idx, upstream) in upstreams.iter().enumerate() {
@@ -200,7 +227,7 @@ pub(crate) fn canonicalize(
                 }
             }
             // Unknown hostname — strip it but use default upstream
-            let ns = upstreams.first().map(|u| u.resolved_namespace());
+            let ns = fallback_ns();
             return Canonical {
                 name: rest.to_string(),
                 namespace: ns,
@@ -210,8 +237,8 @@ pub(crate) fn canonicalize(
         }
     }
 
-    // Step 3: Fallback — first upstream, name unchanged
-    let ns = upstreams.first().map(|u| u.resolved_namespace());
+    // Step 4: Fallback — first unbound upstream, name unchanged
+    let ns = fallback_ns();
     Canonical {
         name: raw_name.to_string(),
         namespace: ns,
@@ -5299,6 +5326,7 @@ mod integration_tests {
                         auth: None,
                         namespace: None,
                         prefix: None,
+                        namespaces: Vec::new(),
                     })
                     .collect();
             });
@@ -5311,6 +5339,287 @@ mod integration_tests {
         assert!(hub
             .iter()
             .any(|r| r.url.path().starts_with("/v2/library/alpine/")));
+    }
+
+    /// #1188: a name in a namespace an upstream owns is asked of that upstream only, whole, and
+    /// whatever it answers is final. Docker Hub here serves every name — the squatter who
+    /// registered `team-a` — and must never be asked, whether the private registry comes first
+    /// or last, whatever it fails with, under `allow`.
+    #[tokio::test]
+    async fn a_bound_namespace_never_falls_through_to_another_upstream() {
+        use crate::config::DockerUpstream;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let squatter = MockServer::start().await;
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex("/blobs/"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"layer".to_vec()))
+            .mount(&squatter)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(
+                        br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#.to_vec(),
+                    ),
+            )
+            .mount(&squatter)
+            .await;
+        let refused = "http://127.0.0.1:9".to_string();
+        let requests = [
+            (Method::GET, "/v2/team-a/service/manifests/1.0".to_string()),
+            (Method::HEAD, "/v2/team-a/service/manifests/1.0".to_string()),
+            (Method::GET, format!("/v2/team-a/service/blobs/{blob}")),
+            (Method::HEAD, format!("/v2/team-a/service/blobs/{blob}")),
+        ];
+
+        for status in [
+            Some(401),
+            Some(403),
+            Some(404),
+            Some(429),
+            Some(500),
+            Some(503),
+            None,
+        ] {
+            let harbor = MockServer::start().await;
+            if let Some(status) = status {
+                Mock::given(wiremock::matchers::any())
+                    .respond_with(ResponseTemplate::new(status))
+                    .mount(&harbor)
+                    .await;
+            }
+            let harbor_url = if status.is_some() {
+                harbor.uri()
+            } else {
+                refused.clone()
+            };
+            for harbor_first in [true, false] {
+                let bound = DockerUpstream {
+                    url: harbor_url.clone(),
+                    auth: None,
+                    namespace: None,
+                    prefix: None,
+                    namespaces: vec!["team-*".to_string()],
+                };
+                let hub = DockerUpstream {
+                    url: squatter.uri(),
+                    auth: None,
+                    namespace: None,
+                    prefix: None,
+                    namespaces: Vec::new(),
+                };
+                let upstreams = if harbor_first {
+                    vec![bound, hub]
+                } else {
+                    vec![hub, bound]
+                };
+                let ctx = create_test_context_with_config(move |cfg| {
+                    cfg.docker.upstreams = upstreams;
+                });
+                for (m, uri) in &requests {
+                    let resp = send(&ctx.app, m.clone(), uri, Body::empty()).await;
+                    assert!(
+                        !resp.status().is_success(),
+                        "{m} {uri}: harbor {status:?} first={harbor_first} served {}",
+                        resp.status()
+                    );
+                }
+            }
+            for r in harbor.received_requests().await.unwrap() {
+                assert!(
+                    r.url.path().starts_with("/v2/team-a/service/"),
+                    "harbor asked for {}",
+                    r.url.path()
+                );
+            }
+        }
+        let asked: Vec<String> = squatter
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(asked.is_empty(), "the public upstream was asked: {asked:?}");
+    }
+
+    /// #1188: the owner of a namespace is asked for the whole name, its copy is stored under its
+    /// own namespace, and a public name is not asked of it.
+    #[tokio::test]
+    async fn a_bound_namespace_is_fetched_whole_and_cached_under_its_owner() {
+        use crate::config::DockerUpstream;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ct = "application/vnd.oci.image.manifest.v1+json";
+        let manifest =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#.to_vec();
+        let harbor = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/team-a/service/manifests/1.0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", ct)
+                    .set_body_bytes(manifest.clone()),
+            )
+            .mount(&harbor)
+            .await;
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/aquasec/trivy/manifests/1.0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", ct)
+                    .set_body_bytes(manifest.clone()),
+            )
+            .mount(&hub)
+            .await;
+        let (harbor_url, hub_url) = (harbor.uri(), hub.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![
+                DockerUpstream {
+                    url: hub_url,
+                    auth: None,
+                    namespace: Some("docker.io".to_string()),
+                    prefix: None,
+                    namespaces: Vec::new(),
+                },
+                DockerUpstream {
+                    url: harbor_url,
+                    auth: None,
+                    namespace: Some("harbor.example".to_string()),
+                    prefix: None,
+                    namespaces: vec!["team-*".to_string()],
+                },
+            ];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team-a/service/manifests/1.0",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), manifest.as_slice());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/aquasec/trivy/manifests/1.0",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // The copies are written in the background: wait for both, with a deadline.
+        let owned = super::manifest_key(Some("harbor.example"), "team-a/service", "1.0");
+        let public = super::manifest_key(Some("docker.io"), "aquasec/trivy", "1.0");
+        let mut cached = false;
+        for _ in 0..200 {
+            if ctx.state.storage.get(&owned).await.is_ok()
+                && ctx.state.storage.get(&public).await.is_ok()
+            {
+                cached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(cached, "{owned} and {public}");
+        let harbor_asked: Vec<String> = harbor
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(harbor_asked, ["/v2/team-a/service/manifests/1.0"]);
+        let hub_asked: Vec<String> = hub
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(hub_asked, ["/v2/aquasec/trivy/manifests/1.0"]);
+    }
+
+    /// #1188: an image pushed to NORA under a name a private registry owns stays NORA's: it is
+    /// served from local storage and the owner is not asked.
+    #[tokio::test]
+    async fn a_hosted_image_under_a_bound_namespace_is_served_locally() {
+        use crate::config::DockerUpstream;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let harbor = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&harbor)
+            .await;
+        let harbor_url = harbor.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.serve_stale = false;
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: harbor_url,
+                auth: None,
+                namespace: None,
+                prefix: None,
+                namespaces: vec!["team-*".to_string()],
+            }];
+        });
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        }))
+        .unwrap();
+        seed_zero_config(&ctx.state, "team-a/hosted").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/team-a/hosted/manifests/v1",
+            Body::from(manifest.clone()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        for m in [Method::GET, Method::HEAD] {
+            let resp = send(
+                &ctx.app,
+                m.clone(),
+                "/v2/team-a/hosted/manifests/v1",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{m}");
+        }
+        // A pushed layer lives under the bare key, which every blob read falls back to.
+        let layer = b"hosted-layer".to_vec();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&layer)));
+        ctx.state
+            .storage
+            .put(&format!("docker/team-a/hosted/blobs/{digest}"), &layer)
+            .await
+            .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/team-a/hosted/blobs/{digest}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), layer.as_slice());
+        assert!(harbor.received_requests().await.unwrap().is_empty());
     }
 
     /// A locally pushed manifest is authoritative: with global pull-through upstreams
@@ -5328,6 +5637,7 @@ mod integration_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
 
@@ -5462,6 +5772,7 @@ mod integration_tests {
             auth: None,
             namespace: None,
             prefix: prefix.map(str::to_string),
+            namespaces: Vec::new(),
         };
         // (case, upstream answer for the asked name, request path, whether the answer is honest)
         for (case, honest) in [
@@ -5589,6 +5900,7 @@ mod integration_tests {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         };
         let ns = upstream.resolved_namespace();
         let ctx = create_test_context_with_config(move |cfg| {
@@ -5705,6 +6017,7 @@ mod integration_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
 
@@ -5795,6 +6108,7 @@ mod integration_tests {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         };
         let ns = upstream.resolved_namespace();
         let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
@@ -5870,6 +6184,7 @@ mod integration_tests {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         };
         let ns = upstream.resolved_namespace();
         let ctx =
@@ -5904,6 +6219,7 @@ mod integration_tests {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         };
         let ns = upstream.resolved_namespace();
         let ctx =
@@ -6176,6 +6492,7 @@ mod integration_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             };
             let ns = upstream.resolved_namespace();
             let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
@@ -6652,6 +6969,7 @@ mod integration_tests {
                 auth: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
         let manifest = serde_json::json!({
@@ -7123,6 +7441,7 @@ mod integration_tests {
                 auth: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
         let manifest = serde_json::json!({
@@ -7203,6 +7522,7 @@ mod integration_tests {
                 auth: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
         let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#;
@@ -8533,6 +8853,7 @@ mod integration_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
 
@@ -8784,12 +9105,14 @@ mod integration_tests {
                     auth: None,
                     namespace: None,
                     prefix: None,
+                    namespaces: Vec::new(),
                 },
                 DockerUpstream {
                     url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
                     auth: None,
                     namespace: None,
                     prefix: None,
+                    namespaces: Vec::new(),
                 },
             ];
         });
@@ -8930,6 +9253,7 @@ mod integration_tests {
             auth: None,
             namespace: Some("docker.io".to_string()),
             prefix: Some("docker-hub".to_string()),
+            namespaces: Vec::new(),
         }];
         let cfg = docker_config_allow(upstreams.clone());
 
@@ -8947,6 +9271,7 @@ mod integration_tests {
             auth: None,
             namespace: Some("docker.io".to_string()),
             prefix: None,
+            namespaces: Vec::new(),
         }];
         let cfg = docker_config_allow(upstreams.clone());
 
@@ -8973,6 +9298,7 @@ mod integration_tests {
             auth: None,
             namespace: Some("docker.io".to_string()),
             prefix: None,
+            namespaces: Vec::new(),
         }];
         let cfg = docker_config_allow(upstreams.clone());
 
@@ -9043,12 +9369,14 @@ mod integration_tests {
                 auth: None,
                 namespace: Some("docker.io".to_string()),
                 prefix: Some("docker-hub".to_string()),
+                namespaces: Vec::new(),
             },
             crate::config::DockerUpstream {
                 url: "https://ghcr.io".to_string(),
                 auth: None,
                 namespace: Some("ghcr.io".to_string()),
                 prefix: Some("ghcr".to_string()),
+                namespaces: Vec::new(),
             },
         ];
         let cfg = docker_config_allow(upstreams.clone());
@@ -9077,12 +9405,14 @@ mod integration_tests {
                 auth: None,
                 namespace: Some("docker.io".to_string()),
                 prefix: Some("docker-hub".to_string()),
+                namespaces: Vec::new(),
             },
             crate::config::DockerUpstream {
                 url: "https://ghcr.io".to_string(),
                 auth: None,
                 namespace: Some("ghcr.io".to_string()),
                 prefix: Some("ghcr".to_string()),
+                namespaces: Vec::new(),
             },
         ];
         let cfg = docker_config_deny(upstreams.clone());
@@ -9113,6 +9443,7 @@ mod integration_tests {
             auth: None,
             namespace: Some("docker.io".to_string()),
             prefix: None,
+            namespaces: Vec::new(),
         }];
         let cfg = docker_config_deny(upstreams.clone());
 
@@ -9123,6 +9454,110 @@ mod integration_tests {
         assert_eq!(c.namespace.as_deref(), Some("docker.io"));
     }
 
+    /// A private registry that owns `team-*` (#1188), a public one with a prefix, and Docker Hub,
+    /// in an order where the private registry is neither first nor last.
+    fn bound_upstreams() -> Vec<crate::config::DockerUpstream> {
+        let entry = |url: &str, ns: &str, prefix: Option<&str>, masks: &[&str]| {
+            crate::config::DockerUpstream {
+                url: url.to_string(),
+                auth: None,
+                namespace: Some(ns.to_string()),
+                prefix: prefix.map(str::to_string),
+                namespaces: masks.iter().map(|m| m.to_string()).collect(),
+            }
+        };
+        vec![
+            entry("https://ghcr.io", "ghcr.io", Some("ghcr"), &[]),
+            entry(
+                "https://harbor.example",
+                "harbor.example",
+                None,
+                &["team-*", "ops"],
+            ),
+            entry("https://registry-1.docker.io", "docker.io", None, &[]),
+        ]
+    }
+
+    /// Routing with namespaces, one row per case of the #1188 decision table: the upstreams
+    /// asked (by url), the name they are asked for, the storage namespace, and whether the
+    /// request is denied.
+    #[test]
+    fn test_canonicalize_namespaces_decision_table() {
+        let upstreams = bound_upstreams();
+        let harbor = vec!["https://harbor.example"];
+        let chain = vec!["https://ghcr.io", "https://registry-1.docker.io"];
+        let ghcr = vec!["https://ghcr.io"];
+        #[rustfmt::skip]
+        let rows: &[(&str, bool, &str, &[&str], &str, bool)] = &[
+            // raw name,             deny,  name sent,           upstreams, namespace, denied
+            ("team-a/service",       false, "team-a/service",    &harbor,   "harbor.example", false),
+            ("team-a/service",       true,  "team-a/service",    &harbor,   "harbor.example", false),
+            ("team-b/x/y",           false, "team-b/x/y",        &harbor,   "harbor.example", false),
+            ("ops/tool",             false, "ops/tool",          &harbor,   "harbor.example", false),
+            // not owned: a mask holds for the whole first segment only
+            ("opsx/tool",            false, "opsx/tool",         &chain,    "ghcr.io", false),
+            ("teamx/service",        false, "teamx/service",     &chain,    "ghcr.io", false),
+            // a single-segment name has no namespace: Docker Hub's library/ path
+            ("team-a",               false, "team-a",            &chain,    "ghcr.io", false),
+            ("nginx",                false, "nginx",             &chain,    "ghcr.io", false),
+            // a public name is never asked of the private registry
+            ("aquasec/trivy",        false, "aquasec/trivy",     &chain,    "ghcr.io", false),
+            ("aquasec/trivy",        true,  "aquasec/trivy",     &chain,    "ghcr.io", true),
+            // an explicit prefix is an explicit choice of upstream, and goes first
+            ("ghcr/team-a/service",  false, "team-a/service",    &ghcr,     "ghcr.io", false),
+            // an unknown host is stripped and falls back, never to the private registry
+            ("quay.io/team-a/svc",   false, "team-a/svc",        &chain,    "ghcr.io", false),
+            // the private registry's own host picks it explicitly, under deny too
+            ("harbor.example/x/svc", true,  "x/svc",             &harbor,   "harbor.example", false),
+        ];
+        for &(raw, deny, name, asked, ns, denied) in rows {
+            let cfg = if deny {
+                docker_config_deny(upstreams.clone())
+            } else {
+                docker_config_allow(upstreams.clone())
+            };
+            let c = super::canonicalize(raw, &cfg);
+            let urls: Vec<&str> = c
+                .upstreams_to_try(&upstreams)
+                .iter()
+                .map(|u| u.url.as_str())
+                .collect();
+            assert_eq!(c.name, name, "{raw} deny={deny}: name");
+            assert_eq!(urls, asked, "{raw} deny={deny}: upstreams");
+            assert_eq!(c.namespace.as_deref(), Some(ns), "{raw} deny={deny}: ns");
+            assert_eq!(c.denied, denied, "{raw} deny={deny}: denied");
+        }
+    }
+
+    /// Copies of public names are stored under the first upstream that serves them, not under
+    /// a private registry that happens to come first (#1188).
+    #[test]
+    fn test_canonicalize_fallback_namespace_skips_bound_upstream() {
+        let mut upstreams = bound_upstreams();
+        upstreams.rotate_left(1); // harbor, docker.io, ghcr
+        let cfg = docker_config_allow(upstreams.clone());
+        let c = super::canonicalize("library/nginx", &cfg);
+        assert_eq!(c.namespace.as_deref(), Some("docker.io"));
+        assert_eq!(c.upstreams_to_try(&upstreams).len(), 2);
+        let c = super::canonicalize("team-a/service", &cfg);
+        assert_eq!(c.namespace.as_deref(), Some("harbor.example"));
+    }
+
+    /// With every upstream bound, a name nobody owns has no upstream: it is served from
+    /// local storage or not at all, never by a private registry.
+    #[test]
+    fn test_canonicalize_every_upstream_bound_leaves_public_names_local() {
+        let upstreams: Vec<_> = bound_upstreams()
+            .into_iter()
+            .filter(|u| u.is_bound())
+            .collect();
+        let cfg = docker_config_allow(upstreams.clone());
+        let c = super::canonicalize("aquasec/trivy", &cfg);
+        assert!(c.upstreams_to_try(&upstreams).is_empty());
+        assert_eq!(c.namespace, None);
+        assert!(!c.denied);
+    }
+
     #[test]
     fn test_denied_response_format() {
         let upstreams = vec![crate::config::DockerUpstream {
@@ -9130,6 +9565,7 @@ mod integration_tests {
             auth: None,
             namespace: Some("docker.io".to_string()),
             prefix: Some("hub".to_string()),
+            namespaces: Vec::new(),
         }];
         let cfg = docker_config_deny(upstreams);
 
@@ -9181,6 +9617,7 @@ mod integration_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
 
@@ -9265,6 +9702,7 @@ mod integration_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
 
@@ -9320,6 +9758,7 @@ mod integration_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
 
@@ -9441,6 +9880,7 @@ mod integration_tests {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         }
     }
 
@@ -9657,6 +10097,7 @@ mod stream_spool_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         })
     }
@@ -10051,6 +10492,7 @@ mod stream_spool_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
             cfg.curation.quarantine = Some(QuarantineMode::Enforce);
             cfg.curation.quarantine_ttl = Some("1h".to_string());
@@ -10297,6 +10739,7 @@ mod upstream_resume_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         })
     }
@@ -10583,6 +11026,7 @@ mod upstream_resume_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
 
@@ -10902,6 +11346,7 @@ mod blob_single_flight_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
         let path = format!("/v2/library/test/blobs/{digest}");
@@ -11289,6 +11734,7 @@ mod upstream_failure_cases {
                     auth: None,
                     namespace: None,
                     prefix: None,
+                    namespaces: Vec::new(),
                 }];
             });
             let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
@@ -11332,6 +11778,7 @@ mod upstream_failure_edge_cases {
                     auth: None,
                     namespace: None,
                     prefix: None,
+                    namespaces: Vec::new(),
                 }];
             });
             let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
@@ -11431,6 +11878,7 @@ mod hosted_pull_stats_and_re_push {
                 auth: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
         let meta_key = "docker/race-img/manifests/v1.meta.json";
@@ -11547,6 +11995,7 @@ mod hosted_pull_stats_and_re_push {
                 auth: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
         let meta_key = "docker/race-img/manifests/v1.meta.json";
@@ -11735,6 +12184,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
                 auth: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
         let manifest = Bytes::from(
@@ -12006,6 +12456,7 @@ mod hosted_pull_stats_after_a_delete {
                 auth: None,
                 namespace: Some("docker.io".into()),
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         })
     }
@@ -12200,6 +12651,7 @@ mod manifest_before_metadata_one_lock_order {
                     auth: None,
                     namespace: Some("docker.io".into()),
                     prefix: None,
+                    namespaces: Vec::new(),
                 }]
             } else {
                 vec![]
