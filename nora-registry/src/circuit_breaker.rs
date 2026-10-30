@@ -1004,6 +1004,7 @@ mod tests {
             auth: None,
             namespace: None,
             prefix: None,
+            namespaces: Vec::new(),
         }];
         let keys = initial_gauge_keys(&config);
         assert!(keys.contains(&"pypi:https://pypi.org/simple".to_string()));
@@ -1358,6 +1359,7 @@ mod integration_tests {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             }];
         });
 

@@ -1987,6 +1987,7 @@ mod first_download_integrity {
                     auth: None,
                     namespace: None,
                     prefix: None,
+                    namespaces: Vec::new(),
                 }];
             },
         )
@@ -2081,6 +2082,7 @@ mod first_download_integrity {
                     auth: None,
                     namespace: None,
                     prefix: None,
+                    namespaces: Vec::new(),
                 }];
             },
         )
@@ -3146,6 +3148,7 @@ mod upstream_failure_matrix {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             })
             .collect();
         cfg.docker.proxy_timeout = 1;
