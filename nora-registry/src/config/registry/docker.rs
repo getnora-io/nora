@@ -9,7 +9,8 @@ use std::fmt;
 /// Controls behavior when a Docker image name doesn't match any configured
 /// upstream prefix or known hostname.
 ///
-/// - `Allow` (default): fall through to the first upstream (current behavior).
+/// - `Allow` (default): ask the fallback chain; a name behind a registry host that no
+///   upstream serves is answered from local storage only (#1195).
 /// - `Deny`: reject the request with 403, preventing unintended upstream queries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -41,7 +42,8 @@ pub struct DockerConfig {
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
     /// What to do with a name that no `prefix`, `namespaces` or registry host routes.
-    /// `allow` (default) = the fallback chain (upstreams without `namespaces`, in order);
+    /// `allow` (default) = the fallback chain (upstreams without `namespaces`, in order), or no
+    /// upstream at all for a name behind a registry host that no upstream serves (#1195);
     /// `deny` = refuse with 403 `DENIED`.
     #[serde(default)]
     pub default_action: DefaultAction,
@@ -93,6 +95,36 @@ impl DockerUpstream {
             .iter()
             .any(|mask| namespace_mask_matches(mask, first_segment))
     }
+
+    /// Whether a registry host in front of an image name (`quay.io/…`) names this upstream:
+    /// its storage namespace, or the host of its url (#1195). A port is not compared: an image
+    /// name that reaches NORA cannot carry one, `:` is refused before routing. Each of
+    /// [`DOCKER_HUB_HOSTS`] names an upstream that any other of them names.
+    pub fn serves_host(&self, host: &str) -> bool {
+        let url_host = self
+            .url
+            .strip_prefix("https://")
+            .or_else(|| self.url.strip_prefix("http://"))
+            .unwrap_or(&self.url)
+            .split(['/', ':'])
+            .next()
+            .unwrap_or_default();
+        let named = |h: &str| {
+            h.eq_ignore_ascii_case(host) || (is_docker_hub_host(h) && is_docker_hub_host(host))
+        };
+        named(&self.resolved_namespace()) || named(url_host)
+    }
+}
+
+/// The hosts Docker Hub is named by in an image name: `docker.io`, the legacy `index.docker.io`
+/// that clients still normalize to it, and `registry-1.docker.io`, the host its API answers on.
+pub const DOCKER_HUB_HOSTS: [&str; 3] = ["docker.io", "index.docker.io", "registry-1.docker.io"];
+
+/// Whether a registry host is one of [`DOCKER_HUB_HOSTS`].
+pub fn is_docker_hub_host(host: &str) -> bool {
+    DOCKER_HUB_HOSTS
+        .iter()
+        .any(|h| h.eq_ignore_ascii_case(host))
 }
 
 /// Whether a `namespaces` entry holds for a first path segment: `team-*` holds for every

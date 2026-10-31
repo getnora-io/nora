@@ -98,25 +98,46 @@ pub(crate) struct Canonical {
     pub name: String,
     /// Namespace for storage key construction (e.g. `"docker.io"`).
     pub namespace: Option<String>,
-    /// Index of the prefix-matched upstream in the config, if any.
-    matched_upstream_idx: Option<usize>,
+    /// Which upstreams are asked for the name.
+    route: Route,
     /// When true, the request should be rejected (no prefix match in deny mode).
     pub denied: bool,
+}
+
+/// Which upstreams a canonical name is asked of.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Route {
+    /// The upstream at this index in the config, matched by prefix, namespaces or host.
+    Upstream(usize),
+    /// The fallback chain: every upstream that owns no namespaces, in config order.
+    Chain,
+    /// None: the name is behind this registry host, which no upstream serves (#1195).
+    UnknownHost(String),
 }
 
 impl Canonical {
     /// Get the list of upstreams to try for fetching this image.
     ///
     /// If a specific upstream was matched (prefix, namespaces or hostname), returns only
-    /// that one. Otherwise returns the fallback chain: every upstream that does not own
-    /// namespaces, in config order — a private registry is never asked for a public name.
+    /// that one. A name behind a registry host that no upstream serves gets none: it is
+    /// answered from local storage only, never by another registry (#1195). Otherwise returns
+    /// the fallback chain: every upstream that does not own namespaces, in config order — a
+    /// private registry is never asked for a public name.
     pub fn upstreams_to_try<'a>(
         &self,
         upstreams: &'a [crate::config::DockerUpstream],
     ) -> Vec<&'a crate::config::DockerUpstream> {
-        match self.matched_upstream_idx {
-            Some(idx) => vec![&upstreams[idx]],
-            None => upstreams.iter().filter(|u| !u.is_bound()).collect(),
+        match &self.route {
+            Route::Upstream(idx) => vec![&upstreams[*idx]],
+            Route::Chain => upstreams.iter().filter(|u| !u.is_bound()).collect(),
+            Route::UnknownHost(host) => {
+                tracing::info!(
+                    host = %host,
+                    name = %self.name,
+                    "no Docker upstream serves this registry host: answering from local storage only"
+                );
+                Vec::new()
+            }
         }
     }
 
@@ -157,7 +178,10 @@ impl Canonical {
 /// 2. Namespace binding — first segment of a multi-segment name is owned by an upstream's
 ///    `namespaces` (#1188): the name is kept whole, and that upstream is the only one asked,
 ///    under either `default_action`
-/// 3. Hostname detection — first segment contains a dot (FQDN like `docker.io`)
+/// 3. Hostname detection — first segment contains a dot (FQDN like `docker.io`): the
+///    upstream that serves the host ([`crate::config::DockerUpstream::serves_host`]); Docker Hub without an
+///    upstream of its own is the fallback chain, as a bare name is; any other host has no
+///    upstream, and the name is answered from local storage only (#1195)
 /// 4. Fallback — if `default_action = deny`, mark as denied; otherwise use
 ///    the first upstream that owns no namespaces
 pub(crate) fn canonicalize(
@@ -189,7 +213,7 @@ pub(crate) fn canonicalize(
                     return Canonical {
                         name: rest.to_string(),
                         namespace: Some(upstream.resolved_namespace()),
-                        matched_upstream_idx: Some(idx),
+                        route: Route::Upstream(idx),
                         denied: false,
                     };
                 }
@@ -207,31 +231,36 @@ pub(crate) fn canonicalize(
             return Canonical {
                 name: raw_name.to_string(),
                 namespace: Some(upstreams[idx].resolved_namespace()),
-                matched_upstream_idx: Some(idx),
+                route: Route::Upstream(idx),
                 denied: false,
             };
         }
 
         // Step 3: Hostname detection (dot in first segment = FQDN)
         if first_segment.contains('.') && !rest.is_empty() {
-            // Check if it matches a known upstream's namespace
-            for (idx, upstream) in upstreams.iter().enumerate() {
-                let ns = upstream.resolved_namespace();
-                if first_segment == ns {
-                    return Canonical {
-                        name: rest.to_string(),
-                        namespace: Some(ns),
-                        matched_upstream_idx: Some(idx),
-                        denied: false,
-                    };
-                }
+            if let Some(idx) = upstreams.iter().position(|u| u.serves_host(first_segment)) {
+                return Canonical {
+                    name: rest.to_string(),
+                    namespace: Some(upstreams[idx].resolved_namespace()),
+                    route: Route::Upstream(idx),
+                    denied: false,
+                };
             }
-            // Unknown hostname — strip it but use default upstream
-            let ns = fallback_ns();
+            // Docker Hub is where a bare name lives: without an upstream of its own, the chain.
+            if crate::config::is_docker_hub_host(first_segment) {
+                return Canonical {
+                    name: rest.to_string(),
+                    namespace: fallback_ns(),
+                    route: Route::Chain,
+                    denied: deny_mode,
+                };
+            }
+            // Any other host: another registry's name, which no upstream here may answer.
+            // `None` keeps the cached copies of the upstreams out; local pushes stay readable.
             return Canonical {
                 name: rest.to_string(),
-                namespace: ns,
-                matched_upstream_idx: None,
+                namespace: None,
+                route: Route::UnknownHost(first_segment.to_string()),
                 denied: deny_mode,
             };
         }
@@ -242,7 +271,7 @@ pub(crate) fn canonicalize(
     Canonical {
         name: raw_name.to_string(),
         namespace: ns,
-        matched_upstream_idx: None,
+        route: Route::Chain,
         denied: deny_mode,
     }
 }
@@ -5705,6 +5734,140 @@ mod integration_tests {
         assert!(harbor.received_requests().await.unwrap().is_empty());
     }
 
+    /// #1195: a name behind a registry host no upstream serves is not answered by another
+    /// registry. Docker Hub here holds every name — whoever registered `library/alpine` and
+    /// `project1/service1` there — and is asked for none of them under `quay.io/…`, nor is its
+    /// cached copy served under that host; an image pushed to NORA under the host is still served.
+    #[tokio::test]
+    async fn a_name_behind_an_unknown_registry_host_is_not_answered_by_another_registry() {
+        use crate::config::DockerUpstream;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        let layer = b"hub-layer".to_vec();
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&layer)));
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path_regex("/blobs/"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(layer.clone()))
+            .mount(&hub)
+            .await;
+        Mock::given(wiremock::matchers::path_regex("/tags/list$"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "x", "tags": ["3.20"]})),
+            )
+            .mount(&hub)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(
+                        br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#.to_vec(),
+                    ),
+            )
+            .mount(&hub)
+            .await;
+        let hub_url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url: hub_url,
+                auth: None,
+                namespace: Some("docker.io".to_string()),
+                prefix: None,
+                namespaces: Vec::new(),
+            }];
+        });
+
+        // Docker Hub's copies are in the cache, under each of its hosts.
+        for uri in [
+            "/v2/library/alpine/manifests/3.20".to_string(),
+            "/v2/index.docker.io/library/alpine/manifests/3.20".to_string(),
+            format!("/v2/library/alpine/blobs/{blob}"),
+        ] {
+            let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        }
+        let asked_before = hub.received_requests().await.unwrap().len();
+
+        for (m, uri) in [
+            (
+                Method::GET,
+                "/v2/quay.io/library/alpine/manifests/3.20".to_string(),
+            ),
+            (
+                Method::HEAD,
+                "/v2/quay.io/library/alpine/manifests/3.20".to_string(),
+            ),
+            (
+                Method::GET,
+                "/v2/quay.io/project1/service1/manifests/1.0".to_string(),
+            ),
+            (
+                Method::GET,
+                format!("/v2/quay.io/library/alpine/blobs/{blob}"),
+            ),
+            (
+                Method::HEAD,
+                format!("/v2/quay.io/library/alpine/blobs/{blob}"),
+            ),
+        ] {
+            let resp = send(&ctx.app, m.clone(), &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{m} {uri}");
+        }
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/quay.io/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        let tags = body_bytes(resp).await;
+        assert!(
+            !String::from_utf8_lossy(&tags).contains("3.20"),
+            "Docker Hub's tags listed under quay.io: {}",
+            String::from_utf8_lossy(&tags)
+        );
+
+        // Pushed under the host, an image is NORA's own and is served.
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 0,
+                "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            },
+            "layers": []
+        }))
+        .unwrap();
+        seed_zero_config(&ctx.state, "myteam/app").await;
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/quay.io/myteam/app/manifests/v1",
+            Body::from(manifest.clone()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/quay.io/myteam/app/manifests/v1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), manifest.as_slice());
+
+        let asked: Vec<String> = hub.received_requests().await.unwrap()[asked_before..]
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert!(asked.is_empty(), "Docker Hub was asked: {asked:?}");
+    }
+
     /// A locally pushed manifest is authoritative: with global pull-through upstreams
     /// configured, GET must serve it without revalidating against upstream — an unreachable
     /// upstream must neither 404 the tag (serve_stale = false) nor stale-mark it.
@@ -9365,12 +9528,11 @@ mod integration_tests {
         assert_eq!(c.upstreams_to_try(&upstreams).len(), 1);
         assert!(!c.denied);
 
-        // Unknown hostname → strip but use default upstream
+        // A host no upstream serves is stripped and asked of no upstream (#1195)
         let c2 = super::canonicalize("ghcr.io/requarks/wiki", &cfg);
         assert_eq!(c2.name, "requarks/wiki");
-        assert_eq!(c2.namespace.as_deref(), Some("docker.io"));
-        // No specific match → all upstreams
-        assert_eq!(c2.upstreams_to_try(&upstreams).len(), 1); // only 1 configured
+        assert_eq!(c2.namespace, None);
+        assert!(c2.upstreams_to_try(&upstreams).is_empty());
         assert!(!c2.denied); // Allow mode → not denied
     }
 
@@ -9588,8 +9750,7 @@ mod integration_tests {
             ("aquasec/trivy",        true,  "aquasec/trivy",     &chain,    "ghcr.io", true),
             // an explicit prefix is an explicit choice of upstream, and goes first
             ("ghcr/team-a/service",  false, "team-a/service",    &ghcr,     "ghcr.io", false),
-            // an unknown host is stripped and falls back, never to the private registry
-            ("quay.io/team-a/svc",   false, "team-a/svc",        &chain,    "ghcr.io", false),
+            // an unknown host never reaches the private registry: see the #1195 table
             // the private registry's own host picks it explicitly, under deny too
             ("harbor.example/x/svc", true,  "x/svc",             &harbor,   "harbor.example", false),
         ];
@@ -9639,6 +9800,106 @@ mod integration_tests {
         assert!(c.upstreams_to_try(&upstreams).is_empty());
         assert_eq!(c.namespace, None);
         assert!(!c.denied);
+    }
+
+    /// Routing by the registry host in front of a name, one row per case of the #1195 decision
+    /// table: a host names the upstream whose namespace or url host it is (Docker Hub by any of
+    /// its hosts); Docker Hub without an upstream of its own is the fallback chain, as a bare name
+    /// is; any other host has no upstream, and its name is answered from local storage only.
+    #[test]
+    fn test_canonicalize_registry_host_decision_table() {
+        let entry = |url: &str, ns: Option<&str>, masks: &[&str]| crate::config::DockerUpstream {
+            url: url.to_string(),
+            auth: None,
+            namespace: ns.map(str::to_string),
+            prefix: None,
+            namespaces: masks.iter().map(|m| m.to_string()).collect(),
+        };
+        let with_hub = vec![
+            entry("https://registry.gitlab.com", None, &[]),
+            entry("https://harbor.example", None, &["team-*"]),
+            entry("https://quay.io", Some("quay"), &[]),
+            entry("https://registry-1.docker.io", None, &[]),
+            entry("http://registry.local:5000", None, &[]),
+        ];
+        // Docker Hub only through a mirror, which no host names.
+        let no_hub = vec![
+            entry("https://mirror.gcr.io", None, &[]),
+            entry("https://harbor.example", None, &["team-*"]),
+        ];
+        let (hub, gitlab, quay, local5000, harbor) = (
+            vec!["https://registry-1.docker.io"],
+            vec!["https://registry.gitlab.com"],
+            vec!["https://quay.io"],
+            vec!["http://registry.local:5000"],
+            vec!["https://harbor.example"],
+        );
+        let (with_hub_chain, mirror): (Vec<&str>, Vec<&str>) = (
+            vec![
+                "https://registry.gitlab.com",
+                "https://quay.io",
+                "https://registry-1.docker.io",
+                "http://registry.local:5000",
+            ],
+            vec!["https://mirror.gcr.io"],
+        );
+        let none: Vec<&str> = Vec::new();
+        /// Upstreams, raw name, deny, name sent, upstreams asked, namespace, denied.
+        type Row<'a> = (
+            &'a [crate::config::DockerUpstream],
+            &'a str,
+            bool,
+            &'a str,
+            &'a [&'a str],
+            Option<&'a str>,
+            bool,
+        );
+        #[rustfmt::skip]
+        let rows: &[Row] = &[
+            // upstreams, raw name,                       deny,  name sent,        upstreams asked,  namespace,          denied
+            // Docker Hub by each of its hosts
+            (&with_hub, "docker.io/library/nginx",            false, "library/nginx",  &hub,           Some("docker.io"),   false),
+            (&with_hub, "index.docker.io/library/nginx",      false, "library/nginx",  &hub,           Some("docker.io"),   false),
+            (&with_hub, "registry-1.docker.io/library/nginx", false, "library/nginx",  &hub,           Some("docker.io"),   false),
+            (&with_hub, "index.docker.io/library/nginx",      true,  "library/nginx",  &hub,           Some("docker.io"),   false),
+            // an upstream by the host of its url, whatever its namespace is, port or not
+            (&with_hub, "registry.gitlab.com/group/proj",     false, "group/proj",     &gitlab,        Some("gitlab.com"),  false),
+            (&with_hub, "gitlab.com/group/proj",              false, "group/proj",     &gitlab,        Some("gitlab.com"),  false),
+            (&with_hub, "quay.io/prometheus/node-exporter",   false, "prometheus/node-exporter", &quay, Some("quay"),       false),
+            (&with_hub, "registry.local/x/y",                 false, "x/y",            &local5000,     Some("local"),       false),
+            // a bound upstream is still named by its host
+            (&with_hub, "harbor.example/x/svc",               false, "x/svc",          &harbor,        Some("harbor.example"), false),
+            // a host no upstream serves: no upstream, local copies only; refused under deny
+            (&with_hub, "ghcr.io/requarks/wiki",              false, "requarks/wiki",  &none,          None,                false),
+            (&with_hub, "ghcr.io/team-a/svc",                 false, "team-a/svc",     &none,          None,                false),
+            (&with_hub, "ghcr.io/requarks/wiki",              true,  "requarks/wiki",  &none,          None,                true),
+            (&with_hub, "docker.io.evil/library/nginx",       false, "library/nginx",  &none,          None,                false),
+            // the chain is unchanged for bare names
+            (&with_hub, "library/nginx",                      false, "library/nginx",  &with_hub_chain, Some("gitlab.com"), false),
+            // Docker Hub with no upstream of its own: the chain, as a bare name, never the owner
+            (&no_hub,   "docker.io/library/alpine",           false, "library/alpine", &mirror,        Some("mirror.gcr.io"), false),
+            (&no_hub,   "index.docker.io/library/alpine",     false, "library/alpine", &mirror,        Some("mirror.gcr.io"), false),
+            (&no_hub,   "docker.io/team-a/svc",               false, "team-a/svc",     &mirror,        Some("mirror.gcr.io"), false),
+            (&no_hub,   "docker.io/library/alpine",           true,  "library/alpine", &mirror,        Some("mirror.gcr.io"), true),
+            (&no_hub,   "quay.io/library/alpine",             false, "library/alpine", &none,          None,                false),
+        ];
+        for &(upstreams, raw, deny, name, asked, ns, denied) in rows {
+            let cfg = if deny {
+                docker_config_deny(upstreams.to_vec())
+            } else {
+                docker_config_allow(upstreams.to_vec())
+            };
+            let c = super::canonicalize(raw, &cfg);
+            let urls: Vec<&str> = c
+                .upstreams_to_try(upstreams)
+                .iter()
+                .map(|u| u.url.as_str())
+                .collect();
+            assert_eq!(c.name, name, "{raw} deny={deny}: name");
+            assert_eq!(urls, asked, "{raw} deny={deny}: upstreams");
+            assert_eq!(c.namespace.as_deref(), ns, "{raw} deny={deny}: ns");
+            assert_eq!(c.denied, denied, "{raw} deny={deny}: denied");
+        }
     }
 
     #[test]
