@@ -40,8 +40,9 @@ pub struct DockerConfig {
     pub metadata_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
-    /// What to do when an image name doesn't match any upstream prefix.
-    /// `allow` (default) = fall through to first upstream; `deny` = reject with 403.
+    /// What to do with a name that no `prefix`, `namespaces` or registry host routes.
+    /// `allow` (default) = the fallback chain (upstreams without `namespaces`, in order);
+    /// `deny` = refuse with 403 `DENIED`.
     #[serde(default)]
     pub default_action: DefaultAction,
     #[serde(default = "default_docker_upstreams")]

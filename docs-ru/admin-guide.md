@@ -172,18 +172,22 @@ audience = "nora"   # в задании: core.getIDToken('nora') / id_tokens: �
 | `NORA_NPM_METADATA_TTL` | TTL кэша метаданных (секунды) | `300` |
 | `NORA_PYPI_PROXY` | URL PyPI-реестра | `https://pypi.org/simple/` |
 | `NORA_MAVEN_PROXIES` | Список Maven-репозиториев через запятую | `https://repo1.maven.org/maven2` |
-| `NORA_DOCKER_PROXIES` | Docker-реестры (quick start), формат: `url\|auth,url2` | `https://registry-1.docker.io` |
+| `NORA_DOCKER_PROXIES` | Docker-реестры (quick start), через запятую `url\|auth\|prefix\|ns1;ns2` — поля после `url` необязательны | `https://registry-1.docker.io` |
+| `NORA_DOCKER_DEFAULT_ACTION` | Для имён, которые не направлены ни `prefix`, ни `namespaces`, ни хостом реестра: `allow` — цепочка upstreams без `namespaces` по порядку, `deny` — `403 DENIED` | `allow` |
 
 > **Рекомендация для production.** Для Docker-прокси с аутентификацией используйте `config.toml` вместо переменной окружения. Это позволяет хранить учётные данные отдельно (например, в Kubernetes Secret, смонтированном как файл) и упрощает ротацию токенов.
 >
 > ```toml
 > [[docker.upstreams]]
-> url = "https://registry-1.docker.io"
->
-> [[docker.upstreams]]
 > url = "https://private.registry.io"
 > auth = "user:token"
+> namespaces = ["team-*"]   # team-a/service — только отсюда
+>
+> [[docker.upstreams]]
+> url = "https://registry-1.docker.io"
 > ```
+>
+> Приватный реестр без `namespaces` стоит в общей цепочке: имя, которого в нём нет или на которое он ответил `401`, будет взято у следующего upstream — например, одноимённый образ с Docker Hub. `namespaces` отдаёт имена с этим первым сегментом только приватному реестру, его ответ окончательный. Подробнее — раздел «Маршрутизация» страницы Docker-прокси в документации.
 
 ### 3.4. Ограничение частоты запросов
 
