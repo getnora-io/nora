@@ -8,10 +8,10 @@ use crate::circuit_breaker::{upstream_key, CircuitBreakerRegistry, ProbeToken};
 use crate::config::basic_auth_header;
 use crate::proxy_coalesce::Flight;
 use crate::registry::docker_auth::{DockerAuth, TokenError};
-use crate::registry::{circuit_open_response, method_not_allowed, ProxyError, UpstreamMiss};
 use crate::registry::{
     content_length, sha256_of_file, stream_body_to_file, StreamOutcome, TempFileGuard,
 };
+use crate::registry::{method_not_allowed, ProxyError, UpstreamMiss};
 use crate::secrets::expose_opt;
 use crate::storage::Storage;
 use crate::validation::{
@@ -1428,9 +1428,8 @@ async fn download_blob(
                         Some(FillStartError::Spool) => {
                             return StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
-                        Some(FillStartError::Upstream(ProxyError::CircuitOpen(reg))) => {
-                            return circuit_open_response(&reg)
-                        }
+                        // An open breaker skips this upstream for the next, as a failure
+                        // does (#1198).
                         Some(FillStartError::Upstream(e)) => {
                             tracing::debug!(error = ?e, upstream = %upstream.url, name = %try_name, "Docker blob proxy fetch failed, trying next");
                             miss.record(&e);
@@ -2203,7 +2202,7 @@ async fn try_fetch_and_cache(
 
                 return Some(manifest_response(data, content_type, digest));
             }
-            Err(ProxyError::CircuitOpen(reg)) => return Some(circuit_open_response(&reg)),
+            // An open breaker skips this upstream for the next, as a failure does (#1198).
             Err(e) => {
                 tracing::debug!(error = ?e, upstream = %upstream.url, name = %upstream_name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
                 miss.record(&e);
@@ -6071,6 +6070,178 @@ mod integration_tests {
             let resp = send(&ctx.app, Method::GET, &uris[0], Body::empty()).await;
             assert_eq!(resp.status(), want);
         }
+    }
+
+    /// An upstream of `upstreams` (url, namespaces it owns) per entry, unauthenticated.
+    fn upstreams_of(entries: Vec<(String, Vec<String>)>) -> Vec<crate::config::DockerUpstream> {
+        entries
+            .into_iter()
+            .map(|(url, namespaces)| crate::config::DockerUpstream {
+                url,
+                auth: None,
+                namespace: None,
+                prefix: None,
+                namespaces,
+            })
+            .collect()
+    }
+
+    /// #1198: in the fallback chain an upstream whose breaker is open is skipped, not asked, and
+    /// the next one serves the manifest and its blob.
+    #[tokio::test]
+    async fn an_open_upstream_is_skipped_for_the_next() {
+        use crate::circuit_breaker::upstream_key;
+        use wiremock::matchers::{any, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        let manifest =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#.to_vec();
+        let (skipped, serving) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&skipped)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myorg/app/manifests/1.0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(manifest.clone()),
+            )
+            .mount(&serving)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/myorg/app/blobs/{blob}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"layer".to_vec()))
+            .mount(&serving)
+            .await;
+        let entries = vec![(skipped.uri(), Vec::new()), (serving.uri(), Vec::new())];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.docker.upstreams = upstreams_of(entries);
+        });
+        ctx.state
+            .circuit_breaker
+            .open_for_test(&upstream_key("docker", &skipped.uri()));
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/myorg/app/manifests/1.0",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), manifest.as_slice());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/myorg/app/blobs/{blob}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), b"layer");
+    }
+
+    /// #1198: a name bound to one upstream has no next upstream; its open breaker is a 503, and
+    /// the chain is not asked in its place.
+    #[tokio::test]
+    async fn a_bound_name_behind_an_open_breaker_is_503() {
+        use crate::circuit_breaker::upstream_key;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let (owner, chain) = (MockServer::start().await, MockServer::start().await);
+        for server in [&owner, &chain] {
+            Mock::given(any())
+                .respond_with(ResponseTemplate::new(200))
+                .expect(0)
+                .mount(server)
+                .await;
+        }
+        let entries = vec![
+            (chain.uri(), Vec::new()),
+            (owner.uri(), vec!["team-*".to_string()]),
+        ];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.docker.upstreams = upstreams_of(entries);
+        });
+        ctx.state
+            .circuit_breaker
+            .open_for_test(&upstream_key("docker", &owner.uri()));
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team-a/service/manifests/1.0",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(resp.headers().get("retry-after").is_some());
+    }
+
+    /// #1198: a cached tag whose revalidation found its upstream skipped is served stale, as when
+    /// the upstream failed.
+    #[tokio::test]
+    async fn an_open_upstream_leaves_the_stale_manifest_served() {
+        use crate::circuit_breaker::upstream_key;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let manifest =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#.to_vec();
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(manifest.clone()),
+            )
+            .expect(1)
+            .mount(&upstream)
+            .await;
+        let entries = vec![(upstream.uri(), Vec::new())];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.docker.upstreams = upstreams_of(entries);
+        });
+        let uri = "/v2/myorg/app/manifests/1.0";
+        let resp = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The copy is written in the background: wait for it, with a deadline.
+        let mut cached = false;
+        for _ in 0..200 {
+            if ctx
+                .state
+                .storage
+                .list("docker/")
+                .await
+                .is_ok_and(|keys| !keys.is_empty())
+            {
+                cached = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(cached, "the manifest was not cached");
+
+        ctx.state
+            .circuit_breaker
+            .open_for_test(&upstream_key("docker", &upstream.uri()));
+        let resp = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
+            Some(b"true".as_slice())
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), manifest.as_slice());
     }
 
     /// A locally pushed manifest is authoritative: with global pull-through upstreams
