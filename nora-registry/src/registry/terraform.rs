@@ -1096,7 +1096,7 @@ async fn mirror_provider_version(
             // the list would be incomplete, and a client on that platform would read
             // "not supported" from an outage.
             Err(ArchiveMiss::Upstream(e)) => {
-                incomplete |= UpstreamMiss::of(&e).status() == StatusCode::BAD_GATEWAY
+                incomplete |= UpstreamMiss::of(&e).status().is_server_error()
             }
             Err(ArchiveMiss::Unreadable(response)) => unreadable = Some(response),
         }
@@ -2996,6 +2996,30 @@ mod upstream_failure_edge_cases {
             )
             .await
             .unwrap();
+        let resp = send(&ctx.app, Method::GET, MIRROR, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// `versions.json` is cached and the breaker is open: the platform was not described, which
+    /// is 502, not a list that leaves it out.
+    #[tokio::test]
+    async fn mirror_platform_behind_an_open_breaker_is_502() {
+        let versions = r#"{"versions":[{"version":"3.2.3","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"}]}]}"#;
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".into());
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.reset_timeout = 3600;
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/hashicorp/null/versions.json",
+                versions.as_bytes(),
+            )
+            .await
+            .unwrap();
+        ctx.state.circuit_breaker.open_for_test("terraform");
         let resp = send(&ctx.app, Method::GET, MIRROR, "").await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }

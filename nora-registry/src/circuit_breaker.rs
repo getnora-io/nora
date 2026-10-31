@@ -51,7 +51,7 @@ fn registry_of(key: &str) -> &str {
 
 /// Breaker keys whose `nora_circuit_breaker_state` series is exported at
 /// startup (#441): one per configured upstream for the formats keyed per
-/// upstream (Docker, PyPI, npm), the format name for every other format. A format
+/// upstream (Docker, PyPI, npm, Maven), the format name for every other format. A format
 /// keyed per upstream gets no format-named series — it would sit at 0 (closed)
 /// forever while the real state moves on the per-upstream series.
 pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> {
@@ -78,6 +78,13 @@ pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> 
                     .upstream_urls()
                     .into_iter()
                     .map(|url| upstream_key(rt.as_str(), url)),
+            ),
+            RegistryType::Maven => keys.extend(
+                config
+                    .maven
+                    .proxies
+                    .iter()
+                    .map(|proxy| upstream_key(rt.as_str(), proxy.url())),
             ),
             _ => keys.push(rt.as_str().to_string()),
         }
@@ -317,6 +324,17 @@ impl CircuitBreakerRegistry {
         let mut keys: Vec<String> = self.breakers.read().keys().cloned().collect();
         keys.sort();
         keys
+    }
+
+    /// Open `key`'s breaker now, as `failure_threshold` failures in a row would.
+    #[cfg(test)]
+    pub(crate) fn open_for_test(&self, key: &str) {
+        let mut breakers = self.breakers.write();
+        let breaker = breakers
+            .entry(key.to_string())
+            .or_insert_with(BreakerInner::new);
+        breaker.state = BreakerState::Open;
+        breaker.last_failure = Some(Instant::now());
     }
 
     /// Backdate `key`'s last failure past any reset timeout, so the next
@@ -993,12 +1011,16 @@ mod tests {
         assert!(cb.health_snapshot("py").is_none(), "format matched whole");
     }
 
-    /// Startup series: per configured upstream for Docker, PyPI and npm, the format
+    /// Startup series: per configured upstream for Docker, PyPI, npm and Maven, the format
     /// name for the rest — never a format-named series that cannot move.
     #[test]
     fn initial_gauge_keys_follow_the_breaker_keys() {
         let mut config = crate::config::Config::default();
         config.pypi.proxy = Some("https://pypi.org/simple/".into());
+        config.maven.proxies = vec![
+            crate::config::MavenProxyEntry::Simple("https://repo1.maven.org/maven2/".into()),
+            crate::config::MavenProxyEntry::Simple("https://nora.example/maven2".into()),
+        ];
         config.docker.upstreams = vec![crate::config::DockerUpstream {
             url: "https://registry-1.docker.io".into(),
             auth: None,
@@ -1010,6 +1032,8 @@ mod tests {
         assert!(keys.contains(&"pypi:https://pypi.org/simple".to_string()));
         assert!(keys.contains(&"docker:https://registry-1.docker.io".to_string()));
         assert!(keys.contains(&"npm:https://registry.npmjs.org".to_string()));
+        assert!(keys.contains(&"maven:https://repo1.maven.org/maven2".to_string()));
+        assert!(keys.contains(&"maven:https://nora.example/maven2".to_string()));
         assert!(
             keys.contains(&"cargo".to_string()),
             "formats without per-upstream keys"
@@ -1017,7 +1041,7 @@ mod tests {
         assert!(
             !keys
                 .iter()
-                .any(|k| k == "pypi" || k == "docker" || k == "npm"),
+                .any(|k| k == "pypi" || k == "docker" || k == "npm" || k == "maven"),
             "{keys:?}"
         );
     }

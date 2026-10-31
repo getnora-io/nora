@@ -61,7 +61,7 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 
 `registry` on both is the breaker key: the format name (`cargo`, `go`, …), or
 `<format>:<upstream URL>` for formats with a breaker per configured upstream (Docker,
-PyPI and npm), credentials stripped — e.g. `pypi:https://pypi.org/simple`. Match a format
+PyPI, npm and Maven), credentials stripped — e.g. `pypi:https://pypi.org/simple`. Match a format
 with `registry=~"pypi(:.*)?"`, not `registry="pypi"`.
 
 ### Security
