@@ -294,7 +294,12 @@ async fn search_query(
             with_json(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
-        Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
+        Err(
+            ProxyError::CircuitOpen(_)
+            | ProxyError::Network(_)
+            | ProxyError::Upstream(_)
+            | ProxyError::CredentialsRefused,
+        ) => {
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
@@ -387,7 +392,12 @@ async fn autocomplete_query(
             with_json(rewritten.into_bytes())
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
-        Err(ProxyError::CircuitOpen(_) | ProxyError::Network(_) | ProxyError::Upstream(_)) => {
+        Err(
+            ProxyError::CircuitOpen(_)
+            | ProxyError::Network(_)
+            | ProxyError::Upstream(_)
+            | ProxyError::CredentialsRefused,
+        ) => {
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }

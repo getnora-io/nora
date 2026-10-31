@@ -824,7 +824,11 @@ async fn handle_request(
             Err(ProxyError::NotFound) => {}
             // The upstream is down or unreachable: a gateway failure, not a missing
             // package — npm retries a 502 and reports E502 instead of E404 (#1055).
-            Err(e @ (ProxyError::Upstream(_) | ProxyError::Network(_))) => {
+            Err(
+                e @ (ProxyError::Upstream(_)
+                | ProxyError::Network(_)
+                | ProxyError::CredentialsRefused),
+            ) => {
                 tracing::warn!(registry = "npm", path = %path, error = ?e, "npm upstream failed, returning 502");
                 return StatusCode::BAD_GATEWAY.into_response();
             }

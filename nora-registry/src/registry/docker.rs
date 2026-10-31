@@ -7,7 +7,7 @@ use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::{upstream_key, CircuitBreakerRegistry, ProbeToken};
 use crate::config::basic_auth_header;
 use crate::proxy_coalesce::Flight;
-use crate::registry::docker_auth::DockerAuth;
+use crate::registry::docker_auth::{DockerAuth, TokenError};
 use crate::registry::{circuit_open_response, method_not_allowed, ProxyError, UpstreamMiss};
 use crate::registry::{
     content_length, sha256_of_file, stream_body_to_file, StreamOutcome, TempFileGuard,
@@ -748,6 +748,27 @@ fn manifest_unknown_response(name: &str, reference: &str) -> Response {
         .into_response()
 }
 
+/// The answer to a Docker miss once every upstream was asked ([`UpstreamMiss::response`]). A
+/// 502 that an upstream's refusal of NORA's credentials caused says so in an OCI error body,
+/// so the client's log names the cause as NORA's does (#1196).
+fn docker_miss_response(miss: &UpstreamMiss, path: &str) -> Response {
+    let response = miss.response("docker", path);
+    if !miss.credentials_refused() {
+        return response;
+    }
+    (
+        response.status(),
+        Json(json!({
+            "errors": [{
+                "code": "DENIED",
+                "message": "an upstream registry refused NORA's credentials",
+                "detail": "the credentials NORA has for this upstream are wrong, lack pull access, or are not configured"
+            }]
+        })),
+    )
+        .into_response()
+}
+
 /// Build a 404 `BLOB_UNKNOWN` response per the OCI Distribution Spec.
 ///
 /// Companion to [`manifest_unknown_response`] for blobs; used for the internal-
@@ -1426,7 +1447,7 @@ async fn download_blob(
     for asked in &misses {
         miss.record_upstream(asked);
     }
-    miss.response("docker", &format!("{name}@{digest}"))
+    docker_miss_response(&miss, &format!("{name}@{digest}"))
 }
 
 /// 201 for a blob that is now present in `name`, in the shape `upload_blob`
@@ -2551,7 +2572,7 @@ async fn get_manifest(
     for asked in &misses {
         miss.record_upstream(asked);
     }
-    miss.response("docker", &format!("{name}:{reference}"))
+    docker_miss_response(&miss, &format!("{name}:{reference}"))
 }
 
 /// Serve a manifest from local cache with all required headers and side-effects.
@@ -3730,15 +3751,21 @@ struct BlobSource {
 enum BlobRequestError {
     /// Connection, TLS or header timeout: counts against the upstream's breaker.
     Network(String),
-    /// Upstream challenged for a token and the token server gave none.
-    Token,
+    /// Upstream answered 401 and no token came of it: refused, or the token server failed.
+    Token(TokenError),
 }
 
-impl From<BlobRequestError> for ProxyError {
-    fn from(e: BlobRequestError) -> Self {
+impl BlobSource {
+    /// The error for a blob request: a token failure is logged and told apart (#1196).
+    fn proxy_error(&self, e: BlobRequestError) -> ProxyError {
         match e {
             BlobRequestError::Network(reason) => ProxyError::Network(reason),
-            BlobRequestError::Token => ProxyError::Network("token fetch failed".into()),
+            BlobRequestError::Token(e) => token_error(
+                e,
+                &self.upstream_url,
+                &self.name,
+                self.basic_auth.as_deref(),
+            ),
         }
     }
 }
@@ -3779,6 +3806,7 @@ impl BlobSource {
                     self.basic_auth.as_deref(),
                 )
                 .await
+                .ok()
                 .map(|token| format!("Bearer {token}")),
             None => None,
         };
@@ -3802,7 +3830,7 @@ impl BlobSource {
                 self.basic_auth.as_deref(),
             )
             .await
-            .ok_or(BlobRequestError::Token)?;
+            .map_err(BlobRequestError::Token)?;
         self.send_once(Some(format!("Bearer {token}")), range_from)
             .await
     }
@@ -3847,7 +3875,9 @@ impl BlobSource {
             Err(BlobRequestError::Network(reason)) => {
                 return Err(FillFailure::Unavailable(ProxyError::Network(reason)))
             }
-            Err(e @ BlobRequestError::Token) => return Err(FillFailure::Refused(e.into())),
+            Err(e @ BlobRequestError::Token(_)) => {
+                return Err(FillFailure::Refused(self.proxy_error(e)))
+            }
         };
         match response.status() {
             reqwest::StatusCode::PARTIAL_CONTENT => {
@@ -3967,9 +3997,9 @@ pub async fn open_blob_from_upstream(
         }
         // The registry answered (401) and the token server gave no token: an auth
         // issue, not the registry down — alive, as on resume (`FillFailure::Refused`).
-        Err(e @ BlobRequestError::Token) => {
+        Err(e @ BlobRequestError::Token(_)) => {
             cb.record_alive(&cb_key, probe);
-            return Err(e.into());
+            return Err(source.proxy_error(e));
         }
     };
 
@@ -4181,6 +4211,34 @@ pub async fn fetch_blob_from_upstream(
     spool_upstream_blob(blob, spool, read_timeout, cb, None).await
 }
 
+/// The error for a 401 that got no token. A refusal is logged with the upstream: its cause is
+/// the credential configured for that upstream, not an outage (#1196).
+fn token_error(
+    e: TokenError,
+    upstream_url: &str,
+    name: &str,
+    basic_auth: Option<&str>,
+) -> ProxyError {
+    match e {
+        TokenError::Refused if basic_auth.is_some() => {
+            tracing::warn!(upstream = %upstream_url, name, "upstream refused NORA's credentials");
+            ProxyError::CredentialsRefused
+        }
+        TokenError::Refused => {
+            tracing::warn!(
+                upstream = %upstream_url,
+                name,
+                "upstream requires credentials and none are configured for it"
+            );
+            ProxyError::CredentialsRefused
+        }
+        TokenError::Unavailable => {
+            tracing::error!(upstream = %upstream_url, name, "Failed to acquire token");
+            ProxyError::Network("token fetch failed".into())
+        }
+    }
+}
+
 /// Fetch a manifest from an upstream Docker registry
 /// Returns (manifest_bytes, content_type)
 #[allow(clippy::too_many_arguments)]
@@ -4241,28 +4299,30 @@ pub async fn fetch_manifest_from_upstream(
 
         tracing::debug!(www_auth = ?www_auth, "Got 401, fetching token");
 
-        if let Some(token) = docker_auth
+        match docker_auth
             .get_token(upstream_url, name, www_auth.as_deref(), basic_auth)
             .await
         {
-            tracing::debug!("Token acquired, retrying with auth");
-            client
-                .get(&url)
-                .header("Accept", accept_header)
-                .header("Authorization", format!("Bearer {}", token))
-                .send()
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "Failed to send authenticated request");
-                    cb.record_failure(&cb_key, probe);
-                    ProxyError::Network(e.to_string())
-                })?
-        } else {
-            tracing::error!("Failed to acquire token");
-            // The registry answered (401) and the token server gave no token: an auth
-            // issue, not the registry down — alive, so the probe is returned.
-            cb.record_alive(&cb_key, probe);
-            return Err(ProxyError::Network("token fetch failed".into()));
+            Ok(token) => {
+                tracing::debug!("Token acquired, retrying with auth");
+                client
+                    .get(&url)
+                    .header("Accept", accept_header)
+                    .header("Authorization", format!("Bearer {}", token))
+                    .send()
+                    .await
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "Failed to send authenticated request");
+                        cb.record_failure(&cb_key, probe);
+                        ProxyError::Network(e.to_string())
+                    })?
+            }
+            // The registry answered (401) and gave no token: an auth issue, not the
+            // registry down — alive, so the probe is returned.
+            Err(e) => {
+                cb.record_alive(&cb_key, probe);
+                return Err(token_error(e, upstream_url, name, basic_auth));
+            }
         }
     } else {
         response
@@ -5866,6 +5926,151 @@ mod integration_tests {
             .map(|r| r.url.path().to_string())
             .collect();
         assert!(asked.is_empty(), "Docker Hub was asked: {asked:?}");
+    }
+
+    /// #1196: an upstream that will not let NORA in answers with one status whatever its
+    /// challenge scheme — 502 with an OCI `DENIED` body that names the refused credential — and
+    /// is not an outage to the circuit breaker. A 401 that a token did not lift stays "not found":
+    /// Docker Hub answers a repository that does not exist that way (measured 31.10.2026).
+    #[tokio::test]
+    async fn an_upstream_that_refuses_noras_credentials_is_a_502_that_says_so() {
+        use crate::config::DockerUpstream;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        let uris = [
+            "/v2/project1/service1/manifests/1.0".to_string(),
+            format!("/v2/project1/service1/blobs/{blob}"),
+        ];
+        // challenge on /v2 (None = 401 without one); token server answer; credential; status;
+        // whether the answer names a refused credential
+        #[rustfmt::skip]
+        let rows: [(Option<&str>, Option<u16>, bool, StatusCode, bool); 8] = [
+            (Some("Basic realm=\"harbor\""), None,      true,  StatusCode::BAD_GATEWAY, true),
+            (Some("Basic realm=\"harbor\""), None,      false, StatusCode::BAD_GATEWAY, true),
+            (None,                           None,      true,  StatusCode::BAD_GATEWAY, true),
+            (Some("Bearer"),                 Some(401), true,  StatusCode::BAD_GATEWAY, true),
+            (Some("Bearer"),                 Some(403), false, StatusCode::BAD_GATEWAY, true),
+            (Some("Bearer"),                 Some(500), true,  StatusCode::BAD_GATEWAY, false),
+            // a token that does not lift the 401: the same as a missing repository on Docker Hub
+            (Some("Bearer"),                 Some(200), true,  StatusCode::NOT_FOUND,   false),
+            (Some("Bearer"),                 Some(200), false, StatusCode::NOT_FOUND,   false),
+        ];
+        for (challenge, token, credential, status, named) in rows {
+            let registry = MockServer::start().await;
+            let mut refusal = ResponseTemplate::new(401);
+            if let Some(challenge) = challenge {
+                let challenge = if challenge == "Bearer" {
+                    format!(
+                        "Bearer realm=\"{}/token\",service=\"registry\"",
+                        registry.uri()
+                    )
+                } else {
+                    challenge.to_string()
+                };
+                refusal = refusal.insert_header("Www-Authenticate", challenge.as_str());
+            }
+            if let Some(token) = token {
+                Mock::given(path("/token"))
+                    .respond_with(
+                        ResponseTemplate::new(token)
+                            .set_body_json(serde_json::json!({"token": "t"})),
+                    )
+                    .mount(&registry)
+                    .await;
+            }
+            Mock::given(method("GET"))
+                .respond_with(refusal)
+                .mount(&registry)
+                .await;
+            let registry_url = registry.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.circuit_breaker.enabled = true;
+                cfg.circuit_breaker.failure_threshold = 3;
+                cfg.docker.upstreams = vec![DockerUpstream {
+                    url: registry_url,
+                    auth: credential.then(|| "robot:secret".to_string().into()),
+                    namespace: None,
+                    prefix: None,
+                    namespaces: Vec::new(),
+                }];
+            });
+            let case = format!("{challenge:?} token={token:?} credential={credential}");
+            // Well past the breaker's threshold: a refusal never opens it (no 503).
+            for _ in 0..8 {
+                for uri in &uris {
+                    let resp = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+                    assert_eq!(resp.status(), status, "{case} {uri}");
+                    let body = body_bytes(resp).await;
+                    let error: serde_json::Value =
+                        serde_json::from_slice(&body).unwrap_or_default();
+                    assert_eq!(
+                        error["errors"][0]["code"] == "DENIED"
+                            && error["errors"][0]["message"]
+                                .as_str()
+                                .unwrap_or_default()
+                                .contains("refused NORA's credentials"),
+                        named,
+                        "{case} {uri}: {}",
+                        String::from_utf8_lossy(&body)
+                    );
+                }
+            }
+            let asked = registry
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|r| r.url.path().starts_with("/v2/"))
+                .count();
+            assert!(asked >= 16, "{case}: the upstream was asked {asked} times");
+        }
+
+        // In the fallback chain another upstream's answer still decides.
+        let refusing = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(401)
+                    .insert_header("Www-Authenticate", "Basic realm=\"harbor\""),
+            )
+            .mount(&refusing)
+            .await;
+        let (missing, serving) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let manifest =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#.to_vec();
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(manifest.clone()),
+            )
+            .mount(&serving)
+            .await;
+        for (second, want) in [
+            (missing.uri(), StatusCode::NOT_FOUND),
+            (serving.uri(), StatusCode::OK),
+        ] {
+            let first = refusing.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.docker.upstreams = [first, second]
+                    .into_iter()
+                    .map(|url| DockerUpstream {
+                        url,
+                        auth: Some("robot:secret".to_string().into()),
+                        namespace: None,
+                        prefix: None,
+                        namespaces: Vec::new(),
+                    })
+                    .collect();
+            });
+            let resp = send(&ctx.app, Method::GET, &uris[0], Body::empty()).await;
+            assert_eq!(resp.status(), want);
+        }
     }
 
     /// A locally pushed manifest is authoritative: with global pull-through upstreams
