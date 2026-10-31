@@ -125,7 +125,7 @@ impl Canonical {
         if self.denied {
             tracing::warn!(
                 name = %self.name,
-                "Docker request denied: image name did not match any configured upstream prefix"
+                "Docker request denied: no prefix, namespaces or registry host routes this name"
             );
             Some(
                 (
@@ -133,7 +133,7 @@ impl Canonical {
                     axum::Json(serde_json::json!({
                         "errors": [{
                             "code": "DENIED",
-                            "message": "image name does not match any configured upstream prefix",
+                            "message": "no upstream prefix, namespaces or registry host routes this image name",
                             "detail": "default_action is set to deny"
                         }]
                     })),
@@ -5445,6 +5445,89 @@ mod integration_tests {
             .map(|r| r.url.path().to_string())
             .collect();
         assert!(asked.is_empty(), "the public upstream was asked: {asked:?}");
+    }
+
+    /// Under `deny` a name that no prefix, namespaces or host routes is refused with `DENIED`
+    /// before any upstream is asked, and the refusal names what would have routed it; a bound
+    /// name is routed, so `deny` does not refuse it (#1188).
+    #[tokio::test]
+    async fn under_deny_an_unrouted_name_is_refused_and_a_bound_name_is_not() {
+        use crate::config::{DefaultAction, DockerUpstream};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let ct = "application/vnd.oci.image.manifest.v1+json";
+        let manifest =
+            br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#.to_vec();
+        let serving = || {
+            ResponseTemplate::new(200)
+                .insert_header("Content-Type", ct)
+                .set_body_bytes(manifest.clone())
+        };
+        let (hub, harbor) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(method("GET"))
+            .respond_with(serving())
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(serving())
+            .mount(&harbor)
+            .await;
+        let (hub_url, harbor_url) = (hub.uri(), harbor.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.default_action = DefaultAction::Deny;
+            cfg.docker.upstreams = vec![
+                DockerUpstream {
+                    url: hub_url,
+                    auth: None,
+                    namespace: Some("docker.io".to_string()),
+                    prefix: None,
+                    namespaces: Vec::new(),
+                },
+                DockerUpstream {
+                    url: harbor_url,
+                    auth: None,
+                    namespace: Some("harbor.example".to_string()),
+                    prefix: None,
+                    namespaces: vec!["team-*".to_string()],
+                },
+            ];
+        });
+
+        for uri in ["/v2/aquasec/trivy/manifests/1.0", "/v2/nginx/manifests/1.0"] {
+            let resp = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{uri}");
+            let body: serde_json::Value =
+                serde_json::from_slice(&body_bytes(resp).await).expect("an OCI error body");
+            let error = &body["errors"][0];
+            assert_eq!(error["code"], "DENIED", "{uri}");
+            let message = error["message"].as_str().unwrap_or_default();
+            for route in ["prefix", "namespaces", "host"] {
+                assert!(
+                    message.contains(route),
+                    "{uri}: {message:?} does not name {route}"
+                );
+            }
+        }
+        let asked = hub.received_requests().await.unwrap();
+        assert!(
+            asked.is_empty(),
+            "a refused name reached the upstream: {asked:?}"
+        );
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team-a/service/manifests/1.0",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a bound name is routed under deny"
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), manifest.as_slice());
     }
 
     /// #1188: the owner of a namespace is asked for the whole name, its copy is stored under its
