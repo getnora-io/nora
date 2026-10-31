@@ -202,6 +202,9 @@ pub(crate) enum ProxyError {
     Upstream(u16),
     Network(String),
     CircuitOpen(String),
+    /// The upstream answered and would not let NORA in: it refused the credential configured
+    /// for it, or asked for one and none is configured (#1196). Alive, not down.
+    CredentialsRefused,
 }
 
 /// The `Authorization` value for an upstream request, built before the breaker is
@@ -223,11 +226,14 @@ fn upstream_auth_header(
 /// the retry, unreachable, breaker open) it is a gateway failure: a client that records a
 /// 404 as "this artifact does not exist" (Maven) must not learn that from an outage.
 /// One upstream answering "not found" decides 404 while another failed, as a group
-/// repository skips a member that is down; with no upstream configured it is 404.
+/// repository skips a member that is down; with no upstream configured it is 404. An upstream
+/// that refused NORA's credentials did not say "not found" either: it fails the miss like an
+/// outage, and the answer says which it was (#1196).
 #[derive(Debug, Default)]
 pub(crate) struct UpstreamMiss {
     not_found: bool,
     failed: bool,
+    refused: bool,
 }
 
 impl UpstreamMiss {
@@ -240,7 +246,7 @@ impl UpstreamMiss {
 
     /// Record one upstream's answer. Any 4xx is an answer, even where a fetch reports it as
     /// `Upstream(4xx)` rather than `NotFound` (Docker manifests); 5xx, network errors and an
-    /// open breaker are failures.
+    /// open breaker are failures; a refused credential is its own kind.
     pub(crate) fn record(&mut self, e: &ProxyError) {
         match e {
             ProxyError::NotFound => self.not_found = true,
@@ -248,6 +254,7 @@ impl UpstreamMiss {
             ProxyError::Upstream(_) | ProxyError::Network(_) | ProxyError::CircuitOpen(_) => {
                 self.failed = true
             }
+            ProxyError::CredentialsRefused => self.refused = true,
         }
     }
 
@@ -260,26 +267,39 @@ impl UpstreamMiss {
     /// asks it for `alpine` and `library/alpine`): it said "not found" only if it failed
     /// under none of them, since a 4xx for one name says nothing about the other.
     pub(crate) fn record_upstream(&mut self, asked: &UpstreamMiss) {
-        if asked.failed {
-            self.failed = true;
+        if asked.failed || asked.refused {
+            self.failed |= asked.failed;
+            self.refused |= asked.refused;
         } else if asked.not_found {
             self.not_found = true;
         }
     }
 
-    /// The status for the miss: 502 when upstreams were asked and every one failed.
+    /// The status for the miss: 502 when upstreams were asked and every one failed or
+    /// refused NORA's credentials.
     pub(crate) fn status(&self) -> StatusCode {
-        if self.failed && !self.not_found {
+        if (self.failed || self.refused) && !self.not_found {
             StatusCode::BAD_GATEWAY
         } else {
             StatusCode::NOT_FOUND
         }
     }
 
+    /// Whether the miss is a 502 at least one of whose upstreams refused NORA's credentials.
+    pub(crate) fn credentials_refused(&self) -> bool {
+        self.refused && self.status() == StatusCode::BAD_GATEWAY
+    }
+
     /// The response for the miss, logging a gateway failure for the operator.
     pub(crate) fn response(&self, registry: &str, path: &str) -> Response {
         let status = self.status();
-        if status == StatusCode::BAD_GATEWAY {
+        if self.credentials_refused() {
+            tracing::warn!(
+                registry,
+                path,
+                "an upstream refused NORA's credentials and none answered, returning 502"
+            );
+        } else if status == StatusCode::BAD_GATEWAY {
             tracing::warn!(registry, path, "every upstream failed, returning 502");
         }
         status.into_response()
@@ -1250,6 +1270,53 @@ mod tests {
             folded(&[hub, asked(&[ProxyError::NotFound])]),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// #1196: an upstream that refused NORA's credentials did not say "not found": alone it is
+    /// a 502 that says so; another upstream's "not found" still decides 404, as for an outage.
+    #[test]
+    fn a_refused_credential_fails_the_miss_and_is_named() {
+        use axum::http::StatusCode;
+        let asked = |answers: &[ProxyError]| {
+            let mut m = UpstreamMiss::default();
+            for a in answers {
+                m.record(a);
+            }
+            m
+        };
+        let folded = |upstreams: &[UpstreamMiss]| {
+            let mut m = UpstreamMiss::default();
+            for u in upstreams {
+                m.record_upstream(u);
+            }
+            m
+        };
+        let refused = || ProxyError::CredentialsRefused;
+        let down = || ProxyError::Upstream(503);
+        #[rustfmt::skip]
+        let rows: &[(&[&[ProxyError]], StatusCode, bool)] = &[
+            // per upstream, the answers under each name it was asked; status; named refused
+            (&[&[refused()]],                                StatusCode::BAD_GATEWAY, true),
+            (&[&[refused(), refused()]],                     StatusCode::BAD_GATEWAY, true),
+            // one upstream, two names (library/): refused under one is not "not found"
+            (&[&[ProxyError::NotFound, refused()]],          StatusCode::BAD_GATEWAY, true),
+            (&[&[refused(), ProxyError::NotFound]],          StatusCode::BAD_GATEWAY, true),
+            // the chain: another upstream's "not found" decides
+            (&[&[refused()], &[ProxyError::NotFound]],       StatusCode::NOT_FOUND,   false),
+            (&[&[ProxyError::Upstream(404)], &[refused()]],  StatusCode::NOT_FOUND,   false),
+            // refused and down: a 502 that names the refusal
+            (&[&[refused()], &[down()]],                     StatusCode::BAD_GATEWAY, true),
+            (&[&[down()], &[refused()]],                     StatusCode::BAD_GATEWAY, true),
+            // no refusal: as before
+            (&[&[down()]],                                   StatusCode::BAD_GATEWAY, false),
+            (&[],                                            StatusCode::NOT_FOUND,   false),
+        ];
+        for (upstreams, status, named) in rows {
+            let each: Vec<UpstreamMiss> = upstreams.iter().map(|a| asked(a)).collect();
+            let miss = folded(&each);
+            assert_eq!(miss.status(), *status, "{upstreams:?}");
+            assert_eq!(miss.credentials_refused(), *named, "{upstreams:?}");
+        }
     }
 
     #[tokio::test]
