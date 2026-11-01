@@ -400,6 +400,7 @@ async fn handle_request(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path(path): Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
     // Handle npm whoami endpoint
@@ -456,7 +457,10 @@ async fn handle_request(
         return match classify_metadata_path(&path) {
             MetadataPath::Other => match dist_tags_package(&path) {
                 Some(name) => serve_dist_tags(&state, &headers, &path, name).await,
-                None => uncached_upstream_metadata(&state, &headers, &path, &package_name).await,
+                None => {
+                    let query = query.as_deref().filter(|q| !q.is_empty());
+                    uncached_upstream_metadata(&state, &headers, &path, &package_name, query).await
+                }
             },
             target => serve_metadata(&state, &headers, &path, target).await,
         };
@@ -1476,7 +1480,7 @@ async fn serve_dist_tags(
         Published::No => None,
     };
     let Some(packument) = own else {
-        return uncached_upstream_metadata(state, headers, path, name).await;
+        return uncached_upstream_metadata(state, headers, path, name, None).await;
     };
     let tags = serde_json::from_slice::<serde_json::Value>(&packument)
         .ok()
@@ -1905,14 +1909,16 @@ fn served_copy(state: &AppState, path: &str, data: Bytes) -> (Option<Bytes>, boo
     }
 }
 
-/// The document an upstream serves for `path`, for this request only: nothing is cached. Used
-/// for registry endpoints such as search, and for the dist-tags of a package NORA has not
-/// published.
+/// The document an upstream serves for `path` and the client's `query`, for this request only:
+/// nothing is cached. Used for registry endpoints such as search, and for the dist-tags of a
+/// package NORA has not published. The query goes as the client sent it (#1148), unless it
+/// names a private package (ADR-8, [`search_names_private`]).
 async fn uncached_upstream_metadata(
     state: &AppState,
     headers: &HeaderMap,
     path: &str,
     name: &str,
+    query: Option<&str>,
 ) -> Response {
     if let Some(response) = crate::curation::check_namespace_isolation(
         &state.curation().curation_engine,
@@ -1921,10 +1927,21 @@ async fn uncached_upstream_metadata(
     ) {
         return response;
     }
+    if query.is_some_and(|q| search_names_private(state, q)) {
+        return audit_refused(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "this search names an internal package or a scope of a private upstream; \
+             NORA does not send such names to the upstream",
+        );
+    }
     let Some(upstream) = state.config.npm.route(path) else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
+    let mut url = format!("{}/{}", upstream.url.trim_end_matches('/'), path);
+    if let Some(query) = query {
+        url.push('?');
+        url.push_str(query);
+    }
     match proxy_fetch(
         metadata_client(state, upstream.scoped),
         &url,
@@ -1943,6 +1960,46 @@ async fn uncached_upstream_metadata(
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::BAD_GATEWAY.into_response(),
     }
+}
+
+/// Whether a query names a package that must not reach the upstream: under a namespace filter
+/// or a scope owned by a private upstream, a word of any value (`text=react @corp/x`,
+/// `scope:corp`, `keywords:corp-x`) that is an internal name, or an owned scope. A value that
+/// does not decode as UTF-8 cannot be checked and counts as naming one (fail closed). With no
+/// filter and no owned scope, nothing is private.
+fn search_names_private(state: &AppState, query: &str) -> bool {
+    let engine = &state.curation().curation_engine;
+    let owned: Vec<&str> = state.config.npm.owned_scopes().collect();
+    if !crate::curation::namespace_filter_active(engine) && owned.is_empty() {
+        return false;
+    }
+    let internal = |name: &str| {
+        crate::curation::is_internal_namespace(engine, crate::curation::RegistryType::Npm, name)
+    };
+    let scope_is_private =
+        |scope: &str| owned.contains(&scope) || internal(&format!("{scope}/x")) || internal(scope);
+    query.split('&').any(|pair| {
+        let value = pair
+            .split_once('=')
+            .map_or("", |(_, v)| v)
+            .replace('+', " ");
+        let Ok(value) = percent_encoding::percent_decode_str(&value).decode_utf8() else {
+            return true;
+        };
+        value.split_whitespace().any(|word| {
+            let (qualifier, term) = word.split_once(':').unwrap_or(("", word));
+            if qualifier == "scope" {
+                let scope = format!("@{}", term.trim_start_matches('@'));
+                return scope_is_private(&scope);
+            }
+            let scope = if term.starts_with('@') {
+                term.split('/').next()
+            } else {
+                None
+            };
+            internal(term) || scope.is_some_and(scope_is_private)
+        })
+    })
 }
 
 /// [`packument_response`] for a cached upstream document, as [`served_copy`] has it; 404 for a
@@ -8739,6 +8796,108 @@ mod published_and_upstream_keys {
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert!(ctx.state.storage.list("npm/").await.unwrap().is_empty());
         assert_eq!(server.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// #1148: a search reaches the upstream with the query the client sent, encoding kept, so
+    /// `npm search` through NORA returns what the upstream finds; a request without a query is
+    /// sent without one.
+    #[tokio::test]
+    async fn a_search_reaches_the_upstream_with_its_query() {
+        use wiremock::matchers::query_param;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/-/v1/search"))
+            .and(query_param("text", "@types/node"))
+            .and(query_param("size", "20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"objects": [{"package": {"name": "@types/node"}}], "total": 1}),
+            ))
+            .mount(&server)
+            .await;
+        // registry.npmjs.org without `text`: 400 'text' query parameter is required
+        Mock::given(method("GET"))
+            .and(path("/-/v1/search"))
+            .respond_with(ResponseTemplate::new(400))
+            .mount(&server)
+            .await;
+        let ctx = context(&server, 3600);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/-/v1/search?text=%40types%2Fnode&size=20",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(String::from_utf8_lossy(&body_bytes(resp).await).contains("@types/node"));
+        let asked = server.received_requests().await.unwrap();
+        assert_eq!(asked[0].url.query(), Some("text=%40types%2Fnode&size=20"));
+        let resp = send(&ctx.app, Method::GET, "/npm/-/v1/search", "").await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let asked = server.received_requests().await.unwrap();
+        assert_eq!(asked[1].url.query(), None);
+    }
+
+    /// #1148, ADR-8: a search that names an internal package or a scope owned by a private
+    /// upstream is refused with the reason and never sent to the upstream, as an audit that
+    /// carries such names is; any other search is sent.
+    #[tokio::test]
+    async fn a_search_naming_a_private_package_is_refused_and_not_sent() {
+        use crate::config::NpmConfig;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"objects": []})),
+            )
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            let npm: NpmConfig = toml::from_str(&format!(
+                r#"proxies = ["{uri}", {{ url = "{uri}/private", scopes = ["@vendor"] }}]"#
+            ))
+            .unwrap();
+            cfg.npm.proxies = npm.proxies;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.internal_namespaces =
+                vec!["@internal/*".to_string(), "corp-*".to_string()];
+        });
+        // (query, refused)
+        let rows: [(&str, bool); 11] = [
+            ("text=%40internal%2Fsecret", true),
+            ("text=react+%40internal%2Fsecret", true),
+            ("text=corp-billing", true),
+            ("text=scope%3Ainternal", true),
+            ("text=%40vendor%2Ftool", true),
+            ("text=scope%3Avendor+cli", true),
+            ("text=%40vendor", true),
+            ("text=lodash&size=20", false),
+            ("text=corporate", false),
+            ("text=keywords%3Acorp-billing", true),
+            // cannot be decoded, so cannot be checked
+            ("text=%FF", true),
+        ];
+        for (query, refused) in rows {
+            let before = server.received_requests().await.unwrap().len();
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/npm/-/v1/search?{query}"),
+                "",
+            )
+            .await;
+            let status = resp.status();
+            let body = String::from_utf8_lossy(&body_bytes(resp).await).to_string();
+            let sent = server.received_requests().await.unwrap().len() - before;
+            if refused {
+                assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{query}");
+                assert!(body.contains("\"error\""), "{query}: {body}");
+                assert_eq!(sent, 0, "{query} reached the upstream");
+            } else {
+                assert_eq!(status, StatusCode::OK, "{query}");
+                assert_eq!(sent, 1, "{query}");
+            }
+        }
     }
 
     /// A published version whose document cannot be read is neither dropped from the packument
