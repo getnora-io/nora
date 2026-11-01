@@ -298,6 +298,14 @@ impl UpstreamMiss {
         }
     }
 
+    /// The breaker key of the first upstream skipped for its open breaker, when that made the
+    /// miss a 503.
+    pub(crate) fn open_key(&self) -> Option<&str> {
+        self.open
+            .as_deref()
+            .filter(|_| self.status() == StatusCode::SERVICE_UNAVAILABLE)
+    }
+
     /// Whether the miss is a 502 at least one of whose upstreams refused NORA's credentials.
     pub(crate) fn credentials_refused(&self) -> bool {
         self.refused && self.status() == StatusCode::BAD_GATEWAY

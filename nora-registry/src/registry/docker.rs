@@ -748,25 +748,55 @@ fn manifest_unknown_response(name: &str, reference: &str) -> Response {
         .into_response()
 }
 
-/// The answer to a Docker miss once every upstream was asked ([`UpstreamMiss::response`]). A
-/// 502 that an upstream's refusal of NORA's credentials caused says so in an OCI error body,
-/// so the client's log names the cause as NORA's does (#1196).
-fn docker_miss_response(miss: &UpstreamMiss, path: &str) -> Response {
-    let response = miss.response("docker", path);
-    if !miss.credentials_refused() {
-        return response;
-    }
-    (
-        response.status(),
-        Json(json!({
-            "errors": [{
-                "code": "DENIED",
-                "message": "an upstream registry refused NORA's credentials",
-                "detail": "the credentials NORA has for this upstream are wrong, lack pull access, or are not configured"
-            }]
-        })),
-    )
-        .into_response()
+/// What a Docker miss was asked for, to name it in the OCI error.
+enum Missed<'a> {
+    Manifest { name: &'a str, reference: &'a str },
+    Blob { name: &'a str, digest: &'a str },
+}
+
+/// The answer to a Docker miss once every upstream was asked ([`UpstreamMiss::response`] decides
+/// the status and logs it), with the OCI error body a client prints (#1189): a manifest or blob no
+/// upstream has is `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN`, as a hosted miss answers; an upstream that
+/// failed or was skipped for its open breaker is `UNAVAILABLE`; a refusal of NORA's credentials
+/// is `DENIED` (#1196). Headers the status carries (`Retry-After` of a 503) are kept.
+fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
+    let path = match missed {
+        Missed::Manifest { name, reference } => format!("{name}:{reference}"),
+        Missed::Blob { name, digest } => format!("{name}@{digest}"),
+    };
+    let response = miss.response("docker", &path);
+    let status = response.status();
+    let (code, message, detail) = if miss.credentials_refused() {
+        (
+            "DENIED",
+            "an upstream registry refused NORA's credentials".to_string(),
+            json!("the credentials NORA has for this upstream are wrong, lack pull access, or are not configured"),
+        )
+    } else if status == StatusCode::NOT_FOUND {
+        return match missed {
+            Missed::Manifest { name, reference } => manifest_unknown_response(name, reference),
+            Missed::Blob { digest, .. } => blob_unknown_response(digest),
+        };
+    } else if let Some(key) = miss.open_key() {
+        (
+            "UNAVAILABLE",
+            format!("upstream {key} temporarily unavailable"),
+            json!("its circuit breaker is open; retry after the Retry-After interval"),
+        )
+    } else {
+        (
+            "UNAVAILABLE",
+            "every upstream registry failed to answer".to_string(),
+            json!("the upstream answered 5xx, timed out or could not be reached; see NORA's log"),
+        )
+    };
+    let (mut parts, _) = response.into_parts();
+    parts.headers.remove(header::CONTENT_LENGTH);
+    parts.headers.remove(header::CONTENT_TYPE);
+    let body = Json(json!({
+        "errors": [{ "code": code, "message": message, "detail": detail }]
+    }));
+    (parts, body).into_response()
 }
 
 /// Build a 404 `BLOB_UNKNOWN` response per the OCI Distribution Spec.
@@ -1446,7 +1476,13 @@ async fn download_blob(
     for asked in &misses {
         miss.record_upstream(asked);
     }
-    docker_miss_response(&miss, &format!("{name}@{digest}"))
+    docker_miss_response(
+        &miss,
+        Missed::Blob {
+            name: &name,
+            digest: &digest,
+        },
+    )
 }
 
 /// 201 for a blob that is now present in `name`, in the shape `upload_blob`
@@ -2571,7 +2607,13 @@ async fn get_manifest(
     for asked in &misses {
         miss.record_upstream(asked);
     }
-    docker_miss_response(&miss, &format!("{name}:{reference}"))
+    docker_miss_response(
+        &miss,
+        Missed::Manifest {
+            name: &name,
+            reference: &reference,
+        },
+    )
 }
 
 /// Serve a manifest from local cache with all required headers and side-effects.
@@ -6242,6 +6284,144 @@ mod integration_tests {
             Some(b"true".as_slice())
         );
         assert_eq!(body_bytes(resp).await.as_ref(), manifest.as_slice());
+    }
+
+    /// #1189: every miss on the proxy path answers an OCI error body with
+    /// `Content-Type: application/json`, so a client prints the reason instead of `unknown:`. A
+    /// missing manifest or blob is the `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN` a hosted miss
+    /// answers; a failed or skipped upstream is `UNAVAILABLE`; a refused credential stays
+    /// `DENIED` (#1196). The table is pinned in a snapshot.
+    #[tokio::test]
+    async fn a_proxied_miss_is_an_oci_error() {
+        use crate::circuit_breaker::upstream_key;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        let manifest = "/v2/myorg/app/manifests/9.9".to_string();
+        let layer = format!("/v2/myorg/app/blobs/{blob}");
+        // (row, upstream answer, path, status, OCI code)
+        let rows: [(&str, Option<u16>, &String, StatusCode, &str); 8] = [
+            (
+                "manifest-404",
+                Some(404),
+                &manifest,
+                StatusCode::NOT_FOUND,
+                "MANIFEST_UNKNOWN",
+            ),
+            (
+                "blob-404",
+                Some(404),
+                &layer,
+                StatusCode::NOT_FOUND,
+                "BLOB_UNKNOWN",
+            ),
+            (
+                "manifest-503",
+                Some(503),
+                &manifest,
+                StatusCode::BAD_GATEWAY,
+                "UNAVAILABLE",
+            ),
+            (
+                "blob-503",
+                Some(503),
+                &layer,
+                StatusCode::BAD_GATEWAY,
+                "UNAVAILABLE",
+            ),
+            (
+                "manifest-unreachable",
+                None,
+                &manifest,
+                StatusCode::BAD_GATEWAY,
+                "UNAVAILABLE",
+            ),
+            (
+                "manifest-breaker-open",
+                Some(200),
+                &manifest,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "UNAVAILABLE",
+            ),
+            (
+                "manifest-refused",
+                Some(401),
+                &manifest,
+                StatusCode::BAD_GATEWAY,
+                "DENIED",
+            ),
+            (
+                "unknown-host",
+                Some(200),
+                &"/v2/quay.io/myorg/app/manifests/9.9".to_string(),
+                StatusCode::NOT_FOUND,
+                "MANIFEST_UNKNOWN",
+            ),
+        ];
+        let mut pinned = Vec::new();
+        for (row, answer, uri, status, code) in rows {
+            let server = MockServer::start().await;
+            let mut template = ResponseTemplate::new(answer.unwrap_or(500));
+            if answer == Some(401) {
+                template = template.insert_header("Www-Authenticate", "Basic realm=\"harbor\"");
+            }
+            Mock::given(any())
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            let url = if answer.is_some() {
+                server.uri()
+            } else {
+                "http://127.0.0.1:9".to_string()
+            };
+            let key = upstream_key("docker", &url);
+            let open = row.ends_with("breaker-open");
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.circuit_breaker.enabled = open;
+                cfg.circuit_breaker.reset_timeout = 3600;
+                cfg.docker.proxy_timeout = 1;
+                cfg.docker.upstreams = vec![crate::config::DockerUpstream {
+                    url,
+                    auth: None,
+                    namespace: None,
+                    prefix: None,
+                    namespaces: Vec::new(),
+                }];
+            });
+            if open {
+                ctx.state.circuit_breaker.open_for_test(&key);
+            }
+            let resp = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+            let got = resp.status();
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let retry_after = resp.headers().get("retry-after").is_some();
+            let body: serde_json::Value =
+                serde_json::from_slice(&body_bytes(resp).await).unwrap_or(serde_json::Value::Null);
+            assert_eq!(got, status, "{row}");
+            assert_eq!(body["errors"][0]["code"], code, "{row}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{row}: {content_type}"
+            );
+            assert_eq!(retry_after, got == StatusCode::SERVICE_UNAVAILABLE, "{row}");
+            // the upstream URL carries a random port: pin the key's shape, not the port
+            let mut body = body;
+            if let Some(m) = body["errors"][0]["message"].as_str() {
+                body["errors"][0]["message"] =
+                    serde_json::Value::from(m.replace(&key, "docker:<upstream>"));
+            }
+            pinned.push(serde_json::json!({
+                "row": row, "status": got.as_u16(), "content_type": content_type,
+                "retry_after": retry_after, "body": body,
+            }));
+        }
+        insta::assert_json_snapshot!("docker_proxied_miss_oci_errors", pinned);
     }
 
     /// A locally pushed manifest is authoritative: with global pull-through upstreams
