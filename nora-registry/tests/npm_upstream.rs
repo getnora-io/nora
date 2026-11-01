@@ -121,12 +121,14 @@ fn upstream(answer: impl Fn(&str) -> String + Send + 'static) -> Upstream {
                 .next()
                 .unwrap_or("")
                 .to_string();
-            let _ = stream.write_all(answer(&line).as_bytes());
+            // Kept before the answer goes out: the test reads the log once NORA has answered,
+            // which can be before this thread runs again.
             let authorized = head.lines().any(|h| h.starts_with("authorization:"));
             log.lock().unwrap().push(format!(
                 "{line}{}",
                 if authorized { " +authorization" } else { "" }
             ));
+            let _ = stream.write_all(answer(&line).as_bytes());
         }
     });
     Upstream { port, seen }
