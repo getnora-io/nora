@@ -706,17 +706,20 @@ async fn module_download(
     );
     let (cached, read_failure) =
         crate::registry::cached_read(state.storage.get(&source_url_key).await);
+    // Only an archive source is stored. One an older release stored for a git source (the
+    // repository address, prefix stripped) names no archive: the upstream is asked again (#1209).
     if let Some(data) = cached {
-        let original_url = String::from_utf8_lossy(&data);
-        let rewritten =
-            rewrite_module_source_url(&original_url, &base_url, &ns, &name, &provider, &ver);
-        state.metrics.record_download("terraform");
-        state.metrics.record_cache_hit("terraform");
-        return (
-            StatusCode::NO_CONTENT,
-            [("x-terraform-get", rewritten.as_str())],
-        )
-            .into_response();
+        let stored = String::from_utf8_lossy(&data);
+        let rewritten = rewrite_module_source_url(&stored, &base_url, &ns, &name, &provider, &ver);
+        if rewritten != stored {
+            state.metrics.record_download("terraform");
+            state.metrics.record_cache_hit("terraform");
+            return (
+                StatusCode::NO_CONTENT,
+                [("x-terraform-get", rewritten.as_str())],
+            )
+                .into_response();
+        }
     }
 
     if internal {
@@ -769,17 +772,13 @@ async fn module_download(
                 "PROXY",
             ));
 
-            // Rewrite X-Terraform-Get to point through NORA (air-gap safe)
+            // An archive source goes through NORA (air-gap safe); anything else is the
+            // client's to fetch, and nothing is stored for it (#1209).
             let rewritten =
                 rewrite_module_source_url(&original_url, &base_url, &ns, &name, &provider, &ver);
-
-            // Cache the inner URL (stripping VCS prefix like git::) for module_source_download
-            let (_, inner_url) = strip_vcs_prefix(&original_url);
-            state.spawn_cache(
-                "terraform",
-                source_url_key,
-                Bytes::from(inner_url.to_string()),
-            );
+            if rewritten != original_url {
+                state.spawn_cache("terraform", source_url_key, Bytes::from(original_url));
+            }
 
             (
                 StatusCode::NO_CONTENT,
@@ -890,7 +889,8 @@ async fn module_source_download(
         ns, name, provider, ver
     );
     let upstream_url = match state.storage.get(&source_url_key).await {
-        Ok(data) => String::from_utf8_lossy(&data).to_string(),
+        // The stored address may carry a `//subdir`: that is the client's, not part of the URL.
+        Ok(data) => split_subdir(&String::from_utf8_lossy(&data)).0,
         Err(_) => {
             return StatusCode::NOT_FOUND.into_response();
         }
@@ -912,6 +912,16 @@ async fn module_source_download(
     )
     .await
     {
+        // A web page (a repository's) is no module: not served, not cached as one (#1209).
+        Ok(bytes) if !looks_like_archive(&bytes) => {
+            tracing::warn!(
+                module = %format!("{ns}/{name}/{provider}"),
+                version = %ver,
+                url = %upstream_url,
+                "module source is not an archive, not served or cached"
+            );
+            StatusCode::BAD_GATEWAY.into_response()
+        }
         Ok(bytes) => {
             state.metrics.record_download("terraform");
             state.metrics.record_cache_miss("terraform");
@@ -1701,12 +1711,11 @@ fn rewrite_download_url(
     }
 }
 
-/// Rewrite X-Terraform-Get URL to point through NORA.
-///
-/// HTTP/HTTPS URLs are rewritten to NORA's module source proxy endpoint.
-/// VCS-prefixed URLs like `git::https://...` have their inner URL extracted
-/// and rewritten (the VCS prefix is dropped since NORA proxies via HTTP).
-/// Non-HTTP URLs (s3::, ssh://, relative paths) are returned as-is.
+/// The `X-Terraform-Get` NORA answers for the source the upstream named (#1209). An HTTP source
+/// that names an archive goes through NORA's module source endpoint, with `archive=<kind>` so
+/// go-getter unpacks it and its `//subdir` kept. Anything else — a VCS source (`git::`, `hg::`),
+/// a non-HTTP one (`s3::`, `ssh://`, a relative path), or an HTTP address nothing marks as an
+/// archive — is answered unchanged, for the client to fetch itself.
 fn rewrite_module_source_url(
     original_url: &str,
     base_url: &str,
@@ -1715,29 +1724,30 @@ fn rewrite_module_source_url(
     provider: &str,
     ver: &str,
 ) -> String {
+    // A VCS source (git::, hg::) or any non-HTTP one is the client's to fetch: NORA cannot
+    // serve a repository as an archive (#1209: it served the repository's web page).
     let (vcs_prefix, inner_url) = strip_vcs_prefix(original_url);
-
-    if inner_url.starts_with("http://") || inner_url.starts_with("https://") {
-        if !vcs_prefix.is_empty() {
-            tracing::warn!(
-                module = %format!("{}/{}/{}", ns, name, provider),
-                version = %ver,
-                vcs = vcs_prefix.trim_end_matches("::"),
-                "Module uses VCS prefix — source download via HTTP proxy may not work"
-            );
-        }
-        format!(
-            "{}/terraform/v1/modules/download/{}/{}/{}/{}/source",
-            base_url.trim_end_matches('/'),
-            ns,
-            name,
-            provider,
-            ver
-        )
-    } else {
-        // s3::, ssh://, relative paths — pass through as-is
-        original_url.to_string()
+    if !vcs_prefix.is_empty()
+        || !(inner_url.starts_with("http://") || inner_url.starts_with("https://"))
+    {
+        return original_url.to_string();
     }
+    let (source, subdir) = split_subdir(inner_url);
+    // An HTTP address nothing marks as an archive may be anything (go-getter asks it for an
+    // X-Terraform-Get of its own): the client follows it itself.
+    let Some(kind) = archive_kind(&source) else {
+        return original_url.to_string();
+    };
+    format!(
+        "{}/terraform/v1/modules/download/{}/{}/{}/{}/source{}?archive={}",
+        base_url.trim_end_matches('/'),
+        ns,
+        name,
+        provider,
+        ver,
+        subdir.map(|sub| format!("//{sub}")).unwrap_or_default(),
+        kind
+    )
 }
 
 /// Strip internal `_nora_*` fields from cached metadata before sending to clients.
@@ -1762,6 +1772,69 @@ fn strip_nora_internal_fields(data: &[u8]) -> Vec<u8> {
 /// Extract VCS prefix (`git::`, `hg::`) from a Terraform module source URL.
 ///
 /// Returns `(prefix, inner_url)`. If no VCS prefix is present, prefix is empty.
+/// Whether `bytes` open as an archive go-getter unpacks: gzip, zip, bzip2, xz or tar, by their
+/// magic bytes. A module's source is served and cached only when they do (#1209): an HTTP
+/// source can answer a web page (a git repository's), which is no module.
+fn looks_like_archive(bytes: &[u8]) -> bool {
+    bytes.starts_with(&[0x1f, 0x8b])
+        || bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"BZh")
+        || bytes.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0x00])
+        || bytes.get(257..262) == Some(b"ustar".as_slice())
+}
+
+/// Archive kinds go-getter recognizes by extension, longest first.
+const ARCHIVE_EXTENSIONS: [&str; 8] = [
+    "tar.gz", "tar.bz2", "tar.xz", "tgz", "tbz2", "txz", "zip", "tar",
+];
+
+/// The kind of archive an HTTP source `address` names, as go-getter would read it: its
+/// `archive=` query value, else the extension its path ends in, else GitHub's codeload form
+/// (`/tar.gz/<ref>`, `/zip/<ref>`). `None` when nothing marks it as an archive.
+fn archive_kind(address: &str) -> Option<String> {
+    let (path, query) = address.split_once('?').unwrap_or((address, ""));
+    if let Some(kind) = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("archive="))
+        .filter(|k| !k.is_empty())
+    {
+        return Some(kind.to_string());
+    }
+    if let Some(ext) = ARCHIVE_EXTENSIONS
+        .iter()
+        .find(|ext| path.ends_with(&format!(".{ext}")))
+    {
+        return Some((*ext).to_string());
+    }
+    let after_host = path.splitn(4, '/').nth(3).unwrap_or("");
+    if path.contains("://codeload.github.com/") {
+        for kind in ["tar.gz", "zip"] {
+            if after_host.contains(&format!("/{kind}/")) {
+                return Some(kind.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// A go-getter address split into the source and its `//subdir`, the query kept on the source.
+fn split_subdir(address: &str) -> (String, Option<&str>) {
+    let scheme_end = address.find("://").map_or(0, |i| i + 3);
+    let (path, query) = address.split_once('?').unwrap_or((address, ""));
+    let Some(i) = path[scheme_end..].find("//") else {
+        return (address.to_string(), None);
+    };
+    let at = scheme_end + i;
+    let subdir = Some(&path[at + 2..]).filter(|sub| !sub.is_empty());
+    let source = if query.is_empty() {
+        path[..at].to_string()
+    } else {
+        format!("{}?{query}", &path[..at])
+    };
+    (source, subdir)
+}
+
 fn strip_vcs_prefix(url: &str) -> (&str, &str) {
     for prefix in &["git::", "hg::"] {
         if let Some(inner) = url.strip_prefix(prefix) {
@@ -1892,7 +1965,7 @@ mod tests {
         );
         assert_eq!(
             result,
-            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source"
+            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source?archive=tar.gz"
         );
         assert!(!result.contains("github.com"), "upstream URL must not leak");
     }
@@ -1908,16 +1981,9 @@ mod tests {
             "aws",
             "0.1.0",
         );
-        assert_eq!(
-            result,
-            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source",
-            "git::https:// URLs must be rewritten through NORA (air-gap)"
-        );
-        assert!(
-            !result.contains("example.com"),
-            "upstream URL must not leak"
-        );
-        assert!(!result.contains("git::"), "VCS prefix must be stripped");
+        // #1209: NORA cannot serve a repository as an archive (it served the repository's web
+        // page); the client clones the source itself.
+        assert_eq!(result, git_url, "git:: sources pass through unchanged");
     }
 
     #[test]
@@ -1932,9 +1998,8 @@ mod tests {
             "0.1.0",
         );
         assert_eq!(
-            result,
-            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source",
-            "hg::https:// URLs must be rewritten through NORA"
+            result, hg_url,
+            "hg:: sources pass through unchanged (#1209)"
         );
     }
 
@@ -2152,8 +2217,74 @@ mod tests {
         );
         assert_eq!(
             result,
-            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source"
+            "http://nora:4000/terraform/v1/modules/download/hashicorp/consul/aws/0.1.0/source?archive=tar.gz"
         );
+    }
+
+    /// #1209: what NORA answers in `X-Terraform-Get` for each kind of source the upstream names.
+    /// An archive is proxied with what tells the getter it is one (`archive=`) and its
+    /// subdirectory kept; a VCS source, or an HTTP address nothing marks as an archive, passes
+    /// through unchanged for the client to fetch itself.
+    #[test]
+    fn module_source_answer_decision_table() {
+        let nora = "http://nora:4000/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source";
+        #[rustfmt::skip]
+        let rows: [(&str, Option<&str>); 14] = [
+            ("https://example.com/m.tar.gz",                 Some("?archive=tar.gz")),
+            ("https://example.com/m.tgz",                    Some("?archive=tgz")),
+            ("https://example.com/m.zip",                    Some("?archive=zip")),
+            ("https://example.com/m.tar.bz2",                Some("?archive=tar.bz2")),
+            ("https://example.com/m.tar.xz",                 Some("?archive=tar.xz")),
+            ("https://example.com/m.tar",                    Some("?archive=tar")),
+            ("https://gitlab.example/api/v4/m/file?archive=tgz", Some("?archive=tgz")),
+            ("https://codeload.github.com/a/b/zip/v1",       Some("?archive=zip")),
+            ("https://example.com/m.tar.gz//modules/vpc",    Some("//modules/vpc?archive=tar.gz")),
+            ("git::https://github.com/a/b?ref=v1",           None),
+            ("git::https://example.com/m.tar.gz",            None),
+            ("hg::https://example.com/m",                    None),
+            ("https://github.com/a/b",                       None),
+            ("https://example.com/m.tar.gz.sig",             None),
+        ];
+        for (source, answer) in rows {
+            let got = rewrite_module_source_url(
+                source,
+                "http://nora:4000",
+                "acme",
+                "vpc",
+                "aws",
+                "1.0.0",
+            );
+            match answer {
+                Some(suffix) => assert_eq!(got, format!("{nora}{suffix}"), "{source}"),
+                None => assert_eq!(got, source, "{source}"),
+            }
+        }
+    }
+
+    /// #1209: only bytes that open as an archive are served or cached as a module's source.
+    #[test]
+    fn a_module_source_is_an_archive_by_its_bytes() {
+        let mut tar = vec![0u8; 512];
+        tar[257..262].copy_from_slice(b"ustar");
+        #[rustfmt::skip]
+        let rows: [(&[u8], bool); 8] = [
+            (&[0x1f, 0x8b, 0x08, 0x00],                    true),
+            (b"PK\x03\x04rest",                           true),
+            (b"PK\x05\x06",                               true),
+            (b"BZh91AY",                                   true),
+            (&[0xfd, b'7', b'z', b'X', b'Z', 0x00, 0x00], true),
+            (&tar,                                         true),
+            (b"<!DOCTYPE html><html>",                     false),
+            (b"",                                          false),
+        ];
+        for (bytes, archive) in rows {
+            assert_eq!(
+                looks_like_archive(bytes),
+                archive,
+                "{:?}",
+                &bytes[..bytes.len().min(8)]
+            );
+        }
     }
 
     #[test]
@@ -2367,6 +2498,180 @@ mod integration_tests {
             "X-Terraform-Get must not leak upstream URL, got: {}",
             tf_get
         );
+    }
+
+    /// An upstream answering the module download with `X-Terraform-Get: <value>` at
+    /// `/v1/modules/acme/vpc/aws/1.0.0/download`, serving `archive` at `/m.tar.gz`.
+    async fn module_upstream(
+        source: impl Fn(&str) -> String,
+        archive: Vec<u8>,
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/vpc/aws/1.0.0/download"))
+            .respond_with(
+                ResponseTemplate::new(204)
+                    .insert_header("x-terraform-get", source(&server.uri()).as_str()),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/m.tar.gz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(archive))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    const MODULE_DL: &str = "/terraform/v1/modules/acme/vpc/aws/1.0.0/download";
+    const SOURCE_KEY: &str = "terraform/modules/acme/vpc/aws/1.0.0/source.tar.gz";
+
+    fn tf_ctx(url: String) -> crate::test_helpers::TestContext {
+        create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(url);
+            cfg.terraform.proxy_timeout = 2;
+        })
+    }
+
+    /// #1209: a git source is answered as the upstream named it; NORA stores no source URL for it.
+    #[tokio::test]
+    async fn a_git_module_source_is_passed_through() {
+        let git = "git::https://github.com/acme/terraform-aws-vpc?ref=v1.0.0";
+        let server = module_upstream(|_| git.to_string(), Vec::new()).await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.headers().get("x-terraform-get").unwrap(), git);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(ctx
+            .state
+            .storage
+            .get("terraform/modules/acme/vpc/aws/1.0.0/_source_url")
+            .await
+            .is_err());
+    }
+
+    /// #1209: an archive source is proxied with `archive=` so the getter unpacks it, and its
+    /// bytes are served as the upstream sent them.
+    #[tokio::test]
+    async fn an_archive_module_source_is_proxied_as_an_archive() {
+        let archive = vec![0x1f, 0x8b, 0x08, 0x00, 1, 2, 3];
+        let server = module_upstream(|uri| format!("{uri}/m.tar.gz"), archive.clone()).await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let get = resp
+            .headers()
+            .get("x-terraform-get")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            get.ends_with(
+                "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source?archive=tar.gz"
+            ),
+            "{get}"
+        );
+        let path = &get[get.find("/terraform/").unwrap()..];
+        let mut resp = send(&ctx.app, Method::GET, path, "").await;
+        for _ in 0..20 {
+            if resp.status() == StatusCode::OK {
+                break;
+            }
+            // the source URL is stored in the background
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            resp = send(&ctx.app, Method::GET, path, "").await;
+        }
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), archive.as_slice());
+    }
+
+    /// #1209: an archive source with a `//subdir`: the client is told the subdirectory, and NORA
+    /// fetches the archive itself, without it.
+    #[tokio::test]
+    async fn an_archive_source_with_a_subdirectory_is_fetched_without_it() {
+        let archive = vec![0x1f, 0x8b, 0x08, 0x00, 9];
+        let server = module_upstream(
+            |uri| format!("{uri}/m.tar.gz//modules/vpc"),
+            archive.clone(),
+        )
+        .await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        let get = resp
+            .headers()
+            .get("x-terraform-get")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        assert!(
+            get.ends_with("/source//modules/vpc?archive=tar.gz"),
+            "{get}"
+        );
+        // go-getter asks for the source without the subdirectory
+        let path = "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source?archive=tar.gz";
+        let mut resp = send(&ctx.app, Method::GET, path, "").await;
+        for _ in 0..20 {
+            if resp.status() == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            resp = send(&ctx.app, Method::GET, path, "").await;
+        }
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), archive.as_slice());
+    }
+
+    /// #1209: what the source URL answers is served and cached only when it is an archive: a web
+    /// page (a repository's) is a 502 and is not cached as the module.
+    #[tokio::test]
+    async fn a_source_that_is_not_an_archive_is_not_served_or_cached() {
+        let server = module_upstream(
+            |uri| format!("{uri}/m.tar.gz"),
+            b"<!DOCTYPE html><html>".to_vec(),
+        )
+        .await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(ctx.state.storage.get(SOURCE_KEY).await.is_err());
+    }
+
+    /// #1209: a source URL an older release stored for a git source (the repository address,
+    /// prefix stripped) names no archive: the module download asks the upstream again instead
+    /// of pointing the client at it.
+    #[tokio::test]
+    async fn a_stored_source_url_that_names_no_archive_is_asked_again() {
+        let git = "git::https://github.com/acme/terraform-aws-vpc?ref=v1.0.0";
+        let server = module_upstream(|_| git.to_string(), Vec::new()).await;
+        let ctx = tf_ctx(server.uri());
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/acme/vpc/aws/1.0.0/_source_url",
+                b"https://github.com/acme/terraform-aws-vpc?ref=v1.0.0",
+            )
+            .await
+            .unwrap();
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(resp.headers().get("x-terraform-get").unwrap(), git);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 
     #[tokio::test]
