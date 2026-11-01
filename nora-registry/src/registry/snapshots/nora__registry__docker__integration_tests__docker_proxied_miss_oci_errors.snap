@@ -1,0 +1,134 @@
+---
+source: nora-registry/src/registry/docker.rs
+expression: pinned
+---
+[
+  {
+    "body": {
+      "errors": [
+        {
+          "code": "MANIFEST_UNKNOWN",
+          "detail": {
+            "name": "myorg/app",
+            "reference": "9.9"
+          },
+          "message": "manifest unknown"
+        }
+      ]
+    },
+    "content_type": "application/json",
+    "retry_after": false,
+    "row": "manifest-404",
+    "status": 404
+  },
+  {
+    "body": {
+      "errors": [
+        {
+          "code": "BLOB_UNKNOWN",
+          "detail": {
+            "digest": "sha256:dac1d7cfa95021764849fd102524e141488c5e3a90f861dbb5a12d9ac8584f85"
+          },
+          "message": "blob unknown to registry"
+        }
+      ]
+    },
+    "content_type": "application/json",
+    "retry_after": false,
+    "row": "blob-404",
+    "status": 404
+  },
+  {
+    "body": {
+      "errors": [
+        {
+          "code": "UNAVAILABLE",
+          "detail": "the upstream answered 5xx, timed out or could not be reached; see NORA's log",
+          "message": "every upstream registry failed to answer"
+        }
+      ]
+    },
+    "content_type": "application/json",
+    "retry_after": false,
+    "row": "manifest-503",
+    "status": 502
+  },
+  {
+    "body": {
+      "errors": [
+        {
+          "code": "UNAVAILABLE",
+          "detail": "the upstream answered 5xx, timed out or could not be reached; see NORA's log",
+          "message": "every upstream registry failed to answer"
+        }
+      ]
+    },
+    "content_type": "application/json",
+    "retry_after": false,
+    "row": "blob-503",
+    "status": 502
+  },
+  {
+    "body": {
+      "errors": [
+        {
+          "code": "UNAVAILABLE",
+          "detail": "the upstream answered 5xx, timed out or could not be reached; see NORA's log",
+          "message": "every upstream registry failed to answer"
+        }
+      ]
+    },
+    "content_type": "application/json",
+    "retry_after": false,
+    "row": "manifest-unreachable",
+    "status": 502
+  },
+  {
+    "body": {
+      "errors": [
+        {
+          "code": "UNAVAILABLE",
+          "detail": "its circuit breaker is open; retry after the Retry-After interval",
+          "message": "upstream docker:<upstream> temporarily unavailable"
+        }
+      ]
+    },
+    "content_type": "application/json",
+    "retry_after": true,
+    "row": "manifest-breaker-open",
+    "status": 503
+  },
+  {
+    "body": {
+      "errors": [
+        {
+          "code": "DENIED",
+          "detail": "the credentials NORA has for this upstream are wrong, lack pull access, or are not configured",
+          "message": "an upstream registry refused NORA's credentials"
+        }
+      ]
+    },
+    "content_type": "application/json",
+    "retry_after": false,
+    "row": "manifest-refused",
+    "status": 502
+  },
+  {
+    "body": {
+      "errors": [
+        {
+          "code": "MANIFEST_UNKNOWN",
+          "detail": {
+            "name": "myorg/app",
+            "reference": "9.9"
+          },
+          "message": "manifest unknown"
+        }
+      ]
+    },
+    "content_type": "application/json",
+    "retry_after": false,
+    "row": "unknown-host",
+    "status": 404
+  }
+]
