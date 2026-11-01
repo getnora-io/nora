@@ -739,63 +739,62 @@ async fn module_download(
         ver
     );
 
-    // Module download returns 204 with X-Terraform-Get header pointing to source
-    let client = &state.http_client;
-    let timeout = state.config.terraform.proxy_timeout;
+    // Module download returns 204 with X-Terraform-Get header pointing to source. Asked through
+    // the `terraform` breaker like every other path (#1202): an open breaker is 503, a failure
+    // counts toward opening it.
+    let fetched = super::proxy_fetch_core(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.terraform.proxy_timeout),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
+        None,
+        |response| async move {
+            Ok(response
+                .headers()
+                .get("x-terraform-get")
+                .map(|v| v.to_str().unwrap_or("").to_string()))
+        },
+        &state.circuit_breaker,
+        RegistryType::Terraform,
+    )
+    .await;
 
-    let mut request = client
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(timeout));
-    if let Some(auth) = expose_opt(&state.config.terraform.proxy_auth) {
-        request = request.header("Authorization", crate::config::basic_auth_header(auth));
-    }
+    match fetched {
+        Ok(Some(original_url)) => {
+            state.metrics.record_download("terraform");
+            state.activity.push(ActivityEntry::new(
+                ActionType::ProxyFetch,
+                format!("{}/{}/{} v{}", ns, name, provider, ver),
+                crate::registry_type::RegistryType::Terraform,
+                "PROXY",
+            ));
 
-    match request.send().await {
-        Ok(response) => {
-            if let Some(tf_get) = response.headers().get("x-terraform-get") {
-                let original_url = tf_get.to_str().unwrap_or("").to_string();
+            // Rewrite X-Terraform-Get to point through NORA (air-gap safe)
+            let rewritten =
+                rewrite_module_source_url(&original_url, &base_url, &ns, &name, &provider, &ver);
 
-                state.metrics.record_download("terraform");
-                state.activity.push(ActivityEntry::new(
-                    ActionType::ProxyFetch,
-                    format!("{}/{}/{} v{}", ns, name, provider, ver),
-                    crate::registry_type::RegistryType::Terraform,
-                    "PROXY",
-                ));
+            // Cache the inner URL (stripping VCS prefix like git::) for module_source_download
+            let (_, inner_url) = strip_vcs_prefix(&original_url);
+            state.spawn_cache(
+                "terraform",
+                source_url_key,
+                Bytes::from(inner_url.to_string()),
+            );
 
-                // Rewrite X-Terraform-Get to point through NORA (air-gap safe)
-                let rewritten = rewrite_module_source_url(
-                    &original_url,
-                    &base_url,
-                    &ns,
-                    &name,
-                    &provider,
-                    &ver,
-                );
-
-                // Cache the inner URL (stripping VCS prefix like git::) for module_source_download
-                let (_, inner_url) = strip_vcs_prefix(&original_url);
-                state.spawn_cache(
-                    "terraform",
-                    source_url_key,
-                    Bytes::from(inner_url.to_string()),
-                );
-
-                return (
-                    StatusCode::NO_CONTENT,
-                    [("x-terraform-get", rewritten.as_str())],
-                )
-                    .into_response();
-            }
-            // No source header: a 4xx says the module is not there; a 5xx, or a reply that
-            // breaks the protocol by leaving the header out, is a failed upstream.
-            let status = response.status().as_u16();
-            UpstreamMiss::of(&ProxyError::Upstream(status))
-                .response("terraform", &format!("{ns}/{name}/{provider}/{ver}"))
+            (
+                StatusCode::NO_CONTENT,
+                [("x-terraform-get", rewritten.as_str())],
+            )
+                .into_response()
         }
+        // A 2xx without the source header breaks the protocol: a failed upstream.
+        Ok(None) => UpstreamMiss::of(&ProxyError::Upstream(502))
+            .response("terraform", &format!("{ns}/{name}/{provider}/{ver}")),
+        // A 4xx says the module is not there; a 5xx, network error or timeout is a failed
+        // upstream; an open breaker is the 503 it is everywhere.
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform module download error");
-            StatusCode::BAD_GATEWAY.into_response()
+            UpstreamMiss::of(&e).response("terraform", &format!("{ns}/{name}/{provider}/{ver}"))
         }
     }
 }
@@ -2929,6 +2928,61 @@ mod upstream_failure_edge_cases {
         let ctx = ctx_for(slow.uri());
         let resp = send(&ctx.app, Method::GET, MODULE, "").await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// #1202: the module download reports to the `terraform` breaker like every other path. An
+    /// open breaker answers 503 with Retry-After without asking the upstream.
+    #[tokio::test]
+    async fn module_download_behind_an_open_breaker_is_503_and_not_asked() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(204)
+                    .insert_header("x-terraform-get", "https://example.invalid/m.tar.gz"),
+            )
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let url = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy_timeout = 1;
+            cfg.terraform.proxy = Some(url);
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.reset_timeout = 3600;
+        });
+        ctx.state.circuit_breaker.open_for_test("terraform");
+        let resp = send(&ctx.app, Method::GET, MODULE, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers().get("retry-after").map(|v| v.as_bytes()),
+            Some(b"30".as_slice())
+        );
+    }
+
+    /// #1202: a failed module download counts toward the breaker, so a dead upstream found by
+    /// module downloads alone opens it for the other Terraform paths too.
+    #[tokio::test]
+    async fn a_failed_module_download_opens_the_breaker() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy_timeout = 1;
+            cfg.terraform.proxy = Some("http://127.0.0.1:9".into());
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 1;
+            cfg.circuit_breaker.reset_timeout = 3600;
+        });
+        let resp = send(&ctx.app, Method::GET, MODULE, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(ctx.state.circuit_breaker.check("terraform").is_err());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/hashicorp/null/versions",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     /// A module upstream answering 400 said "not here" — 404.

@@ -3419,8 +3419,7 @@ mod upstream_failure_matrix {
 
     const TERRAFORM: Format = Format {
         configure: terraform,
-        // The module download asks its upstream with a bare client, past the breaker.
-        key: None,
+        key: Some(|_| "terraform".to_string()),
         several: false,
         open_beside_an_answer: StatusCode::NOT_FOUND,
     };
