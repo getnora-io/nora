@@ -1849,8 +1849,8 @@ mod tests {
         assert_eq!(config.auth_burst, 5);
         assert_eq!(config.upload_rps, 200);
         assert_eq!(config.upload_burst, 500);
-        assert_eq!(config.general_rps, 100);
-        assert_eq!(config.general_burst, 200);
+        assert_eq!(config.general_rps, 1000);
+        assert_eq!(config.general_burst, 2000);
     }
 
     // NORA_RATE_LIMIT_*_RPS/_BURST reach the config unchanged, also far

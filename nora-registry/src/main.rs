@@ -2990,33 +2990,27 @@ fn open_log_file(
     Some((non_blocking, guard))
 }
 
-/// Auth routes behind the auth and general limiters, registry routes behind the upload limiter,
-/// each limiter built for its quota. Returns the quotas the built limiters enforce, read back
-/// from them, for the startup log.
+/// Auth routes behind the auth limiter; registry routes behind the read and the write limiter,
+/// a request spending the bucket of its class ([`rate_limit::request_class`]). Each limiter is
+/// built for its quota ([`rate_limit::LimiterQuotas::routes`]). Returns the quotas the built
+/// limiters enforce, read back from them, for the startup log.
 fn rate_limited_routes<S: Clone + Send + Sync + 'static>(
     auth_routes: Router<S>,
     registry_routes: Router<S>,
     quotas: &rate_limit::LimiterQuotas,
     trusted_proxies: config::TrustedProxies,
-) -> (Router<S>, rate_limit::LimiterQuotas) {
-    let (auth_limiter, auth) = rate_limit::auth_rate_limiter(quotas.auth, trusted_proxies.clone());
-    let (upload_limiter, upload) =
-        rate_limit::upload_rate_limiter(quotas.upload, trusted_proxies.clone());
-    let (general_limiter, general) =
-        rate_limit::general_rate_limiter(quotas.general, trusted_proxies);
+) -> (Router<S>, rate_limit::RouteQuotas) {
+    let routes = quotas.routes();
+    let (auth_limiter, auth) = rate_limit::auth_rate_limiter(routes.auth, trusted_proxies.clone());
+    let (write_limiter, write) =
+        rate_limit::upload_rate_limiter(routes.write, trusted_proxies.clone());
+    let (read_limiter, read) = rate_limit::general_rate_limiter(routes.read, trusted_proxies);
 
-    // Auth routes: auth_limiter (strict 1rps) + general_limiter
-    let auth_routes = auth_routes.layer(auth_limiter).layer(general_limiter);
-    // Registry routes: upload_limiter only (200rps/500burst)
-    // No general_limiter — avoids double-limiting that causes 429
-    // during cache warming (dotnet restore with many packages)
-    let limited_registry = registry_routes.layer(upload_limiter);
+    let auth_routes = auth_routes.layer(auth_limiter);
+    let limited_registry =
+        registry_routes.layer(rate_limit::ReadWriteLimit::new(read_limiter, write_limiter));
 
-    let enforced = rate_limit::LimiterQuotas {
-        auth,
-        upload,
-        general,
-    };
+    let enforced = rate_limit::RouteQuotas { auth, write, read };
     (
         Router::new().merge(auth_routes).merge(limited_registry),
         enforced,
@@ -3028,23 +3022,6 @@ mod rate_limited_routes_tests {
     use super::*;
     use std::net::SocketAddr;
     use tower::ServiceExt;
-
-    async fn statuses(app: &Router, path: &str, count: usize) -> Vec<u16> {
-        let mut out = Vec::new();
-        for _ in 0..count {
-            let mut req = axum::http::Request::builder()
-                .uri(path)
-                .body(axum::body::Body::empty())
-                .unwrap();
-            req.extensions_mut()
-                .insert(axum::extract::ConnectInfo(SocketAddr::from((
-                    [127, 0, 0, 1],
-                    4000,
-                ))));
-            out.push(app.clone().oneshot(req).await.unwrap().status().as_u16());
-        }
-        out
-    }
 
     /// Every registry answer is inert in a browser: what a client or an upstream put in a
     /// registry — HTML, SVG, an XML document with a stylesheet — cannot run script on NORA's
@@ -3124,22 +3101,46 @@ mod rate_limited_routes_tests {
         assert!(sandboxed(&get));
     }
 
-    // Registry routes are limited by the upload_* settings and only by
-    // them; auth routes by auth_* and general_*. Bursts differ (auth 1, upload 2, general 3), one
-    // request a second, so the first refusal tells which limiter answered.
-    #[tokio::test]
-    async fn registry_routes_use_the_upload_limiter_only() {
+    /// A request from one client, as the routes see it behind `ConnectInfo`.
+    async fn send(app: &Router, method: &str, path: &str) -> axum::response::Response {
+        let mut req = axum::http::Request::builder()
+            .method(axum::http::Method::from_bytes(method.as_bytes()).unwrap())
+            .uri(path)
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [127, 0, 0, 1],
+                4000,
+            ))));
+        app.clone().oneshot(req).await.unwrap()
+    }
+
+    async fn sent(app: &Router, method: &str, path: &str, count: usize) -> Vec<u16> {
+        let mut out = Vec::new();
+        for _ in 0..count {
+            out.push(send(app, method, path).await.status().as_u16());
+        }
+        out
+    }
+
+    /// The routes built from these bursts, one request a second each: auth routes at
+    /// `/api/tokens`, registry routes shaped like docker's catch-all and npm's.
+    fn routes_with(auth_burst: u32, upload_burst: u32, general_burst: u32) -> Router {
         let rl = config::RateLimitConfig {
             enabled: true,
             auth_rps: 1,
-            auth_burst: 1,
+            auth_burst,
             upload_rps: 1,
-            upload_burst: 2,
+            upload_burst,
             general_rps: 1,
-            general_burst: 3,
+            general_burst,
         };
-        let auth = Router::new().route("/api/tokens", axum::routing::get(|| async { "ok" }));
-        let registry = Router::new().route("/v2/", axum::routing::get(|| async { "ok" }));
+        let ok = || async { "ok" };
+        let auth = Router::new().route("/api/tokens", axum::routing::get(ok));
+        let registry = Router::new()
+            .route("/v2/{*rest}", axum::routing::any(ok))
+            .route("/npm/{*path}", axum::routing::get(ok).put(ok).post(ok));
         let quotas = rate_limit::limiter_quotas(&rl);
         let (app, enforced) = rate_limited_routes(
             auth,
@@ -3147,45 +3148,87 @@ mod rate_limited_routes_tests {
             &quotas,
             config::TrustedProxies::default_loopback(),
         );
-        assert_eq!(enforced, quotas);
+        assert_eq!(enforced, quotas.routes());
+        app
+    }
+
+    // Reads spend the general_* bucket and writes the upload_* bucket, each its own: a client
+    // that has spent its writes still reads, and one that has spent its reads still writes.
+    #[tokio::test]
+    async fn reads_and_writes_from_one_client_spend_their_own_buckets() {
+        let app = routes_with(1, 2, 3);
+        assert_eq!(sent(&app, "PUT", "/npm/pkg", 3).await, vec![200, 200, 429]);
         assert_eq!(
-            statuses(&app, "/v2/", 4).await,
-            vec![200, 200, 429, 429],
-            "registry"
-        );
-        assert_eq!(
-            statuses(&app, "/api/tokens", 2).await,
-            vec![200, 429],
-            "auth"
+            sent(&app, "GET", "/v2/x/manifests/1", 4).await,
+            vec![200, 200, 200, 429],
+            "reads once the writes are spent"
         );
 
-        // The general limiter stricter than the upload one must not reach registry routes.
-        let rl = config::RateLimitConfig {
-            auth_burst: 2,
-            upload_burst: 3,
-            general_burst: 1,
-            ..rl
-        };
-        let auth = Router::new().route("/api/tokens", axum::routing::get(|| async { "ok" }));
-        let registry = Router::new().route("/v2/", axum::routing::get(|| async { "ok" }));
-        let quotas = rate_limit::limiter_quotas(&rl);
-        let (app, enforced) = rate_limited_routes(
-            auth,
-            registry,
-            &quotas,
-            config::TrustedProxies::default_loopback(),
-        );
-        assert_eq!(enforced, quotas);
+        let app = routes_with(1, 2, 3);
         assert_eq!(
-            statuses(&app, "/v2/", 4).await,
-            vec![200, 200, 200, 429],
-            "registry"
+            sent(&app, "HEAD", "/v2/x/blobs/sha256:00", 3).await,
+            vec![200, 200, 200]
         );
         assert_eq!(
-            statuses(&app, "/api/tokens", 2).await,
-            vec![200, 429],
-            "auth"
+            sent(&app, "GET", "/npm/pkg", 1).await,
+            vec![429],
+            "HEAD reads"
         );
+        assert_eq!(
+            sent(&app, "POST", "/v2/x/blobs/uploads/", 3).await,
+            vec![200, 200, 429],
+            "writes once the reads are spent"
+        );
+    }
+
+    // npm's audit POST reads; a method NORA does not know writes.
+    #[tokio::test]
+    async fn the_npm_audit_post_reads_and_an_unknown_method_writes() {
+        let app = routes_with(1, 1, 2);
+        assert_eq!(sent(&app, "PROPFIND", "/v2/x", 2).await, vec![200, 429]);
+        assert_eq!(
+            sent(&app, "POST", "/npm/-/npm/v1/security/advisories/bulk", 2).await,
+            vec![200, 200],
+            "the audit once the writes are spent"
+        );
+        assert_eq!(
+            sent(&app, "GET", "/npm/pkg", 1).await,
+            vec![429],
+            "audit read"
+        );
+    }
+
+    // Auth routes answer to auth_* alone: general_* is the read setting, not a second auth limit,
+    // and neither registry bucket, both smaller here than the auth burst, reaches them.
+    #[tokio::test]
+    async fn auth_routes_are_limited_by_the_auth_settings_only() {
+        let app = routes_with(3, 1, 1);
+        assert_eq!(
+            sent(&app, "GET", "/api/tokens", 4).await,
+            vec![200, 200, 200, 429]
+        );
+    }
+
+    /// The burst a response announces in `x-ratelimit-limit`.
+    async fn announced(app: &Router, method: &str, path: &str) -> u32 {
+        send(app, method, path).await.headers()["x-ratelimit-limit"]
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    // A read announces the read burst and a write the write burst (#1205: GENERAL_BURST=2000
+    // with the upload default 500 announced 500 on a cargo download). Until 1.5 a general_*
+    // setting below upload_* (the helm chart's 100/200 against 200/500) reads at upload_*.
+    #[tokio::test]
+    async fn a_read_announces_the_read_burst_and_a_write_the_write_burst() {
+        let app = routes_with(1, 500, 2000);
+        assert_eq!(announced(&app, "GET", "/v2/x/manifests/1").await, 2000);
+        assert_eq!(announced(&app, "PUT", "/npm/pkg").await, 500);
+        let app = routes_with(1, 500, 200);
+        assert_eq!(announced(&app, "GET", "/v2/x/manifests/1").await, 500);
+        assert_eq!(announced(&app, "PUT", "/npm/pkg").await, 500);
     }
 
     // Whatever the rates, the routes are built with the quotas they are given, each from its
@@ -3213,7 +3256,7 @@ mod rate_limited_routes_tests {
                 &quotas,
                 config::TrustedProxies::default_loopback(),
             );
-            assert_eq!(enforced, quotas, "{auth} {upload} {general}");
+            assert_eq!(enforced, quotas.routes(), "{auth} {upload} {general}");
         }
     }
 }
@@ -3404,10 +3447,22 @@ async fn run_server(mut config: Config, storage: Storage) {
     };
 
     let app_routes = if rate_limit_enabled {
+        let quotas = rate_limit::limiter_quotas(&config.rate_limit);
+        if quotas.read_borrows_upload() {
+            warn!(
+                general_rps = config.rate_limit.general_rps,
+                general_burst = config.rate_limit.general_burst,
+                upload_rps = config.rate_limit.upload_rps,
+                upload_burst = config.rate_limit.upload_burst,
+                "Registry reads are limited by general_*, which is below upload_*: until 1.5 \
+                 reads use the larger of the two; from 1.5 general_* alone, so set \
+                 NORA_RATE_LIMIT_GENERAL_RPS/BURST to what reads need"
+            );
+        }
         let (routes, enforced) = rate_limited_routes(
             auth::token_routes(),
             registry_routes,
-            &rate_limit::limiter_quotas(&config.rate_limit),
+            &quotas,
             config.auth.trusted_proxies.clone(),
         );
         // What the built limiters enforce, read back from them: any narrowing between the
@@ -3415,10 +3470,10 @@ async fn run_server(mut config: Config, storage: Storage) {
         info!(
             auth_rps = enforced.auth.per_second(),
             auth_burst = enforced.auth.burst,
-            upload_rps = enforced.upload.per_second(),
-            upload_burst = enforced.upload.burst,
-            general_rps = enforced.general.per_second(),
-            general_burst = enforced.general.burst,
+            write_rps = enforced.write.per_second(),
+            write_burst = enforced.write.burst,
+            read_rps = enforced.read.per_second(),
+            read_burst = enforced.read.burst,
             "Rate limits enforced"
         );
         routes
