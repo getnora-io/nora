@@ -101,6 +101,8 @@ Type=simple
 User=nora
 Group=nora
 ExecStart=/usr/local/bin/nora serve
+# `systemctl reload nora`: re-read config.toml in place (curation policy, see the deployment guide)
+ExecReload=/bin/kill -HUP $MAINPID
 WorkingDirectory=/etc/nora
 Restart=on-failure
 RestartSec=5

@@ -2789,6 +2789,29 @@ proxies = [
         assert!(script.contains(&wanted), "install.sh's unit lacks {wanted}");
     }
 
+    /// #1190: every unit NORA ships answers `systemctl reload` with the SIGHUP that re-reads the
+    /// configuration, as the deployment guide says; without `ExecReload` systemd refuses the job.
+    #[test]
+    fn units_reload_with_sighup() {
+        let wanted = "ExecReload=/bin/kill -HUP $MAINPID";
+        for (name, unit) in [
+            (
+                "dist/nora.service",
+                include_str!("../../../dist/nora.service"),
+            ),
+            (
+                "deploy/nora.service",
+                include_str!("../../../deploy/nora.service"),
+            ),
+            ("dist/install.sh", include_str!("../../../dist/install.sh")),
+        ] {
+            assert!(
+                unit.lines().any(|line| line.trim() == wanted),
+                "{name} lacks {wanted}"
+            );
+        }
+    }
+
     /// Every fatal case of loading comes back as its own typed error, never a panic:
     /// an unreadable config file, invalid TOML, and a configuration validation rejects.
     #[test]

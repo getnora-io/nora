@@ -115,6 +115,19 @@ fi
 docker exec "$CT" systemctl restart nora >/dev/null 2>&1 || true
 check "restart brings it back" "200" "$(wait_health)"
 
+# #1190: `systemctl reload nora` sends the SIGHUP that re-reads the configuration, in the
+# same process; without ExecReload systemd refuses the job ("reload is not applicable").
+pid_before=$(docker exec "$CT" systemctl show -p MainPID --value nora 2>/dev/null | one)
+check "systemctl reload is accepted" "0" "$(docker exec "$CT" sh -c 'systemctl reload nora >/dev/null 2>&1; echo $?' | one)"
+reloaded=no
+for _ in $(seq 1 10); do
+    docker exec "$CT" sh -c 'journalctl -u nora --no-pager 2>/dev/null | grep -q "SIGHUP received"' && { reloaded=yes; break; }
+    sleep 1
+done
+check "the reload reaches NORA as SIGHUP" "yes" "$reloaded"
+check "reload keeps the same process" "$pid_before" "$(docker exec "$CT" systemctl show -p MainPID --value nora 2>/dev/null | one)"
+check "service answers /health after the reload" "200" "$(wait_health)"
+
 echo "=== self-upgrade: the same package installed over itself ==="
 # This is the hop the maintainer scripts can actually control: BOTH the prerm that
 # runs and the postinst that follows come from this build. #1035 lives here — prerm
