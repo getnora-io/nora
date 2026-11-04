@@ -5969,6 +5969,134 @@ mod integration_tests {
         assert!(asked.is_empty(), "Docker Hub was asked: {asked:?}");
     }
 
+    /// Pushes an image of one config blob (`salt` makes it unique) and returns its manifest.
+    async fn push_salted_image(app: &axum::Router, name: &str, tag: &str, salt: &str) -> Vec<u8> {
+        let config = serde_json::to_vec(&serde_json::json!({ "salt": salt })).unwrap();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&config)));
+        let started = send(
+            app,
+            Method::POST,
+            &format!("/v2/{name}/blobs/uploads/"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            started.status(),
+            StatusCode::ACCEPTED,
+            "start upload {name}"
+        );
+        let location = started.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        let sep = if location.contains('?') { '&' } else { '?' };
+        let put = send(
+            app,
+            Method::PUT,
+            &format!("{location}{sep}digest={digest}"),
+            Body::from(config.clone()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED, "config blob {name}");
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": config.len(),
+                "digest": digest
+            },
+            "layers": []
+        }))
+        .unwrap();
+        let put = send(
+            app,
+            Method::PUT,
+            &format!("/v2/{name}/manifests/{tag}"),
+            Body::from(manifest.clone()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED, "manifest {name}:{tag}");
+        manifest
+    }
+
+    /// A push is stored under the name it was pushed as. A registry host (`quay.io/…`) or an
+    /// upstream prefix (`hub/…`) in front of a pushed name is part of the repository: the push
+    /// answers that name only, never the name without it, and it does not replace a tag pushed
+    /// under the shorter name. Each row is one push and the names that must not see it.
+    #[tokio::test]
+    async fn a_push_under_a_registry_host_or_prefix_is_its_own_repository() {
+        use crate::config::DockerUpstream;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let url = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![
+                DockerUpstream {
+                    url: url.clone(),
+                    auth: None,
+                    namespace: Some("docker.io".to_string()),
+                    prefix: None,
+                    namespaces: Vec::new(),
+                },
+                DockerUpstream {
+                    url,
+                    auth: None,
+                    namespace: Some("hubmirror".to_string()),
+                    prefix: Some("hub".to_string()),
+                    namespaces: Vec::new(),
+                },
+            ];
+        });
+        let get = |name: &str, tag: &str| {
+            let uri = format!("/v2/{name}/manifests/{tag}");
+            let app = ctx.app.clone();
+            async move {
+                let resp = send(&app, Method::GET, &uri, Body::empty()).await;
+                let status = resp.status();
+                (status, body_bytes(resp).await.to_vec())
+            }
+        };
+
+        // (pushed as, the names that must not answer with it)
+        // The first row holds before the fix too: a plain first segment was never dropped.
+        let rows: [(&str, &[&str]); 4] = [
+            ("zzz/other/img", &["other/img"]),
+            ("quay.io/org/img", &["org/img"]),
+            ("hub/acme/tool", &["acme/tool"]),
+            ("lib/x", &["quay.io/lib/x"]),
+        ];
+        for (pushed_as, others) in rows {
+            let manifest = push_salted_image(&ctx.app, pushed_as, "v1", pushed_as).await;
+            let (status, body) = get(pushed_as, "v1").await;
+            assert_eq!(status, StatusCode::OK, "{pushed_as} reads its own push");
+            assert_eq!(body, manifest, "{pushed_as} reads its own push");
+            for other in others {
+                let (status, body) = get(other, "v1").await;
+                assert_ne!(
+                    body, manifest,
+                    "{other} answered with the push to {pushed_as}"
+                );
+                assert_ne!(status, StatusCode::OK, "{other}: nothing was pushed there");
+            }
+        }
+
+        // A tag pushed under a host does not replace the same tag under the shorter name.
+        let short = push_salted_image(&ctx.app, "team/app", "t", "short").await;
+        let hosted = push_salted_image(&ctx.app, "quay.io/team/app", "t", "hosted").await;
+        assert_eq!(
+            get("team/app", "t").await.1,
+            short,
+            "team/app:t was replaced"
+        );
+        assert_eq!(get("quay.io/team/app", "t").await.1, hosted);
+    }
+
     /// #1196: an upstream that will not let NORA in answers with one status whatever its
     /// challenge scheme — 502 with an OCI `DENIED` body that names the refused credential — and
     /// is not an outage to the circuit breaker. A 401 that a token did not lift stays "not found":
