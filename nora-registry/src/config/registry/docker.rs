@@ -237,6 +237,10 @@ impl Default for DockerConfig {
     }
 }
 
+/// The first storage segment of images pushed under a registry host or an upstream prefix
+/// (`docker/_/quay.io/org/img/…`): no image name starts with `_`, and no upstream may use it.
+pub const QUALIFIED_PUSH_ROOT: &str = "_";
+
 /// Path segments of the Docker API that a first name segment may not take.
 pub(in crate::config) const RESERVED_DOCKER_SEGMENTS: &[&str] =
     &["blobs", "manifests", "tags", "uploads", "_catalog", "v2"];
@@ -251,6 +255,18 @@ impl DockerConfig {
         let mut warnings = Vec::new();
         let mut errors = Vec::new();
         for (i, upstream) in self.upstreams.iter().enumerate() {
+            // `_` holds the images pushed under a registry host or a prefix
+            // (`docker/_/quay.io/org/img`): an upstream's copies or names may not go there.
+            if upstream.resolved_namespace() == QUALIFIED_PUSH_ROOT {
+                errors.push(format!(
+                    "docker.upstreams[{i}]: namespace \"{QUALIFIED_PUSH_ROOT}\" is where images pushed under a registry host or prefix are stored; choose another"
+                ));
+            }
+            if upstream.prefix.as_deref() == Some(QUALIFIED_PUSH_ROOT) {
+                errors.push(format!(
+                    "docker.upstreams[{i}]: prefix \"{QUALIFIED_PUSH_ROOT}\" is not an image name segment; choose another"
+                ));
+            }
             if let Some(prefix) = &upstream.prefix {
                 if prefix.contains(['*', '?']) {
                     errors.push(format!(

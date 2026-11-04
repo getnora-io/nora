@@ -120,8 +120,12 @@ pub async fn migrate_docker_keys(
             continue;
         }
 
-        // A repository pushed here keeps its bare keys: they are the pushed images.
-        if pushed.contains(repo_name) {
+        // A repository pushed here keeps its bare keys: they are the pushed images. So does
+        // everything under the root of pushes made under a registry host or prefix.
+        let qualified_push = repo_name
+            .strip_prefix(crate::config::QUALIFIED_PUSH_ROOT)
+            .is_some_and(|rest| rest.starts_with('/'));
+        if qualified_push || pushed.contains(repo_name) {
             stats.skipped += 1;
             pb.inc(1);
             continue;
@@ -362,6 +366,33 @@ mod tests {
             .is_ok());
         assert_eq!(stats.migrated, 1);
         assert_eq!(stats.deduped, 0);
+    }
+
+    /// A push under a registry host or prefix (`_/…`) is never moved under an upstream's
+    /// namespace, with or without its push record (a blob uploaded before its manifest).
+    #[tokio::test]
+    async fn a_push_under_a_host_keeps_its_keys() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let keys = [
+            "docker/_/quay.io/org/img/manifests/v1.json",
+            "docker/_/quay.io/org/img/blobs/sha256:11",
+            "docker/_/hub/acme/tool/blobs/sha256:22",
+        ];
+        for key in keys {
+            storage.put(key, b"x").await.unwrap();
+        }
+        let stats = migrate_docker_keys(
+            &storage,
+            "docker.io",
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await
+        .unwrap();
+        for key in keys {
+            assert!(storage.get(key).await.is_ok(), "{key}");
+        }
+        assert_eq!(stats.migrated, 0);
     }
 
     #[test]
