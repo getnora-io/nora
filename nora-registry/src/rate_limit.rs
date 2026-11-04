@@ -10,6 +10,7 @@
 
 use crate::auth::resolve_client_ip;
 use crate::config::{RateLimitConfig, TrustedProxies};
+use axum::http::Method;
 use std::net::IpAddr;
 use std::time::Duration;
 use tower_governor::errors::GovernorError;
@@ -90,6 +91,137 @@ pub struct LimiterQuotas {
     pub auth: Quota,
     pub upload: Quota,
     pub general: Quota,
+}
+
+/// The quotas the routes are built with: auth routes by `auth`, registry writes by `write`,
+/// registry reads by `read`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouteQuotas {
+    pub auth: Quota,
+    pub write: Quota,
+    pub read: Quota,
+}
+
+impl LimiterQuotas {
+    /// The quotas the routes enforce: auth routes by `auth_*` alone, registry writes by
+    /// `upload_*`, registry reads by `general_*`. Until 1.5 a read gets the larger of
+    /// `general_*` and `upload_*`, setting by setting: before the split every registry
+    /// request was limited by `upload_*`, and the helm chart and the documented presets set
+    /// `general_*` below it, so no configuration reads harder than it did (#1205).
+    pub fn routes(&self) -> RouteQuotas {
+        RouteQuotas {
+            auth: self.auth,
+            write: self.upload,
+            read: Quota {
+                interval: self.general.interval.min(self.upload.interval),
+                burst: self.general.burst.max(self.upload.burst),
+            },
+        }
+    }
+
+    /// Whether a read setting is taken from `upload_*` because `general_*` is below it — the
+    /// configurations whose reads 1.5 limits harder, warned about at startup.
+    pub fn read_borrows_upload(&self) -> bool {
+        self.upload.interval < self.general.interval || self.upload.burst > self.general.burst
+    }
+}
+
+/// Whether a registry request reads or writes: each spends its own bucket, so that a client
+/// reading hard does not starve its own writes, nor the other way round (#1205).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestClass {
+    Read,
+    Write,
+}
+
+/// npm's audit posts a lockfile and reads the advisories for it; nothing is stored (#597).
+/// The paths as the client sends them, under the `/npm/{*path}` route.
+const NPM_AUDIT_PATHS: [&str; 3] = [
+    "/npm/-/npm/v1/security/advisories/bulk",
+    "/npm/-/npm/v1/security/audits/quick",
+    "/npm/-/npm/v1/security/audits",
+];
+
+/// The class of a registry request: GET, HEAD and OPTIONS read, and so does npm's audit POST
+/// at exactly its path. Everything else writes — an unknown method, and the audit path spelled
+/// any other way, so that a misjudged request is held to the write bucket.
+pub fn request_class(method: &Method, path: &str) -> RequestClass {
+    let reads = matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+        || (*method == Method::POST && NPM_AUDIT_PATHS.contains(&path));
+    if reads {
+        RequestClass::Read
+    } else {
+        RequestClass::Write
+    }
+}
+
+/// Registry routes behind two limiters: a request spends the bucket of its
+/// [`request_class`], the read limiter's or the write limiter's.
+#[derive(Clone)]
+pub struct ReadWriteLimit<K: KeyExtractor> {
+    read: Limiter<K>,
+    write: Limiter<K>,
+}
+
+impl<K: KeyExtractor> ReadWriteLimit<K> {
+    /// Reads through `read`, writes through `write`.
+    pub fn new(read: Limiter<K>, write: Limiter<K>) -> Self {
+        Self { read, write }
+    }
+}
+
+impl<K: KeyExtractor, S: Clone> tower::Layer<S> for ReadWriteLimit<K> {
+    type Service = ReadWrite<
+        tower_governor::governor::Governor<
+            K,
+            governor::middleware::StateInformationMiddleware,
+            S,
+            axum::body::Body,
+        >,
+    >;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        // Each limiter layer shares its limiter state across the services it builds.
+        ReadWrite {
+            read: self.read.layer(inner.clone()),
+            write: self.write.layer(inner),
+        }
+    }
+}
+
+/// The service of [`ReadWriteLimit`]: the inner service behind the read limiter and behind
+/// the write limiter.
+#[derive(Clone)]
+pub struct ReadWrite<T> {
+    read: T,
+    write: T,
+}
+
+impl<T, B> tower::Service<axum::http::Request<B>> for ReadWrite<T>
+where
+    T: tower::Service<axum::http::Request<B>> + Clone,
+{
+    type Response = T::Response;
+    type Error = T::Error;
+    type Future = tower::util::Oneshot<T, axum::http::Request<B>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        // Which side serves the request is known only in `call`; the side chosen is driven to
+        // readiness there, on its own clone.
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: axum::http::Request<B>) -> Self::Future {
+        use tower::ServiceExt;
+        let side = match request_class(req.method(), req.uri().path()) {
+            RequestClass::Read => self.read.clone(),
+            RequestClass::Write => self.write.clone(),
+        };
+        side.oneshot(req)
+    }
 }
 
 /// The one place a configured rate becomes a quota: each limiter gets its own rate as an
@@ -180,7 +312,7 @@ mod tests {
         assert_eq!(config.auth_rps, 1);
         assert_eq!(config.auth_burst, 5);
         assert_eq!(config.upload_rps, 200);
-        assert_eq!(config.general_rps, 100);
+        assert_eq!(config.general_rps, 1000);
     }
 
     #[test]
@@ -666,14 +798,14 @@ mod tests {
                 "general enforced"
             );
         }
-        // The defaults keep their intervals: 1 s, 5 ms, 10 ms; bursts 5, 500, 200.
+        // The default intervals: 1 s, 5 ms, 1 ms; bursts 5, 500, 2000.
         let quotas = limiter_quotas(&RateLimitConfig::default());
         let ms = std::time::Duration::from_millis;
         assert_eq!((quotas.auth.interval, quotas.auth.burst), (ms(1000), 5));
         assert_eq!((quotas.upload.interval, quotas.upload.burst), (ms(5), 500));
         assert_eq!(
             (quotas.general.interval, quotas.general.burst),
-            (ms(10), 200)
+            (ms(1), 2000)
         );
     }
 
@@ -792,6 +924,121 @@ mod tests {
                 "general"
             );
         }
+    }
+
+    // A request reads by GET, HEAD or OPTIONS, and npm's audit POST at exactly its path reads;
+    // every other request writes, an unknown method and the audit path spelled another way too,
+    // so that a misjudged request is held to the write bucket.
+    #[test]
+    fn a_request_reads_by_its_method_and_the_npm_audit_post_reads() {
+        use RequestClass::{Read, Write};
+        for (method, path, class) in [
+            ("GET", "/v2/library/alpine/manifests/3", Read),
+            ("HEAD", "/v2/library/alpine/blobs/sha256:00", Read),
+            ("OPTIONS", "/npm/left-pad", Read),
+            ("GET", "/npm/-/npm/v1/security/advisories/bulk", Read),
+            ("POST", "/npm/-/npm/v1/security/advisories/bulk", Read),
+            ("POST", "/npm/-/npm/v1/security/audits/quick", Read),
+            ("POST", "/npm/-/npm/v1/security/audits", Read),
+            ("PUT", "/npm/left-pad", Write),
+            ("PUT", "/npm/-/npm/v1/security/audits", Write),
+            ("DELETE", "/npm/-/npm/v1/security/advisories/bulk", Write),
+            ("PATCH", "/v2/x/blobs/uploads/1", Write),
+            ("DELETE", "/raw/a.txt", Write),
+            ("POST", "/v2/x/blobs/uploads/", Write),
+            ("POST", "/pypi/", Write),
+            ("POST", "/deb/main/-/reindex", Write),
+            ("POST", "/npm/-/npm/v1/security/audits/", Write),
+            ("POST", "/npm/%2D/npm/v1/security/audits", Write),
+            ("POST", "/npm/-/npm/v1/security/advisories/bulk/x", Write),
+            ("POST", "/raw/-/npm/v1/security/audits", Write),
+            ("PROPFIND", "/raw/a.txt", Write),
+            ("TRACE", "/v2/", Write),
+            ("CONNECT", "/v2/", Write),
+        ] {
+            let m = Method::from_bytes(method.as_bytes()).unwrap();
+            assert_eq!(request_class(&m, path), class, "{method} {path}");
+        }
+    }
+
+    fn reads_and_writes(upload: (u64, u32), general: (u64, u32)) -> RateLimitConfig {
+        RateLimitConfig {
+            enabled: true,
+            auth_rps: 1,
+            auth_burst: 5,
+            upload_rps: upload.0,
+            upload_burst: upload.1,
+            general_rps: general.0,
+            general_burst: general.1,
+        }
+    }
+
+    // Until 1.5 a read is held to the larger of general_* and upload_*, setting by setting,
+    // so that no configuration reads harder than before the split, and the read borrows from
+    // upload_* (a startup warning) only where general_* is below it.
+    #[test]
+    fn a_read_gets_the_larger_of_general_and_upload_per_setting() {
+        for (name, upload, general, read, borrows) in [
+            (
+                "only upload raised",
+                (200, 5000),
+                (100, 200),
+                (200, 5000),
+                true,
+            ),
+            (
+                "docs preset high",
+                (2000, 5000),
+                (1000, 2000),
+                (2000, 5000),
+                true,
+            ),
+            ("helm chart", (200, 500), (100, 200), (200, 500), true),
+            (
+                "rate from upload",
+                (2000, 500),
+                (1000, 2000),
+                (2000, 2000),
+                true,
+            ),
+            (
+                "burst from upload",
+                (200, 5000),
+                (1000, 2000),
+                (1000, 5000),
+                true,
+            ),
+            (
+                "general above upload",
+                (200, 500),
+                (1000, 2000),
+                (1000, 2000),
+                false,
+            ),
+            ("general equal", (300, 600), (300, 600), (300, 600), false),
+        ] {
+            let quotas = limiter_quotas(&reads_and_writes(upload, general));
+            let routes = quotas.routes();
+            let expected = Quota {
+                interval: rps_to_period(read.0),
+                burst: read.1,
+            };
+            assert_eq!(routes.read, expected, "{name}: read");
+            assert_eq!(routes.write, quotas.upload, "{name}: write");
+            assert_eq!(routes.auth, quotas.auth, "{name}: auth");
+            assert_eq!(quotas.read_borrows_upload(), borrows, "{name}: borrows");
+        }
+    }
+
+    // The defaults read at general_*, which is not below upload_*: no warning on a default start.
+    #[test]
+    fn the_defaults_read_at_general_without_borrowing() {
+        let config = RateLimitConfig::default();
+        assert!(config.general_rps >= config.upload_rps, "rate");
+        assert!(config.general_burst >= config.upload_burst, "burst");
+        let quotas = limiter_quotas(&config);
+        assert!(!quotas.read_borrows_upload());
+        assert_eq!(quotas.routes().read, quotas.general);
     }
 
     #[test]
