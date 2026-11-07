@@ -29,6 +29,14 @@ fn streaming_client_options() -> object_store::ClientOptions {
     object_store::ClientOptions::new().with_timeout(STREAM_ATTEMPT_TIMEOUT)
 }
 
+/// object_store's reqwest 0.13 has no built-in TLS provider (`rustls-no-provider` keeps
+/// aws-lc-rs out), so install ring; an install Err means a concurrent caller installed it.
+fn install_ring_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+}
+
 fn streaming_retry_config() -> object_store::RetryConfig {
     object_store::RetryConfig {
         retry_timeout: STREAM_ATTEMPT_TIMEOUT.saturating_mul(2),
@@ -77,6 +85,7 @@ impl ObjectStorage {
         secret_key: Option<&str>,
         virtual_hosted: bool,
     ) -> Self {
+        install_ring_provider();
         let url = s3_url.trim_end_matches('/');
         let allow_http = url.starts_with("http://");
 
@@ -127,6 +136,7 @@ impl ObjectStorage {
         service_account_path: Option<&str>,
         base_url: Option<&str>,
     ) -> Self {
+        install_ring_provider();
         let mut builder = GoogleCloudStorageBuilder::from_env()
             .with_bucket_name(bucket)
             .with_retry(streaming_retry_config());
