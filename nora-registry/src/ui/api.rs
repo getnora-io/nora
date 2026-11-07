@@ -396,11 +396,31 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     // bounded number of listings — one per upstream — instead of scanning every
     // key under docker/, whose cost grew with the whole registry, not the
     // repository being viewed (#986).
-    let mut keys = state
-        .storage
-        .list(&format!("docker/{}/manifests/", name))
-        .await
-        .unwrap_or_default();
+    // A name behind a registry host is never stored bare: `docker/quay.io/…` is the copy an
+    // upstream namespaced `quay.io` serves of another name. Its pushes are under `_/`.
+    let host_first = name
+        .split_once('/')
+        .is_some_and(|(first, _)| first.contains('.'));
+    let mut keys = if host_first {
+        Vec::new()
+    } else {
+        state
+            .storage
+            .list(&format!("docker/{}/manifests/", name))
+            .await
+            .unwrap_or_default()
+    };
+    keys.extend(
+        state
+            .storage
+            .list(&format!(
+                "docker/{}/{}/manifests/",
+                crate::config::QUALIFIED_PUSH_ROOT,
+                name
+            ))
+            .await
+            .unwrap_or_default(),
+    );
 
     for upstream in &state.config.docker.upstreams {
         let ns = upstream.resolved_namespace();

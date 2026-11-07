@@ -3853,6 +3853,7 @@ proxies = [
             (&[(Some("team-?"), &[])],                         "matched literally"),
             (&[(None, &["v*"])],                               "reserved"),
             (&[(None, &["blob*"])],                            "reserved"),
+            (&[(Some("_"), &[])],                              "not an image name segment"),
         ];
         for (entries, want) in refused {
             let (_, errors) = docker_problems(entries, allow, &[]);
@@ -3894,6 +3895,31 @@ proxies = [
             let (_, errors) = docker_problems(entries, allow, &[]);
             assert!(errors.is_empty(), "{entries:?}: {errors:?}");
         }
+    }
+
+    /// `_` holds the images pushed under a registry host or prefix: an upstream's copies may not
+    /// be stored there, whether its namespace is set or derived from its url.
+    #[test]
+    fn docker_namespace_of_pushes_under_a_host_is_refused_to_an_upstream() {
+        let _lock = crate::test_env::env_lock();
+        let mut config = Config::default();
+        config.docker.upstreams = vec![DockerUpstream {
+            url: "https://r0.example".to_string(),
+            auth: None,
+            namespace: Some("_".to_string()),
+            prefix: None,
+            namespaces: Vec::new(),
+        }];
+        let (_, errors) = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("images pushed under a registry host or prefix")),
+            "{errors:?}"
+        );
+        config.docker.upstreams[0].namespace = Some("r0".to_string());
+        let (_, errors) = config.validate();
+        assert!(!errors.iter().any(|e| e.contains("docker")), "{errors:?}");
     }
 
     /// #1188 warnings: deny with only bound upstreams is not a deny-everything trap; every entry

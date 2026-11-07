@@ -287,7 +287,14 @@ async fn build_docker_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                 continue;
             }
             let raw_name = parts[..boundary].join("/");
-            let name = crate::registry::docker::strip_docker_namespace(&raw_name).to_string();
+            // A push under a registry host or prefix is listed under the name it was pushed as.
+            let name = match raw_name
+                .strip_prefix(crate::config::QUALIFIED_PUSH_ROOT)
+                .and_then(|rest| rest.strip_prefix('/'))
+            {
+                Some(qualified) => qualified.to_string(),
+                None => crate::registry::docker::strip_docker_namespace(&raw_name).to_string(),
+            };
             let entry = repos.entry(name).or_insert((0, 0, 0));
 
             // Size = ACTUAL on-disk bytes of every file in the repo (blobs +
@@ -1275,6 +1282,27 @@ mod tests {
             .unwrap();
         let repos = build_docker_index(&s).await.expect("index built");
         assert_eq!(repos[0].versions, 1);
+    }
+
+    /// A push under a registry host or prefix is listed under the name it was pushed as, apart
+    /// from the upstream's copy of the name without the host.
+    #[tokio::test]
+    async fn docker_index_lists_a_push_under_a_host_by_its_full_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::new_local(dir.path().to_str().unwrap());
+        s.put("docker/_/quay.io/org/img/manifests/v1.json", b"{}")
+            .await
+            .unwrap();
+        s.put("docker/_/hub/acme/tool/manifests/v1.json", b"{}")
+            .await
+            .unwrap();
+        s.put("docker/quay.io/org/img/manifests/up.json", b"{}")
+            .await
+            .unwrap();
+        let repos = build_docker_index(&s).await.expect("index built");
+        let mut names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["hub/acme/tool", "org/img", "quay.io/org/img"]);
     }
 
     /// only tags count as versions: a sha512 digest copy of a manifest is not one.

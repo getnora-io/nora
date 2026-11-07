@@ -80,6 +80,29 @@ pub(crate) fn tag_from_manifest_file(file_name: &str) -> Option<&str> {
     (is_tag && !is_sidecar).then_some(tag)
 }
 
+/// A blob's key for a canonical name and the bare key of its repository (`local`): the
+/// namespaced copy when the name has an upstream namespace, else the bare key itself.
+fn blob_keys(namespace: Option<&str>, name: &str, local: &str, digest: &str) -> (String, String) {
+    let bare = blob_key(None, local, digest);
+    let key = namespace.map_or_else(|| bare.clone(), |ns| blob_key(Some(ns), name, digest));
+    (key, bare)
+}
+
+/// [`blob_keys`] for a manifest.
+fn manifest_keys(
+    namespace: Option<&str>,
+    name: &str,
+    local: &str,
+    reference: &str,
+) -> (String, String) {
+    let bare = manifest_key(None, local, reference);
+    let key = namespace.map_or_else(
+        || bare.clone(),
+        |ns| manifest_key(Some(ns), name, reference),
+    );
+    (key, bare)
+}
+
 /// Build a namespaced storage key prefix for listing manifests.
 fn manifest_prefix(namespace: Option<&str>, name: &str) -> String {
     match namespace {
@@ -94,8 +117,14 @@ fn manifest_prefix(namespace: Option<&str>, name: &str) -> String {
 /// detection into a single entry point, eliminating the asymmetry between
 /// write-path (former `resolve_upstream`) and read-path (`strip_docker_namespace`).
 pub(crate) struct Canonical {
-    /// Cleaned image name (prefix/hostname stripped).
+    /// Cleaned image name (prefix/hostname stripped): what an upstream is asked for, and the
+    /// name of its cached copy under `namespace`.
     pub name: String,
+    /// The repository a push to this name is stored and answered under (no namespace): the name
+    /// as written, so a registry host or an upstream prefix in front of it is part of it. A name
+    /// behind one is kept under [`QUALIFIED_ROOT`], where neither an image name nor an upstream's
+    /// namespace can be; Docker Hub's hosts are a bare name's synonyms and are dropped.
+    pub local: String,
     /// Namespace for storage key construction (e.g. `"docker.io"`).
     pub namespace: Option<String>,
     /// Which upstreams are asked for the name.
@@ -113,6 +142,26 @@ enum Route {
     Chain,
     /// None: the name is behind this registry host, which no upstream serves (#1195).
     UnknownHost(String),
+}
+
+/// The first segment that holds pushes made under a registry host or an upstream prefix
+/// (`docker/_/quay.io/org/img/…`). Every segment of an image name starts with a letter or a
+/// digit ([`validate_docker_name`], which the dispatcher applies to the name as requested), and
+/// no upstream may take `_` as its namespace or prefix, so these keys meet neither a bare
+/// name's nor a cached copy's.
+pub(crate) const QUALIFIED_ROOT: &str = crate::config::QUALIFIED_PUSH_ROOT;
+
+/// The repository a qualified name (`quay.io/org/img`, `hub/acme/tool`) is pushed to.
+fn qualified_local(raw_name: &str) -> String {
+    format!("{QUALIFIED_ROOT}/{raw_name}")
+}
+
+/// The name a client addresses a stored repository by: `local` without [`QUALIFIED_ROOT`].
+pub(crate) fn repository_of_local(local: &str) -> &str {
+    local
+        .strip_prefix(QUALIFIED_ROOT)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(local)
 }
 
 impl Canonical {
@@ -212,6 +261,7 @@ pub(crate) fn canonicalize(
                     );
                     return Canonical {
                         name: rest.to_string(),
+                        local: qualified_local(raw_name),
                         namespace: Some(upstream.resolved_namespace()),
                         route: Route::Upstream(idx),
                         denied: false,
@@ -230,6 +280,7 @@ pub(crate) fn canonicalize(
             );
             return Canonical {
                 name: raw_name.to_string(),
+                local: raw_name.to_string(),
                 namespace: Some(upstreams[idx].resolved_namespace()),
                 route: Route::Upstream(idx),
                 denied: false,
@@ -238,9 +289,16 @@ pub(crate) fn canonicalize(
 
         // Step 3: Hostname detection (dot in first segment = FQDN)
         if first_segment.contains('.') && !rest.is_empty() {
+            // Docker Hub is where a bare name lives: `docker.io/x/y` is `x/y`, pushed or pulled.
+            let local = if crate::config::is_docker_hub_host(first_segment) {
+                rest.to_string()
+            } else {
+                qualified_local(raw_name)
+            };
             if let Some(idx) = upstreams.iter().position(|u| u.serves_host(first_segment)) {
                 return Canonical {
                     name: rest.to_string(),
+                    local,
                     namespace: Some(upstreams[idx].resolved_namespace()),
                     route: Route::Upstream(idx),
                     denied: false,
@@ -250,6 +308,7 @@ pub(crate) fn canonicalize(
             if crate::config::is_docker_hub_host(first_segment) {
                 return Canonical {
                     name: rest.to_string(),
+                    local,
                     namespace: fallback_ns(),
                     route: Route::Chain,
                     denied: deny_mode,
@@ -259,6 +318,7 @@ pub(crate) fn canonicalize(
             // `None` keeps the cached copies of the upstreams out; local pushes stay readable.
             return Canonical {
                 name: rest.to_string(),
+                local,
                 namespace: None,
                 route: Route::UnknownHost(first_segment.to_string()),
                 denied: deny_mode,
@@ -270,6 +330,7 @@ pub(crate) fn canonicalize(
     let ns = fallback_ns();
     Canonical {
         name: raw_name.to_string(),
+        local: raw_name.to_string(),
         namespace: ns,
         route: Route::Chain,
         denied: deny_mode,
@@ -1178,6 +1239,10 @@ async fn catalog(State(state): State<AppState>) -> Response {
             if name.is_empty() {
                 return None;
             }
+            // A push under a registry host or prefix is listed as it was pushed.
+            if name.starts_with(&format!("{QUALIFIED_ROOT}/")) {
+                return Some(repository_of_local(name).to_string());
+            }
             // Canonicalize to strip upstream namespace prefix (e.g. "docker.io/")
             // so that images proxied through different upstreams are deduplicated.
             Some(canonicalize(name, &state.config.docker).name)
@@ -1199,6 +1264,7 @@ async fn check_blob(
         return r;
     }
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1206,8 +1272,7 @@ async fn check_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let key = blob_key(c.namespace.as_deref(), &name, &digest);
-    let legacy_key = blob_key(None, &name, &digest);
+    let (key, legacy_key) = blob_keys(c.namespace.as_deref(), &name, &local, &digest);
     // Use stat() instead of get() to avoid loading multi-GB blobs into memory
     // just to return Content-Length on a HEAD request (#526).
     match storage_stat_with_fallback(&state.storage, &key, &legacy_key).await {
@@ -1327,6 +1392,7 @@ async fn download_blob(
     let upstreams_to_try = c.upstreams_to_try(&state.config.docker.upstreams);
     let ns = c.namespace;
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1356,8 +1422,7 @@ async fn download_blob(
         }
     }
 
-    let key = blob_key(ns.as_deref(), &name, &digest);
-    let legacy_key = blob_key(None, &name, &digest);
+    let (key, legacy_key) = blob_keys(ns.as_deref(), &name, &local, &digest);
 
     // Try local storage first — streaming read, never loads full blob into RAM (#580)
     if let Some(response) =
@@ -1514,6 +1579,7 @@ async fn mount_blob(state: State<AppState>, raw_name: &str, from: &str, digest: 
         return r;
     }
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1533,9 +1599,10 @@ async fn mount_blob(state: State<AppState>, raw_name: &str, from: &str, digest: 
     }
 
     // Must match the key upload finalization writes.
-    let dst_key = format!("docker/{}/blobs/{}", name, digest);
+    let dst_key = blob_key(None, &local, digest);
+    let repository = repository_of_local(&local);
     if state.storage.stat(&dst_key).await.is_some() {
-        return blob_created(&name, digest);
+        return blob_created(repository, digest);
     }
 
     // A digest still inside its proxy cooldown must not be laundered into a
@@ -1544,8 +1611,12 @@ async fn mount_blob(state: State<AppState>, raw_name: &str, from: &str, digest: 
         return start_upload(state, Path(raw_name.to_string())).await;
     }
 
-    let ns_key = blob_key(c_from.namespace.as_deref(), &c_from.name, digest);
-    let legacy_key = blob_key(None, &c_from.name, digest);
+    let (ns_key, legacy_key) = blob_keys(
+        c_from.namespace.as_deref(),
+        &c_from.name,
+        &c_from.local,
+        digest,
+    );
     let src_key = if state.storage.stat(&ns_key).await.is_some() {
         ns_key
     } else if ns_key != legacy_key && state.storage.stat(&legacy_key).await.is_some() {
@@ -1562,18 +1633,18 @@ async fn mount_blob(state: State<AppState>, raw_name: &str, from: &str, digest: 
     state.audit.log(AuditEntry::new(
         "mount",
         "api",
-        &format!("{}@{}", name, digest),
+        &format!("{}@{}", repository, digest),
         "docker",
         "blob",
     ));
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
-        format!("{}@{}", name, &digest[..19.min(digest.len())]),
+        format!("{}@{}", repository, &digest[..19.min(digest.len())]),
         crate::registry_type::RegistryType::Docker,
         "LOCAL",
     ));
     state.repo_index.invalidate("docker");
-    blob_created(&name, digest)
+    blob_created(repository, digest)
 }
 
 async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -> Response {
@@ -1582,6 +1653,7 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
         return r;
     }
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1617,7 +1689,7 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
                 UploadSession {
                     temp_path,
                     size: 0,
-                    name: name.clone(),
+                    name: local.clone(),
                     created_at: std::time::Instant::now(),
                 },
             );
@@ -1629,7 +1701,7 @@ async fn start_upload(State(state): State<AppState>, Path(name): Path<String>) -
         return too_many_uploads();
     }
 
-    let location = format!("/v2/{}/blobs/uploads/{}", name, uuid);
+    let location = format!("/v2/{}/blobs/uploads/{}", repository_of_local(&local), uuid);
     (
         StatusCode::ACCEPTED,
         [
@@ -1652,6 +1724,7 @@ async fn patch_blob(
         return r;
     }
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1678,10 +1751,10 @@ async fn patch_blob(
         };
 
         // Verify session belongs to this repository
-        if session.name != name {
+        if session.name != local {
             tracing::warn!(
                 session_name = %session.name,
-                request_name = %name,
+                request_name = %local,
                 "SECURITY: upload session name mismatch — possible session fixation"
             );
             return (
@@ -1783,7 +1856,7 @@ async fn patch_blob(
 
     let total_size = new_size;
 
-    let location = format!("/v2/{}/blobs/uploads/{}", name, uuid);
+    let location = format!("/v2/{}/blobs/uploads/{}", repository_of_local(&local), uuid);
     // Range header indicates bytes 0 to (total_size - 1) have been received
     let range = if total_size > 0 {
         format!("0-{}", total_size - 1)
@@ -1817,6 +1890,7 @@ async fn cancel_upload(
         return r;
     }
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1827,11 +1901,11 @@ async fn cancel_upload(
     // `map` yields an owned bool so no borrow of `sessions` outlives the match.
     let temp_path = {
         let mut sessions = state.upload_sessions.write();
-        match sessions.get(&uuid).map(|s| s.name == name) {
+        match sessions.get(&uuid).map(|s| s.name == local) {
             None => None,
             Some(false) => {
                 tracing::warn!(
-                    request_name = %name,
+                    request_name = %local,
                     uuid = %uuid,
                     "SECURITY: upload cancel name mismatch — possible session fixation"
                 );
@@ -1868,6 +1942,7 @@ async fn upload_blob(
         return r;
     }
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -1914,10 +1989,10 @@ async fn upload_blob(
     // client disconnect, digest mismatch, storage failure, cancellation) — #580.
     let (temp_path, mut guard) = if let Some(session) = session_opt {
         // Verify session belongs to this repository
-        if session.name != name {
+        if session.name != local {
             tracing::warn!(
                 session_name = %session.name,
-                request_name = %name,
+                request_name = %local,
                 "SECURITY: upload finalization name mismatch"
             );
             let _ = tokio::fs::remove_file(&session.temp_path).await;
@@ -2023,7 +2098,8 @@ async fn upload_blob(
 
     // Move temp file into storage — no RAM copy of the blob. The digest was just checked
     // against the bytes (`sha256:` and their hex), so it pins them (#1154).
-    let key = format!("docker/{}/blobs/{}", name, digest);
+    let key = blob_key(None, &local, digest);
+    let repository = repository_of_local(&local);
     match state
         .storage
         .put_from_path(&key, &temp_path, digest.strip_prefix("sha256:"))
@@ -2035,18 +2111,18 @@ async fn upload_blob(
             state.audit.log(AuditEntry::new(
                 "push",
                 "api",
-                &format!("{}@{}", name, digest),
+                &format!("{}@{}", repository, digest),
                 "docker",
                 "blob",
             ));
             state.activity.push(ActivityEntry::new(
                 ActionType::Push,
-                format!("{}@{}", name, &digest[..19.min(digest.len())]),
+                format!("{}@{}", repository, &digest[..19.min(digest.len())]),
                 crate::registry_type::RegistryType::Docker,
                 "LOCAL",
             ));
             state.repo_index.invalidate("docker");
-            blob_created(&name, digest)
+            blob_created(repository, digest)
         }
         Err(e) => {
             tracing::error!(error = %e, key = %key, name = %name, "Failed to store blob");
@@ -2268,9 +2344,9 @@ fn is_digest_reference(reference: &str) -> bool {
 
 /// Whether resolving a reference consults its push record: a tag whose namespaced (proxied) key
 /// is not its bare (pushed) one. Only then is the tag's bare metadata needed to answer it.
-fn consults_push_record(ns: Option<&str>, name: &str, reference: &str) -> bool {
-    !is_digest_reference(reference)
-        && manifest_key(ns, name, reference) != manifest_key(None, name, reference)
+fn consults_push_record(ns: Option<&str>, name: &str, local: &str, reference: &str) -> bool {
+    let (key, bare) = manifest_keys(ns, name, local, reference);
+    !is_digest_reference(reference) && key != bare
 }
 
 /// The stored copy that answers a manifest reference, and whether it is hosted (pushed or bare)
@@ -2283,16 +2359,16 @@ async fn resolve_manifest(
     state: &AppState,
     ns: Option<&str>,
     name: &str,
+    local: &str,
     reference: &str,
     pushed: Option<crate::storage::Result<PushedTag>>,
 ) -> crate::storage::Result<Option<(Bytes, bool)>> {
     use crate::storage::StorageError;
-    let key = manifest_key(ns, name, reference);
-    let legacy_key = manifest_key(None, name, reference);
-    if consults_push_record(ns, name, reference) {
+    let (key, legacy_key) = manifest_keys(ns, name, local, reference);
+    if consults_push_record(ns, name, local, reference) {
         let pushed = match pushed {
             Some(pushed) => pushed,
-            None => pushed_tag(&state.storage, name, reference).await,
+            None => pushed_tag(&state.storage, local, reference).await,
         };
         if let PushedTag::Push { manifest, .. } = pushed? {
             return Ok(Some((manifest, true)));
@@ -2326,20 +2402,20 @@ enum PushedTag {
     NotPushed { bare_meta: Option<Bytes> },
 }
 
-/// Reads whether a push answers a tag: its bare metadata and, with a push record
-/// ([`push_record`]) there, its bare manifest. Err on a storage error other than NotFound, so that a
-/// failed read never hands the tag to another copy.
+/// Reads whether a push answers a tag of the repository `local` ([`Canonical::local`]): its bare
+/// metadata and, with a push record ([`push_record`]) there, its bare manifest. Err on a storage
+/// error other than NotFound, so that a failed read never hands the tag to another copy.
 async fn pushed_tag(
     storage: &Storage,
-    name: &str,
+    local: &str,
     reference: &str,
 ) -> crate::storage::Result<PushedTag> {
     use crate::storage::StorageError;
-    let bare_meta = read_bare_meta(storage, name, reference).await?;
+    let bare_meta = read_bare_meta(storage, local, reference).await?;
     let Some(record) = bare_meta.as_deref().and_then(push_record) else {
         return Ok(PushedTag::NotPushed { bare_meta });
     };
-    match storage.get(&manifest_key(None, name, reference)).await {
+    match storage.get(&manifest_key(None, local, reference)).await {
         Ok(manifest) => Ok(PushedTag::Push { manifest, record }),
         Err(StorageError::NotFound) => Ok(PushedTag::NotPushed { bare_meta }),
         Err(e) => Err(e),
@@ -2393,6 +2469,7 @@ async fn get_manifest(
     let upstreams_to_try = c.upstreams_to_try(&state.config.docker.upstreams);
     let ns = c.namespace;
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -2403,8 +2480,8 @@ async fn get_manifest(
     // Whether a push answers the tag, read once: a tag that is the push's is dated by its record and
     // answered by its manifest; otherwise the date comes from the .meta.json sidecars (namespaced,
     // then the bare one already read) and the resolver goes on to the other copies.
-    let pushed = if consults_push_record(ns.as_deref(), &name, &reference) {
-        Some(pushed_tag(&state.storage, &name, &reference).await)
+    let pushed = if consults_push_record(ns.as_deref(), &name, &local, &reference) {
+        Some(pushed_tag(&state.storage, &local, &reference).await)
     } else {
         None
     };
@@ -2416,6 +2493,7 @@ async fn get_manifest(
             extract_docker_publish_date(
                 &state.storage,
                 &name,
+                &local,
                 &reference,
                 state.config.docker.upstreams.is_empty(),
                 ns.as_deref(),
@@ -2427,6 +2505,7 @@ async fn get_manifest(
             extract_docker_publish_date(
                 &state.storage,
                 &name,
+                &local,
                 &reference,
                 state.config.docker.upstreams.is_empty(),
                 ns.as_deref(),
@@ -2458,8 +2537,7 @@ async fn get_manifest(
         }
     }
 
-    let key = manifest_key(ns.as_deref(), &name, &reference);
-    let legacy_key = manifest_key(None, &name, &reference);
+    let (key, legacy_key) = manifest_keys(ns.as_deref(), &name, &local, &reference);
 
     // Try local storage first (namespaced key, then bare-key fallback). Provenance lives in
     // the key layout: the namespaced key only ever holds an upstream-proxied copy, while the
@@ -2471,8 +2549,15 @@ async fn get_manifest(
     // fallback silently flips WHICH copy answers (proxied-current vs legacy/hosted), and
     // an error-driven proxy would resolve a hosted name against an upstream that may be
     // squatted. Only `NotFound` may advance to the next source.
-    let (cached, hosted) = match resolve_manifest(&state, ns.as_deref(), &name, &reference, pushed)
-        .await
+    let (cached, hosted) = match resolve_manifest(
+        &state,
+        ns.as_deref(),
+        &name,
+        &local,
+        &reference,
+        pushed,
+    )
+    .await
     {
         Ok(Some((data, hosted))) => (Some(data), hosted),
         Ok(None) => (None, true),
@@ -2520,7 +2605,7 @@ async fn get_manifest(
     // Serve fresh cache immediately
     if let Some(ref data) = cached {
         if cache_fresh {
-            return serve_cached_manifest(&state, data, &name, &reference, served_ns);
+            return serve_cached_manifest(&state, data, &name, &local, &reference, served_ns);
         }
     }
 
@@ -2532,7 +2617,7 @@ async fn get_manifest(
     // lookups on locally-hosted images.
     if internal {
         if let Some(ref data) = cached {
-            return serve_cached_manifest(&state, data, &name, &reference, served_ns);
+            return serve_cached_manifest(&state, data, &name, &local, &reference, served_ns);
         }
         crate::metrics::record_namespace_isolation_refused("docker");
         return manifest_unknown_response(&name, &reference);
@@ -2590,7 +2675,8 @@ async fn get_manifest(
                 reference = %reference,
                 "Upstream failed, serving stale cached manifest"
             );
-            let mut response = serve_cached_manifest(&state, data, &name, &reference, served_ns);
+            let mut response =
+                serve_cached_manifest(&state, data, &name, &local, &reference, served_ns);
             response.headers_mut().insert(
                 axum::http::header::HeaderName::from_static("x-nora-stale"),
                 axum::http::header::HeaderValue::from_static("true"),
@@ -2621,6 +2707,7 @@ fn serve_cached_manifest(
     state: &AppState,
     data: &[u8],
     name: &str,
+    local: &str,
     reference: &str,
     ns: Option<&str>,
 ) -> Response {
@@ -2639,7 +2726,11 @@ fn serve_cached_manifest(
     state.metrics.record_cache_hit("docker");
     state.activity.push(ActivityEntry::new(
         ActionType::Pull,
-        format!("{}:{}", name, reference),
+        format!(
+            "{}:{}",
+            ns.map_or_else(|| repository_of_local(local), |_| name),
+            reference
+        ),
         crate::registry_type::RegistryType::Docker,
         "LOCAL",
     ));
@@ -2667,9 +2758,13 @@ fn serve_cached_manifest(
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    state
-        .pull_stats
-        .record(&manifest_meta_key(ns, name, reference), now);
+    state.pull_stats.record(
+        &ns.map_or_else(
+            || manifest_meta_key(None, local, reference),
+            |ns| manifest_meta_key(Some(ns), name, reference),
+        ),
+        now,
+    );
 
     manifest_response(Bytes::copy_from_slice(data), content_type, digest)
 }
@@ -2736,6 +2831,7 @@ async fn put_manifest(
         return r;
     }
     let name = c.name;
+    let local = c.local;
     let ns = c.namespace;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
@@ -2764,7 +2860,7 @@ async fn put_manifest(
 
     // Reject a manifest that references content (config / layers / sub-manifests) we do
     // not have — a broken image must not be pushable (OCI MANIFEST_BLOB_UNKNOWN).
-    if let Some(missing) = missing_manifest_ref(&body, &state.storage, &name).await {
+    if let Some(missing) = missing_manifest_ref(&body, &state.storage, &local).await {
         tracing::warn!(
             name = %name,
             reference = %reference,
@@ -2792,24 +2888,24 @@ async fn put_manifest(
     // Store by tag/reference. Hold the SAME publish_lock key as delete_manifest so a
     // concurrent push/push or push/delete of one tag cannot interleave (the tag + digest
     // + metadata writes below stay consistent). Held until the end of the handler.
-    let key = format!("docker/{}/manifests/{}.json", name, reference);
-    let manifest_lock = state.publish_lock(&manifest_key(ns.as_deref(), &name, &reference));
+    let (lock_key, key) = manifest_keys(ns.as_deref(), &name, &local, &reference);
+    let manifest_lock = state.publish_lock(&lock_key);
     let _manifest_guard = manifest_lock.lock().await;
     if state.storage.put(&key, &body).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     // Also store by digest for direct digest lookups
-    let digest_key = format!("docker/{}/manifests/{}.json", name, digest);
+    let digest_key = manifest_key(None, &local, &digest);
     if state.storage.put(&digest_key, &body).await.is_err() {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
     // Extract and save metadata, with the record that this tag was pushed here.
-    let mut metadata = extract_metadata(&body, &state.storage, &name).await;
+    let mut metadata = extract_metadata(&body, &state.storage, &local).await;
     metadata.pushed_digest = Some(digest.clone());
     if let Ok(meta_json) = serde_json::to_vec(&metadata) {
-        if let Err(e) = write_manifest_meta(&state, None, &name, &reference, &meta_json).await {
+        if let Err(e) = write_manifest_meta(&state, None, &local, &reference, &meta_json).await {
             tracing::warn!(name = %name, reference = %reference, error = %e, "cache write failed (push metadata by tag)");
             crate::metrics::CACHE_WRITE_ERRORS
                 .with_label_values(&["docker", "metadata"])
@@ -2817,7 +2913,7 @@ async fn put_manifest(
         }
 
         // Also save metadata by digest
-        if let Err(e) = write_manifest_meta(&state, None, &name, &digest, &meta_json).await {
+        if let Err(e) = write_manifest_meta(&state, None, &local, &digest, &meta_json).await {
             tracing::warn!(name = %name, digest = %digest, error = %e, "cache write failed (push metadata by digest)");
             crate::metrics::CACHE_WRITE_ERRORS
                 .with_label_values(&["docker", "metadata"])
@@ -2833,23 +2929,24 @@ async fn put_manifest(
         }
     }
 
+    let repository = repository_of_local(&local);
     state.metrics.record_upload("docker");
     state.activity.push(ActivityEntry::new(
         ActionType::Push,
-        format!("{}:{}", name, reference),
+        format!("{}:{}", repository, reference),
         crate::registry_type::RegistryType::Docker,
         "LOCAL",
     ));
     state.audit.log(AuditEntry::new(
         "push",
         "api",
-        &format!("{}:{}", name, reference),
+        &format!("{}:{}", repository, reference),
         "docker",
         "manifest",
     ));
     state.repo_index.invalidate("docker");
 
-    let location = format!("/v2/{}/manifests/{}", name, reference);
+    let location = format!("/v2/{}/manifests/{}", repository, reference);
     (
         StatusCode::CREATED,
         [
@@ -2867,11 +2964,15 @@ async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> R
     }
     let ns = c.namespace;
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
-    let prefix = manifest_prefix(ns.as_deref(), &name);
-    let legacy_prefix = manifest_prefix(None, &name);
+    let legacy_prefix = manifest_prefix(None, &local);
+    let prefix = ns.as_deref().map_or_else(
+        || legacy_prefix.clone(),
+        |ns| manifest_prefix(Some(ns), &name),
+    );
     let mut keys = match state.storage.list(&prefix).await {
         Ok(k) => k,
         Err(e) => {
@@ -2944,10 +3045,10 @@ async fn delete_manifest_and_meta(
     state: &AppState,
     ns: Option<&str>,
     name: &str,
+    local: &str,
     reference: &str,
 ) -> crate::storage::Result<()> {
-    let key = manifest_key(ns, name, reference);
-    let legacy_key = manifest_key(None, name, reference);
+    let (key, legacy_key) = manifest_keys(ns, name, local, reference);
     // Every copy goes, the namespaced one and a pre-migration bare one: a read falls back to the
     // bare copy, so a delete that stopped at the first copy left the manifest served. A failure
     // other than "not there" is the answer, so the client retries instead of believing it gone.
@@ -2973,9 +3074,9 @@ async fn delete_manifest_and_meta(
     };
     // Metadata goes only once the manifest is gone (deleted now, or not there at all).
     if matches!(result, Ok(()) | Err(crate::storage::StorageError::NotFound)) {
-        let mut meta_keys = vec![manifest_meta_key(ns, name, reference)];
-        if ns.is_some() {
-            meta_keys.push(manifest_meta_key(None, name, reference));
+        let mut meta_keys = vec![manifest_meta_key(None, local, reference)];
+        if let Some(ns) = ns {
+            meta_keys.insert(0, manifest_meta_key(Some(ns), name, reference));
         }
         for meta_key in meta_keys {
             let lock = state.publish_lock(&meta_key);
@@ -3042,12 +3143,16 @@ async fn delete_tags_for_digest(
     state: &AppState,
     ns: Option<&str>,
     name: &str,
+    local: &str,
     digest: &str,
 ) -> crate::storage::Result<()> {
     use sha2::Digest as _;
 
-    let prefix = manifest_prefix(ns, name);
-    let legacy_prefix = manifest_prefix(None, name);
+    let legacy_prefix = manifest_prefix(None, local);
+    let prefix = ns.map_or_else(
+        || legacy_prefix.clone(),
+        |ns| manifest_prefix(Some(ns), name),
+    );
     let mut keys = state.storage.list(&prefix).await?;
     if prefix != legacy_prefix {
         keys.extend(state.storage.list(&legacy_prefix).await?);
@@ -3070,24 +3175,24 @@ async fn delete_tags_for_digest(
     // Every tag resolved before anything is deleted: an unreadable one stops the delete here.
     let mut candidates = Vec::new();
     for tag in tags {
-        if let Some((data, _)) = resolve_manifest(state, ns, name, &tag, None).await? {
+        if let Some((data, _)) = resolve_manifest(state, ns, name, local, &tag, None).await? {
             if resolves_to_digest(&data) {
                 candidates.push(tag);
             }
         }
     }
     for tag in candidates {
-        let key = manifest_key(ns, name, &tag);
+        let (key, _) = manifest_keys(ns, name, local, &tag);
         // Serialize with put_manifest on this tag.
         let lock = state.publish_lock(&key);
         let _guard = lock.lock().await;
         // Re-read under the lock, as a read resolves the tag (a recorded push first); only delete if
         // it STILL resolves to `digest`.
-        match resolve_manifest(state, ns, name, &tag, None).await? {
+        match resolve_manifest(state, ns, name, local, &tag, None).await? {
             Some((data, _)) if resolves_to_digest(&data) => {}
             _ => continue,
         }
-        let _ = delete_manifest_and_meta(state, ns, name, &tag).await;
+        let _ = delete_manifest_and_meta(state, ns, name, local, &tag).await;
         tracing::info!(
             name = %name, tag = %tag, digest = %digest,
             "Docker tag removed because its manifest was deleted by digest (#658)"
@@ -3106,6 +3211,7 @@ async fn delete_manifest(
     }
     let ns = c.namespace;
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -3113,7 +3219,7 @@ async fn delete_manifest(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let key = manifest_key(ns.as_deref(), &name, &reference);
+    let (key, _) = manifest_keys(ns.as_deref(), &name, &local, &reference);
 
     // Serialize tag delete with put_manifest via publish_lock to prevent
     // concurrent put from updating the tag between our read and delete
@@ -3126,12 +3232,13 @@ async fn delete_manifest(
         // The manifest the tag answers with, as a read resolves it (a recorded push first). A read
         // that fails is the answer: a delete that cannot tell what the tag answers with removes
         // nothing, as a pull of the tag answers 500 — never the tag without its manifest.
-        match resolve_manifest(&state, ns.as_deref(), &name, &reference, None).await {
+        match resolve_manifest(&state, ns.as_deref(), &name, &local, &reference, None).await {
             Ok(Some((data, _))) => {
                 use sha2::Digest;
                 let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&data)));
                 // Delete from both namespaced and legacy locations, then the metadata.
-                let _ = delete_manifest_and_meta(&state, ns.as_deref(), &name, &digest).await;
+                let _ =
+                    delete_manifest_and_meta(&state, ns.as_deref(), &name, &local, &digest).await;
             }
             Ok(None) => {}
             Err(e) => {
@@ -3143,19 +3250,21 @@ async fn delete_manifest(
         // #658: deleting by digest must also drop the tags that resolve to it,
         // so the registry stops serving a tag whose manifest is now gone. A tag
         // that cannot be read stops the delete before anything is removed.
-        if let Err(e) = delete_tags_for_digest(&state, ns.as_deref(), &name, &reference).await {
+        if let Err(e) =
+            delete_tags_for_digest(&state, ns.as_deref(), &name, &local, &reference).await
+        {
             tracing::error!(error = %e, name = %name, reference = %reference, "delete by digest: reading the tags failed; nothing deleted");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     }
 
     // Delete manifest — try namespaced key first, then legacy fallback — then its metadata.
-    match delete_manifest_and_meta(&state, ns.as_deref(), &name, &reference).await {
+    match delete_manifest_and_meta(&state, ns.as_deref(), &name, &local, &reference).await {
         Ok(()) => {
             state.audit.log(AuditEntry::new(
                 "delete",
                 "api",
-                &format!("{}:{}", name, reference),
+                &format!("{}:{}", repository_of_local(&local), reference),
                 "docker",
                 "manifest",
             ));
@@ -3181,6 +3290,7 @@ async fn delete_blob(
     }
     let ns = c.namespace;
     let name = c.name;
+    let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
@@ -3188,8 +3298,7 @@ async fn delete_blob(
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
     }
 
-    let key = blob_key(ns.as_deref(), &name, &digest);
-    let legacy_key = blob_key(None, &name, &digest);
+    let (key, legacy_key) = blob_keys(ns.as_deref(), &name, &local, &digest);
     // Delete from both locations during migration
     if key != legacy_key {
         let _ = state.storage.delete(&legacy_key).await;
@@ -3199,7 +3308,11 @@ async fn delete_blob(
             state.audit.log(AuditEntry::new(
                 "delete",
                 "api",
-                &format!("{}@{}", name, &digest[..19.min(digest.len())]),
+                &format!(
+                    "{}@{}",
+                    repository_of_local(&local),
+                    &digest[..19.min(digest.len())]
+                ),
                 "docker",
                 "blob",
             ));
@@ -4461,6 +4574,7 @@ fn detect_manifest_media_type(data: &[u8]) -> String {
 async fn extract_docker_publish_date(
     storage: &Storage,
     name: &str,
+    local: &str,
     reference: &str,
     upstreams_empty: bool,
     ns: Option<&str>,
@@ -4469,8 +4583,11 @@ async fn extract_docker_publish_date(
     // The .meta.json sidecar (has push_timestamp) — namespaced, then legacy. The legacy (bare) one is
     // read only when no namespaced one exists, and not again when the request already holds it. (A
     // tag a push answers is dated by its record before this is asked: see `get_manifest`.)
-    let meta = manifest_meta_key(ns, name, reference);
-    let legacy_meta = manifest_meta_key(None, name, reference);
+    let legacy_meta = manifest_meta_key(None, local, reference);
+    let meta = ns.map_or_else(
+        || legacy_meta.clone(),
+        |ns| manifest_meta_key(Some(ns), name, reference),
+    );
     let namespaced = if meta != legacy_meta {
         Some(storage.get(&meta).await)
     } else {
@@ -4480,7 +4597,7 @@ async fn extract_docker_publish_date(
         Some(Ok(data)) => Some(data),
         Some(Err(crate::storage::StorageError::NotFound)) | None => {
             if let BareMeta::Unread = bare {
-                *bare = BareMeta::Read(read_bare_meta(storage, name, reference).await);
+                *bare = BareMeta::Read(read_bare_meta(storage, local, reference).await);
             }
             match bare {
                 BareMeta::Read(Ok(Some(data))) => Some(data.clone()),
@@ -4499,8 +4616,7 @@ async fn extract_docker_publish_date(
 
     // mtime fallback — only for hosted mode (no upstreams configured)
     if upstreams_empty {
-        let key = manifest_key(ns, name, reference);
-        let legacy = manifest_key(None, name, reference);
+        let (key, legacy) = manifest_keys(ns, name, local, reference);
         // Try namespaced first, then legacy
         if let Some(date) = crate::curation::extract_mtime_as_publish_date(storage, &key).await {
             return Some(date);
@@ -5943,7 +6059,8 @@ mod integration_tests {
             "layers": []
         }))
         .unwrap();
-        seed_zero_config(&ctx.state, "myteam/app").await;
+        // Its config is in the repository it is pushed to: the name with its host.
+        seed_zero_config(&ctx.state, "_/quay.io/myteam/app").await;
         let put = send(
             &ctx.app,
             Method::PUT,
@@ -5967,6 +6084,373 @@ mod integration_tests {
             .map(|r| r.url.path().to_string())
             .collect();
         assert!(asked.is_empty(), "Docker Hub was asked: {asked:?}");
+    }
+
+    /// Pushes an image of one config blob (`salt` makes it unique) and returns its manifest and the
+    /// config's digest. The upload continues where the registry's `Location` sends it, which
+    /// keeps the name as pushed.
+    async fn push_salted_image(
+        app: &axum::Router,
+        name: &str,
+        tag: &str,
+        salt: &str,
+    ) -> (Vec<u8>, String) {
+        let config = serde_json::to_vec(&serde_json::json!({ "salt": salt })).unwrap();
+        let digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&config)));
+        let started = send(
+            app,
+            Method::POST,
+            &format!("/v2/{name}/blobs/uploads/"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            started.status(),
+            StatusCode::ACCEPTED,
+            "start upload {name}"
+        );
+        let location = started.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_string();
+        // Docker Hub's host is a synonym of the bare name.
+        let repository = name.strip_prefix("docker.io/").unwrap_or(name);
+        assert!(
+            location.starts_with(&format!("/v2/{repository}/blobs/uploads/")),
+            "{name}: upload continues at {location}"
+        );
+        let sep = if location.contains('?') { '&' } else { '?' };
+        let put = send(
+            app,
+            Method::PUT,
+            &format!("{location}{sep}digest={digest}"),
+            Body::from(config.clone()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED, "config blob {name}");
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "size": config.len(),
+                "digest": digest
+            },
+            "layers": []
+        }))
+        .unwrap();
+        let put = send(
+            app,
+            Method::PUT,
+            &format!("/v2/{name}/manifests/{tag}"),
+            Body::from(manifest.clone()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED, "manifest {name}:{tag}");
+        (manifest, digest)
+    }
+
+    /// GET a path; the status and the body.
+    async fn get_bytes(app: &axum::Router, uri: &str) -> (StatusCode, Vec<u8>) {
+        let resp = send(app, Method::GET, uri, Body::empty()).await;
+        let status = resp.status();
+        (status, body_bytes(resp).await.to_vec())
+    }
+
+    /// A push is stored under the name it was pushed as. A registry host (`quay.io/…`) or an
+    /// upstream prefix (`hub/…`) in front of a pushed name is part of the repository: the push —
+    /// its manifest and its blobs — answers that name only, never the name without it, and it does
+    /// not replace a tag pushed under the shorter name. Docker Hub's hosts stay a bare name's
+    /// synonyms, and a name storage keeps those pushes under (`_/…`) is not a name a client
+    /// can ask for.
+    #[tokio::test]
+    async fn a_push_under_a_registry_host_or_prefix_is_its_own_repository() {
+        use crate::config::DockerUpstream;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let url = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![
+                DockerUpstream {
+                    url: url.clone(),
+                    auth: None,
+                    namespace: Some("docker.io".to_string()),
+                    prefix: None,
+                    namespaces: Vec::new(),
+                },
+                DockerUpstream {
+                    url,
+                    auth: None,
+                    namespace: Some("hubmirror".to_string()),
+                    prefix: Some("hub".to_string()),
+                    namespaces: Vec::new(),
+                },
+            ];
+        });
+        let app = &ctx.app;
+
+        // (pushed as, the names that must not answer with it). The first row holds before the
+        // fix too: a plain first segment was never dropped.
+        let rows: [(&str, &[&str]); 4] = [
+            ("zzz/other/img", &["other/img"]),
+            ("quay.io/org/img", &["org/img"]),
+            ("hub/acme/tool", &["acme/tool"]),
+            ("lib/x", &["quay.io/lib/x"]),
+        ];
+        for (pushed_as, others) in rows {
+            let (manifest, config) = push_salted_image(app, pushed_as, "v1", pushed_as).await;
+            let (status, body) = get_bytes(app, &format!("/v2/{pushed_as}/manifests/v1")).await;
+            assert_eq!(status, StatusCode::OK, "{pushed_as} reads its own push");
+            assert_eq!(body, manifest, "{pushed_as} reads its own push");
+            let (status, _) = get_bytes(app, &format!("/v2/{pushed_as}/blobs/{config}")).await;
+            assert_eq!(status, StatusCode::OK, "{pushed_as} reads its own blob");
+            for other in others {
+                let (status, body) = get_bytes(app, &format!("/v2/{other}/manifests/v1")).await;
+                assert_ne!(
+                    body, manifest,
+                    "{other} answered with the push to {pushed_as}"
+                );
+                assert_ne!(status, StatusCode::OK, "{other}: nothing was pushed there");
+                let (status, _) = get_bytes(app, &format!("/v2/{other}/blobs/{config}")).await;
+                assert_ne!(status, StatusCode::OK, "{other} served {pushed_as}'s blob");
+            }
+        }
+
+        // A tag pushed under a host does not replace the same tag under the shorter name.
+        let (short, short_config) = push_salted_image(app, "team/app", "t", "short").await;
+        let (hosted, _) = push_salted_image(app, "quay.io/team/app", "t", "hosted").await;
+        assert_eq!(
+            get_bytes(app, "/v2/team/app/manifests/t").await.1,
+            short,
+            "team/app:t was replaced"
+        );
+        assert_eq!(
+            get_bytes(app, "/v2/quay.io/team/app/manifests/t").await.1,
+            hosted
+        );
+
+        // A mount into a name under a host lands in that repository, not in the shorter name.
+        let mounted = send(
+            app,
+            Method::POST,
+            &format!("/v2/quay.io/mnt/img/blobs/uploads/?mount={short_config}&from=team/app"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(mounted.status(), StatusCode::CREATED);
+        assert_eq!(
+            mounted.headers()[header::LOCATION],
+            format!("/v2/quay.io/mnt/img/blobs/{short_config}").as_str()
+        );
+        let blob = |name: &str| format!("/v2/{name}/blobs/{short_config}");
+        assert_eq!(
+            get_bytes(app, &blob("quay.io/mnt/img")).await.0,
+            StatusCode::OK
+        );
+        assert_ne!(get_bytes(app, &blob("mnt/img")).await.0, StatusCode::OK);
+
+        // Docker Hub's hosts name the bare repository.
+        let (hub, _) = push_salted_image(app, "docker.io/hubteam/img", "v1", "hub").await;
+        assert_eq!(get_bytes(app, "/v2/hubteam/img/manifests/v1").await.1, hub);
+
+        // The storage of those pushes is not a name, and neither is a host with `..` in it.
+        for uri in [
+            "/v2/_/quay.io/org/img/manifests/v1",
+            "/v2/x..y/team/app/manifests/t",
+        ] {
+            let (status, body) = get_bytes(app, uri).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+            assert_ne!(body, short, "{uri}");
+        }
+
+        // The catalog lists each push under the name it was pushed as.
+        let (_, catalog) = get_bytes(app, "/v2/_catalog").await;
+        let catalog: serde_json::Value = serde_json::from_slice(&catalog).unwrap();
+        let repos: Vec<&str> = catalog["repositories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|r| r.as_str())
+            .collect();
+        for name in [
+            "quay.io/org/img",
+            "hub/acme/tool",
+            "team/app",
+            "quay.io/team/app",
+        ] {
+            assert!(repos.contains(&name), "{name} not in {repos:?}");
+        }
+        for name in ["org/img", "acme/tool"] {
+            assert!(!repos.contains(&name), "{name} in {repos:?}");
+        }
+
+        // tags/list lists the repository asked for, not the name without its host.
+        let tags = |name: &str| {
+            let uri = format!("/v2/{name}/tags/list");
+            async move {
+                let (_, body) = get_bytes(app, &uri).await;
+                let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                v["tags"]
+                    .as_array()
+                    .map(|t| {
+                        t.iter()
+                            .filter_map(|x| x.as_str().map(String::from))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            }
+        };
+        assert_eq!(tags("quay.io/org/img").await, ["v1"]);
+        assert_eq!(tags("hub/acme/tool").await, ["v1"]);
+        assert!(tags("org/img").await.is_empty());
+        assert_eq!(tags("lib/x").await, ["v1"]);
+        assert!(tags("quay.io/lib/x").await.is_empty());
+
+        // A delete under the host removes that push only.
+        let deleted = send(
+            app,
+            Method::DELETE,
+            "/v2/quay.io/team/app/manifests/t",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::ACCEPTED);
+        assert_ne!(
+            get_bytes(app, "/v2/quay.io/team/app/manifests/t").await.0,
+            StatusCode::OK
+        );
+        assert_eq!(get_bytes(app, "/v2/team/app/manifests/t").await.1, short);
+    }
+
+    /// The host an upstream serves under a namespace equal to it (`quay.io`, derived from its
+    /// url): the upstream's copies stay under `docker/quay.io/…` and are revalidated as before,
+    /// and a push under the host is kept apart from them, under `_/`, and answers its tag.
+    #[tokio::test]
+    async fn a_push_under_a_host_an_upstream_serves_is_kept_apart_from_its_copies() {
+        use crate::config::DockerUpstream;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let quay = MockServer::start().await;
+        let upstream_manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#.to_vec();
+        Mock::given(wiremock::matchers::path_regex("/manifests/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+                    .set_body_bytes(upstream_manifest.clone()),
+            )
+            .mount(&quay)
+            .await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&quay)
+            .await;
+        let url = quay.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![DockerUpstream {
+                url,
+                auth: None,
+                namespace: Some("quay.io".to_string()),
+                prefix: None,
+                namespaces: Vec::new(),
+            }];
+        });
+        let app = &ctx.app;
+        let storage = &ctx.state.storage;
+        let asked = |tag: &'static str| {
+            let quay = &quay;
+            async move {
+                quay.received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r.url.path().ends_with(&format!("/manifests/{tag}")))
+                    .count()
+            }
+        };
+
+        let (status, body) = get_bytes(app, "/v2/quay.io/org/img/manifests/up").await;
+        assert_eq!((status, body), (StatusCode::OK, upstream_manifest.clone()));
+        // The copy is written in the background.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while storage
+            .stat("docker/quay.io/org/img/manifests/up.json")
+            .await
+            .is_none()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the upstream's copy is not under its namespace"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let (pushed, _) = push_salted_image(app, "quay.io/org/img", "v1", "pushed").await;
+        assert!(storage
+            .stat("docker/_/quay.io/org/img/manifests/v1.json")
+            .await
+            .is_some());
+        assert!(storage
+            .stat("docker/quay.io/org/img/manifests/v1.json")
+            .await
+            .is_none());
+        assert_eq!(
+            get_bytes(app, "/v2/quay.io/org/img/manifests/v1").await.1,
+            pushed
+        );
+        assert_eq!(
+            asked("v1").await,
+            0,
+            "the upstream was asked for a pushed tag"
+        );
+
+        // The upstream's copy is still a copy: the next pull asks the upstream again.
+        let before = asked("up").await;
+        assert_eq!(
+            get_bytes(app, "/v2/quay.io/org/img/manifests/up").await.1,
+            upstream_manifest
+        );
+        assert_eq!(
+            asked("up").await,
+            before + 1,
+            "a proxied tag was not revalidated"
+        );
+
+        // The name without the host is the upstream's, not the push.
+        assert_ne!(get_bytes(app, "/v2/org/img/manifests/v1").await.1, pushed);
+
+        // A copy of the pushed tag written under the namespace later (a fill racing the push)
+        // does not answer it: the push does.
+        storage
+            .put(
+                "docker/quay.io/org/img/manifests/v1.json",
+                &upstream_manifest,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            get_bytes(app, "/v2/quay.io/org/img/manifests/v1").await.1,
+            pushed
+        );
+
+        // Its pulls count against the push.
+        let stats = super::current_pull_stats(
+            &ctx.state,
+            "docker/_/quay.io/org/img/manifests/v1.meta.json",
+        )
+        .await;
+        assert!(stats.downloads >= 2, "{}", stats.downloads);
+
+        // The UI shows the push under its name, and not the upstream's copies of the name
+        // without the host.
+        let detail = crate::ui::api::get_docker_detail(&ctx.state, "quay.io/org/img").await;
+        let mut shown: Vec<&str> = detail.tags.iter().map(|t| t.name.as_str()).collect();
+        shown.sort_unstable();
+        assert_eq!(shown, ["v1"]);
     }
 
     /// #1196: an upstream that will not let NORA in answers with one status whatever its
@@ -7145,6 +7629,7 @@ mod integration_tests {
                     let unread = super::extract_docker_publish_date(
                         &storage,
                         name,
+                        name,
                         reference,
                         false,
                         ns,
@@ -7155,7 +7640,7 @@ mod integration_tests {
                         super::read_bare_meta(&storage, name, reference).await,
                     );
                     let read = super::extract_docker_publish_date(
-                        &storage, name, reference, false, ns, &mut once,
+                        &storage, name, name, reference, false, ns, &mut once,
                     )
                     .await;
                     // The decision table: the namespaced document decides when it exists (a date, or none when
@@ -7802,6 +8287,7 @@ mod integration_tests {
             super::extract_docker_publish_date(
                 &state.storage,
                 "hosted-img",
+                "hosted-img",
                 "v1",
                 false,
                 Some("docker.io"),
@@ -8301,6 +8787,7 @@ mod integration_tests {
         }
         let date = super::extract_docker_publish_date(
             &ctx.state.storage,
+            "aged-img",
             "aged-img",
             "v1",
             false,
@@ -9583,6 +10070,7 @@ mod integration_tests {
         let result = super::extract_docker_publish_date(
             &storage,
             "library/nginx",
+            "library/nginx",
             "latest",
             true, // no upstreams
             None, // no namespace
@@ -9605,6 +10093,7 @@ mod integration_tests {
 
         let result = super::extract_docker_publish_date(
             &storage,
+            "library/nginx",
             "library/nginx",
             "latest",
             true, // hosted mode (no upstreams)
@@ -9629,6 +10118,7 @@ mod integration_tests {
 
         let result = super::extract_docker_publish_date(
             &storage,
+            "library/nginx",
             "library/nginx",
             "latest",
             false, // proxy mode (has upstreams)
@@ -12858,6 +13348,7 @@ mod hosted_pull_stats_and_re_push {
         super::extract_docker_publish_date(
             &state.storage,
             "race-img",
+            "race-img",
             "v1",
             false,
             Some("docker.io"),
@@ -13172,6 +13663,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
     async fn date(state: &crate::AppState, reference: &str) -> Option<i64> {
         super::extract_docker_publish_date(
             &state.storage,
+            "race-img",
             "race-img",
             reference,
             false,
