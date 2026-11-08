@@ -42,6 +42,40 @@ expression: pinned
     "body": {
       "errors": [
         {
+          "code": "TOOMANYREQUESTS",
+          "detail": {
+            "retry_after": 7
+          },
+          "message": "upstream docker:<upstream> is rate-limiting NORA, retry after 7 seconds"
+        }
+      ]
+    },
+    "content_type": "application/json",
+    "retry_after": true,
+    "row": "manifest-429",
+    "status": 429
+  },
+  {
+    "body": {
+      "errors": [
+        {
+          "code": "TOOMANYREQUESTS",
+          "detail": {
+            "retry_after": 7
+          },
+          "message": "upstream docker:<upstream> is rate-limiting NORA, retry after 7 seconds"
+        }
+      ]
+    },
+    "content_type": "application/json",
+    "retry_after": true,
+    "row": "blob-429",
+    "status": 429
+  },
+  {
+    "body": {
+      "errors": [
+        {
           "code": "UNAVAILABLE",
           "detail": "the upstream answered 5xx, timed out or could not be reached; see NORA's log",
           "message": "every upstream registry failed to answer"

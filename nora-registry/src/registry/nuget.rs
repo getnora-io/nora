@@ -298,7 +298,8 @@ async fn search_query(
             ProxyError::CircuitOpen(_)
             | ProxyError::Network(_)
             | ProxyError::Upstream(_)
-            | ProxyError::CredentialsRefused,
+            | ProxyError::CredentialsRefused
+            | ProxyError::RateLimited { .. },
         ) => {
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -396,7 +397,8 @@ async fn autocomplete_query(
             ProxyError::CircuitOpen(_)
             | ProxyError::Network(_)
             | ProxyError::Upstream(_)
-            | ProxyError::CredentialsRefused,
+            | ProxyError::CredentialsRefused
+            | ProxyError::RateLimited { .. },
         ) => {
             if !state.config.nuget.serve_stale {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();

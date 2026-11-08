@@ -205,6 +205,12 @@ pub(crate) enum ProxyError {
     /// The upstream answered and would not let NORA in: it refused the credential configured
     /// for it, or asked for one and none is configured (#1196). Alive, not down.
     CredentialsRefused,
+    /// The upstream answered 429, or is still inside the window of an earlier 429: alive, said
+    /// nothing about the artifact, and may be asked again in `retry_after` seconds (#1191).
+    RateLimited {
+        key: String,
+        retry_after: u64,
+    },
 }
 
 /// The `Authorization` value for an upstream request, built before the breaker is
@@ -230,7 +236,9 @@ fn upstream_auth_header(
 /// that refused NORA's credentials did not say "not found" either: it fails the miss like an
 /// outage, and the answer says which it was (#1196). An upstream skipped for its open breaker
 /// was not asked: with no answer from another upstream the miss is the 503 an open breaker is,
-/// with `Retry-After` (#1198).
+/// with `Retry-After` (#1198). An upstream that rate-limited NORA may have the artifact and can
+/// be asked again soon: that decides the miss over every other answer, as a 429 with the
+/// shortest `Retry-After` among them, since clients retry a 429 and not a 5xx (#1191).
 #[derive(Debug, Default)]
 pub(crate) struct UpstreamMiss {
     not_found: bool,
@@ -238,6 +246,8 @@ pub(crate) struct UpstreamMiss {
     refused: bool,
     /// The breaker key of the first upstream skipped for its open breaker.
     open: Option<String>,
+    /// The rate-limited upstream that may be asked again soonest: its key and seconds to wait.
+    limited: Option<(String, u64)>,
 }
 
 impl UpstreamMiss {
@@ -260,6 +270,14 @@ impl UpstreamMiss {
             ProxyError::CircuitOpen(key) => {
                 self.open.get_or_insert_with(|| key.clone());
             }
+            ProxyError::RateLimited { key, retry_after } => self.limit(key, *retry_after),
+        }
+    }
+
+    /// Keep the rate-limited upstream that may be asked again soonest.
+    fn limit(&mut self, key: &str, retry_after: u64) {
+        if self.limited.as_ref().is_none_or(|(_, s)| retry_after < *s) {
+            self.limited = Some((key.to_string(), retry_after));
         }
     }
 
@@ -272,22 +290,28 @@ impl UpstreamMiss {
     /// asks it for `alpine` and `library/alpine`): it said "not found" only if it failed
     /// under none of them, since a 4xx for one name says nothing about the other.
     pub(crate) fn record_upstream(&mut self, asked: &UpstreamMiss) {
+        // A rate limit under one name is no "not found" for the other either (#1191).
+        if let Some((key, retry_after)) = &asked.limited {
+            self.limit(key, *retry_after);
+        }
         if asked.failed || asked.refused || asked.open.is_some() {
             self.failed |= asked.failed;
             self.refused |= asked.refused;
             if self.open.is_none() {
                 self.open.clone_from(&asked.open);
             }
-        } else if asked.not_found {
+        } else if asked.not_found && asked.limited.is_none() {
             self.not_found = true;
         }
     }
 
-    /// The status for the miss: 404 when an upstream said "not found" or none was asked;
-    /// otherwise 503 when one was skipped for its open breaker, 502 when every one failed or
-    /// refused NORA's credentials.
+    /// The status for the miss: 429 when an upstream rate-limited NORA; otherwise 404 when an
+    /// upstream said "not found" or none was asked; otherwise 503 when one was skipped for its
+    /// open breaker, 502 when every one failed or refused NORA's credentials.
     pub(crate) fn status(&self) -> StatusCode {
-        if self.not_found {
+        if self.limited.is_some() {
+            StatusCode::TOO_MANY_REQUESTS
+        } else if self.not_found {
             StatusCode::NOT_FOUND
         } else if self.open.is_some() {
             StatusCode::SERVICE_UNAVAILABLE
@@ -311,8 +335,31 @@ impl UpstreamMiss {
         self.refused && self.status() == StatusCode::BAD_GATEWAY
     }
 
+    /// The rate-limited upstream that made the miss a 429, and the seconds to wait for it.
+    pub(crate) fn rate_limited(&self) -> Option<(&str, u64)> {
+        self.limited
+            .as_ref()
+            .filter(|_| self.status() == StatusCode::TOO_MANY_REQUESTS)
+            .map(|(key, secs)| (key.as_str(), *secs))
+    }
+
     /// The response for the miss, logging a gateway failure for the operator.
     pub(crate) fn response(&self, registry: &str, path: &str) -> Response {
+        if let Some((key, secs)) = self.rate_limited() {
+            tracing::warn!(
+                registry,
+                path,
+                upstream = key,
+                retry_after = secs,
+                "an upstream rate-limited NORA and none served the request, returning 429"
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, secs.to_string())],
+                format!("upstream {key} is rate-limiting NORA, retry after {secs} seconds"),
+            )
+                .into_response();
+        }
         let status = self.status();
         if let (StatusCode::SERVICE_UNAVAILABLE, Some(key)) = (status, &self.open) {
             tracing::warn!(
@@ -1301,21 +1348,24 @@ mod tests {
         );
     }
 
-    /// #1191: an upstream that rate-limited NORA (429) said nothing about the artifact: alone it
-    /// is a status a client retries, never 404, and an upstream asked under two names that
-    /// answered 404 to one and 429 to the other did not say "not found" either. A real 404
-    /// stays 404. Which retryable status (429, 503, 502) is still open in the issue, so the
-    /// test pins only what every candidate shares.
+    /// An upstream that answered 429 with `retry_after` seconds.
+    fn limited_for(retry_after: u64) -> ProxyError {
+        ProxyError::RateLimited {
+            key: format!("docker:http://limited-{retry_after}"),
+            retry_after,
+        }
+    }
+
+    /// #1191: an upstream that rate-limited NORA said nothing about the artifact: alone it is a
+    /// 429, never 404, and an upstream asked under two names that answered 404 to one and 429
+    /// to the other did not say "not found" either. A real 404 stays 404.
     #[test]
     fn an_upstream_rate_limit_is_not_a_missing_artifact() {
         use axum::http::StatusCode;
-        let retryable = [
-            StatusCode::TOO_MANY_REQUESTS,
-            StatusCode::SERVICE_UNAVAILABLE,
-            StatusCode::BAD_GATEWAY,
-        ];
-        let limited = UpstreamMiss::of(&ProxyError::Upstream(429)).status();
-        assert!(retryable.contains(&limited), "upstream 429 -> {limited}");
+        assert_eq!(
+            UpstreamMiss::of(&limited_for(7)).status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
         assert_eq!(
             UpstreamMiss::of(&ProxyError::Upstream(404)).status(),
             StatusCode::NOT_FOUND
@@ -1323,14 +1373,68 @@ mod tests {
 
         let mut hub = UpstreamMiss::default();
         hub.record(&ProxyError::Upstream(404));
-        hub.record(&ProxyError::Upstream(429));
+        hub.record(&limited_for(7));
         let mut folded = UpstreamMiss::default();
         folded.record_upstream(&hub);
-        let status = folded.status();
-        assert!(
-            retryable.contains(&status),
-            "404 + 429 under two names -> {status}"
-        );
+        assert_eq!(folded.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// #1191: a rate limit decides the miss over every other answer — "not found" (the
+    /// artifact may be on the limited upstream), a refused credential, an open breaker, a
+    /// failure — as a 429 with the shortest wait among the limited upstreams, folded or not.
+    /// Clients retry a 429 and not a 5xx (measured), and the limited upstream is the only one
+    /// whose answer can change soon.
+    #[test]
+    fn a_rate_limit_decides_the_miss() {
+        use axum::http::StatusCode;
+        let asked = |answers: &[ProxyError]| {
+            let mut m = UpstreamMiss::default();
+            for a in answers {
+                m.record(a);
+            }
+            m
+        };
+        let limited = || limited_for(7);
+        let down = || ProxyError::Upstream(503);
+        let open = || ProxyError::CircuitOpen("docker:http://open".into());
+        let refused = || ProxyError::CredentialsRefused;
+        let missing = || ProxyError::NotFound;
+        let too_many = StatusCode::TOO_MANY_REQUESTS;
+        #[rustfmt::skip]
+        let rows: &[(&[&[ProxyError]], StatusCode, Option<u64>)] = &[
+            // per upstream, the answers under each name; status; Retry-After
+            (&[&[limited()]],                        too_many, Some(7)),
+            (&[&[missing()], &[limited()]],          too_many, Some(7)),
+            (&[&[limited()], &[missing()]],          too_many, Some(7)),
+            (&[&[missing(), limited()]],             too_many, Some(7)),
+            (&[&[refused()], &[limited()]],          too_many, Some(7)),
+            (&[&[open()], &[limited()]],             too_many, Some(7)),
+            (&[&[down()], &[limited()]],             too_many, Some(7)),
+            (&[&[limited_for(30)], &[limited_for(5)]], too_many, Some(5)),
+            (&[&[limited_for(5)], &[limited_for(30)]], too_many, Some(5)),
+            // without a rate limit, nothing changes
+            (&[&[missing()], &[down()]],             StatusCode::NOT_FOUND, None),
+            (&[&[refused()]],                        StatusCode::BAD_GATEWAY, None),
+            (&[&[open()]],                           StatusCode::SERVICE_UNAVAILABLE, None),
+        ];
+        for (upstreams, status, wait) in rows {
+            let mut miss = UpstreamMiss::default();
+            for names in upstreams.iter() {
+                miss.record_upstream(&asked(names));
+            }
+            assert_eq!(miss.status(), *status, "{upstreams:?}");
+            assert_eq!(miss.rate_limited().map(|(_, s)| s), *wait, "{upstreams:?}");
+            let response = miss.response("docker", "myorg/app:1");
+            assert_eq!(response.status(), *status, "{upstreams:?}");
+            if let Some(wait) = wait {
+                let header = response.headers().get(header::RETRY_AFTER);
+                assert_eq!(
+                    header.and_then(|v| v.to_str().ok()),
+                    Some(wait.to_string().as_str()),
+                    "{upstreams:?}"
+                );
+            }
+        }
     }
 
     /// #1196: an upstream that refused NORA's credentials did not say "not found": alone it is
