@@ -6908,6 +6908,115 @@ mod integration_tests {
         insta::assert_json_snapshot!("docker_proxied_miss_oci_errors", pinned);
     }
 
+    /// #1191: an upstream that rate-limits NORA (`429`, `Retry-After: 60`, `TOOMANYREQUESTS`)
+    /// said nothing about the image. A cold manifest or blob miss behind it is a status the
+    /// client retries, with `Retry-After` and, on GET, an OCI error that is not
+    /// `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN`; the upstream's own `404 MANIFEST_UNKNOWN` stays 404.
+    /// The status itself (429 relayed, 503, 502) and the Retry-After cap are not chosen yet:
+    /// the rows pin only what every candidate shares. A blob HEAD is answered from storage
+    /// alone (`check_blob`) and never asks the upstream, so it has no row.
+    #[tokio::test]
+    async fn an_upstream_rate_limit_is_not_a_missing_artifact() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        let manifest = "/v2/myorg/app/manifests/9.9".to_string();
+        let layer = format!("/v2/myorg/app/blobs/{blob}");
+        let retryable = [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_GATEWAY,
+        ];
+        // (row, upstream answer, method, path, unknown code a limit must not become)
+        let rows = [
+            (
+                "manifest-get",
+                429,
+                Method::GET,
+                &manifest,
+                "MANIFEST_UNKNOWN",
+            ),
+            (
+                "manifest-head",
+                429,
+                Method::HEAD,
+                &manifest,
+                "MANIFEST_UNKNOWN",
+            ),
+            ("blob-get", 429, Method::GET, &layer, "BLOB_UNKNOWN"),
+            (
+                "manifest-404",
+                404,
+                Method::GET,
+                &manifest,
+                "MANIFEST_UNKNOWN",
+            ),
+        ];
+        // every row is checked, so a red run names each path that still answers 404
+        let mut wrong = Vec::new();
+        for (row, answer, verb, uri, unknown) in rows {
+            let server = MockServer::start().await;
+            let template = if answer == 429 {
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "60")
+                    .set_body_json(serde_json::json!({"errors": [{
+                        "code": "TOOMANYREQUESTS",
+                        "message": "You have reached your pull rate limit."
+                    }]}))
+            } else {
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({"errors": [{
+                    "code": "MANIFEST_UNKNOWN", "message": "manifest unknown"
+                }]}))
+            };
+            Mock::given(any())
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            let url = server.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.docker.proxy_timeout = 1;
+                cfg.docker.upstreams = upstreams_of(vec![(url, Vec::new())]);
+            });
+            let resp = send(&ctx.app, verb.clone(), uri, Body::empty()).await;
+            let got = resp.status();
+            let retry_after = resp
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body: serde_json::Value =
+                serde_json::from_slice(&body_bytes(resp).await).unwrap_or(serde_json::Value::Null);
+            let code = body["errors"][0]["code"].as_str().unwrap_or_default();
+            if answer == 404 {
+                if got != StatusCode::NOT_FOUND || code != unknown {
+                    wrong.push(format!("{row}: upstream 404 -> {got} {code}"));
+                }
+                continue;
+            }
+            if !retryable.contains(&got) {
+                wrong.push(format!("{row}: upstream 429 -> {got} {code}"));
+            }
+            if retry_after.is_none_or(|s| s == 0) {
+                wrong.push(format!("{row}: no Retry-After in seconds"));
+            }
+            if verb == Method::GET
+                && (!content_type.starts_with("application/json")
+                    || code.is_empty()
+                    || code == unknown)
+            {
+                wrong.push(format!("{row}: {content_type} {body}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// A locally pushed manifest is authoritative: with global pull-through upstreams
     /// configured, GET must serve it without revalidating against upstream — an unreachable
     /// upstream must neither 404 the tag (serve_stale = false) nor stale-mark it.

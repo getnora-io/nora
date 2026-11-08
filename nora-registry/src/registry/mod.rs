@@ -1301,6 +1301,38 @@ mod tests {
         );
     }
 
+    /// #1191: an upstream that rate-limited NORA (429) said nothing about the artifact: alone it
+    /// is a status a client retries, never 404, and an upstream asked under two names that
+    /// answered 404 to one and 429 to the other did not say "not found" either. A real 404
+    /// stays 404. Which retryable status (429, 503, 502) is still open in the issue, so the
+    /// test pins only what every candidate shares.
+    #[test]
+    fn an_upstream_rate_limit_is_not_a_missing_artifact() {
+        use axum::http::StatusCode;
+        let retryable = [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_GATEWAY,
+        ];
+        let limited = UpstreamMiss::of(&ProxyError::Upstream(429)).status();
+        assert!(retryable.contains(&limited), "upstream 429 -> {limited}");
+        assert_eq!(
+            UpstreamMiss::of(&ProxyError::Upstream(404)).status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let mut hub = UpstreamMiss::default();
+        hub.record(&ProxyError::Upstream(404));
+        hub.record(&ProxyError::Upstream(429));
+        let mut folded = UpstreamMiss::default();
+        folded.record_upstream(&hub);
+        let status = folded.status();
+        assert!(
+            retryable.contains(&status),
+            "404 + 429 under two names -> {status}"
+        );
+    }
+
     /// #1196: an upstream that refused NORA's credentials did not say "not found": alone it is
     /// a 502 that says so; another upstream's "not found" still decides 404, as for an outage.
     #[test]
