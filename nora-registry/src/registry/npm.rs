@@ -831,7 +831,8 @@ async fn handle_request(
             Err(
                 e @ (ProxyError::Upstream(_)
                 | ProxyError::Network(_)
-                | ProxyError::CredentialsRefused),
+                | ProxyError::CredentialsRefused
+                | ProxyError::RateLimited { .. }),
             ) => {
                 tracing::warn!(registry = "npm", path = %path, error = ?e, "npm upstream failed, returning 502");
                 return StatusCode::BAD_GATEWAY.into_response();

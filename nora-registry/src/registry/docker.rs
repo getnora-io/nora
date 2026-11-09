@@ -4,7 +4,7 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
-use crate::circuit_breaker::{upstream_key, CircuitBreakerRegistry, ProbeToken};
+use crate::circuit_breaker::{upstream_key, CircuitBreakerRegistry, ProbeToken, RateLimits};
 use crate::config::basic_auth_header;
 use crate::proxy_coalesce::Flight;
 use crate::registry::docker_auth::{DockerAuth, TokenError};
@@ -819,7 +819,9 @@ enum Missed<'a> {
 /// the status and logs it), with the OCI error body a client prints (#1189): a manifest or blob no
 /// upstream has is `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN`, as a hosted miss answers; an upstream that
 /// failed or was skipped for its open breaker is `UNAVAILABLE`; a refusal of NORA's credentials
-/// is `DENIED` (#1196). Headers the status carries (`Retry-After` of a 503) are kept.
+/// is `DENIED` (#1196); an upstream that rate-limited NORA is `TOOMANYREQUESTS`, named with the
+/// wait and not with the upstream's own message (#1191). Headers the status carries
+/// (`Retry-After` of a 503 or a 429) are kept.
 fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
     let path = match missed {
         Missed::Manifest { name, reference } => format!("{name}:{reference}"),
@@ -827,7 +829,13 @@ fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
     };
     let response = miss.response("docker", &path);
     let status = response.status();
-    let (code, message, detail) = if miss.credentials_refused() {
+    let (code, message, detail) = if let Some((key, secs)) = miss.rate_limited() {
+        (
+            "TOOMANYREQUESTS",
+            format!("upstream {key} is rate-limiting NORA, retry after {secs} seconds"),
+            json!({ "retry_after": secs }),
+        )
+    } else if miss.credentials_refused() {
         (
             "DENIED",
             "an upstream registry refused NORA's credentials".to_string(),
@@ -1523,8 +1531,8 @@ async fn download_blob(
                         Some(FillStartError::Spool) => {
                             return StatusCode::INTERNAL_SERVER_ERROR.into_response()
                         }
-                        // An open breaker skips this upstream for the next, as a failure
-                        // does (#1198).
+                        // An open breaker (#1198) or a rate limit (#1191) skips this
+                        // upstream for the next, as a failure does.
                         Some(FillStartError::Upstream(e)) => {
                             tracing::debug!(error = ?e, upstream = %upstream.url, name = %try_name, "Docker blob proxy fetch failed, trying next");
                             miss.record(&e);
@@ -2314,7 +2322,8 @@ async fn try_fetch_and_cache(
 
                 return Some(manifest_response(data, content_type, digest));
             }
-            // An open breaker skips this upstream for the next, as a failure does (#1198).
+            // An open breaker (#1198) or a rate limit (#1191) skips this upstream for the next,
+            // as a failure does.
             Err(e) => {
                 tracing::debug!(error = ?e, upstream = %upstream.url, name = %upstream_name, reference = %reference, "Docker manifest proxy fetch failed, trying next");
                 miss.record(&e);
@@ -4023,7 +4032,10 @@ impl BlobSource {
         &self,
         offset: u64,
         total: Option<u64>,
+        limits: &RateLimits,
+        cb_key: &str,
     ) -> Result<(reqwest::Response, u64), FillFailure> {
+        limits.check(cb_key).map_err(FillFailure::Refused)?;
         let response = match self.send(Some(offset)).await {
             Ok(response) => response,
             Err(BlobRequestError::Network(reason)) => {
@@ -4059,6 +4071,13 @@ impl BlobSource {
                 }
                 _ => Ok((response, offset)),
             },
+            // 429: alive, and not to be asked again until its Retry-After (#1191)
+            reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                let retry_after = response.headers().get(reqwest::header::RETRY_AFTER);
+                Err(FillFailure::Refused(
+                    limits.limited(cb_key, retry_after.map(|v| v.as_bytes())),
+                ))
+            }
             // 4xx: upstream is alive and answered (a rejected token, say), as on open (#606)
             status if status.is_client_error() => {
                 Err(FillFailure::Refused(ProxyError::Upstream(status.as_u16())))
@@ -4127,6 +4146,7 @@ pub async fn open_blob_from_upstream(
         crate::registry_type::RegistryType::Docker.as_str(),
         upstream_url,
     );
+    cb.rate_limits().check(&cb_key)?;
     let probe = cb.check(&cb_key)?;
 
     let source = BlobSource {
@@ -4156,6 +4176,14 @@ pub async fn open_blob_from_upstream(
             return Err(source.proxy_error(e));
         }
     };
+
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        cb.record_alive(&cb_key, probe);
+        let retry_after = response.headers().get(reqwest::header::RETRY_AFTER);
+        return Err(cb
+            .rate_limits()
+            .limited(&cb_key, retry_after.map(|v| v.as_bytes())));
+    }
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -4304,8 +4332,16 @@ pub(crate) async fn spool_upstream_blob(
                 "Proxy blob body interrupted, resuming from upstream"
             );
             tokio::time::sleep(UPSTREAM_RESUME_BACKOFF * stalls).await;
-            match source.resume(bytes_written, content_length).await {
+            match source
+                .resume(bytes_written, content_length, cb.rate_limits(), &cb_key)
+                .await
+            {
                 Ok(next) => break next,
+                // A rate-limited upstream is not asked again within its window: the fill ends.
+                Err(FillFailure::Refused(e @ ProxyError::RateLimited { .. })) => {
+                    cb.record_alive(&cb_key, probe);
+                    return Err(e);
+                }
                 Err(e) => last = e,
             }
         };
@@ -4410,6 +4446,8 @@ pub async fn fetch_manifest_from_upstream(
         crate::registry_type::RegistryType::Docker.as_str(),
         upstream_url,
     );
+    // A rate-limited upstream is left alone until its Retry-After, before it can take a probe.
+    cb.rate_limits().check(&cb_key)?;
     let probe = cb.check(&cb_key)?;
 
     let url = format!(
@@ -4483,6 +4521,15 @@ pub async fn fetch_manifest_from_upstream(
     };
 
     tracing::debug!(status = %response.status(), "Final upstream response");
+
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // Alive and refusing for a while: not a failure for the breaker (#1191).
+        cb.record_alive(&cb_key, probe);
+        let retry_after = response.headers().get(reqwest::header::RETRY_AFTER);
+        return Err(cb
+            .rate_limits()
+            .limited(&cb_key, retry_after.map(|v| v.as_bytes())));
+    }
 
     if !response.status().is_success() {
         let status = response.status().as_u16();
@@ -6774,7 +6821,8 @@ mod integration_tests {
     /// `Content-Type: application/json`, so a client prints the reason instead of `unknown:`. A
     /// missing manifest or blob is the `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN` a hosted miss
     /// answers; a failed or skipped upstream is `UNAVAILABLE`; a refused credential stays
-    /// `DENIED` (#1196). The table is pinned in a snapshot.
+    /// `DENIED` (#1196); a rate-limited upstream is `429 TOOMANYREQUESTS` with `Retry-After`
+    /// (#1191). The table is pinned in a snapshot.
     #[tokio::test]
     async fn a_proxied_miss_is_an_oci_error() {
         use crate::circuit_breaker::upstream_key;
@@ -6785,7 +6833,7 @@ mod integration_tests {
         let manifest = "/v2/myorg/app/manifests/9.9".to_string();
         let layer = format!("/v2/myorg/app/blobs/{blob}");
         // (row, upstream answer, path, status, OCI code)
-        let rows: [(&str, Option<u16>, &String, StatusCode, &str); 8] = [
+        let rows: [(&str, Option<u16>, &String, StatusCode, &str); 10] = [
             (
                 "manifest-404",
                 Some(404),
@@ -6799,6 +6847,20 @@ mod integration_tests {
                 &layer,
                 StatusCode::NOT_FOUND,
                 "BLOB_UNKNOWN",
+            ),
+            (
+                "manifest-429",
+                Some(429),
+                &manifest,
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
+            ),
+            (
+                "blob-429",
+                Some(429),
+                &layer,
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
             ),
             (
                 "manifest-503",
@@ -6850,6 +6912,9 @@ mod integration_tests {
             if answer == Some(401) {
                 template = template.insert_header("Www-Authenticate", "Basic realm=\"harbor\"");
             }
+            if answer == Some(429) {
+                template = template.insert_header("Retry-After", "7");
+            }
             Mock::given(any())
                 .respond_with(template)
                 .mount(&server)
@@ -6893,7 +6958,11 @@ mod integration_tests {
                 content_type.starts_with("application/json"),
                 "{row}: {content_type}"
             );
-            assert_eq!(retry_after, got == StatusCode::SERVICE_UNAVAILABLE, "{row}");
+            let retryable = [
+                StatusCode::SERVICE_UNAVAILABLE,
+                StatusCode::TOO_MANY_REQUESTS,
+            ];
+            assert_eq!(retry_after, retryable.contains(&got), "{row}");
             // the upstream URL carries a random port: pin the key's shape, not the port
             let mut body = body;
             if let Some(m) = body["errors"][0]["message"].as_str() {
@@ -6906,6 +6975,311 @@ mod integration_tests {
             }));
         }
         insta::assert_json_snapshot!("docker_proxied_miss_oci_errors", pinned);
+    }
+
+    /// #1191: an upstream that rate-limits NORA (`429`, `Retry-After: 60`, `TOOMANYREQUESTS`)
+    /// said nothing about the image. A cold manifest or blob miss behind it is a status the
+    /// client retries, with `Retry-After` and, on GET, an OCI error that is not
+    /// `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN`; the upstream's own `404 MANIFEST_UNKNOWN` stays 404.
+    /// The status itself (429 relayed, 503, 502) and the Retry-After cap are not chosen yet:
+    /// the rows pin only what every candidate shares. A blob HEAD is answered from storage
+    /// alone (`check_blob`) and never asks the upstream, so it has no row.
+    #[tokio::test]
+    async fn an_upstream_rate_limit_is_not_a_missing_artifact() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        let manifest = "/v2/myorg/app/manifests/9.9".to_string();
+        let layer = format!("/v2/myorg/app/blobs/{blob}");
+        let retryable = [
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::BAD_GATEWAY,
+        ];
+        // (row, upstream answer, method, path, unknown code a limit must not become)
+        let rows = [
+            (
+                "manifest-get",
+                429,
+                Method::GET,
+                &manifest,
+                "MANIFEST_UNKNOWN",
+            ),
+            (
+                "manifest-head",
+                429,
+                Method::HEAD,
+                &manifest,
+                "MANIFEST_UNKNOWN",
+            ),
+            ("blob-get", 429, Method::GET, &layer, "BLOB_UNKNOWN"),
+            (
+                "manifest-404",
+                404,
+                Method::GET,
+                &manifest,
+                "MANIFEST_UNKNOWN",
+            ),
+        ];
+        // every row is checked, so a red run names each path that still answers 404
+        let mut wrong = Vec::new();
+        for (row, answer, verb, uri, unknown) in rows {
+            let server = MockServer::start().await;
+            let template = if answer == 429 {
+                ResponseTemplate::new(429)
+                    .insert_header("Retry-After", "60")
+                    .set_body_json(serde_json::json!({"errors": [{
+                        "code": "TOOMANYREQUESTS",
+                        "message": "You have reached your pull rate limit."
+                    }]}))
+            } else {
+                ResponseTemplate::new(404).set_body_json(serde_json::json!({"errors": [{
+                    "code": "MANIFEST_UNKNOWN", "message": "manifest unknown"
+                }]}))
+            };
+            Mock::given(any())
+                .respond_with(template)
+                .mount(&server)
+                .await;
+            let url = server.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.docker.proxy_timeout = 1;
+                cfg.docker.upstreams = upstreams_of(vec![(url, Vec::new())]);
+            });
+            let resp = send(&ctx.app, verb.clone(), uri, Body::empty()).await;
+            let got = resp.status();
+            let retry_after = resp
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok());
+            let content_type = resp
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            let body: serde_json::Value =
+                serde_json::from_slice(&body_bytes(resp).await).unwrap_or(serde_json::Value::Null);
+            let code = body["errors"][0]["code"].as_str().unwrap_or_default();
+            if answer == 404 {
+                if got != StatusCode::NOT_FOUND || code != unknown {
+                    wrong.push(format!("{row}: upstream 404 -> {got} {code}"));
+                }
+                continue;
+            }
+            if !retryable.contains(&got) {
+                wrong.push(format!("{row}: upstream 429 -> {got} {code}"));
+            }
+            if retry_after.is_none_or(|s| s == 0) {
+                wrong.push(format!("{row}: no Retry-After in seconds"));
+            }
+            if verb == Method::GET
+                && (!content_type.starts_with("application/json")
+                    || code.is_empty()
+                    || code == unknown)
+            {
+                wrong.push(format!("{row}: {content_type} {body}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A 429 template the way Docker Hub sends it.
+    fn rate_limit_answer(retry_after: &str) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(429)
+            .insert_header("Retry-After", retry_after)
+            .set_body_json(serde_json::json!({"errors": [{
+                "code": "TOOMANYREQUESTS",
+                "message": "You have reached your pull rate limit."
+            }]}))
+    }
+
+    /// An upstream manifest any tag answers.
+    fn manifest_answer() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .insert_header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+            .set_body_bytes(
+                br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"digest":"sha256:aaaa"},"layers":[]}"#.to_vec(),
+            )
+    }
+
+    /// Shift tokio's clock forward by `by` without sleeping. After `resume` the clock keeps
+    /// the offset, so real I/O goes on from the later instant.
+    async fn skip_time(by: std::time::Duration) {
+        tokio::time::pause();
+        tokio::time::advance(by).await;
+        tokio::time::resume();
+    }
+
+    /// #1191: once an upstream answered 429, it is not asked again until its `Retry-After` has
+    /// passed: the misses in between are answered 429 with what is left of it, and the first
+    /// one after the window asks the upstream again.
+    #[tokio::test]
+    async fn a_rate_limited_upstream_is_left_alone_for_its_retry_after() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer};
+
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(rate_limit_answer("7"))
+            .mount(&upstream)
+            .await;
+        let url = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = upstreams_of(vec![(url, Vec::new())]);
+        });
+        let asked = || async { upstream.received_requests().await.unwrap_or_default().len() };
+        let mut retry_afters = Vec::new();
+        for tag in ["1", "2", "3", "4", "5"] {
+            let uri = format!("/v2/myorg/app/manifests/{tag}");
+            let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{tag}");
+            retry_afters.push(
+                resp.headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok()),
+            );
+        }
+        assert_eq!(asked().await, 1, "the upstream was asked inside its window");
+        assert!(
+            retry_afters
+                .iter()
+                .all(|r| r.is_some_and(|s| (1..=7).contains(&s))),
+            "{retry_afters:?}"
+        );
+
+        skip_time(std::time::Duration::from_secs(8)).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/myorg/app/manifests/6",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            asked().await,
+            2,
+            "the upstream was not asked after its window"
+        );
+    }
+
+    /// #1191: in the fallback chain a rate limit outweighs another upstream's "not found" (the
+    /// image may be on the limited one), an answer from another upstream is served, and an
+    /// upstream inside its window is skipped for the next one as an open breaker is.
+    #[tokio::test]
+    async fn a_rate_limited_upstream_in_the_chain() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // 404 first, 429 second: 429
+        let missing = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&missing)
+            .await;
+        let limited = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(rate_limit_answer("7"))
+            .mount(&limited)
+            .await;
+        let chain = vec![(missing.uri(), Vec::new()), (limited.uri(), Vec::new())];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = upstreams_of(chain);
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/myorg/app/manifests/1",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "404 + 429");
+        assert!(resp.headers().get(header::RETRY_AFTER).is_some());
+
+        // 429 first, 200 second: 200, and the limited upstream stays skipped in its window
+        let limited = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(rate_limit_answer("7"))
+            .mount(&limited)
+            .await;
+        let serving = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(manifest_answer())
+            .mount(&serving)
+            .await;
+        let chain = vec![(limited.uri(), Vec::new()), (serving.uri(), Vec::new())];
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = upstreams_of(chain);
+        });
+        for tag in ["1", "2", "3"] {
+            let uri = format!("/v2/myorg/app/manifests/{tag}");
+            let resp = send(&ctx.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::OK, "429 + 200, tag {tag}");
+        }
+        let asked = limited.received_requests().await.unwrap_or_default().len();
+        assert_eq!(asked, 1, "the limited upstream was asked inside its window");
+        let served = serving.received_requests().await.unwrap_or_default().len();
+        assert_eq!(served, 3, "the next upstream was not asked for every tag");
+    }
+
+    /// #1191: a 429 says the upstream is alive. Ten of them in a row leave its breaker closed,
+    /// with a threshold of three, whether they answer manifests or blobs, so the next manifest is
+    /// asked of the upstream and not refused with the 503 of an open breaker. A 429 on a blob
+    /// resume is held by `a_rate_limited_resume_ends_the_fill_and_opens_the_window`.
+    #[tokio::test]
+    async fn rate_limits_do_not_open_the_breaker() {
+        use crate::circuit_breaker::upstream_key;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer};
+
+        let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
+        for (row, path) in [
+            ("manifest", "/v2/myorg/app/manifests/1.0".to_string()),
+            ("blob", format!("/v2/myorg/app/blobs/{blob}")),
+        ] {
+            let upstream = MockServer::start().await;
+            Mock::given(any())
+                .respond_with(rate_limit_answer("1"))
+                .mount(&upstream)
+                .await;
+            let url = upstream.uri();
+            let key = upstream_key("docker", &url);
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.circuit_breaker.enabled = true;
+                cfg.circuit_breaker.failure_threshold = 3;
+                cfg.circuit_breaker.reset_timeout = 3600;
+                cfg.docker.upstreams = upstreams_of(vec![(url, Vec::new())]);
+            });
+            for n in 0..10 {
+                let resp = send(&ctx.app, Method::GET, &path, Body::empty()).await;
+                assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS, "{row} {n}");
+                skip_time(std::time::Duration::from_secs(2)).await;
+            }
+            let asked = upstream.received_requests().await.unwrap_or_default().len();
+            assert_eq!(
+                asked, 10,
+                "{row}: each request after a window asks the upstream"
+            );
+            let health = ctx.state.circuit_breaker.health_snapshot("docker");
+            assert_eq!(health.map(|h| h.status), Some("closed"), "{row}: {key}");
+
+            let uri = "/v2/myorg/app/manifests/2.0";
+            let resp = send(&ctx.app, Method::GET, uri, Body::empty()).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::TOO_MANY_REQUESTS,
+                "{row}: next manifest"
+            );
+            let asked = upstream.received_requests().await.unwrap_or_default().len();
+            assert_eq!(
+                asked, 11,
+                "{row}: the next manifest was not asked of the upstream"
+            );
+        }
     }
 
     /// A locally pushed manifest is authoritative: with global pull-through upstreams
@@ -12438,6 +12812,104 @@ mod upstream_resume_tests {
             ctx.state.circuit_breaker.check(&cb_key).is_ok(),
             "a refused resume must not open the registry's breaker"
         );
+        server.abort();
+    }
+
+    /// #1191: a resume the upstream answers 429 ends the fill at once — it is not resumed
+    /// four more times into the limit — records the window, so the next pull of the blob is a
+    /// 429 that does not ask the upstream, and leaves the breaker closed at a threshold of one.
+    #[tokio::test]
+    async fn a_rate_limited_resume_ends_the_fill_and_opens_the_window() {
+        use axum::routing::get;
+        let (blob, digest) = layer(96 * 1024);
+        let blob = Arc::new(blob);
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (b, h) = (blob.clone(), hits.clone());
+        // The first GET sends a third of the blob and breaks off; every later GET is a 429.
+        let app = Router::new().route(
+            "/v2/{*rest}",
+            get(move || {
+                let (blob, hits) = (b.clone(), h.clone());
+                async move {
+                    if hits.fetch_add(1, Ordering::SeqCst) > 0 {
+                        return Response::builder()
+                            .status(StatusCode::TOO_MANY_REQUESTS)
+                            .header(header::RETRY_AFTER, "7")
+                            .body(Body::from(r#"{"errors":[{"code":"TOOMANYREQUESTS"}]}"#))
+                            .unwrap();
+                    }
+                    let third = blob.len() / 3;
+                    let pieces: Vec<std::io::Result<Bytes>> = vec![
+                        Ok(Bytes::copy_from_slice(&blob[..third])),
+                        Err(std::io::Error::other("connection cut")),
+                    ];
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_LENGTH, blob.len())
+                        .body(Body::from_stream(futures::stream::iter(pieces).then(
+                            |p| async move {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                p
+                            },
+                        )))
+                        .unwrap()
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let upstream_url = url.clone();
+        let ctx = create_test_context_with_config(move |cfg| {
+            // One failure would open the breaker: the resume's 429 must not count as one.
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.failure_threshold = 1;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.docker.proxy_timeout = 5;
+            cfg.docker.upstreams = vec![crate::config::DockerUpstream {
+                url: upstream_url,
+                auth: None,
+                namespace: None,
+                prefix: None,
+                namespaces: Vec::new(),
+            }];
+        });
+
+        let response = pull(&ctx, &digest).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await;
+        assert!(body.is_err(), "the fill cannot complete under the limit");
+        let started = std::time::Instant::now();
+        while proxy_temp_count(&ctx) > 0 && started.elapsed() < Duration::from_secs(10) {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "resumed into the rate limit"
+        );
+        let cb_key = crate::circuit_breaker::upstream_key("docker", &url);
+        assert!(
+            ctx.state
+                .circuit_breaker
+                .rate_limits()
+                .check(&cb_key)
+                .is_err(),
+            "the resume's 429 opened no window"
+        );
+        let health = ctx.state.circuit_breaker.health_snapshot("docker");
+        assert_eq!(
+            health.map(|h| h.status),
+            Some("closed"),
+            "the resume's 429 counted as a failure"
+        );
+
+        let response = pull(&ctx, &digest).await;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(response.headers().get(header::RETRY_AFTER).is_some());
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "asked inside the window");
         server.abort();
     }
 

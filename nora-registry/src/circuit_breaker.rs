@@ -17,7 +17,7 @@ use crate::registry_type::RegistryType;
 use parking_lot::RwLock;
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Breaker key of one configured upstream of `registry`:
 /// `"<registry>:<upstream url>"`, trailing `/` trimmed and any `user:pass@`
@@ -255,6 +255,90 @@ impl BreakerInner {
 pub(crate) struct CircuitBreakerRegistry {
     config: CircuitBreakerConfig,
     breakers: RwLock<HashMap<String, BreakerInner>>,
+    /// Upstreams that rate-limited NORA. Kept whether or not the breaker is enabled.
+    rate_limits: RateLimits,
+}
+
+/// The longest `Retry-After` NORA honours from an upstream and passes on: skopeo and podman
+/// (containers/image) cap their own wait at 60 s, and dockerd, containerd and BuildKit do not
+/// read the header (measured, #1191).
+pub(crate) const RATE_LIMIT_MAX_SECS: u64 = 60;
+/// When an upstream's 429 gives no delay in seconds (no `Retry-After`, an HTTP-date, garbage):
+/// the 30 s an open breaker asks for (`circuit_open_response`), so both "retry later" agree.
+pub(crate) const RATE_LIMIT_DEFAULT_SECS: u64 = 30;
+
+/// Seconds to wait from an upstream's `Retry-After`, in `1..=RATE_LIMIT_MAX_SECS`. Only delay
+/// seconds are read; a number too long for `u64` is just long, so it is the cap. The value
+/// comes from the upstream and is never trusted further than that.
+pub(crate) fn retry_after_secs(value: Option<&[u8]>) -> u64 {
+    let Some(value) = value.map(<[u8]>::trim_ascii) else {
+        return RATE_LIMIT_DEFAULT_SECS;
+    };
+    if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
+        return RATE_LIMIT_DEFAULT_SECS;
+    }
+    std::str::from_utf8(value)
+        .ok()
+        .and_then(|digits| digits.parse::<u64>().ok())
+        .unwrap_or(u64::MAX)
+        .clamp(1, RATE_LIMIT_MAX_SECS)
+}
+
+/// Upstreams that answered 429, each with the instant it may be asked again (#1191). Until then
+/// a request for it is answered from here, without contacting it: clients that retry a 429 at
+/// once (containerd, BuildKit) would otherwise multiply the load on an upstream that is already
+/// refusing NORA. Process-local, like the breaker. A key is an [`upstream_key`] of a configured
+/// upstream, and expired entries go on every insert, so the map holds at most the upstreams
+/// limited within the last [`RATE_LIMIT_MAX_SECS`].
+#[derive(Default)]
+pub(crate) struct RateLimits {
+    until: RwLock<HashMap<String, tokio::time::Instant>>,
+}
+
+impl RateLimits {
+    /// `Err(RateLimited)` with the seconds left while `key` is inside its window.
+    pub(crate) fn check(&self, key: &str) -> Result<(), ProxyError> {
+        let now = tokio::time::Instant::now();
+        let left = match self.until.read().get(key) {
+            Some(until) => until.saturating_duration_since(now),
+            None => return Ok(()),
+        };
+        if left.is_zero() {
+            return Ok(());
+        }
+        let secs = left.as_secs() + u64::from(left.subsec_nanos() > 0);
+        Err(ProxyError::RateLimited {
+            key: key.to_string(),
+            retry_after: secs.min(RATE_LIMIT_MAX_SECS),
+        })
+    }
+
+    /// Record that `key` answered 429 with `retry_after` (the raw header), and return the
+    /// error for it. A later deadline already recorded is kept.
+    pub(crate) fn limited(&self, key: &str, retry_after: Option<&[u8]>) -> ProxyError {
+        let secs = retry_after_secs(retry_after);
+        let now = tokio::time::Instant::now();
+        let until = now + Duration::from_secs(secs);
+        let mut map = self.until.write();
+        map.retain(|_, t| *t > now);
+        let entry = map.entry(key.to_string()).or_insert(until);
+        *entry = (*entry).max(until);
+        tracing::warn!(
+            upstream = key,
+            retry_after = secs,
+            "upstream rate-limited NORA, not asking it until Retry-After"
+        );
+        ProxyError::RateLimited {
+            key: key.to_string(),
+            retry_after: secs,
+        }
+    }
+
+    /// How many keys are held, for the bound test.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.until.read().len()
+    }
 }
 
 impl CircuitBreakerRegistry {
@@ -262,7 +346,14 @@ impl CircuitBreakerRegistry {
         Self {
             config,
             breakers: RwLock::new(HashMap::new()),
+            rate_limits: RateLimits::default(),
         }
+    }
+
+    /// The rate-limit windows of the upstreams this registry guards (#1191). They work with the
+    /// breaker disabled too: a 429 is not a failure and never moves the breaker.
+    pub(crate) fn rate_limits(&self) -> &RateLimits {
+        &self.rate_limits
     }
 
     /// Create a disabled (no-op) circuit breaker registry.
@@ -597,6 +688,77 @@ impl CircuitBreakerRegistry {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// #1191: delay seconds are read and capped at what clients honour; anything else an
+    /// upstream may send is the default, and nothing it sends can panic or overflow.
+    #[test]
+    fn retry_after_is_seconds_capped_or_the_default() {
+        let d = RATE_LIMIT_DEFAULT_SECS;
+        #[rustfmt::skip]
+        let rows: &[(Option<&[u8]>, u64)] = &[
+            (Some(b"7"), 7),
+            (Some(b" 7 "), 7),
+            (Some(b"60"), 60),
+            (Some(b"100"), 60),
+            (Some(b"0"), 1),
+            (Some(b"99999999999999999999999999"), 60),
+            (Some(b"Wed, 21 Oct 2026 07:28:00 GMT"), d),
+            (Some(b"-5"), d),
+            (Some(b"7s"), d),
+            (Some(b"1.5"), d),
+            (Some(b""), d),
+            (Some(b"\xff\xfe"), d),
+            (None, d),
+        ];
+        for (value, want) in rows {
+            assert_eq!(retry_after_secs(*value), *want, "{value:?}");
+        }
+    }
+
+    /// #1191: inside its window an upstream is refused with what is left of it, rounded up;
+    /// after it, asked again; a later 429 never shortens a window already held.
+    #[tokio::test(start_paused = true)]
+    async fn a_rate_limit_window_runs_out() {
+        use std::time::Duration;
+        let limits = RateLimits::default();
+        let key = "docker:http://hub";
+        let left = |limits: &RateLimits| match limits.check(key) {
+            Err(ProxyError::RateLimited { retry_after, .. }) => Some(retry_after),
+            _ => None,
+        };
+        assert_eq!(left(&limits), None);
+        assert!(matches!(
+            limits.limited(key, Some(b"7")),
+            ProxyError::RateLimited { retry_after: 7, .. }
+        ));
+        assert_eq!(left(&limits), Some(7));
+        tokio::time::advance(Duration::from_millis(2500)).await;
+        assert_eq!(left(&limits), Some(5));
+        limits.limited(key, Some(b"1"));
+        assert_eq!(left(&limits), Some(5), "a shorter 429 cut the window");
+        tokio::time::advance(Duration::from_millis(4500)).await;
+        assert_eq!(left(&limits), None);
+        assert_eq!(left(&limits), None, "a check alone reopened the window");
+        // the cap holds for the window too, not only for the header
+        limits.limited(key, Some(b"3600"));
+        assert_eq!(left(&limits), Some(RATE_LIMIT_MAX_SECS));
+        tokio::time::advance(Duration::from_secs(RATE_LIMIT_MAX_SECS + 1)).await;
+        assert_eq!(left(&limits), None, "a window outlived the cap");
+    }
+
+    /// #1191: a window that ran out is dropped on the next insert, so the map holds only the
+    /// upstreams limited within the last minute.
+    #[tokio::test(start_paused = true)]
+    async fn expired_rate_limit_windows_are_dropped() {
+        let limits = RateLimits::default();
+        for n in 0..20 {
+            limits.limited(&format!("docker:http://upstream-{n}"), Some(b"1"));
+        }
+        assert_eq!(limits.len(), 20);
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        limits.limited("docker:http://hub", Some(b"1"));
+        assert_eq!(limits.len(), 1);
+    }
 
     fn enabled_config(threshold: u32, reset_timeout: u64) -> CircuitBreakerConfig {
         CircuitBreakerConfig {
