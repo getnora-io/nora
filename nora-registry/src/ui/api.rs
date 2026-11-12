@@ -38,6 +38,7 @@ pub struct RegistryStats {
     pub rpm: usize,
     pub deb: usize,
     pub cpan: usize,
+    pub composer: usize,
     pub hf: usize,
 }
 
@@ -101,6 +102,21 @@ pub struct PackageDetail {
     /// Total stable versions available (may be > versions.len() if truncated)
     pub total_stable: usize,
     pub metadata: PackageMetadata,
+}
+
+/// One version of a Composer package NORA holds an archive of.
+#[derive(Serialize)]
+pub struct ComposerVersion {
+    pub version: String,
+    pub size: u64,
+    pub published: String,
+    /// Uploaded to NORA, not cached from an upstream.
+    pub hosted: bool,
+}
+
+#[derive(Serialize)]
+pub struct ComposerDetail {
+    pub versions: Vec<ComposerVersion>,
 }
 
 #[derive(Serialize)]
@@ -181,6 +197,7 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
         rpm: get(RegistryType::Rpm),
         deb: get(RegistryType::Deb),
         cpan: get(RegistryType::Cpan),
+        composer: get(RegistryType::Composer),
         hf: get(RegistryType::HuggingFace),
     })
 }
@@ -268,6 +285,13 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                 RegistryType::Rpm => vec![],
                 RegistryType::Deb => vec![],
                 RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
+                RegistryType::Composer => state
+                    .config
+                    .composer
+                    .upstreams()
+                    .iter()
+                    .map(|u| u.url().to_string())
+                    .collect(),
                 RegistryType::HuggingFace => state.config.hf.proxy.clone().into_iter().collect(),
             }
         } else {
@@ -1841,6 +1865,22 @@ pub async fn get_cpan_detail(
         total_stable,
         metadata: PackageMetadata::default(),
     }
+}
+
+/// Composer detail: the versions of `vendor/package` NORA holds an archive of, uploaded
+/// and cached, newest first. `name` must be a valid package name; any other yields none.
+pub async fn get_composer_detail(storage: &Storage, name: &str) -> ComposerDetail {
+    let versions = crate::registry::composer::stored_versions(storage, name)
+        .await
+        .into_iter()
+        .map(|v| ComposerVersion {
+            version: v.version,
+            size: v.size,
+            published: format_timestamp(v.modified),
+            hosted: v.hosted,
+        })
+        .collect();
+    ComposerDetail { versions }
 }
 
 /// Fallback: scan storage for files matching {registry}/{name}/*

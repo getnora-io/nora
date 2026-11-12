@@ -140,6 +140,8 @@ pub struct CurationConfig {
     pub deb: RegistryCurationOverride,
     #[serde(default)]
     pub cpan: RegistryCurationOverride,
+    #[serde(default)]
+    pub composer: RegistryCurationOverride,
 }
 
 /// Per-registry curation override (used within `[curation.{registry}]`).
@@ -185,6 +187,7 @@ impl Default for CurationConfig {
             rpm: RegistryCurationOverride::default(),
             deb: RegistryCurationOverride::default(),
             cpan: RegistryCurationOverride::default(),
+            composer: RegistryCurationOverride::default(),
         }
     }
 }
@@ -215,6 +218,7 @@ impl CurationConfig {
             RegistryType::Rpm => Some(&self.rpm),
             RegistryType::Deb => Some(&self.deb),
             RegistryType::Cpan => Some(&self.cpan),
+            RegistryType::Composer => Some(&self.composer),
             RegistryType::HuggingFace => None,
         }
     }
@@ -262,6 +266,7 @@ impl CurationConfig {
             rpm: _,
             deb: _,
             cpan: _,
+            composer: _,
         } = self;
         let mut settings = vec![
             ("curation.quarantine".to_string(), format!("{quarantine:?}")),
@@ -316,6 +321,7 @@ impl CurationConfig {
             RegistryType::Rpm => Some(&mut self.rpm),
             RegistryType::Deb => Some(&mut self.deb),
             RegistryType::Cpan => Some(&mut self.cpan),
+            RegistryType::Composer => Some(&mut self.composer),
             RegistryType::HuggingFace => None,
         }
     }
@@ -391,6 +397,7 @@ impl CurationConfig {
             ("RPM", &mut self.rpm),
             ("DEB", &mut self.deb),
             ("CPAN", &mut self.cpan),
+            ("COMPOSER", &mut self.composer),
         ] {
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_MIN_RELEASE_AGE", env_suffix)) {
                 field.min_release_age = if val.is_empty() { None } else { Some(val) };

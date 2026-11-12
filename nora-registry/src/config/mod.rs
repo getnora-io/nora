@@ -362,6 +362,8 @@ pub struct Config {
     #[serde(default)]
     pub cpan: CpanConfig,
     #[serde(default)]
+    pub composer: ComposerConfig,
+    #[serde(default)]
     pub hf: HfConfig,
     #[serde(default)]
     pub auth: AuthConfig,
@@ -418,6 +420,7 @@ pub(crate) fn legacy_enable_var(rt: RegistryType) -> &'static str {
         RegistryType::Rpm => "NORA_RPM_ENABLED",
         RegistryType::Deb => "NORA_DEB_ENABLED",
         RegistryType::Cpan => "NORA_CPAN_ENABLED",
+        RegistryType::Composer => "NORA_COMPOSER_ENABLED",
         RegistryType::HuggingFace => "NORA_HF_ENABLED",
     }
 }
@@ -440,7 +443,8 @@ pub(crate) fn release_date_check(rt: RegistryType) -> ReleaseDateCheck {
         | RegistryType::Ansible
         | RegistryType::Nuget
         | RegistryType::PubDart
-        | RegistryType::Conan => ReleaseDateCheck::Dated,
+        | RegistryType::Conan
+        | RegistryType::Composer => ReleaseDateCheck::Dated,
     }
 }
 
@@ -603,6 +607,7 @@ impl Config {
                 RegistryType::Rpm => self.rpm.enabled = on,
                 RegistryType::Deb => self.deb.enabled = on,
                 RegistryType::Cpan => self.cpan.enabled = on,
+                RegistryType::Composer => self.composer.enabled = on,
                 RegistryType::HuggingFace => self.hf.enabled = on,
             }
         }
@@ -658,6 +663,9 @@ impl Config {
         }
         if self.cpan.enabled {
             set.insert(RegistryType::Cpan);
+        }
+        if self.composer.enabled {
+            set.insert(RegistryType::Composer);
         }
         if self.hf.enabled {
             set.insert(RegistryType::HuggingFace);
@@ -716,6 +724,10 @@ impl Config {
             RegistryType::Rpm => self.rpm.enabled && !self.rpm.proxies.is_empty(),
             RegistryType::Deb => self.deb.enabled && !self.deb.proxies.is_empty(),
             RegistryType::Cpan => self.cpan.enabled && self.cpan.proxy.is_some(),
+            RegistryType::Composer => {
+                self.composer.enabled
+                    && (self.composer.proxy.is_some() || !self.composer.proxies.is_empty())
+            }
             RegistryType::HuggingFace => self.hf.enabled && self.hf.proxy.is_some(),
         }
     }
@@ -756,6 +768,7 @@ impl Config {
             // its handlers (quarantine gates proxy downloads).
             RegistryType::Raw => return QuarantineMode::Off,
             RegistryType::Cpan => self.curation.cpan.quarantine.as_ref(),
+            RegistryType::Composer => self.curation.composer.quarantine.as_ref(),
             // Hugging Face has no curation section and its handler no quarantine path
             // (files are kept by the digest the Hub names and checked on the way in), so
             // nothing in it enforces a quarantine; counting it would be the same phantom
@@ -875,6 +888,24 @@ impl Config {
                     "PyPI upstream credentials in config.toml are plaintext — consider NORA_PYPI_PROXIES env var"
                 );
             }
+        }
+        // Composer
+        if self.composer.proxy_auth.is_some() && std::env::var("NORA_COMPOSER_PROXY_AUTH").is_err()
+        {
+            tracing::warn!("Composer proxy credentials in config.toml are plaintext — consider NORA_COMPOSER_PROXY_AUTH env var");
+        }
+        for proxy in &self.composer.proxies {
+            if proxy.auth().is_some() && std::env::var("NORA_COMPOSER_PROXIES").is_err() {
+                tracing::warn!(
+                    url = %proxy.url(),
+                    "Composer upstream credentials in config.toml are plaintext — consider NORA_COMPOSER_PROXIES env var"
+                );
+            }
+        }
+        if self.composer.github_token.is_some()
+            && std::env::var("NORA_COMPOSER_GITHUB_TOKEN").is_err()
+        {
+            tracing::warn!("Composer GitHub token in config.toml is plaintext — consider NORA_COMPOSER_GITHUB_TOKEN env var");
         }
         // Cargo
         if self.cargo.proxy_auth.is_some() && std::env::var("NORA_CARGO_PROXY_AUTH").is_err() {
@@ -1018,6 +1049,13 @@ impl Config {
                         .to_string(),
                     host,
                 ));
+            }
+        }
+
+        // Composer upstreams: every one, the single `proxy` included.
+        for up in self.composer.upstreams() {
+            if let Some(host) = extract_host(up.url()) {
+                result.push((RegistryType::Composer.as_str().to_string(), host));
             }
         }
 
@@ -1685,6 +1723,7 @@ impl Config {
         self.rpm.apply_env_overrides();
         self.deb.apply_env_overrides();
         self.cpan.apply_env_overrides();
+        self.composer.apply_env_overrides();
         self.hf.apply_env_overrides();
 
         // Rate limit, GC, retention
@@ -2132,6 +2171,7 @@ proxies = [
         assert_eq!(config.auth.htpasswd_file, "users.htpasswd");
         assert_eq!(config.auth.token_storage, "data/tokens");
         assert!(!config.cpan.enabled, "CPAN defaults to disabled");
+        assert!(!config.composer.enabled, "Composer defaults to disabled");
         assert!(!config.hf.enabled, "Hugging Face defaults to disabled");
     }
 
@@ -2673,6 +2713,7 @@ proxies = [
         assert_serde_default_eq_default::<RpmConfig>("rpm");
         assert_serde_default_eq_default::<DebConfig>("deb");
         assert_serde_default_eq_default::<CpanConfig>("cpan");
+        assert_serde_default_eq_default::<ComposerConfig>("composer");
         assert_serde_default_eq_default::<HfConfig>("hf");
         assert_serde_default_eq_default::<SigningConfig>("signing");
 
@@ -3039,6 +3080,10 @@ proxies = [
             proxy_auth = "u:p"  # secret
             [cpan]
             proxy_auth = "u:p"  # secret
+            [composer]
+            proxy_auth = "u:p"  # secret
+            github_token = "t"  # secret
+            proxies = [{ url = "https://composer.example", auth = "u:p" }]  # secret
             [rpm.proxies]
             fedora = { url = "https://rpm.example", auth = "u:p" }  # secret
         "#;
@@ -4554,6 +4599,7 @@ proxies = [
             &mut config.curation.rpm,
             &mut config.curation.deb,
             &mut config.curation.cpan,
+            &mut config.curation.composer,
         ] {
             o.quarantine = Some(QuarantineMode::Off);
         }
@@ -4769,6 +4815,7 @@ proxies = [
             (RegistryType::Rpm, NoNameOrDate),
             (RegistryType::Deb, NoNameOrDate),
             (RegistryType::Cpan, NoDate),
+            (RegistryType::Composer, Dated),
             (RegistryType::HuggingFace, NoDate),
         ];
         assert_eq!(expected.len(), RegistryType::all().len());
@@ -4799,6 +4846,8 @@ proxies = [
             (RegistryType::Rpm, "[rpm]\nenabled = true\n[rpm.proxies]\nfedora = \"https://repo.example.com/fedora\"\n", none),
             (RegistryType::Deb, "[deb]\nenabled = true\n[deb.proxies]\ndebian = \"https://deb.debian.org/debian\"\n", none),
             (RegistryType::Cpan, "[cpan]\nenabled = true\nproxy = \"https://www.cpan.org\"\n", none),
+            (RegistryType::Composer, "[composer]\nenabled = true\nproxy = \"https://repo.packagist.org\"\n", |c| c.composer.proxies.clear()),
+            (RegistryType::Composer, "[composer]\nenabled = true\nproxies = [\"https://repo.packagist.org\"]\n", |c| c.composer.proxy = None),
         ]
     }
 
@@ -4822,6 +4871,9 @@ proxies = [
             RegistryType::Rpm => (c.rpm.enabled, c.rpm.proxies) = (true, Default::default()),
             RegistryType::Deb => (c.deb.enabled, c.deb.proxies) = (true, Default::default()),
             RegistryType::Cpan => (c.cpan.enabled, c.cpan.proxy) = (true, None),
+            RegistryType::Composer => {
+                (c.composer.enabled, c.composer.proxy, c.composer.proxies) = (true, None, vec![])
+            }
             RegistryType::Raw => c.raw.enabled = true,
             RegistryType::HuggingFace => (c.hf.enabled, c.hf.proxy) = (true, None),
         }
@@ -4845,6 +4897,7 @@ proxies = [
             RegistryType::Rpm => c.rpm.enabled = false,
             RegistryType::Deb => c.deb.enabled = false,
             RegistryType::Cpan => c.cpan.enabled = false,
+            RegistryType::Composer => c.composer.enabled = false,
             RegistryType::Raw => c.raw.enabled = false,
             RegistryType::HuggingFace => c.hf.enabled = false,
         }
@@ -5261,6 +5314,7 @@ proxies = [
             RegistryType::Rpm => Some("RPM"),
             RegistryType::Deb => Some("DEB"),
             RegistryType::Cpan => Some("CPAN"),
+            RegistryType::Composer => Some("COMPOSER"),
             RegistryType::HuggingFace => None,
         }
     }

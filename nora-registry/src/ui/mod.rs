@@ -144,6 +144,8 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/deb/{name}", get(generic_registry_detail))
         .route("/ui/cpan", get(cpan_browse_root))
         .route("/ui/cpan/{*path}", get(cpan_browse))
+        .route("/ui/composer", get(generic_registry_list))
+        .route("/ui/composer/{*name}", get(composer_detail))
         .route("/ui/gems/{name}", get(generic_registry_detail))
         .route("/ui/terraform/{name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
@@ -687,6 +689,7 @@ async fn generic_registry_list(
         Some(crate::registry_type::RegistryType::Rpm) => "RPM (yum/dnf)",
         Some(crate::registry_type::RegistryType::Deb) => "Debian (APT)",
         Some(crate::registry_type::RegistryType::Cpan) => "CPAN",
+        Some(crate::registry_type::RegistryType::Composer) => "Composer (PHP)",
         _ => registry_key,
     };
 
@@ -845,6 +848,34 @@ async fn cpan_browse(
             .into_response()
         }
     }
+}
+
+// Composer detail: a package is `vendor/package`, linked with its slash encoded or not
+async fn composer_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let valid = name.split_once('/').is_some_and(|(vendor, package)| {
+        crate::registry::composer::is_valid_package_name(vendor, package)
+    });
+    if !valid {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let auth_enabled = state.auth.is_some();
+    let detail = api::get_composer_detail(&state.storage, &name).await;
+    Html(templates::render_composer_detail(
+        &name,
+        &detail,
+        lang,
+        auth_enabled,
+    ))
+    .into_response()
 }
 
 // Ansible Galaxy hierarchical browsing (namespace → collection → versions)
@@ -1334,5 +1365,116 @@ mod base_path_tests {
         assert!(UiMintRefusal::ScopedCannotMintUnrestricted
             .message()
             .contains("scoped"));
+    }
+}
+
+/// The Composer pages: a list of `vendor/package` names, and a detail page per package whose
+/// versions say whether NORA hosts them or cached them.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod composer_pages {
+    use crate::registry::composer::build_test_zip;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+
+    fn ctx() -> TestContext {
+        create_test_context_with_config(|c| c.composer.enabled = true)
+    }
+
+    async fn page(ctx: &TestContext, uri: &str) -> (StatusCode, String) {
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        let status = resp.status();
+        let body = body_bytes(resp).await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn upload(ctx: &TestContext, name: &str, version: &str) {
+        let manifest = serde_json::json!({"name": name}).to_string();
+        let zip = build_test_zip(&[("composer.json", manifest.as_bytes(), false)]);
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/composer/packages/upload/{name}/{version}"),
+            zip,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn an_uploaded_package_is_listed_and_has_a_page_of_hosted_versions() {
+        let ctx = ctx();
+        upload(&ctx, "acme/greeter", "1.0.0").await;
+        upload(&ctx, "acme/greeter", "1.1.0").await;
+
+        let (status, list) = page(&ctx, "/ui/composer").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(list.contains("Composer (PHP)"));
+        assert!(
+            list.contains(">acme/greeter</a>"),
+            "the list names the package"
+        );
+        assert!(list.contains(r#"hx-get="/api/ui/composer/search""#));
+
+        // The list links the name as the client would write it, with the slash encoded: the
+        // page answers to that link and to the plain one alike.
+        let (_, search) = page(&ctx, "/api/ui/composer/search?q=greet").await;
+        assert!(search.contains("/ui/composer/acme%2Fgreeter"));
+        for uri in ["/ui/composer/acme/greeter", "/ui/composer/acme%2Fgreeter"] {
+            let (status, html) = page(&ctx, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(html.contains("composer require acme/greeter"), "{uri}");
+            for version in ["1.0.0", "1.1.0"] {
+                assert!(
+                    html.contains(&format!(r#"data-version="{version}""#)),
+                    "{uri}: no row for {version}"
+                );
+            }
+            assert!(
+                html.contains(">hosted<") && !html.contains(">cached<"),
+                "{uri}"
+            );
+            assert!(html.contains("(2 total)"), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cached_archive_is_a_cached_version() {
+        let ctx = ctx();
+        ctx.state
+            .storage
+            .put("composer/dists/acme/lib/2.3.4/aaaa.zip", b"PK")
+            .await
+            .unwrap();
+        let (status, html) = page(&ctx, "/ui/composer/acme/lib").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(r#"data-version="2.3.4""#));
+        assert!(html.contains(">cached<") && !html.contains(">hosted<"));
+    }
+
+    #[tokio::test]
+    async fn a_package_nora_holds_nothing_of_has_an_empty_page() {
+        let ctx = ctx();
+        let (status, html) = page(&ctx, "/ui/composer/acme/none").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("composer require acme/none"));
+        assert!(!html.contains("version-row"));
+    }
+
+    #[tokio::test]
+    async fn only_a_package_name_has_a_page() {
+        let ctx = ctx();
+        for uri in [
+            "/ui/composer/acme",
+            "/ui/composer/acme/greeter/extra",
+            "/ui/composer/Acme/Greeter",
+            "/ui/composer/acme/gree%20ter",
+            "/ui/composer/acme/..",
+            "/ui/composer/acme/",
+            "/ui/composer/%2F",
+        ] {
+            let (status, _) = page(&ctx, uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        }
     }
 }

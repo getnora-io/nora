@@ -1,7 +1,9 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
-use super::api::{DashboardResponse, DockerDetail, MavenDetail, PackageDetail, PackageMetadata};
+use super::api::{
+    ComposerDetail, DashboardResponse, DockerDetail, MavenDetail, PackageDetail, PackageMetadata,
+};
 use super::components::*;
 use super::i18n::{get_translations, Lang};
 use crate::registry_type::RegistryType;
@@ -1523,6 +1525,139 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
     )
 }
 
+/// Renders Composer package detail page: the versions NORA holds an archive of, each marked
+/// as uploaded to NORA (hosted) or cached from an upstream
+pub fn render_composer_detail(
+    name: &str,
+    detail: &ComposerDetail,
+    lang: Lang,
+    auth_enabled: bool,
+) -> String {
+    let t = get_translations(lang);
+    let icon = get_registry_icon("composer");
+    let registry_title = get_registry_title("composer");
+
+    let versions_rows = if detail.versions.is_empty() {
+        format!(
+            r##"<tr><td colspan="4" class="px-6 py-8 text-center text-slate-500">{}</td></tr>"##,
+            t.no_repos_found
+        )
+    } else {
+        detail
+            .versions
+            .iter()
+            .map(|v| {
+                let source_badge = if v.hosted {
+                    r#"<span class="px-1.5 py-0.5 text-xs font-medium text-blue-400 bg-blue-900/30 border border-blue-800 rounded">hosted</span>"#
+                } else {
+                    r#"<span class="px-1.5 py-0.5 text-xs font-medium text-green-400 bg-green-900/30 border border-green-800 rounded">cached</span>"#
+                };
+                format!(
+                    r##"
+                <tr class="hover:bg-slate-700 version-row" data-version="{ver}">
+                    <td class="px-3 md:px-6 py-3 md:py-4">
+                        <span class="font-mono text-sm bg-slate-700 text-slate-200 px-2 py-1 rounded">{ver}</span>
+                    </td>
+                    <td class="px-3 md:px-6 py-3 md:py-4">{badge}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-400">{size}</td>
+                    <td class="px-3 md:px-6 py-3 md:py-4 text-slate-500 text-sm hidden md:table-cell">{published}</td>
+                </tr>
+            "##,
+                    ver = html_escape(&v.version),
+                    badge = source_badge,
+                    size = format_size(v.size),
+                    published = html_escape(&v.published)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    };
+
+    // `vendor/package`: the vendor has no page of its own, so only the registry links back
+    let breadcrumbs = match name.split_once('/') {
+        Some((vendor, package)) => format!(
+            r#"<a href="/ui/composer" class="text-blue-400 hover:text-blue-300">{}</a><span class="mx-2 text-slate-500">/</span><span class="text-slate-400">{}</span><span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+            registry_title,
+            html_escape(vendor),
+            html_escape(package)
+        ),
+        None => format!(
+            r#"<a href="/ui/composer" class="text-blue-400 hover:text-blue-300">{}</a><span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+            registry_title,
+            html_escape(name)
+        ),
+    };
+
+    let install_cmd = format!("composer require {}", name);
+
+    let content = format!(
+        r##"
+        <div class="mb-6">
+            <div class="flex items-center mb-2 text-sm">
+                {breadcrumbs}
+            </div>
+            <div class="flex items-center">
+                <svg class="w-6 h-6 md:w-8 md:h-8 mr-3 text-slate-400 flex-shrink-0" fill="currentColor" viewBox="0 0 24 24">{icon}</svg>
+                <h1 class="text-xl md:text-2xl font-bold text-slate-200">{title}</h1>
+            </div>
+        </div>
+
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 p-3 md:p-6 mb-6">
+            <h2 class="text-lg font-semibold text-slate-200 mb-3">{install_label}</h2>
+            <div class="flex items-center bg-slate-900 text-green-400 rounded-lg p-3 md:p-4 font-mono text-xs md:text-sm overflow-x-auto">
+                <code id="install-cmd" class="flex-1 whitespace-nowrap">{cmd}</code>
+                <button id="copy-btn" data-cmd="{cmd}" onclick="navigator.clipboard.writeText(this.getAttribute('data-cmd'))" class="ml-4 text-slate-400 hover:text-white transition-colors flex-shrink-0" title="Copy to clipboard">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+
+        <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
+            <div class="px-3 md:px-6 py-4 border-b border-slate-700 flex items-center justify-between">
+                <h2 class="text-lg font-semibold text-slate-200">{versions_label} ({total} {total_word})</h2>
+            </div>
+            <table class="w-full">
+                <thead class="bg-slate-800 border-b border-slate-700">
+                    <tr>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_version}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_source}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider">{col_size}</th>
+                        <th class="px-3 md:px-6 py-3 text-left text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">{col_published}</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-slate-700">
+                    {rows}
+                </tbody>
+            </table>
+        </div>
+    "##,
+        breadcrumbs = breadcrumbs,
+        icon = icon,
+        title = html_escape(name),
+        install_label = t.install_command,
+        cmd = html_escape(&install_cmd),
+        versions_label = t.versions,
+        total = detail.versions.len(),
+        total_word = t.total,
+        col_version = t.versions,
+        col_source = t.source,
+        col_size = t.size,
+        col_published = t.published,
+        rows = versions_rows,
+    );
+
+    layout_dark(
+        &format!("{} - {}", name, registry_title),
+        &content,
+        Some("composer"),
+        "",
+        lang,
+        auth_enabled,
+    )
+}
+
 /// Renders Maven artifact detail page
 pub fn render_maven_detail(
     path: &str,
@@ -1891,6 +2026,7 @@ fn get_registry_icon(registry_type: &str) -> &'static str {
         Some(RegistryType::Rpm) => icons::RPM,
         Some(RegistryType::Deb) => icons::DEB,
         Some(RegistryType::Cpan) => icons::CPAN,
+        Some(RegistryType::Composer) => icons::COMPOSER,
         Some(RegistryType::HuggingFace) => icons::HF,
         None => {
             r#"<path fill="currentColor" d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/>"#
@@ -1916,6 +2052,7 @@ fn get_registry_title(registry_type: &str) -> &'static str {
         Some(RegistryType::Rpm) => "RPM (yum/dnf)",
         Some(RegistryType::Deb) => "Debian (APT)",
         Some(RegistryType::Cpan) => "CPAN",
+        Some(RegistryType::Composer) => "Composer (PHP)",
         Some(RegistryType::HuggingFace) => "Hugging Face Hub",
         None => "Registry",
     }
@@ -2035,7 +2172,7 @@ mod tests {
     /// of it survives raw, so none can close an attribute or open an element.
     #[test]
     fn a_hostile_name_never_reaches_a_page_raw() {
-        use crate::ui::api::{MavenArtifact, TagInfo, VersionInfo};
+        use crate::ui::api::{ComposerVersion, MavenArtifact, TagInfo, VersionInfo};
         const H: &str = "h\"q'l<g>t";
         let entry = |name: String, is_file| RepoInfo {
             name,
@@ -2074,6 +2211,14 @@ mod tests {
                 repository: None,
                 keywords: vec![H.into()],
             },
+        };
+        let composer = ComposerDetail {
+            versions: vec![ComposerVersion {
+                version: H.into(),
+                size: 1,
+                published: H.into(),
+                hosted: true,
+            }],
         };
         let maven = MavenDetail {
             artifacts: vec![MavenArtifact {
@@ -2129,6 +2274,10 @@ mod tests {
             (
                 "package detail",
                 render_package_detail("npm", H, &package, Lang::En, "http://nora", false),
+            ),
+            (
+                "composer detail",
+                render_composer_detail(&format!("{H}/{H}"), &composer, Lang::En, false),
             ),
             ("activity", render_activity_row(H, "PULL", H, H, H)),
         ];
@@ -2273,6 +2422,75 @@ mod tests {
             html.contains("cpanm --from https://registry.example.com/cpan Module::Build::XSUtil"),
             "CPAN install command must use public_url and a module name"
         );
+    }
+
+    fn composer_version(version: &str, hosted: bool) -> crate::ui::api::ComposerVersion {
+        crate::ui::api::ComposerVersion {
+            version: version.to_string(),
+            size: 2048,
+            published: "2026-11-12 10:00".to_string(),
+            hosted,
+        }
+    }
+
+    #[test]
+    fn composer_detail_names_the_package_and_each_versions_source() {
+        let detail = ComposerDetail {
+            versions: vec![
+                composer_version("1.2.0", true),
+                composer_version("dev-main", false),
+            ],
+        };
+        let html = render_composer_detail("acme/greeter", &detail, Lang::En, false);
+        assert!(
+            html.contains(
+                r#"<code id="install-cmd" class="flex-1 whitespace-nowrap">composer require acme/greeter</code>"#
+            ),
+            "the install command is composer require, with the package name"
+        );
+        assert!(
+            html.contains(
+                r#"<h1 class="text-xl md:text-2xl font-bold text-slate-200">acme/greeter</h1>"#
+            ),
+            "the title is the whole package name"
+        );
+        assert!(
+            html.contains(r#"<a href="/ui/composer" class="text-blue-400 hover:text-blue-300">Composer (PHP)</a>"#),
+            "the registry links back to the list"
+        );
+        let row = |version: &str| {
+            let marker = format!(r#"version-row" data-version="{version}""#);
+            let start = html
+                .find(&marker)
+                .unwrap_or_else(|| panic!("no row for {version}"));
+            let end = html[start..]
+                .find("</tr>")
+                .map_or(html.len(), |e| start + e);
+            html[start..end].to_string()
+        };
+        assert!(row("1.2.0").contains(">hosted<") && !row("1.2.0").contains(">cached<"));
+        assert!(row("dev-main").contains(">cached<") && !row("dev-main").contains(">hosted<"));
+        assert!(row("1.2.0").contains("2.0 KB") && row("1.2.0").contains("2026-11-12 10:00"));
+        for header in ["Versions", "Source", "Size", "Published"] {
+            assert!(
+                html.contains(&format!(">{header}</th>")),
+                "no {header} column"
+            );
+        }
+        assert!(html.contains("(2 total)"));
+    }
+
+    #[test]
+    fn composer_detail_without_versions_says_so() {
+        let html = render_composer_detail(
+            "acme/greeter",
+            &ComposerDetail { versions: vec![] },
+            Lang::En,
+            false,
+        );
+        assert!(html.contains("No repositories found"));
+        assert!(!html.contains("version-row"));
+        assert!(html.contains("(0 total)"));
     }
 
     #[test]

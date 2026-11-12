@@ -201,6 +201,7 @@ impl RepoIndex {
                     build_generic_index(storage, p, s).await
                 }
                 RegistryType::Cpan => build_cpan_index(storage).await,
+                RegistryType::Composer => build_composer_index(storage).await,
                 RegistryType::HuggingFace => build_hf_index(storage).await,
             };
             match data {
@@ -609,6 +610,26 @@ fn cpan_package_of(rel: &str) -> Option<String> {
     let (author_path, file) = rel.rsplit_once('/')?;
     let (distribution, _) = crate::registry::cpan::parse_dist_archive_filename(file)?;
     Some(format!("{author_path}/{distribution}"))
+}
+
+/// Composer index: one entry per `vendor/package` holding an archive, uploaded
+/// (`composer/hosted/{name}/dists/{version}.zip`) or cached
+/// (`composer/dists/{name}/{version}/{ref}.{type}`), counting its archives.
+async fn build_composer_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "composer/").await?;
+    let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    for (key, meta) in &keys {
+        let Some(name) = crate::registry::composer::package_of_archive(key) else {
+            continue;
+        };
+        let entry = packages.entry(name).or_insert((0, 0, 0));
+        entry.0 += 1;
+        entry.1 += meta.size;
+        if meta.modified > entry.2 {
+            entry.2 = meta.modified;
+        }
+    }
+    Some(to_sorted_vec(packages))
 }
 
 /// Hugging Face index: cached files under `hf/models/{repo}/blobs/{digest}`, one entry per
