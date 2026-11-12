@@ -2043,6 +2043,7 @@ mod tests {
             size: 1,
             updated: H.into(),
             is_file,
+            ..Default::default()
         };
         let entries = vec![entry(H.into(), false), entry(format!("{H}.bin"), true)];
         let path = format!("a/{H}/b");

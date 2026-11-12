@@ -31,6 +31,10 @@ pub struct RepoInfo {
     /// True for root-level files in raw storage (not directories)
     #[serde(default)]
     pub is_file: bool,
+    /// Newest modification time (epoch seconds) behind `updated`, so a page that folds
+    /// entries together can take the newest of them (#1216).
+    #[serde(skip)]
+    pub modified: u64,
 }
 
 /// Index for a single registry type
@@ -506,6 +510,7 @@ async fn build_raw_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                 "N/A".to_string()
             },
             is_file,
+            modified,
         })
         .collect();
 
@@ -675,6 +680,7 @@ fn to_sorted_vec(map: HashMap<String, (usize, u64, u64)>) -> Vec<RepoInfo> {
                 "N/A".to_string()
             },
             is_file: false,
+            modified,
         })
         .collect();
 
