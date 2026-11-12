@@ -242,20 +242,20 @@ pub struct AuthConfig {
     /// switch does NOT open Docker, so an operator can serve Maven/raw anonymously
     /// while keeping images private.
     ///
-    /// When `true`, the `GET /v2/` ping returns `200` (no auth challenge) so the
-    /// Docker client proceeds anonymously; manifest/blob/tag reads are served
-    /// without auth. Writes (push/delete) are unaffected and still require auth.
-    /// `GET /v2/_catalog` (cross-repo enumeration) stays authenticated — it is
-    /// not part of anonymous pull. Per-image reads needed to resolve a known
-    /// name (manifests, blobs, and `tags/list`) ARE served anonymously. A request
-    /// that DOES carry an `Authorization` header is always validated (honest
-    /// `docker login`, correct audit attribution) rather than treated as anonymous.
-    ///
-    /// Limitation: clients built on `containers/image` (skopeo/podman/buildah)
-    /// read auth parameters only from the `/v2/` ping, so with the ping returning
-    /// `200` their *authenticated* operations degrade (anonymous pull still
-    /// works). Upgrade path for scoped anonymous access: a Docker Bearer-token
-    /// endpoint. ENV: NORA_AUTH_DOCKER_ANON_PULL.
+    /// When `true`, NORA runs a Docker token service at `/api/docker/token`, as
+    /// Docker Hub does (#1226). The anonymous `GET /v2/` ping, and every 401 on a
+    /// Docker path, is a Bearer challenge naming it: a client without credentials
+    /// gets a token that pulls, a client with credentials (password or API token,
+    /// as Basic or, for containerd, an OAuth2 password grant) gets a token for its
+    /// identity and role, and a wrong password gets 401, so `docker login` checks
+    /// it. Manifest/blob/tag reads are served without auth, with or without a
+    /// token; writes (push/delete) still require credentials. `GET /v2/_catalog`
+    /// (cross-repo enumeration) stays authenticated — it is not part of anonymous
+    /// pull. A request that carries Basic credentials is validated as before.
+    /// The token's signing key is kept in `token_storage`, so replicas share it
+    /// when they share that directory. The token service is advertised at
+    /// `public_url` (else the bind address), like every URL NORA hands out.
+    /// ENV: NORA_AUTH_DOCKER_ANON_PULL.
     #[serde(default)]
     pub docker_anon_pull: bool,
     /// Serve the browse UI and its JSON API (`/ui`, `/api/ui`) and the API
