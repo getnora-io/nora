@@ -1,0 +1,75 @@
+---
+source: nora-registry/src/ui/mod.rs
+expression: pages
+---
+[
+  {
+    "children": [
+      {
+        "bytes": 3340,
+        "files": 3,
+        "name": "com"
+      },
+      {
+        "bytes": 10,
+        "files": 1,
+        "name": "org"
+      }
+    ],
+    "leaf": false,
+    "path": ""
+  },
+  {
+    "children": [
+      {
+        "bytes": 3340,
+        "files": 3,
+        "name": "acme"
+      }
+    ],
+    "leaf": false,
+    "path": "com"
+  },
+  {
+    "children": [
+      {
+        "bytes": 3340,
+        "files": 3,
+        "name": "lib"
+      }
+    ],
+    "leaf": false,
+    "path": "com/acme"
+  },
+  {
+    "children": [
+      {
+        "bytes": 1240,
+        "files": 2,
+        "name": "1.0"
+      },
+      {
+        "bytes": 2000,
+        "files": 1,
+        "name": "2.0"
+      }
+    ],
+    "leaf": false,
+    "path": "com/acme/lib"
+  },
+  {
+    "children": [],
+    "leaf": true,
+    "path": "com/acme/lib/1.0"
+  },
+  {
+    "children": [],
+    "leaf": false,
+    "path": "com/ac"
+  },
+  {
+    "children": [],
+    "leaf": false,
+    "path": "nope"
+  }
+]
