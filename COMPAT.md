@@ -199,9 +199,9 @@ NORA serves both Terraform protocols against the same upstream: the **Registry P
 | Service discovery (`.well-known/terraform.json`) | Full | Registry protocol; points to NORA |
 | Provider versions list | Full | TTL-cached |
 | Provider download metadata | Full | `download_url` rewritten to NORA |
-| Provider binary download | Full | Immutable cache |
+| Provider binary download | Full | Immutable cache. Fetched from where the upstream's download metadata says, also when that metadata is not stored yet (cold cache, another replica): checked with terraform 1.16.5 for providers on GitHub releases (#1150) |
 | Module versions list | Full | TTL-cached |
-| Module download | Full | `X-Terraform-Get` header pass-through |
+| Module download | Full | `X-Terraform-Get` header pass-through; an archive source asked for before its address is stored is resolved from the upstream again (#1150) |
 | **Network mirror — `index.json`** | Full | Mirror protocol; list versions (#801) |
 | **Network mirror — `{version}.json`** | Full | Mirror protocol; archives via NORA + `zh:` hash (#801) |
 | Provider publish | — | Proxy-only (read) |

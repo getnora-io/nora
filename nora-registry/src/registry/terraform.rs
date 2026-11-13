@@ -507,10 +507,17 @@ async fn provider_download_binary(
         return StatusCode::NOT_FOUND.into_response();
     }
 
-    // Try upstream — resolve the real upstream URL from cached provider metadata.
-    // The metadata JSON (cached by provider_download_meta) stores the
-    // original download_url in `_nora_upstream_url`.
-    let url = resolve_upstream_download_url(&state, ns, ptype, ver, filename).await;
+    // Where the upstream's download metadata says the file is: from the stored metadata, or,
+    // when it is not stored yet, from the upstream (#1150).
+    let url = match resolve_upstream_download_url(&state, ns, ptype, ver, filename).await {
+        Ok(url) => url,
+        Err(ProxyError::NotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
+        Err(e) => {
+            tracing::debug!(error = ?e, "Terraform download metadata error");
+            return StatusCode::BAD_GATEWAY.into_response();
+        }
+    };
 
     match proxy_fetch(
         &state.http_client,
@@ -733,34 +740,7 @@ async fn module_download(
     let Some(proxy_url) = upstream_url(&state) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    let url = format!(
-        "{}/v1/modules/{}/{}/{}/{}/download",
-        proxy_url.trim_end_matches('/'),
-        ns,
-        name,
-        provider,
-        ver
-    );
-
-    // Module download returns 204 with X-Terraform-Get header pointing to source. Asked through
-    // the `terraform` breaker like every other path (#1202): an open breaker is 503, a failure
-    // counts toward opening it.
-    let fetched = super::proxy_fetch_core(
-        &state.http_client,
-        &url,
-        Duration::from_secs(state.config.terraform.proxy_timeout),
-        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
-        None,
-        |response| async move {
-            Ok(response
-                .headers()
-                .get("x-terraform-get")
-                .map(|v| v.to_str().unwrap_or("").to_string()))
-        },
-        &state.circuit_breaker,
-        RegistryType::Terraform,
-    )
-    .await;
+    let fetched = upstream_module_source(&state, &proxy_url, &ns, &name, &provider, &ver).await;
 
     match fetched {
         Ok(Some(original_url)) => {
@@ -796,6 +776,45 @@ async fn module_download(
             UpstreamMiss::of(&e).response("terraform", &format!("{ns}/{name}/{provider}/{ver}"))
         }
     }
+}
+
+/// Where the upstream's module download points (`X-Terraform-Get`), or `None` when it answers
+/// without one. Asked through the `terraform` breaker like every other path (#1202): an open
+/// breaker is 503, a failure counts toward opening it.
+async fn upstream_module_source(
+    state: &AppState,
+    proxy_url: &str,
+    ns: &str,
+    name: &str,
+    provider: &str,
+    ver: &str,
+) -> Result<Option<String>, ProxyError> {
+    let url = format!(
+        "{}/v1/modules/{}/{}/{}/{}/download",
+        proxy_url.trim_end_matches('/'),
+        ns,
+        name,
+        provider,
+        ver
+    );
+
+    // Module download returns 204 with X-Terraform-Get header pointing to source.
+    super::proxy_fetch_core(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.terraform.proxy_timeout),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
+        None,
+        |response| async move {
+            Ok(response
+                .headers()
+                .get("x-terraform-get")
+                .map(|v| v.to_str().unwrap_or("").to_string()))
+        },
+        &state.circuit_breaker,
+        RegistryType::Terraform,
+    )
+    .await
 }
 
 // ── Module source download (cached, proxied) ─────────────────────────
@@ -879,9 +898,9 @@ async fn module_source_download(
     }
     // With the upstream switched off, a source URL stored while it was on is not followed: the
     // archive is served from storage or not at all.
-    if upstream_url(&state).is_none() {
+    let Some(proxy_url) = upstream_url(&state) else {
         return StatusCode::NOT_FOUND.into_response();
-    }
+    };
 
     // Resolve original upstream URL from cached metadata
     let source_url_key = format!(
@@ -891,8 +910,28 @@ async fn module_source_download(
     let upstream_url = match state.storage.get(&source_url_key).await {
         // The stored address may carry a `//subdir`: that is the client's, not part of the URL.
         Ok(data) => split_subdir(&String::from_utf8_lossy(&data)).0,
+        // Not stored: the download's background write had not landed, another replica answered
+        // the download, or it is gone. The upstream's download endpoint is asked again, as the
+        // download asks it (#1150); only an archive source is followed and stored.
         Err(_) => {
-            return StatusCode::NOT_FOUND.into_response();
+            let module = format!("{ns}/{name}/{provider}/{ver}");
+            match upstream_module_source(&state, &proxy_url, &ns, &name, &provider, &ver).await {
+                Ok(Some(original))
+                    if rewrite_module_source_url(
+                        &original,
+                        &nora_base_url(&state),
+                        &ns,
+                        &name,
+                        &provider,
+                        &ver,
+                    ) != original =>
+                {
+                    state.spawn_cache("terraform", source_url_key, Bytes::from(original.clone()));
+                    split_subdir(&original).0
+                }
+                Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+                Err(e) => return UpstreamMiss::of(&e).response("terraform", &module),
+            }
         }
     };
 
@@ -1466,18 +1505,19 @@ async fn extract_terraform_publish_date(
 
 /// Resolve the real upstream download URL for a provider file.
 ///
-/// Looks up the cached metadata JSON to find the original URL (typically on
-/// releases.hashicorp.com). Checks `_nora_upstream_url` for binaries,
-/// `_nora_upstream_shasums_url` for SHA256SUMS, and
-/// `_nora_upstream_shasums_sig_url` for signature files.
-/// Falls back to constructing a releases.hashicorp.com URL from path components.
+/// Reads the provider's download metadata, which keeps the upstream's URLs beside the rewritten
+/// ones: `_nora_upstream_url` for an archive, `_nora_upstream_shasums_url` for SHA256SUMS and
+/// `_nora_upstream_shasums_sig_url` for its signature. Metadata that is not stored yet is asked
+/// of the upstream: the file may be requested before the background write of the metadata
+/// lands, on another replica, or after it was evicted (#1150). Nothing is guessed: a file whose
+/// metadata the upstream does not give is not fetched from anywhere.
 async fn resolve_upstream_download_url(
     state: &AppState,
     ns: &str,
     ptype: &str,
     ver: &str,
     filename: &str,
-) -> String {
+) -> Result<String, ProxyError> {
     // Determine which metadata field to look up based on filename
     let meta_field = if filename.ends_with(".sig") {
         "_nora_upstream_shasums_sig_url"
@@ -1486,20 +1526,24 @@ async fn resolve_upstream_download_url(
     } else {
         "_nora_upstream_url"
     };
+    let field = |json: &serde_json::Value| {
+        json.get(meta_field)
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
 
     // For binary .zip files, parse os/arch from filename to find the right metadata
-    if let Some((os, arch)) = parse_os_arch_from_filename(filename) {
+    let platform = if let Some((os, arch)) = parse_os_arch_from_filename(filename) {
         let meta_key = format!(
             "terraform/providers/{}/{}/{}/{}_{}.json",
             ns, ptype, ver, os, arch
         );
         if let Ok(data) = state.storage.get(&meta_key).await {
-            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                if let Some(url) = json.get(meta_field).and_then(|v| v.as_str()) {
-                    return url.to_string();
-                }
+            if let Some(url) = serde_json::from_slice(&data).ok().as_ref().and_then(field) {
+                return Ok(url);
             }
         }
+        (os.to_string(), arch.to_string())
     } else {
         // For shasums/sig files, scan any cached metadata for this provider version
         // (shasums URLs are the same regardless of os/arch)
@@ -1508,21 +1552,109 @@ async fn resolve_upstream_download_url(
         for key in keys {
             if key.ends_with(".json") {
                 if let Ok(data) = state.storage.get(&key).await {
-                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) {
-                        if let Some(url) = json.get(meta_field).and_then(|v| v.as_str()) {
-                            return url.to_string();
-                        }
+                    if let Some(url) = serde_json::from_slice(&data).ok().as_ref().and_then(field) {
+                        return Ok(url);
                     }
                 }
             }
         }
-    }
+        // Any platform of the release names the same SHA256SUMS.
+        upstream_platform(state, ns, ptype, ver).await?
+    };
+    let meta = upstream_download_meta(state, ns, ptype, ver, &platform).await?;
+    field(&meta).ok_or(ProxyError::NotFound)
+}
 
-    // Fallback: construct releases.hashicorp.com URL from path parts
-    format!(
-        "https://releases.hashicorp.com/terraform-provider-{}/{}/{}",
-        ptype, ver, filename
+/// A provider's download metadata for one platform from the upstream, rewritten and stored as
+/// the download metadata handlers store it.
+async fn upstream_download_meta(
+    state: &AppState,
+    ns: &str,
+    ptype: &str,
+    ver: &str,
+    (os, arch): &(String, String),
+) -> Result<serde_json::Value, ProxyError> {
+    let Some(proxy_url) = upstream_url(state) else {
+        return Err(ProxyError::NotFound);
+    };
+    if !is_valid_name(os) || !is_valid_name(arch) {
+        return Err(ProxyError::NotFound);
+    }
+    let url = format!(
+        "{}/v1/providers/{}/{}/{}/download/{}/{}",
+        proxy_url.trim_end_matches('/'),
+        ns,
+        ptype,
+        ver,
+        os,
+        arch
+    );
+    let text = proxy_fetch_text(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.terraform.proxy_timeout),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
+        None,
+        &state.circuit_breaker,
+        RegistryType::Terraform,
     )
+    .await?;
+    let rewritten = rewrite_download_url(&text, &nora_base_url(state), ns, ptype, ver);
+    let json = serde_json::from_str(&rewritten).map_err(|e| unreadable(&url, &e))?;
+    let storage_key = format!(
+        "terraform/providers/{}/{}/{}/{}_{}.json",
+        ns, ptype, ver, os, arch
+    );
+    state.spawn_cache("terraform", storage_key, Bytes::from(rewritten));
+    Ok(json)
+}
+
+/// An upstream answer that is not the JSON the protocol names: a failed upstream.
+fn unreadable(url: &str, e: &serde_json::Error) -> ProxyError {
+    tracing::debug!(url = %url, error = %e, "Terraform upstream answer is not protocol JSON");
+    ProxyError::Upstream(502)
+}
+
+/// A platform the upstream lists for a provider release, from its version list.
+async fn upstream_platform(
+    state: &AppState,
+    ns: &str,
+    ptype: &str,
+    ver: &str,
+) -> Result<(String, String), ProxyError> {
+    let Some(proxy_url) = upstream_url(state) else {
+        return Err(ProxyError::NotFound);
+    };
+    let url = format!(
+        "{}/v1/providers/{}/{}/versions",
+        proxy_url.trim_end_matches('/'),
+        ns,
+        ptype
+    );
+    let text = proxy_fetch_text(
+        &state.http_client,
+        &url,
+        Duration::from_secs(state.config.terraform.proxy_timeout),
+        expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
+        None,
+        &state.circuit_breaker,
+        RegistryType::Terraform,
+    )
+    .await?;
+    let json: serde_json::Value = serde_json::from_str(&text).map_err(|e| unreadable(&url, &e))?;
+    json["versions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|v| v["version"].as_str() == Some(ver))
+        .flat_map(|v| v["platforms"].as_array().into_iter().flatten())
+        .find_map(|p| {
+            Some((
+                p["os"].as_str()?.to_string(),
+                p["arch"].as_str()?.to_string(),
+            ))
+        })
+        .ok_or(ProxyError::NotFound)
 }
 
 /// Extract OS and arch from a terraform provider filename.
@@ -2627,6 +2759,185 @@ mod integration_tests {
         assert_eq!(body_bytes(resp).await.as_ref(), archive.as_slice());
     }
 
+    /// An upstream for `selectel/selectel 9.3.2` whose files live off releases.hashicorp.com
+    /// (`/gh/...`, as on GitHub releases): the version list, the linux_amd64 download metadata
+    /// and the zip, SHA256SUMS and signature it names.
+    async fn provider_upstream() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let files = format!("{}/gh/v9.3.2", server.uri());
+        let stem = "terraform-provider-selectel_9.3.2";
+        Mock::given(method("GET"))
+            .and(path("/v1/providers/selectel/selectel/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "versions": [
+                    {"version": "9.0.0", "protocols": ["5.0"],
+                        "platforms": [{"os": "freebsd", "arch": "arm"}]},
+                    {"version": "9.3.2", "protocols": ["5.0"],
+                        "platforms": [{"os": "linux", "arch": "amd64"}]}
+                ]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1/providers/selectel/selectel/9.3.2/download/linux/amd64",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "os": "linux", "arch": "amd64", "filename": format!("{stem}_linux_amd64.zip"),
+                "download_url": format!("{files}/{stem}_linux_amd64.zip"),
+                "shasums_url": format!("{files}/{stem}_SHA256SUMS"),
+                "shasums_signature_url": format!("{files}/{stem}_SHA256SUMS.sig"),
+                "shasum": "abc"
+            })))
+            .mount(&server)
+            .await;
+        for (file, body) in [
+            (format!("{stem}_linux_amd64.zip"), b"zip".to_vec()),
+            (format!("{stem}_SHA256SUMS"), b"sums".to_vec()),
+            (format!("{stem}_SHA256SUMS.sig"), b"sig".to_vec()),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/gh/v9.3.2/{file}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    /// #1150: a provider file asked for before its download metadata is stored (the background
+    /// write had not landed, another replica answered the metadata, or it was evicted) comes from
+    /// where the upstream's metadata says, not from a releases.hashicorp.com guess.
+    #[tokio::test]
+    async fn a_provider_file_without_stored_metadata_comes_from_where_the_upstream_says() {
+        let server = provider_upstream().await;
+        let ctx = tf_ctx(server.uri());
+        let base = "/terraform/v1/providers/download/selectel/selectel/9.3.2/terraform-provider-selectel_9.3.2";
+        for (suffix, body) in [
+            ("_linux_amd64.zip", &b"zip"[..]),
+            ("_SHA256SUMS", &b"sums"[..]),
+            ("_SHA256SUMS.sig", &b"sig"[..]),
+        ] {
+            let resp = send(&ctx.app, Method::GET, &format!("{base}{suffix}"), "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{suffix}");
+            assert_eq!(body_bytes(resp).await.as_ref(), body, "{suffix}");
+        }
+    }
+
+    /// #1150: metadata fetched for a file is stored like the download metadata handlers store it,
+    /// so the next file of the release does not ask the upstream again.
+    #[tokio::test]
+    async fn metadata_fetched_for_a_file_is_stored() {
+        let server = provider_upstream().await;
+        let ctx = tf_ctx(server.uri());
+        let zip = "/terraform/v1/providers/download/selectel/selectel/9.3.2/terraform-provider-selectel_9.3.2_linux_amd64.zip";
+        assert_eq!(
+            send(&ctx.app, Method::GET, zip, "").await.status(),
+            StatusCode::OK
+        );
+        let key = "terraform/providers/selectel/selectel/9.3.2/linux_amd64.json";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ctx.state.storage.get(key).await.is_err() {
+            assert!(std::time::Instant::now() < deadline, "{key} never stored");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let stored: serde_json::Value =
+            serde_json::from_slice(&ctx.state.storage.get(key).await.unwrap()).unwrap();
+        assert!(stored["_nora_upstream_url"]
+            .as_str()
+            .unwrap()
+            .ends_with("/gh/v9.3.2/terraform-provider-selectel_9.3.2_linux_amd64.zip"));
+    }
+
+    /// #1150: with no metadata from the upstream either, nothing is guessed: the client gets the
+    /// upstream's answer, not a file fetched from a host the upstream never named.
+    #[tokio::test]
+    async fn a_provider_file_the_upstream_does_not_know_is_not_guessed() {
+        let server = provider_upstream().await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/download/selectel/selectel/9.3.2/terraform-provider-selectel_9.3.2_windows_arm64.zip",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(
+            asked,
+            ["/v1/providers/selectel/selectel/9.3.2/download/windows/arm64"],
+            "the upstream is asked for the metadata, and nothing else is fetched"
+        );
+    }
+
+    /// #1150: the platform read off a file name goes into the upstream's metadata URL only when it
+    /// is a plain name: anything else is not asked for.
+    #[tokio::test]
+    async fn a_platform_that_is_not_a_name_is_not_asked_for() {
+        let server = provider_upstream().await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/download/selectel/selectel/9.3.2/terraform-provider-selectel_9.3.2_linux%3Fx=1_amd64.zip",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    /// #1150: a module source asked for before its source URL is stored is resolved by asking the
+    /// upstream's download endpoint again, as the module download does.
+    #[tokio::test]
+    async fn a_module_source_without_a_stored_url_asks_the_upstream() {
+        let archive = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3];
+        let server = module_upstream(|uri| format!("{uri}/m.tar.gz"), archive.clone()).await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), archive.as_slice());
+    }
+
+    /// #1150: a source resolved from the upstream on a miss is followed only when it names an
+    /// archive, as the download stores only those: a repository page is not fetched.
+    #[tokio::test]
+    async fn a_module_source_resolved_on_a_miss_is_followed_only_to_an_archive() {
+        let server = module_upstream(|uri| format!("{uri}/acme/vpc"), Vec::new()).await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let asked: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        assert_eq!(asked, ["/v1/modules/acme/vpc/aws/1.0.0/download"]);
+    }
+
     /// #1209: what the source URL answers is served and cached only when it is an archive: a web
     /// page (a repository's) is a 502 and is not cached as the module.
     #[tokio::test]
@@ -2639,7 +2950,7 @@ mod integration_tests {
         let ctx = tf_ctx(server.uri());
         let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // No wait for the download's background write: the source resolves without it (#1150).
         let resp = send(
             &ctx.app,
             Method::GET,
