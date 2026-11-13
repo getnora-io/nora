@@ -1677,7 +1677,11 @@ async fn serve_metadata(
             Some(spec) => published_version_manifest(state, name, spec).await,
         },
         Published::No => {
-            upstream_metadata(state, headers, path, name, &cache_key, spec.is_none()).await
+            let document = match spec {
+                None => Document::Packument,
+                Some(_) => Document::Other,
+            };
+            upstream_metadata(state, headers, path, name, &cache_key, document).await
         }
         // The listing failed. A packument NORA assembled is still here: the package is published,
         // and its documents are served as they are, read only. Without one, or with an upstream copy
@@ -1686,7 +1690,7 @@ async fn serve_metadata(
             let key = published_packument_key(name);
             match state.storage.get(&key).await {
                 Ok(data) if is_assembled_by_nora(&state.storage, &key, &data).await => match spec {
-                    None => packument_response(headers, data),
+                    None => metadata_response(headers, Document::Packument, data),
                     Some(spec) => published_version_manifest(state, name, spec).await,
                 },
                 // Without one NORA cannot tell whether the package is its own: unavailable (503), as
@@ -1714,7 +1718,7 @@ async fn published_packument_response(
     if let Ok(data) = state.storage.get(&key).await {
         if current(&data) && is_assembled_by_nora(&state.storage, &key, &data).await {
             state.metrics.record_cache_hit("npm");
-            return packument_response(headers, data);
+            return metadata_response(headers, Document::Packument, data);
         }
     }
     // LOCK-SAFE: tokio mutex, the one publish holds while it writes this package; a CI fleet
@@ -1731,7 +1735,7 @@ async fn published_packument_response(
     if let Ok(data) = state.storage.get(&key).await {
         if current(&data) && is_assembled_by_nora(&state.storage, &key, &data).await {
             state.metrics.record_cache_hit("npm");
-            return packument_response(headers, data);
+            return metadata_response(headers, Document::Packument, data);
         }
     }
     match assemble_packument(&state.storage, name).await {
@@ -1748,7 +1752,7 @@ async fn published_packument_response(
                 tracing::warn!(registry = "npm", package = %name, error = %e, "rebuilt packument not stored; served anyway");
             }
             state.metrics.record_cache_hit("npm");
-            packument_response(headers, Bytes::from(bytes))
+            metadata_response(headers, Document::Packument, Bytes::from(bytes))
         }
         Err(unassembled) => unassembled.response(name),
     }
@@ -1954,7 +1958,7 @@ async fn uncached_upstream_metadata(
     .await
     {
         Ok(data) => match rewrite_for_nora(state, &data, upstream.url, path, Links::Served) {
-            Some(rewritten) => packument_response(headers, Bytes::from(rewritten)),
+            Some(rewritten) => metadata_response(headers, Document::Other, Bytes::from(rewritten)),
             None => StatusCode::NOT_FOUND.into_response(),
         },
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -2003,26 +2007,32 @@ fn search_names_private(state: &AppState, query: &str) -> bool {
     })
 }
 
-/// [`packument_response`] for a cached upstream document, as [`served_copy`] has it; 404 for a
+/// [`metadata_response`] for a cached upstream document, as [`served_copy`] has it; 404 for a
 /// version manifest whose tarball lies outside the upstream.
-fn served_packument(state: &AppState, headers: &HeaderMap, path: &str, data: Bytes) -> Response {
+fn served_metadata(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+    document: Document,
+    data: Bytes,
+) -> Response {
     match served_copy(state, path, data) {
-        (Some(data), _) => packument_response(headers, data),
+        (Some(data), _) => metadata_response(headers, document, data),
         (None, _) => StatusCode::NOT_FOUND.into_response(),
     }
 }
 
 /// A packument or version manifest of a package NORA has not published: from its cache under
 /// `npm/<name>/upstream/` (or, until that is written, what an older release cached), revalidated
-/// after the metadata TTL, else fetched from the upstream and cached. `packument` says whether
-/// the document is a packument, whose versions the first-seen ledger records.
+/// after the metadata TTL, else fetched from the upstream and cached. A packument's versions are
+/// recorded in the first-seen ledger, and only a packument is served abbreviated.
 async fn upstream_metadata(
     state: &AppState,
     headers: &HeaderMap,
     path: &str,
     name: &str,
     cache_key: &str,
-    packument: bool,
+    document: Document,
 ) -> Response {
     let legacy_key = legacy_cache_key(path);
     let mut cached = None;
@@ -2064,16 +2074,23 @@ async fn upstream_metadata(
             )
         {
             return match served {
-                Some(data) => packument_response(headers, data),
+                Some(data) => metadata_response(headers, document, data),
                 None => StatusCode::NOT_FOUND.into_response(),
             };
         }
         // Single-flight: a CI fleet stampeding one expired packument revalidates it once (#595).
         let refetch = || async {
-            refetch_metadata(state, path, cache_key, &from_key, packument, !past_nora)
-                .await
-                .ok()
-                .map(Bytes::from)
+            refetch_metadata(
+                state,
+                path,
+                cache_key,
+                &from_key,
+                document == Document::Packument,
+                !past_nora,
+            )
+            .await
+            .ok()
+            .map(Bytes::from)
         };
         let refreshed = if state.config.server.proxy_coalesce {
             let budget = crate::proxy_coalesce::follower_budget(state.config.npm.proxy_timeout);
@@ -2085,14 +2102,14 @@ async fn upstream_metadata(
             refetch().await
         };
         if let Some(refreshed) = refreshed {
-            return served_packument(state, headers, path, refreshed);
+            return served_metadata(state, headers, path, document, refreshed);
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
             let Some(data) = served else {
                 return StatusCode::NOT_FOUND.into_response();
             };
-            let (stale_body, stale_type) = packument_body(headers, data);
+            let (stale_body, stale_type) = metadata_body(headers, document, data);
             return (
                 StatusCode::OK,
                 [
@@ -2144,7 +2161,7 @@ async fn upstream_metadata(
             else {
                 return StatusCode::NOT_FOUND.into_response();
             };
-            if packument {
+            if document == Document::Packument {
                 record_first_seen(state, cache_key, &rewritten, None).await;
             }
             use futures::FutureExt as _;
@@ -2163,7 +2180,7 @@ async fn upstream_metadata(
                     tracing::error!(panic = ?panic, "npm metadata cache task panicked");
                 }
             }));
-            served_packument(state, headers, path, Bytes::from(rewritten))
+            served_metadata(state, headers, path, document, Bytes::from(rewritten))
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -3088,13 +3105,25 @@ fn abbreviate_packument(full: &[u8]) -> Option<Vec<u8>> {
     serde_json::to_vec(&serde_json::Value::Object(out)).ok()
 }
 
-/// Serve a packument, honouring the abbreviated form when the client asks for it.
+/// What an npm metadata response carries. Only a packument has an abbreviated form: a version
+/// manifest (by version or by dist-tag), the dist-tags and a search result go out as they are
+/// whatever the Accept, as registry.npmjs.org answers them. Projecting one of those as a
+/// packument leaves `{"name":…,"versions":{}}`, and corepack reads `dist` off `<name>/latest`
+/// (#1225).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Document {
+    Packument,
+    Other,
+}
+
+/// Serve a metadata document, honouring the abbreviated form when the client asks for it and
+/// the document is a packument.
 ///
 /// `Vary: Accept` is not decoration here: the body depends on a request header
 /// and NORA marks metadata `Cache-Control: public`, so without it a shared cache
 /// can hand the abbreviated document to a client that asked for the full one.
-fn packument_body(headers: &HeaderMap, data: Bytes) -> (Bytes, &'static str) {
-    if !wants_install_v1(headers) {
+fn metadata_body(headers: &HeaderMap, document: Document, data: Bytes) -> (Bytes, &'static str) {
+    if document != Document::Packument || !wants_install_v1(headers) {
         return (data, "application/json");
     }
     match abbreviate_packument(&data) {
@@ -3105,8 +3134,8 @@ fn packument_body(headers: &HeaderMap, data: Bytes) -> (Bytes, &'static str) {
     }
 }
 
-fn packument_response(headers: &HeaderMap, data: Bytes) -> Response {
-    let (body, content_type) = packument_body(headers, data);
+fn metadata_response(headers: &HeaderMap, document: Document, data: Bytes) -> Response {
+    let (body, content_type) = metadata_body(headers, document, data);
 
     (
         StatusCode::OK,
@@ -8266,6 +8295,34 @@ mod published_and_upstream_keys {
         assert_eq!(versions(&ctx, "/npm/corp-lib").await, ["1.0.0"]);
         let resp = send(&ctx.app, Method::GET, "/npm/corp-lib/1.0.0", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
+        // The abbreviated form is still the packument's alone (#957, #1225).
+        let install_v1 = vec![("accept", "application/vnd.npm.install-v1+json")];
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/corp-lib",
+            install_v1.clone(),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/vnd.npm.install-v1+json")
+        );
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/corp-lib/1.0.0",
+            install_v1,
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let manifest: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(manifest["version"], "1.0.0", "{manifest}");
         assert_eq!(asked(&server, "corp-lib").await, 0);
         // An upstream copy in its place is not taken for NORA's own, and NORA cannot tell whether
         // the package is published: unavailable, the upstream not asked.
@@ -8959,6 +9016,58 @@ mod published_and_upstream_keys {
             .stat("npm/corp-lib/metadata.json")
             .await
             .is_none());
+        assert_eq!(asked(&server, "corp-lib").await, 0);
+    }
+
+    /// A published package's packument is the abbreviated form when asked for it, rebuilt from
+    /// its keys or as stored; its version manifest is the full document (#957, #1225).
+    #[tokio::test]
+    async fn a_published_packument_is_abbreviated_and_its_manifest_is_not() {
+        use axum::http::header;
+        let server = upstream("corp-lib", &["9.9.9"]).await;
+        let ctx = context(&server, 3600);
+        publish(&ctx, "corp-lib", "1.0.0").await;
+        // Gone: the next read rebuilds it from the published keys, then serves what it stored.
+        let _ = ctx.state.storage.delete("npm/corp-lib/metadata.json").await;
+        let install_v1 = || vec![("accept", "application/vnd.npm.install-v1+json")];
+        for read in ["rebuilt", "stored"] {
+            let resp = crate::test_helpers::send_with_headers(
+                &ctx.app,
+                Method::GET,
+                "/npm/corp-lib",
+                install_v1(),
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{read}");
+            assert_eq!(
+                resp.headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok()),
+                Some("application/vnd.npm.install-v1+json"),
+                "{read}"
+            );
+        }
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/corp-lib/1.0.0",
+            install_v1(),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let manifest: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(manifest["version"], "1.0.0", "{manifest}");
+        insta::assert_json_snapshot!(
+            "npm_install_v1_published_version_manifest",
+            serde_json::json!({ "content_type": content_type, "body": manifest })
+        );
         assert_eq!(asked(&server, "corp-lib").await, 0);
     }
 
@@ -12463,5 +12572,204 @@ mod upstream_dates_gate {
             }
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+}
+
+/// #1225: the abbreviated form (`Accept: application/vnd.npm.install-v1+json`) exists only for
+/// a packument. A version manifest — by version or by dist-tag — is answered as the full document
+/// whatever the Accept, as registry.npmjs.org does; corepack reads `dist` off `GET <name>/latest`.
+#[cfg(test)]
+mod install_v1_version_manifest {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send_with_headers};
+    use axum::http::{header, Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const INSTALL_V1: &str =
+        "application/vnd.npm.install-v1+json; q=1.0, application/json; q=0.8, */*";
+
+    fn manifest(base: &str) -> serde_json::Value {
+        serde_json::json!({
+            "name": "pnpm",
+            "version": "10.17.1",
+            "bin": { "pnpm": "bin/pnpm.cjs" },
+            "dist": {
+                "integrity": "sha512-AAAA",
+                "shasum": "0000000000000000000000000000000000000000",
+                "tarball": format!("{base}/pnpm/-/pnpm-10.17.1.tgz")
+            }
+        })
+    }
+
+    async fn upstream() -> MockServer {
+        let server = MockServer::start().await;
+        for spec in ["latest", "10.17.1"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/pnpm/{spec}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(manifest(&server.uri())))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .and(path("/pnpm"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "pnpm",
+                "dist-tags": { "latest": "10.17.1" },
+                "readme": "dropped from the abbreviated form",
+                "versions": { "10.17.1": manifest(&server.uri()) }
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn get(ctx: &crate::test_helpers::TestContext, uri: &str) -> (String, serde_json::Value) {
+        let resp =
+            send_with_headers(&ctx.app, Method::GET, uri, vec![("accept", INSTALL_V1)], "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let doc = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        (content_type, doc)
+    }
+
+    fn assert_full_manifest(uri: &str, content_type: &str, doc: &serde_json::Value) {
+        assert_eq!(doc["version"], "10.17.1", "{uri}: {doc}");
+        assert_eq!(doc["dist"]["integrity"], "sha512-AAAA", "{uri}: {doc}");
+        assert!(doc["dist"]["tarball"].is_string(), "{uri}: {doc}");
+        assert!(
+            doc.get("versions").is_none(),
+            "{uri}: not a packument: {doc}"
+        );
+        assert_eq!(content_type, "application/json", "{uri}");
+    }
+
+    #[tokio::test]
+    async fn an_upstream_version_manifest_is_full_cold_and_cached() {
+        let server = upstream().await;
+        let uri = server.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.npm.metadata_ttl = 3600;
+        });
+        for spec in ["latest", "10.17.1"] {
+            let uri = format!("/npm/pnpm/{spec}");
+            // Cold: fetched from the upstream.
+            let (content_type, doc) = get(&ctx, &uri).await;
+            assert_full_manifest(&uri, &content_type, &doc);
+            // Warm: served from the cache once it is written.
+            let key = format!("npm/pnpm/upstream/manifests/{spec}.json");
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            while ctx.state.storage.stat(&key).await.is_none() {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "{key} never written"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let (content_type, doc) = get(&ctx, &uri).await;
+            assert_full_manifest(&uri, &content_type, &doc);
+        }
+        // The packument of the same package is still the abbreviated form (#957).
+        let (content_type, doc) = get(&ctx, "/npm/pnpm").await;
+        assert_eq!(content_type, "application/vnd.npm.install-v1+json");
+        assert!(doc.get("readme").is_none(), "{doc}");
+        assert_eq!(
+            doc["versions"]["10.17.1"]["dist"]["integrity"], "sha512-AAAA",
+            "{doc}"
+        );
+    }
+
+    /// The stale copy served while the upstream is down is the full manifest too.
+    #[tokio::test]
+    async fn a_stale_version_manifest_is_full() {
+        let server = upstream().await;
+        let uri = server.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.serve_stale = true;
+        });
+        let (content_type, doc) = get(&ctx, "/npm/pnpm/latest").await;
+        assert_full_manifest("/npm/pnpm/latest", &content_type, &doc);
+        let key = "npm/pnpm/upstream/manifests/latest.json";
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ctx.state.storage.stat(key).await.is_none() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "{key} never written"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        server.reset().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            "/npm/pnpm/latest",
+            vec![("accept", INSTALL_V1)],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-nora-stale")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "served from the stale copy"
+        );
+        let content_type = resp
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let doc = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_full_manifest("/npm/pnpm/latest (stale)", &content_type, &doc);
+    }
+
+    /// Endpoints answered by the upstream uncached — the dist-tags of a package NORA has not
+    /// published, and search — have no abbreviated form either: the upstream's document as it is.
+    #[tokio::test]
+    async fn uncached_endpoints_are_served_as_the_upstream_sends_them() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/-/package/pnpm/dist-tags"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(
+                    serde_json::json!({ "latest": "10.17.1", "next-10": "10.18.0" }),
+                ),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/-/v1/search"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "objects": [{ "package": { "name": "pnpm", "version": "10.17.1" } }],
+                "total": 1
+            })))
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+        let ctx = create_test_context_with_config(move |cfg| cfg.npm.proxy = Some(uri));
+
+        let (content_type, tags) = get(&ctx, "/npm/-/package/pnpm/dist-tags").await;
+        assert_eq!(tags["latest"], "10.17.1", "{tags}");
+        assert!(tags.get("versions").is_none(), "{tags}");
+        assert_eq!(content_type, "application/json");
+
+        let (content_type, found) = get(&ctx, "/npm/-/v1/search?text=pnpm").await;
+        assert_eq!(found["total"], 1, "{found}");
+        assert_eq!(found["objects"][0]["package"]["name"], "pnpm", "{found}");
+        assert_eq!(content_type, "application/json");
     }
 }
