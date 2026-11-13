@@ -28,6 +28,10 @@ tracing-subscriber.workspace = true
 tracing-appender.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
+# Docker tokens (#1226). hmac 0.12 speaks digest 0.10, so it is paired with sha2 0.10, not the
+# workspace sha2 0.11; both are already in the graph through jsonwebtoken (hmac 0.13 adds crates).
+hmac = "0.12"
+hmac-sha2 = { package = "sha2", version = "0.10" }
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 sha1 = "0.11"
 md-5 = "0.11"

@@ -8,6 +8,7 @@
 //! - Bearer token auth (opaque tokens with Argon2 verification)
 //! - Brute-force protection with exponential backoff
 
+pub(crate) mod docker_token;
 mod htpasswd;
 mod namespace;
 pub mod oidc;
@@ -198,7 +199,12 @@ impl AuthFailureTracker {
 fn is_public_path(path: &str) -> bool {
     matches!(
         path,
-        "/" | "/health" | "/ready" | "/api/tokens" | "/api/tokens/list" | "/api/tokens/revoke"
+        "/" | "/health"
+            | "/ready"
+            | "/api/tokens"
+            | "/api/tokens/list"
+            | "/api/tokens/revoke"
+            | docker_token::TOKEN_PATH
     )
 }
 
@@ -482,17 +488,40 @@ pub async fn auth_middleware(
     // DELETE) are not read methods, so they fall through and still require auth.
     // With the flag off (default), `/v2/` returns 401 + WWW-Authenticate: Basic
     // so `docker login` works and the basic-auth-accepts-api-token contract holds.
+    //
+    // Except the ping when the Docker token service runs (#1226): a ping answered 200 tells
+    // docker the registry wants no credentials, and it never sends the ones `docker login`
+    // stored, so a push fails and a login with any password succeeds. The ping and every 401
+    // on a Docker path then send the client to the token service (Bearer challenge), which
+    // hands out a pull token without credentials and an identity token with them.
+    let docker_tokens = if is_docker {
+        state.docker_tokens.clone()
+    } else {
+        None
+    };
+    let is_docker_ping = path == "/v2" || path == "/v2/";
     if state.config.auth.docker_anon_pull
         && is_read_method
         && is_docker
         && !is_docker_catalog
         && !has_auth_header
+        && !(is_docker_ping && docker_tokens.is_some())
     {
         return anonymous_read_passthrough(request, next).await;
     }
 
     // Compute realm from public_url for WWW-Authenticate header
     let realm = state.config.server.public_url.as_deref().unwrap_or("Nora");
+
+    // A 401: a Basic challenge, or on a Docker path under the token service a Bearer one
+    // naming it, with the scope this request needs.
+    let bearer_challenge = docker_tokens
+        .as_ref()
+        .map(|_| docker_token::challenge(&state, path, is_write_method(request.method())));
+    let deny = |message: &str| match &bearer_challenge {
+        Some(challenge) => docker_token::unauthorized_with(challenge, message),
+        None => unauthorized_response(message, realm),
+    };
 
     // The client address the password lockout counts by.
     let client_ip = extract_client_ip(&request, &state.config.auth.trusted_proxies);
@@ -505,11 +534,42 @@ pub async fn auth_middleware(
 
     let auth_header = match auth_header {
         Some(h) => h,
-        None => return unauthorized_response("Authentication required", realm),
+        None => return deny("Authentication required"),
     };
 
-    // Try Bearer token first (opaque nra_ tokens, then OIDC JWT)
+    // Try Bearer token first (NORA Docker tokens, then opaque nra_ tokens, then OIDC JWT)
     if let Some(token) = auth_header.strip_prefix("Bearer ") {
+        // 0. A NORA Docker token (#1226): honoured on the Docker paths only, never handed to
+        // the token store or an OIDC provider.
+        if docker_token::is_docker_token(token) {
+            let grant = docker_tokens
+                .as_ref()
+                .and_then(|tokens| tokens.verify(token, docker_token::now_secs()));
+            return match grant {
+                None => deny("Invalid or expired token"),
+                // What anonymous pull serves, nothing more: a write or the catalog is sent
+                // back to the token service for credentials.
+                Some(docker_token::Grant::Anonymous) => {
+                    if is_read_method && !is_docker_catalog {
+                        anonymous_read_passthrough(request, next).await
+                    } else {
+                        deny("authentication required")
+                    }
+                }
+                Some(docker_token::Grant::User { user, role }) => {
+                    if is_write_method(request.method()) && !role.can_write() {
+                        return (StatusCode::FORBIDDEN, "Read-only token").into_response();
+                    }
+                    // Like the Basic identity it was issued for: not namespace-scoped.
+                    request
+                        .extensions_mut()
+                        .insert(NamespaceAuthority::Unrestricted);
+                    request.extensions_mut().insert(AuthenticatedUser(user));
+                    request.extensions_mut().insert(AuthenticatedRole(role));
+                    next.run(request).await
+                }
+            };
+        }
         // 1. Try opaque token (nra_ prefix)
         if let Some(ref token_store) = state.tokens {
             match token_store.verify_token(token) {
@@ -616,18 +676,59 @@ pub async fn auth_middleware(
         // (a random API token or a signed JWT), so a wrong one does not count
         // toward the password lockout: a client replaying an expired token
         // must not lock everyone behind its address out of their passwords.
-        return unauthorized_response("Invalid or expired token", realm);
+        return deny("Invalid or expired token");
     }
 
     // Parse Basic auth
     if !auth_header.starts_with("Basic ") {
-        return unauthorized_response("Basic or Bearer authentication required", realm);
+        return deny("Basic or Bearer authentication required");
     }
 
+    let encoded = &auth_header[6..];
+    let decision = authenticate_basic(&state, client_ip, encoded, request.method(), is_admin).await;
+    match decision {
+        BasicDecision::Authenticated { user, role } => {
+            // Basic-auth identities and opaque (nra_) tokens are not
+            // namespace-scoped (#583 is OIDC-only).
+            request
+                .extensions_mut()
+                .insert(NamespaceAuthority::Unrestricted);
+            request.extensions_mut().insert(AuthenticatedUser(user));
+            request.extensions_mut().insert(AuthenticatedRole(role));
+            next.run(request).await
+        }
+        // Valid credentials, not authorized: not a wrong password, so not
+        // counted.
+        BasicDecision::Forbidden(reason) => (StatusCode::FORBIDDEN, reason).into_response(),
+        BasicDecision::Unauthorized { message, .. } => deny(message),
+        BasicDecision::LockedOut(retry_after) => too_many_failed_attempts(retry_after),
+        BasicDecision::ServiceUnavailable(e) => {
+            tracing::error!(error = %e, "token store read failed during Basic auth fallback");
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Token verification unavailable",
+            )
+                .into_response()
+        }
+        BasicDecision::NotConfigured => deny("Basic auth not configured"),
+    }
+}
+
+/// Check Basic credentials (`encoded`, the header value after `Basic `) for a request with
+/// this method on an admin path or not, from `client_ip`: the htpasswd file and the token
+/// store as [`decide_basic_auth`] rules, under the password lockout as [`lockout_rule`]
+/// rules, with the lockout counts updated. The middleware answers a Basic request with it and
+/// the Docker token service a token request (#1226), so both decide a password alike.
+pub(crate) async fn authenticate_basic(
+    state: &AppState,
+    client_ip: Option<IpAddr>,
+    encoded: &str,
+    method: &Method,
+    is_admin: bool,
+) -> BasicDecision {
     // The account the password lockout counts by: the username at the client
     // address. A header that does not decode to `user:password` is refused
     // below without being counted.
-    let encoded = &auth_header[6..];
     let account = client_ip.zip(basic_credentials(encoded).ok().map(|(user, _)| user));
     let locked_out = account
         .as_ref()
@@ -651,7 +752,7 @@ pub async fn auth_middleware(
                 .auth
                 .as_deref()
                 .map(|_| move |_: &str, _: &str| htpasswd_match);
-            decide_basic_auth(encoded, htpasswd, tokens, request.method(), is_admin)
+            decide_basic_auth(encoded, htpasswd, tokens, method, is_admin)
         }
         // A locked-out account gets no password checked, so no bcrypt runs for it. An API
         // token sent as the password cannot be guessed, so it is still verified, as over
@@ -660,7 +761,7 @@ pub async fn auth_middleware(
             encoded,
             None::<fn(&str, &str) -> bool>,
             tokens,
-            request.method(),
+            method,
             is_admin,
         ),
     };
@@ -672,32 +773,7 @@ pub async fn auth_middleware(
     if let Some((ip, username)) = &account {
         state.auth_failures.count(*ip, username, count);
     }
-    match decision {
-        BasicDecision::Authenticated { user, role } => {
-            // Basic-auth identities and opaque (nra_) tokens are not
-            // namespace-scoped (#583 is OIDC-only).
-            request
-                .extensions_mut()
-                .insert(NamespaceAuthority::Unrestricted);
-            request.extensions_mut().insert(AuthenticatedUser(user));
-            request.extensions_mut().insert(AuthenticatedRole(role));
-            next.run(request).await
-        }
-        // Valid credentials, not authorized: not a wrong password, so not
-        // counted.
-        BasicDecision::Forbidden(reason) => (StatusCode::FORBIDDEN, reason).into_response(),
-        BasicDecision::Unauthorized { message, .. } => unauthorized_response(message, realm),
-        BasicDecision::LockedOut(retry_after) => too_many_failed_attempts(retry_after),
-        BasicDecision::ServiceUnavailable(e) => {
-            tracing::error!(error = %e, "token store read failed during Basic auth fallback");
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Token verification unavailable",
-            )
-                .into_response()
-        }
-        BasicDecision::NotConfigured => unauthorized_response("Basic auth not configured", realm),
-    }
+    decision
 }
 
 /// What the Basic branch of [`auth_middleware`] does with a request, as
@@ -1981,13 +2057,19 @@ mod integration_tests {
 
     // --- #778: anonymous Docker pull via the `docker_anon_pull` opt-in ---
 
-    /// docker_anon_pull=true: the `GET /v2/` ping is served anonymously
-    /// (200, no challenge) so the Docker client proceeds without credentials.
+    /// docker_anon_pull=true: the anonymous `GET /v2/` ping is a Bearer challenge naming the
+    /// token service, not 200 (#1226): answered 200 it told docker no credentials were wanted,
+    /// so docker never sent the ones `docker login` stored and push failed. An anonymous
+    /// client follows the challenge to a pull token (auth::docker_token).
     #[tokio::test]
-    async fn test_docker_anon_pull_allows_v2_ping() {
+    async fn test_docker_anon_pull_ping_points_at_the_token_service() {
         let ctx = create_test_context_with_docker_anon_pull(&[("admin", "secret")]);
         let response = send(&ctx.app, Method::GET, "/v2/", "").await;
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let challenge = response.headers()[axum::http::header::WWW_AUTHENTICATE]
+            .to_str()
+            .unwrap();
+        assert!(challenge.starts_with("Bearer realm="), "{challenge}");
     }
 
     /// docker_anon_pull=true: an anonymous manifest read passes the auth
@@ -3646,6 +3728,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             activity: Arc::new(crate::activity_log::ActivityLog::new(50)),
             audit: ctx.state.audit.clone(),
             docker_auth: Arc::new(crate::registry::DockerAuth::new(reqwest::Client::new(), 5)),
+            docker_tokens: None,
             repo_index: Arc::new(crate::repo_index::RepoIndex::new()),
             http_client: reqwest::Client::new(),
             http_client_no_redirect: reqwest::Client::new(),

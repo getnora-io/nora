@@ -52,6 +52,7 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 | Namespaced `{ns}/{name}` | * | Full | Two-level paths |
 | Deep paths `a/b/c/name` | * | — | Max 2-level (`org/image`) |
 | Token auth (Bearer) | — | Full | WWW-Authenticate challenge |
+| Token service `/api/docker/token` | GET, POST | Full | Under `docker_anon_pull`: the anonymous ping and every 401 on `/v2/` name it (Bearer). No credentials → a pull token; credentials as Basic or an OAuth2 `password` grant (containerd) → a token for that user and role; a wrong password → 401, so `docker login` checks it. Checked with docker 29, dockerd 27 as `registry-mirrors`, skopeo 1.4, podman 6.1 and containerd 1.7: login, push with credentials, anonymous pull, mirror pull. (#1226) |
 | Cross-repo blob mount | POST | — | Not implemented |
 | Referrers API | GET | — | OCI 1.1 referrers |
 
@@ -198,9 +199,9 @@ NORA serves both Terraform protocols against the same upstream: the **Registry P
 | Service discovery (`.well-known/terraform.json`) | Full | Registry protocol; points to NORA |
 | Provider versions list | Full | TTL-cached |
 | Provider download metadata | Full | `download_url` rewritten to NORA |
-| Provider binary download | Full | Immutable cache |
+| Provider binary download | Full | Immutable cache. Fetched from where the upstream's download metadata says, also when that metadata is not stored yet (cold cache, another replica): checked with terraform 1.16.5 for providers on GitHub releases (#1150) |
 | Module versions list | Full | TTL-cached |
-| Module download | Full | `X-Terraform-Get` header pass-through |
+| Module download | Full | `X-Terraform-Get` header pass-through; an archive source asked for before its address is stored is resolved from the upstream again (#1150) |
 | **Network mirror — `index.json`** | Full | Mirror protocol; list versions (#801) |
 | **Network mirror — `{version}.json`** | Full | Mirror protocol; archives via NORA + `zh:` hash (#801) |
 | Provider publish | — | Proxy-only (read) |
