@@ -52,6 +52,7 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 | Namespaced `{ns}/{name}` | * | Full | Two-level paths |
 | Deep paths `a/b/c/name` | * | — | Max 2-level (`org/image`) |
 | Token auth (Bearer) | — | Full | WWW-Authenticate challenge |
+| Token service `/api/docker/token` | GET, POST | Full | Under `docker_anon_pull`: the anonymous ping and every 401 on `/v2/` name it (Bearer). No credentials → a pull token; credentials as Basic or an OAuth2 `password` grant (containerd) → a token for that user and role; a wrong password → 401, so `docker login` checks it. Checked with docker 29, dockerd 27 as `registry-mirrors`, skopeo 1.4, podman 6.1 and containerd 1.7: login, push with credentials, anonymous pull, mirror pull. (#1226) |
 | Cross-repo blob mount | POST | — | Not implemented |
 | Referrers API | GET | — | OCI 1.1 referrers |
 

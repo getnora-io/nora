@@ -313,6 +313,14 @@ fn build_context_full(
     } else {
         None
     };
+    let docker_tokens = (auth_enabled && config.auth.docker_anon_pull).then(|| {
+        let dir = tempdir.path().join("tokens");
+        std::fs::create_dir_all(&dir).expect("token dir");
+        Arc::new(
+            crate::auth::docker_token::DockerTokens::load_or_create(&dir)
+                .expect("docker token key"),
+        )
+    });
 
     let docker_auth =
         registry::DockerAuth::new(reqwest::Client::new(), config.docker.proxy_timeout);
@@ -397,6 +405,7 @@ fn build_context_full(
         activity: Arc::new(ActivityLog::new(50)),
         audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
+        docker_tokens,
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
         http_client_no_redirect,
