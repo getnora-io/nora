@@ -1855,31 +1855,39 @@ async fn local_autocomplete_results(
 fn generate_service_index(base_url: &str) -> String {
     let nora_nuget = format!("{}/nuget", base_url.trim_end_matches('/'));
 
-    let index = serde_json::json!({
-        "version": "3.0.0",
-        "resources": [
-            {
-                "@id": format!("{}/v3/flatcontainer/", nora_nuget),
-                "@type": "PackageBaseAddress/3.0.0",
-                "comment": "Base URL of NuGet package storage"
-            },
-            {
-                "@id": format!("{}/v3/registration/", nora_nuget),
-                "@type": "RegistrationsBaseUrl/3.6.0",
-                "comment": "Base URL of NuGet package registration info"
-            },
-            {
-                "@id": format!("{}/v3/query", nora_nuget),
-                "@type": "SearchQueryService",
-                "comment": "NuGet search endpoint"
-            },
-            {
-                "@id": format!("{}/v3/autocomplete", nora_nuget),
-                "@type": "SearchAutocompleteService",
-                "comment": "NuGet autocomplete endpoint"
-            }
-        ]
-    });
+    let mut resources = vec![
+        serde_json::json!({
+            "@id": format!("{}/v3/flatcontainer/", nora_nuget),
+            "@type": "PackageBaseAddress/3.0.0",
+            "comment": "Base URL of NuGet package storage"
+        }),
+        serde_json::json!({
+            "@id": format!("{}/v3/registration/", nora_nuget),
+            "@type": "RegistrationsBaseUrl/3.6.0",
+            "comment": "Base URL of NuGet package registration info"
+        }),
+    ];
+    // A client looks a service up by a versioned `@type` (NuGet.Client `ServiceTypes.cs`:
+    // search by `/3.0.0-beta`, `/3.4.0` or `/Versioned`), so search and autocomplete are listed
+    // under the bare name and the versions nuget.org lists them under, all on the same endpoint
+    // (#1215). Not `/3.5.0`: it promises the packageType filter, which the local search lacks.
+    for (service, path, comment) in [
+        ("SearchQueryService", "query", "NuGet search endpoint"),
+        (
+            "SearchAutocompleteService",
+            "autocomplete",
+            "NuGet autocomplete endpoint",
+        ),
+    ] {
+        for version in ["", "/3.0.0-beta", "/3.0.0-rc"] {
+            resources.push(serde_json::json!({
+                "@id": format!("{nora_nuget}/v3/{path}"),
+                "@type": format!("{service}{version}"),
+                "comment": comment,
+            }));
+        }
+    }
+    let index = serde_json::json!({ "version": "3.0.0", "resources": resources });
 
     serde_json::to_string_pretty(&index).expect("static JSON serialization cannot fail")
 }
@@ -2673,7 +2681,8 @@ mod tests {
         let json: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(json["version"], "3.0.0");
         let resources = json["resources"].as_array().unwrap();
-        assert_eq!(resources.len(), 4);
+        // Base address and registrations, then search and autocomplete under three types each.
+        assert_eq!(resources.len(), 8);
         assert!(result.contains("http://nora:4000/nuget/v3/flatcontainer/"));
         assert!(result.contains("http://nora:4000/nuget/v3/registration/"));
         assert!(result.contains("http://nora:4000/nuget/v3/query"));
@@ -2716,6 +2725,85 @@ mod tests {
         assert!(!types.iter().any(|t| t.contains("Catalog")));
         assert!(!types.iter().any(|t| t.contains("RepositorySignatures")));
         assert!(!types.iter().any(|t| t.contains("Vulnerability")));
+    }
+
+    /// A client finds each resource by one of the `@type`s it knows, not by the bare name:
+    /// NuGet.Client `ServiceTypes.cs` (`SearchQueryService`, `SearchAutocompleteService`,
+    /// `RegistrationsBaseUrl`, `PackageBaseAddress`). With only a bare `SearchQueryService`,
+    /// `dotnet package search` and Visual Studio said "The source does not have a Search
+    /// service!" while `/v3/query` answered (#1215).
+    #[test]
+    fn every_resource_resolves_by_a_type_the_client_knows() {
+        let result = generate_service_index("http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let resources: Vec<(&str, &str)> = json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["@type"].as_str().unwrap(), r["@id"].as_str().unwrap()))
+            .collect();
+        let resolve = |known: &[&str]| -> Option<&str> {
+            known
+                .iter()
+                .find_map(|k| resources.iter().find(|(t, _)| t == k).map(|(_, id)| *id))
+        };
+        let base = "http://nora:4000/nuget/v3";
+        for (known, id) in [
+            (
+                &[
+                    "SearchQueryService/Versioned",
+                    "SearchQueryService/3.4.0",
+                    "SearchQueryService/3.0.0-beta",
+                ][..],
+                format!("{base}/query"),
+            ),
+            (
+                &[
+                    "SearchAutocompleteService/Versioned",
+                    "SearchAutocompleteService/3.0.0-beta",
+                ][..],
+                format!("{base}/autocomplete"),
+            ),
+            (
+                &[
+                    "RegistrationsBaseUrl/Versioned",
+                    "RegistrationsBaseUrl/3.6.0",
+                    "RegistrationsBaseUrl/3.4.0",
+                    "RegistrationsBaseUrl/3.0.0-rc",
+                    "RegistrationsBaseUrl/3.0.0-beta",
+                    "RegistrationsBaseUrl",
+                ][..],
+                format!("{base}/registration/"),
+            ),
+            (
+                &["PackageBaseAddress/Versioned", "PackageBaseAddress/3.0.0"][..],
+                format!("{base}/flatcontainer/"),
+            ),
+        ] {
+            assert_eq!(resolve(known), Some(id.as_str()), "{known:?}");
+        }
+        // 3.5.0 promises the packageType filter, which the local search does not apply.
+        assert!(!resources.iter().any(|(t, _)| t.ends_with("/3.5.0")));
+    }
+
+    /// The whole index, type by type: what a client is told is a reviewed artifact.
+    #[test]
+    fn test_generated_service_index_resources_snapshot() {
+        let generated = generate_service_index("http://nora:4000");
+        let json: serde_json::Value = serde_json::from_str(&generated).unwrap();
+        let resources: Vec<String> = json["resources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{} {}",
+                    r["@type"].as_str().unwrap(),
+                    r["@id"].as_str().unwrap()
+                )
+            })
+            .collect();
+        insta::assert_json_snapshot!("nuget_service_index_resources", resources);
     }
 
     #[test]

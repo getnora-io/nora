@@ -249,7 +249,8 @@ Caching proxy for api.nuget.org. Service index URLs are rewritten to point throu
 | `.nupkg` download | Full | Immutable cache |
 | `.nuspec` download | Full | Immutable cache |
 | Package push | — | Proxy-only (read) |
-| Search | — | Not implemented |
+| Search (`/v3/query`) | Full | Proxied to the upstream, local results from the cache when it is unreachable. Listed as `SearchQueryService`, `/3.0.0-beta` and `/3.0.0-rc`; checked with `dotnet package search` (SDK 10.0.404) (#1215). No `packageType` filter (`/3.5.0` not listed) |
+| Autocomplete (`/v3/autocomplete`) | Full | Listed as `SearchAutocompleteService`, `/3.0.0-beta` and `/3.0.0-rc` |
 
 Client: `dotnet nuget add source http://nora:4000/nuget/v3/index.json -n nora`
 
