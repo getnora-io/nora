@@ -2087,6 +2087,145 @@ mod integration_tests {
         );
     }
 
+    /// An imported package is found by search and autocomplete with the versions its flat
+    /// container lists, upstream or not: the records of the import, not a list an upstream gave
+    /// for the id before. Before, search read only the cached upstream list, which an import
+    /// does not write, so an imported package was not found (`totalHits: 0`), and a package
+    /// an upstream had served before was found with the upstream's versions.
+    #[tokio::test]
+    async fn an_imported_nupkg_is_found_by_search_with_the_versions_it_lists() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        // What an upstream served under one id before its import: a version and its list.
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/corp.old/9.9.9/corp.old.9.9.9.nupkg",
+                &b"squatted"[..],
+            ),
+            (
+                "nuget/flatcontainer/corp.old/index.json",
+                br#"{"versions":["9.9.9"]}"#,
+            ),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![
+                (
+                    "Corp.Lib/Corp.Lib.1.0.nupkg".into(),
+                    nupkg("Corp.Lib", "1.0"),
+                ),
+                ("Corp.Old.2.0.nupkg".into(), nupkg("Corp.Old", "2.0")),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (2, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        let get = |path: String| {
+            let app = ctx.app.clone();
+            async move {
+                let resp = send(&app, Method::GET, &path, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{path}");
+                serde_json::from_slice::<serde_json::Value>(&body_bytes(resp).await).unwrap()
+            }
+        };
+        let strings = |values: &serde_json::Value| -> Vec<String> {
+            let values = values.as_array().unwrap().iter();
+            values.map(|v| v.as_str().unwrap().to_string()).collect()
+        };
+        for id in ["corp.lib", "corp.old"] {
+            let listed = get(format!("/nuget/v3/flatcontainer/{id}/index.json")).await;
+            let found = get(format!("/nuget/v3/query?q={id}")).await;
+            assert_eq!(found["totalHits"], 1, "{id}: {found}");
+            let versions: Vec<serde_json::Value> = found["data"][0]["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["version"].clone())
+                .collect();
+            assert_eq!(
+                strings(&serde_json::Value::Array(versions)),
+                strings(&listed["versions"]),
+                "{id}: search and the flat container disagree"
+            );
+        }
+        // An import that stopped after marking the package: hosted, nothing of its own yet, so
+        // nothing found — not what an upstream once listed under the id.
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/corp.cut/9.9.9/corp.cut.9.9.9.nupkg",
+                &b"squatted"[..],
+            ),
+            (
+                "nuget/flatcontainer/corp.cut/index.json",
+                br#"{"versions":["9.9.9"]}"#,
+            ),
+            ("nuget/hosted/corp.cut/imported", b""),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+        let listed = get("/nuget/v3/flatcontainer/corp.cut/index.json".to_string()).await;
+        assert_eq!(listed["versions"], json!([]), "{listed}");
+        let found = get("/nuget/v3/query?q=corp.cut".to_string()).await;
+        assert_eq!(found["totalHits"], 0, "{found}");
+        let names = get("/nuget/v3/autocomplete?q=corp".to_string()).await;
+        assert_eq!(names["data"], json!(["corp.lib", "corp.old"]), "{names}");
+    }
+
+    /// When the records of a package cannot be listed, whether it is hosted is not known: search
+    /// leaves it out rather than show the list an upstream gave for the id, as its flat
+    /// container answers 503 rather than that list.
+    #[tokio::test]
+    async fn a_package_whose_records_cannot_be_listed_is_not_found_by_an_upstream_list() {
+        use crate::test_helpers::{
+            body_bytes, create_test_context_with_storage_and_config, outage_storage, send,
+        };
+        use axum::http::{Method, StatusCode};
+
+        let (storage, outage) = outage_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/corp.lib/9.9.9/corp.lib.9.9.9.nupkg",
+                &b"squatted"[..],
+            ),
+            (
+                "nuget/flatcontainer/corp.lib/index.json",
+                br#"{"versions":["9.9.9"]}"#,
+            ),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+        let found = |app: axum::Router| async move {
+            let resp = send(&app, Method::GET, "/nuget/v3/query?q=corp", "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            serde_json::from_slice::<serde_json::Value>(&body_bytes(resp).await).unwrap()
+        };
+        // Control: listed, the package is not hosted and its cached list is what it has.
+        assert_eq!(found(ctx.app.clone()).await["totalHits"], 1);
+        outage.fail_listings_of("nuget/hosted/corp.lib/");
+        let listing = "/nuget/v3/flatcontainer/corp.lib/index.json";
+        let status = send(&ctx.app, Method::GET, listing, "").await.status();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let result = found(ctx.app.clone()).await;
+        assert_eq!(result["totalHits"], 0, "{result}");
+    }
+
     /// A .nupkg imported from a hosted repository is NORA's own: the flat container lists and
     /// serves it with its .nuspec, the registration names it with the dependencies its .nuspec
     /// declares, and no upstream is asked for the id — nor for a version NORA does not hold.

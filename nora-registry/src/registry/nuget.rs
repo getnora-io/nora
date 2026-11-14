@@ -1685,8 +1685,17 @@ fn with_json_stale(data: Vec<u8>) -> Response {
 }
 // ── Local search helpers ───────────────────────────────────────────────
 
-/// Read cached version list from flatcontainer index.json.
+/// The versions package `id` lists: a hosted package's records, else the cached flatcontainer
+/// index.json an upstream gave.
 async fn get_cached_versions(storage: &crate::storage::Storage, id: &str) -> Vec<String> {
+    // A hosted package's versions are its records, as its flat container lists them: an import
+    // writes no upstream list, and one an upstream gave for the id before is not its own.
+    match hosted_versions(storage, &id.to_lowercase()).await {
+        Some(versions) if versions.hosted() => return versions.listed().to_vec(),
+        Some(_) => {}
+        // Nothing is decided on a guess: the package is left out until its records list.
+        None => return Vec::new(),
+    }
     let key = format!("nuget/flatcontainer/{}/index.json", id.to_lowercase());
     let data = match storage.get(&key).await {
         Ok(d) => d,
