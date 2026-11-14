@@ -15,6 +15,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_conditional, proxy_fetch_text,
@@ -275,7 +276,9 @@ async fn search_query(
         None, // search endpoint is public
         None,
         &state.circuit_breaker,
-        RegistryType::Nuget,
+        // Its own breaker: the search host is not the package source, and its failures
+        // must not stop restore (nor the reverse).
+        BreakerScope::upstream(RegistryType::Nuget, &state.config.nuget.search_service),
     )
     .await
     {
@@ -374,7 +377,7 @@ async fn autocomplete_query(
         None, // autocomplete endpoint is public
         None,
         &state.circuit_breaker,
-        RegistryType::Nuget,
+        BreakerScope::upstream(RegistryType::Nuget, &state.config.nuget.autocomplete),
     )
     .await
     {
@@ -5162,5 +5165,176 @@ mod nuget_release_dates {
             assert_eq!(nuget_version_order(a, b), Some(want), "{a} vs {b}");
         }
         assert_eq!(nuget_version_order("not.a.version.x", "1.0.0"), None);
+    }
+}
+
+/// Search and autocomplete go to their own hosts (`nuget.search_service`, `nuget.autocomplete`,
+/// for nuget.org not `api.nuget.org`), so each reports to the breaker of that host, not to the
+/// one restore goes through: a failing search host does not stop restore from a healthy
+/// package source, and the reverse.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod search_breaker {
+    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A NuGet proxy on `source` (package source) and `search` (search and autocomplete
+    /// host), with the breaker on and slow to close.
+    fn ctx(source: String, search: String) -> TestContext {
+        let autocomplete = format!("{search}/autocomplete");
+        ctx_with(source, format!("{search}/query"), autocomplete)
+    }
+
+    /// The same with search and autocomplete on hosts of their own.
+    fn ctx_with(source: String, search: String, autocomplete: String) -> TestContext {
+        create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(source);
+            cfg.nuget.search_service = search;
+            cfg.nuget.autocomplete = autocomplete;
+            cfg.nuget.serve_stale = true;
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.reset_timeout = 3600;
+        })
+    }
+
+    async fn answering(status: u16) -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_json(serde_json::json!({ "versions": ["1.0.0"], "data": [] })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn status(ctx: &TestContext, path: &str) -> StatusCode {
+        send(&ctx.app, Method::GET, path, "").await.status()
+    }
+
+    async fn asked(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    /// Searches and autocompletes that fail against a dead search host leave restore from a
+    /// healthy package source alone. Before, they counted toward the one `nuget` breaker and
+    /// restore answered 503 for `reset_timeout` while the package source was up.
+    #[tokio::test]
+    async fn failed_searches_do_not_open_the_restore_breaker() {
+        for search_path in ["/nuget/v3/query?q=anything", "/nuget/v3/autocomplete?q=any"] {
+            let source = answering(200).await;
+            let ctx = ctx(source.uri(), "http://127.0.0.1:1".to_string());
+            let restore = "/nuget/v3/flatcontainer/before.pkg/index.json";
+            assert_eq!(status(&ctx, restore).await, StatusCode::OK, "control");
+            for _ in 0..ctx.state.config.circuit_breaker.failure_threshold {
+                assert_eq!(status(&ctx, search_path).await, StatusCode::OK);
+            }
+            let restore = "/nuget/v3/flatcontainer/after.pkg/index.json";
+            assert_eq!(
+                status(&ctx, restore).await,
+                StatusCode::OK,
+                "restore after failed {search_path}"
+            );
+            let registration = "/nuget/v3/registration/after.pkg/index.json";
+            assert_ne!(
+                status(&ctx, registration).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "registration after failed {search_path}"
+            );
+        }
+    }
+
+    /// The search host still has a breaker: once it has failed `failure_threshold` times it is
+    /// not asked again until the breaker lets a probe through, and searches are served from
+    /// the local index meanwhile. One breaker for it, whatever the query.
+    #[tokio::test]
+    async fn a_failing_search_host_has_its_own_breaker() {
+        let source = answering(200).await;
+        let search = answering(500).await;
+        let ctx = ctx(source.uri(), search.uri());
+        let threshold = ctx.state.config.circuit_breaker.failure_threshold as usize;
+        for i in 0..threshold * 2 {
+            let path = format!("/nuget/v3/query?q=term{i}");
+            assert_eq!(status(&ctx, &path).await, StatusCode::OK);
+        }
+        // A failure is two attempts (one retry after a 5xx), then the breaker holds.
+        assert_eq!(
+            asked(&search).await,
+            threshold * 2,
+            "asked past an open breaker"
+        );
+        let search_keys: Vec<String> = ctx
+            .state
+            .circuit_breaker
+            .keys()
+            .into_iter()
+            .filter(|key| key.starts_with("nuget:"))
+            .collect();
+        assert_eq!(
+            search_keys,
+            [format!("nuget:{}/query", search.uri())],
+            "one breaker for the search host, not one per query"
+        );
+        // The package source is still asked.
+        let restore = "/nuget/v3/flatcontainer/pkg/index.json";
+        assert_eq!(status(&ctx, restore).await, StatusCode::OK);
+        assert_eq!(asked(&source).await, 1);
+    }
+
+    /// Search and autocomplete on different hosts each have their own breaker: a dead
+    /// autocomplete host does not stop search, and the reverse.
+    #[tokio::test]
+    async fn search_and_autocomplete_hosts_have_breakers_of_their_own() {
+        let source = answering(200).await;
+        let alive = answering(200).await;
+        let dead = "http://127.0.0.1:1".to_string();
+        for (dead_path, alive_path, search, autocomplete) in [
+            (
+                "/nuget/v3/autocomplete?q=x",
+                "/nuget/v3/query?q=x",
+                format!("{}/query", alive.uri()),
+                format!("{dead}/autocomplete"),
+            ),
+            (
+                "/nuget/v3/query?q=x",
+                "/nuget/v3/autocomplete?q=x",
+                format!("{dead}/query"),
+                format!("{}/autocomplete", alive.uri()),
+            ),
+        ] {
+            let ctx = ctx_with(source.uri(), search, autocomplete);
+            for _ in 0..ctx.state.config.circuit_breaker.failure_threshold {
+                assert_eq!(status(&ctx, dead_path).await, StatusCode::OK);
+            }
+            let before = asked(&alive).await;
+            assert_eq!(status(&ctx, alive_path).await, StatusCode::OK);
+            assert_eq!(
+                asked(&alive).await,
+                before + 1,
+                "{alive_path} not asked after {dead_path} failed"
+            );
+        }
+    }
+
+    /// The reverse: a dead package source does not stop search from a healthy search host.
+    #[tokio::test]
+    async fn a_failing_package_source_does_not_open_the_search_breaker() {
+        let search = answering(200).await;
+        let ctx = ctx("http://127.0.0.1:1".to_string(), search.uri());
+        let threshold = ctx.state.config.circuit_breaker.failure_threshold;
+        for i in 0..threshold {
+            let path = format!("/nuget/v3/flatcontainer/pkg{i}/index.json");
+            assert_ne!(status(&ctx, &path).await, StatusCode::OK);
+        }
+        let before = asked(&search).await;
+        assert_eq!(status(&ctx, "/nuget/v3/query?q=x").await, StatusCode::OK);
+        assert_eq!(
+            status(&ctx, "/nuget/v3/autocomplete?q=x").await,
+            StatusCode::OK
+        );
+        assert_eq!(asked(&search).await, before + 2, "search host not asked");
     }
 }
