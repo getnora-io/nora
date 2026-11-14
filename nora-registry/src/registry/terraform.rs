@@ -1567,22 +1567,30 @@ async fn resolve_upstream_download_url(
 }
 
 /// The upstream URL of the provider file a download metadata document names `filename`: the
-/// archive, SHA256SUMS or its signature, each under the last segment of the URL NORA answers for
-/// it (`rewrite_download_url`). `None` for a name the metadata does not give.
+/// archive, SHA256SUMS or its signature, each named by the last segment of the path of the URL the
+/// upstream gives for it, decoded as a request path is. A query (a signed download link) or a
+/// fragment is no part of the name; the URL is returned whole, so its query goes to the upstream.
+/// `None` for a name the metadata does not give.
 fn upstream_url_of_file(meta: &serde_json::Value, filename: &str) -> Option<String> {
     [
-        ("download_url", "_nora_upstream_url"),
-        ("shasums_url", "_nora_upstream_shasums_url"),
-        ("shasums_signature_url", "_nora_upstream_shasums_sig_url"),
+        "_nora_upstream_url",
+        "_nora_upstream_shasums_url",
+        "_nora_upstream_shasums_sig_url",
     ]
     .into_iter()
-    .find(|(answered, _)| {
-        meta.get(answered)
-            .and_then(|v| v.as_str())
-            .and_then(|url| url.rsplit('/').next())
-            == Some(filename)
-    })
-    .and_then(|(_, upstream)| meta.get(upstream)?.as_str().map(String::from))
+    .filter_map(|field| meta.get(field)?.as_str())
+    .find(|url| url_file_name(url).as_deref() == Some(filename))
+    .map(String::from)
+}
+
+/// The last segment of a URL's path, without its query or fragment, percent-decoded.
+fn url_file_name(url: &str) -> Option<String> {
+    let path = url.split('#').next()?.split('?').next()?;
+    let segment = path.rsplit('/').next()?;
+    percent_encoding::percent_decode_str(segment)
+        .decode_utf8()
+        .ok()
+        .map(|name| name.into_owned())
 }
 
 /// A provider's download metadata for one platform from the upstream, rewritten and stored as
@@ -3050,6 +3058,78 @@ mod integration_tests {
             let resp = send(&ctx.app, Method::GET, &format!("{stem}{suffix}"), "").await;
             assert_eq!(resp.status(), StatusCode::OK, "{suffix}");
         }
+    }
+
+    /// The name a provider file is asked for under is the last segment of the path of the URL its
+    /// metadata gives, decoded as the request path is: a query (a signed download link) or a
+    /// fragment on that URL is not part of the name, and the query goes to the upstream with the
+    /// request for the file.
+    #[tokio::test]
+    async fn a_file_url_with_a_query_or_an_encoded_name_is_fetched_under_its_path_name() {
+        use wiremock::matchers::{method, path, path_regex, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let files = format!("{}/gh/v9.3.2", server.uri());
+        let stem = "terraform-provider-selectel_9.3.2";
+        Mock::given(method("GET"))
+            .and(path("/v1/providers/selectel/selectel/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "versions": [{"version": "9.3.2", "protocols": ["5.0"],
+                    "platforms": [{"os": "linux", "arch": "amd64"}]}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1/providers/selectel/selectel/9.3.2/download/linux/amd64",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "os": "linux", "arch": "amd64", "filename": format!("{stem}_linux_amd64.zip"),
+                "download_url": format!("{files}/{stem}_linux_amd64.zip?token=abc"),
+                "shasums_url": format!("{files}/terraform-provider-selectel%5F9.3.2_SHA256SUMS"),
+                "shasums_signature_url": format!("{files}/{stem}_SHA256SUMS.sig#sig"),
+                "shasum": "abc"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/gh/v9.3.2/{stem}_linux_amd64.zip")))
+            .and(query_param("token", "abc"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"zip".to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(
+                r"^/gh/v9\.3\.2/terraform-provider-selectel(_|%5F)9\.3\.2_SHA256SUMS$",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sums".to_vec()))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/gh/v9.3.2/{stem}_SHA256SUMS.sig")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"sig".to_vec()))
+            .mount(&server)
+            .await;
+        let ctx = tf_ctx(server.uri());
+        let base = "/terraform/v1/providers/download/selectel/selectel/9.3.2";
+        for (file, body) in [
+            (format!("{stem}_linux_amd64.zip?token=abc"), &b"zip"[..]),
+            (format!("{stem}_SHA256SUMS"), &b"sums"[..]),
+            (format!("{stem}_SHA256SUMS.sig"), &b"sig"[..]),
+        ] {
+            let resp = send(&ctx.app, Method::GET, &format!("{base}/{file}"), "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{file}");
+            assert_eq!(body_bytes(resp).await.as_ref(), body, "{file}");
+        }
+        // The query is no part of the name: a name ending in it is not given.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("{base}/{stem}_linux_amd64.zip%3Ftoken=abc"),
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::OK);
     }
 
     /// A blocklist rule holds for a provider asked for under a name the URL parser folds into the
