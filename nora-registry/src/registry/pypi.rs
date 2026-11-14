@@ -133,7 +133,7 @@ async fn package_versions(
     headers: HeaderMap,
 ) -> Response {
     let normalized = normalize_name(&name);
-    if !crate::validation::is_one_segment(&normalized) {
+    if !is_pypi_name(&name) || !crate::validation::is_one_segment(&normalized) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     let prefix = format!("pypi/{}/", normalized);
@@ -358,7 +358,7 @@ async fn download_file(
     Path((name, filename)): Path<(String, String)>,
 ) -> Response {
     let normalized = normalize_name(&name);
-    if !crate::validation::is_one_segment(&normalized) {
+    if !is_pypi_name(&name) || !crate::validation::is_one_segment(&normalized) {
         return StatusCode::BAD_REQUEST.into_response();
     }
 
@@ -1460,12 +1460,25 @@ async fn backfill_hash_marker(
 }
 
 /// Validate PyPI filename.
+/// Whether a project name in a request is one: the characters of a PEP 508 name (ASCII letters,
+/// digits, `.`, `-`, `_`). Any other byte is dropped or cut by the upstream URL, which would then
+/// fetch another project than the one curation checked.
+fn is_pypi_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
 fn is_valid_pypi_filename(name: &str) -> bool {
     !name.is_empty()
         && !name.contains("..")
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'!'))
         && nora_registry::pypi_files::served_extension(name).is_some()
 }
 
@@ -5072,5 +5085,46 @@ mod upstream_index_digest {
         for key in [format!("pypi/hm/{FILE}"), format!("pypi/hm/{FILE}.sha256")] {
             assert!(stored.contains(&key), "control: {key} not in {stored:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod url_fold {
+    //! A name or version holding a byte the upstream URL drops or cuts at (`%09`, `%0A`, `%0D`,
+    //! `%3F`, `%23`) is refused by this handler with a 400 before curation, storage or the upstream
+    //! sees it, and the upstream is never asked. Legitimate names of the format still reach it.
+    use crate::test_helpers::{
+        assert_refused, assert_refused_as, assert_served_upstream, SMUGGLED,
+    };
+    use axum::http::StatusCode;
+
+    fn pypi_proxy(cfg: &mut crate::config::Config, up: &str) {
+        cfg.pypi.proxies = serde_json::from_value(serde_json::json!([up])).unwrap();
+    }
+
+    #[tokio::test]
+    async fn project_name_with_a_smuggled_byte_is_refused() {
+        let mut uris = Vec::new();
+        for s in SMUGGLED {
+            uris.push(format!("/simple/ev{s}il/"));
+            uris.push(format!("/simple/ev{s}il/ev{s}il-1.0.tar.gz"));
+        }
+        assert_refused("pypi", &uris, pypi_proxy).await;
+    }
+
+    #[tokio::test]
+    async fn file_name_with_a_smuggled_byte_is_not_found() {
+        // The handler's own file-name gate (`is_valid_pypi_filename`): 404, before storage or the
+        // upstream. The project name here is clean, so the gate is what refuses.
+        let files: Vec<String> = SMUGGLED
+            .iter()
+            .map(|s| format!("/simple/evil/ev{s}il-1.0.tar.gz"))
+            .collect();
+        assert_refused_as("pypi file", StatusCode::NOT_FOUND, &files, pypi_proxy).await;
+    }
+
+    #[tokio::test]
+    async fn legitimate_name_still_reaches_upstream() {
+        assert_served_upstream("pypi", "/simple/My_Pkg.name/", pypi_proxy).await;
     }
 }
