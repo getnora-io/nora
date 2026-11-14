@@ -549,6 +549,9 @@ const COUNTED_METHODS: [&str; 11] = [
 #[derive(Default)]
 pub struct OpCounts {
     counts: [AtomicUsize; COUNTED_METHODS.len()],
+    /// Keys the listings returned: a listing is one round-trip, but its cost grows with what
+    /// it enumerates (an object store pages it, a local store walks it).
+    listed: AtomicUsize,
 }
 
 impl OpCounts {
@@ -566,6 +569,16 @@ impl OpCounts {
         for count in &self.counts {
             count.store(0, Ordering::Relaxed);
         }
+        self.listed.store(0, Ordering::Relaxed);
+    }
+
+    /// Keys every listing since the last [`reset`](Self::reset) returned, together.
+    pub fn listed_keys(&self) -> usize {
+        self.listed.load(Ordering::Relaxed)
+    }
+
+    fn enumerated(&self, keys: usize) {
+        self.listed.fetch_add(keys, Ordering::Relaxed);
     }
 
     /// Round-trips counted since the last [`reset`](Self::reset).
@@ -637,7 +650,9 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
     async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
         self.counts.hit("list");
-        self.inner.list(prefix).await
+        let keys = self.inner.list(prefix).await?;
+        self.counts.enumerated(keys.len());
+        Ok(keys)
     }
 
     async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
@@ -650,7 +665,9 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         prefix: &str,
     ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
         self.counts.hit("list_with_meta");
-        self.inner.list_with_meta(prefix).await
+        let keys = self.inner.list_with_meta(prefix).await?;
+        self.counts.enumerated(keys.len());
+        Ok(keys)
     }
 
     async fn health_check(&self) -> bool {

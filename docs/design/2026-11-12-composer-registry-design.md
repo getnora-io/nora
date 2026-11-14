@@ -73,7 +73,9 @@ read. Private Packagist (`/org/p2/…`), Satis and Packagist mirrors work unchan
 - Cached **as the upstream sent it** at `composer/p2/{name}[~dev].json`, with the
   validators (`.meta`) and the upstream that served it (`.origin`).
 - Fresh within `metadata_ttl`; then revalidated with `If-None-Match` /
-  `If-Modified-Since` (Packagist sends both); a 304 restarts the TTL. Validators
+  `If-Modified-Since` (Packagist sends both); a 304 restarts the TTL. When the root
+  cannot be read, the usual layout (`/p2/%package%.json`) is tried, and a 4xx there
+  is a 502, not a missing package: the real address is not known. Validators
   are stored only with the body they describe: a new body that cannot be stored
   leaves the old copy's, so the next revalidation fetches the new body again.
 - Served stale (`x-nora-stale: true`) when every upstream that did not answer
@@ -117,10 +119,14 @@ to 60 requests an hour.
 ### `source` and VCS fallback
 
 Composer clones a version's `source` when its dist download fails — a refusal by
-curation included — and reaches the VCS host without NORA. `keep_source = false`
-lists every version NORA serves an archive of without its `source`; a version with
-no dist keeps it (it has no other way to install). The default keeps Composer's and
-Nexus's behaviour; with curation enforced, `false` is recommended.
+curation included — and reaches the VCS host without NORA. With curation on, a
+proxied document lists only the versions NORA serves an archive of, all without
+`source`, whatever `keep_source` says: curation runs on that download, and a source
+or an archive left on another host would let the client past it. Without curation,
+`keep_source = false` lists every version NORA serves an archive of without its
+`source`, and a version with no dist keeps it (it has no other way to install); the
+default keeps Composer's and Nexus's behaviour. Hosted and internal packages are not
+curated (#733) and keep theirs as configured.
 
 ### Hosted
 
@@ -162,8 +168,8 @@ and forwards the rest to the first upstream whose root names an advisories API.
 When an upstream's root cannot be read (no answer, no cached copy, or a 200
 that is not a repository root: `null`, `[]`, an error object) and no other
 names an API, the answer is 502, not an empty result. A query names at most 1000
-distinct packages (413), and costs one listing of the hosted space whatever its
-size.
+distinct packages (413), and costs one listing per name asked about — the name's
+own hosted space, at most 16 at a time — never a walk of the whole registry.
 Treated as a read under `anonymous_read`, like `npm audit`. `composer update`'s
 `block-insecure` check reads the advisories inline in the p2 documents
 (`security-advisories.metadata: true`), which NORA serves as cached.

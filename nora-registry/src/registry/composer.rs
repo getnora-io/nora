@@ -462,7 +462,7 @@ fn rewrite_document(
     name: &str,
     nora_base: &str,
     hosted: bool,
-    keep_source: bool,
+    sources: Sources,
 ) -> Option<Vec<u8>> {
     let mut doc: Value = serde_json::from_slice(body).ok()?;
     let minified = doc.get("minified").and_then(Value::as_str) == Some(MINIFIED);
@@ -483,9 +483,13 @@ fn rewrite_document(
                 .filter_map(|v| v.as_object().cloned())
                 .collect()
         };
-        for version in &mut versions {
-            rewrite_version(version, name, nora_base, hosted, keep_source);
-        }
+        // Under curation a version is listed only with an archive NORA serves: curation runs
+        // on that download, and a `source` (or an archive left on another host) would let the
+        // client fetch the release past it.
+        versions.retain_mut(|version| {
+            let through_nora = rewrite_version(version, name, nora_base, hosted, sources);
+            through_nora || sources != Sources::Curated
+        });
         *list = Value::Array(if minified {
             minify(&versions)
         } else {
@@ -495,29 +499,54 @@ fn rewrite_document(
     serde_json::to_vec(&doc).ok()
 }
 
+/// What a served p2 document keeps of the upstream's `source` entries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sources {
+    /// Every `source`, and versions without an archive NORA serves (`keep_source = true`).
+    Keep,
+    /// No `source` beside an archive NORA serves; a version without one keeps its own.
+    Drop,
+    /// Curation is on: no `source` anywhere, and only versions with an archive NORA serves.
+    Curated,
+}
+
+impl Sources {
+    /// For a proxied document: curation decides first, then `keep_source`.
+    fn for_proxy(state: &AppState) -> Self {
+        if state.curation().curation_engine.is_active() {
+            Sources::Curated
+        } else if state.config.composer.keep_source {
+            Sources::Keep
+        } else {
+            Sources::Drop
+        }
+    }
+}
+
+/// Point `version`'s archive at NORA; whether it now has one served through NORA.
 fn rewrite_version(
     version: &mut Map<String, Value>,
     name: &str,
     nora_base: &str,
     hosted: bool,
-    keep_source: bool,
-) {
+    sources: Sources,
+) -> bool {
     let Some(written) = version.get("version").and_then(Value::as_str) else {
-        return;
+        return false;
     };
     let segment = if hosted {
         match normalize_version(written) {
             Some(normal) => normal,
-            None => return,
+            None => return false,
         }
     } else {
         version_segment(written)
     };
     let Some(dist) = version.get_mut("dist").and_then(Value::as_object_mut) else {
-        return;
+        return false;
     };
     let Some(token) = dist_token(dist) else {
-        return;
+        return false;
     };
     let url = format!(
         "{}/composer/dists/{name}/{segment}/{token}.{}",
@@ -527,9 +556,10 @@ fn rewrite_version(
     dist.insert("url".to_string(), Value::String(url));
     // Mirrors would send the client past NORA.
     dist.remove("mirrors");
-    if !keep_source {
+    if sources != Sources::Keep {
         version.remove("source");
     }
+    true
 }
 
 // ============================================================================
@@ -778,12 +808,7 @@ fn parse_root(base: &str, body: Option<&[u8]>) -> UpstreamRoot {
 }
 
 /// An upstream's root: its `packages.json`, cached for `metadata_ttl`, a stale copy when it
-/// cannot be reached.
-async fn upstream_root(state: &AppState, up: &ComposerProxyEntry) -> UpstreamRoot {
-    root_of(state, up).await.0
-}
-
-/// [`upstream_root`], and whether it was read from the upstream's answer or a cached copy of
+/// cannot be reached; and whether it was read from the upstream's answer or a cached copy of
 /// one: `false` when it is the default layout because nothing could be read.
 async fn root_of(state: &AppState, up: &ComposerProxyEntry) -> (UpstreamRoot, bool) {
     let base = up.url().trim_end_matches('/');
@@ -1046,7 +1071,9 @@ async fn upstream_document(
     let mut miss = UpstreamMiss::default();
     let mut failed = false;
     for up in &upstreams {
-        let root = upstream_root(state, up).await;
+        // `known`: the address comes from the upstream's root. Without it the address is the
+        // usual layout's guess, and a 4xx there says nothing about the package.
+        let (root, known) = root_of(state, up).await;
         let url = root.p2_url(name, dev);
         let from_here = cached.as_ref().filter(|c| {
             c.origin
@@ -1162,6 +1189,15 @@ async fn upstream_document(
                         .with_label_values(&[REGISTRY])
                         .inc();
                 }
+                let answered = matches!(e, ProxyError::NotFound | ProxyError::Upstream(400..=499));
+                let e = if answered && !known {
+                    // A guessed address that is not there: the package may be elsewhere.
+                    ProxyError::Network(
+                        "metadata address unknown: the root could not be read".into(),
+                    )
+                } else {
+                    e
+                };
                 if !matches!(e, ProxyError::NotFound) {
                     failed = true;
                 }
@@ -1268,13 +1304,14 @@ async fn package_metadata(
         let Some(c) = cached else {
             return internal_refused(&state, &name);
         };
-        return match rewrite_document(
-            &c.body,
-            &name,
-            &base,
-            false,
-            state.config.composer.keep_source,
-        ) {
+        // An internal package is the operator's own and not curated (#733): its sources as
+        // configured.
+        let sources = if state.config.composer.keep_source {
+            Sources::Keep
+        } else {
+            Sources::Drop
+        };
+        return match rewrite_document(&c.body, &name, &base, false, sources) {
             Some(body) => metadata_response(&headers, body, c.last_modified, !c.fresh),
             None => {
                 tracing::warn!(
@@ -1302,13 +1339,7 @@ async fn package_metadata(
         Ok(doc) => doc,
         Err(response) => return response,
     };
-    match rewrite_document(
-        &doc.body,
-        &name,
-        &base,
-        false,
-        state.config.composer.keep_source,
-    ) {
+    match rewrite_document(&doc.body, &name, &base, false, Sources::for_proxy(&state)) {
         Some(body) => metadata_response(&headers, body, doc.last_modified, doc.stale),
         None => {
             tracing::warn!(
@@ -1359,7 +1390,7 @@ async fn hosted_metadata(
         .stat(&key)
         .await
         .map(|m| http_date(m.modified));
-    match rewrite_document(&body, name, base, true, true) {
+    match rewrite_document(&body, name, base, true, Sources::Keep) {
         Some(body) => metadata_response(headers, body, last_modified, false),
         None => {
             tracing::error!(registry = REGISTRY, key, "hosted metadata does not parse");
@@ -1976,21 +2007,36 @@ fn advisories_empty() -> Response {
         .into_response()
 }
 
-/// The names of the packages with anything uploaded, from one listing of the hosted space.
-async fn hosted_names(
+/// Listings an advisories query runs at once, one per name asked about.
+const HOSTED_LOOKUP_CONCURRENCY: usize = 16;
+
+/// Which of `names` have anything uploaded: one listing of each name's own hosted space, so a
+/// query costs what it names, not what the registry holds. Any listing that fails fails all.
+async fn hosted_among(
     state: &AppState,
-) -> Result<std::collections::HashSet<String>, crate::storage::StorageError> {
-    let keys = state.storage.list("composer/hosted/").await?;
-    Ok(keys
-        .iter()
-        .filter_map(|k| k.strip_prefix("composer/hosted/"))
-        .filter_map(|k| {
-            let mut parts = k.splitn(3, '/');
-            let (vendor, package) = (parts.next()?, parts.next()?);
-            parts.next()?;
-            Some(format!("{vendor}/{package}"))
-        })
-        .collect())
+    names: &[String],
+) -> Result<std::collections::HashSet<String>, (String, crate::storage::StorageError)> {
+    use futures::StreamExt;
+    let found: Vec<_> = futures::stream::iter(names.iter().cloned().map(|name| {
+        let storage = state.storage.clone();
+        async move {
+            let prefix = hosted_prefix(&name);
+            match storage.list(&prefix).await {
+                Ok(keys) => Ok((!keys.is_empty()).then_some(name)),
+                Err(e) => Err((prefix, e)),
+            }
+        }
+    }))
+    .buffer_unordered(HOSTED_LOOKUP_CONCURRENCY)
+    .collect()
+    .await;
+    let mut hosted = std::collections::HashSet::new();
+    for answer in found {
+        if let Some(name) = answer? {
+            hosted.insert(name);
+        }
+    }
+    Ok(hosted)
 }
 
 /// `composer audit`: the advisories of the packages named in the query (`packages[]=…`, in
@@ -2036,15 +2082,19 @@ async fn security_advisories(
     if names.is_empty() {
         return advisories_empty();
     }
-    // One listing for the whole query, whatever its size: a hosted name is NORA's own, and a
-    // store that cannot say which names are hosted cannot say which may leave.
-    let hosted = match hosted_names(&state).await {
-        Ok(hosted) => hosted,
-        Err(e) => return crate::registry::local_copy_unreadable(REGISTRY, "composer/hosted/", &e),
-    };
-    let asked: Vec<String> = names
+    // A hosted name is NORA's own, and a store that cannot say which names are hosted cannot
+    // say which may leave. Internal names need no lookup.
+    let candidates: Vec<String> = names
         .into_iter()
-        .filter(|name| !hosted.contains(name) && !is_internal(&state, name))
+        .filter(|name| !is_internal(&state, name))
+        .collect();
+    let hosted = match hosted_among(&state, &candidates).await {
+        Ok(hosted) => hosted,
+        Err((prefix, e)) => return crate::registry::local_copy_unreadable(REGISTRY, &prefix, &e),
+    };
+    let asked: Vec<String> = candidates
+        .into_iter()
+        .filter(|name| !hosted.contains(name))
         .collect();
     if asked.is_empty() {
         return advisories_empty();
