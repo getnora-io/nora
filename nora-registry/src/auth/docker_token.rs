@@ -27,7 +27,7 @@ use crate::tokens::Role;
 use crate::AppState;
 use axum::{
     body::Bytes,
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, DefaultBodyLimit, State},
     http::{header, HeaderMap, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
@@ -54,14 +54,22 @@ const TTL_SECS: u64 = 300;
 /// The key file, beside the API tokens.
 const KEY_FILE: &str = "docker-token.key";
 const KEY_LEN: usize = 32;
+/// The most of a token request body read: a few short form fields fit many times over.
+const BODY_LIMIT: usize = 64 * 1024;
 
 /// Who a Docker token speaks for.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Grant {
     /// No credentials were presented: what anonymous pull serves, nothing more.
     Anonymous,
-    /// Credentials were presented and checked: this user with this role.
-    User { user: String, role: Role },
+    /// Credentials were presented and checked: this user with this role. `api_token` is the
+    /// file id of the API token the password was: the token speaks for it, and is refused
+    /// once the store no longer has it valid (revoked, expired), as the API token itself is.
+    User {
+        user: String,
+        role: Role,
+        api_token: Option<String>,
+    },
 }
 
 #[derive(Serialize, Deserialize)]
@@ -71,13 +79,27 @@ struct Claims {
     sub: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     role: Option<Role>,
+    /// The file id of the API token the credentials were (public: the token list shows it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tok: Option<String>,
     iat: u64,
     exp: u64,
 }
 
-/// The signing key of Docker tokens.
+/// Seconds within which a `GET` with Basic credentials is taken for containerd's retry of a
+/// password grant just refused: it falls back from the `POST` form to a `GET` at once.
+const RETRY_SECS: u64 = 30;
+/// The most refused password grants remembered; past it a retry is checked and counted again.
+const RETRIES_MAX: usize = 4096;
+
+/// The signing key of Docker tokens, and the password grants just refused.
 pub(crate) struct DockerTokens {
     key: [u8; KEY_LEN],
+    /// When each refused `POST` password grant was refused, by a keyed digest of address and
+    /// credentials (never the password itself). containerd (1.7.25 and 2.2.1, measured 15.11) follows
+    /// a refused grant with a `GET` carrying the same credentials as Basic, whatever the
+    /// status: without this one wrong password counted twice toward the lockout.
+    refused: tokio::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>,
 }
 
 impl std::fmt::Debug for DockerTokens {
@@ -88,7 +110,42 @@ impl std::fmt::Debug for DockerTokens {
 
 impl DockerTokens {
     fn from_key(key: [u8; KEY_LEN]) -> Self {
-        Self { key }
+        Self {
+            key,
+            refused: tokio::sync::Mutex::default(),
+        }
+    }
+
+    /// The digest a refused grant is remembered by: keyed, so the map holds nothing a
+    /// password can be guessed from.
+    fn retry_key(&self, ip: std::net::IpAddr, encoded: &str) -> [u8; 32] {
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC takes any key");
+        mac.update(b"retry\0");
+        mac.update(ip.to_string().as_bytes());
+        mac.update(b"\0");
+        mac.update(encoded.as_bytes());
+        mac.finalize().into_bytes().into()
+    }
+
+    /// Remember that the password grant `encoded` (Basic-encoded) from `ip` was refused and
+    /// counted.
+    async fn note_refused_grant(&self, ip: std::net::IpAddr, encoded: &str) {
+        let key = self.retry_key(ip, encoded);
+        let mut refused = self.refused.lock().await;
+        refused.retain(|_, at| at.elapsed().as_secs() < RETRY_SECS);
+        if refused.len() < RETRIES_MAX {
+            refused.insert(key, std::time::Instant::now());
+        }
+    }
+
+    /// Whether Basic credentials `encoded` from `ip` repeat a password grant refused and
+    /// counted moments ago; each refusal answers for one retry.
+    async fn is_retry_of_refused_grant(&self, ip: std::net::IpAddr, encoded: &str) -> bool {
+        let key = self.retry_key(ip, encoded);
+        let mut refused = self.refused.lock().await;
+        refused
+            .remove(&key)
+            .is_some_and(|at| at.elapsed().as_secs() < RETRY_SECS)
     }
 
     /// The MAC over the prefix and the encoded claims.
@@ -142,15 +199,20 @@ impl DockerTokens {
 
     /// A token for `grant`, issued at `now` (Unix seconds).
     pub(crate) fn mint(&self, grant: &Grant, now: u64) -> String {
-        let (sub, role) = match grant {
-            Grant::Anonymous => (String::new(), None),
-            Grant::User { user, role } => (user.clone(), Some(role.clone())),
+        let (sub, role, tok) = match grant {
+            Grant::Anonymous => (String::new(), None, None),
+            Grant::User {
+                user,
+                role,
+                api_token,
+            } => (user.clone(), Some(role.clone()), api_token.clone()),
         };
         let claims = Claims {
             iss: ISSUER.to_string(),
             aud: AUDIENCE.to_string(),
             sub,
             role,
+            tok,
             iat: now,
             exp: now + TTL_SECS,
         };
@@ -177,6 +239,7 @@ impl DockerTokens {
             Some(role) => Grant::User {
                 user: claims.sub,
                 role,
+                api_token: claims.tok,
             },
         })
     }
@@ -264,15 +327,23 @@ struct TokenResponse {
     issued_at: String,
 }
 
+/// The credentials of a token request, Basic-encoded.
+enum Presented {
+    /// In an `Authorization: Basic` header (docker, skopeo, podman; containerd's retry).
+    Basic(String),
+    /// An OAuth2 password grant in a `POST` form (containerd).
+    Form(String),
+}
+
 /// The credentials a token request carries: Basic (docker, skopeo, podman) or an OAuth2
 /// password grant in a POST form (containerd). `None` for an anonymous request.
-fn presented(headers: &HeaderMap, method: &Method, body: &[u8]) -> Option<String> {
+fn presented(headers: &HeaderMap, method: &Method, body: &[u8]) -> Option<Presented> {
     if let Some(basic) = headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|h| h.strip_prefix("Basic "))
     {
-        return Some(basic.to_string());
+        return Some(Presented::Basic(basic.to_string()));
     }
     if *method != Method::POST {
         return None;
@@ -287,7 +358,9 @@ fn presented(headers: &HeaderMap, method: &Method, body: &[u8]) -> Option<String
         return None;
     }
     let (user, password) = (field("username")?, field("password")?);
-    Some(base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}")))
+    Some(Presented::Form(
+        base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}")),
+    ))
 }
 
 /// The fields of an `application/x-www-form-urlencoded` body (`+` is a space).
@@ -320,13 +393,30 @@ async fn issue(
     };
     let grant = match presented(&headers, &method, &body) {
         None => Grant::Anonymous,
-        Some(encoded) => {
+        Some(presented) => {
             let client_ip =
                 super::resolve_client_ip(addr.ip(), &headers, &state.config.auth.trusted_proxies);
+            let (encoded, form) = match &presented {
+                Presented::Basic(encoded) => (encoded.as_str(), false),
+                Presented::Form(encoded) => (encoded.as_str(), true),
+            };
+            // containerd's retry of a grant refused moments ago: the same wrong password,
+            // already counted once. Refused unchecked, so it counts no second time.
+            if !form && tokens.is_retry_of_refused_grant(client_ip, encoded).await {
+                return wrong_credentials("Invalid username or password");
+            }
             // Decided as a read: the token carries the role, and a read-only credential is
             // refused when it writes, as on the Basic path.
-            match authenticate_basic(&state, Some(client_ip), &encoded, &Method::GET, false).await {
-                BasicDecision::Authenticated { user, role } => Grant::User { user, role },
+            match authenticate_basic(&state, Some(client_ip), encoded, &Method::GET, false).await {
+                BasicDecision::Authenticated {
+                    user,
+                    role,
+                    api_token,
+                } => Grant::User {
+                    user,
+                    role,
+                    api_token,
+                },
                 BasicDecision::LockedOut(retry_after) => {
                     return too_many_failed_attempts(retry_after)
                 }
@@ -341,12 +431,14 @@ async fn issue(
                 BasicDecision::Forbidden(reason) => {
                     return (StatusCode::FORBIDDEN, reason).into_response()
                 }
-                BasicDecision::Unauthorized { message, .. } => {
-                    return (
-                        StatusCode::UNAUTHORIZED,
-                        Json(serde_json::json!({ "details": message })),
-                    )
-                        .into_response()
+                BasicDecision::Unauthorized {
+                    message,
+                    record_failure,
+                } => {
+                    if form && record_failure {
+                        tokens.note_refused_grant(client_ip, encoded).await;
+                    }
+                    return wrong_credentials(message);
                 }
                 BasicDecision::NotConfigured => {
                     return (
@@ -375,11 +467,27 @@ async fn issue(
         .into_response()
 }
 
+/// The answer to credentials that do not pass.
+fn wrong_credentials(message: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({ "details": message })),
+    )
+        .into_response()
+}
+
 /// The token service route. It is merged with the Docker registry routes, under their read
 /// and write quotas: docker, skopeo and podman ask for a token on nearly every repository
 /// operation, and the auth quota (1/s, burst 5) answered a push or a pull 429 on the polygon.
+/// Its body is a few form fields and anyone may send one, so it is read up to [`BODY_LIMIT`],
+/// not up to `server.body_limit_mb`, which is sized for artifact uploads.
 pub(crate) fn routes() -> Router<AppState> {
-    Router::new().route(TOKEN_PATH, get(issue).post(issue))
+    Router::new().route(
+        TOKEN_PATH,
+        get(issue)
+            .post(issue)
+            .layer(DefaultBodyLimit::max(BODY_LIMIT)),
+    )
 }
 
 #[cfg(test)]
@@ -543,6 +651,292 @@ mod tests {
         assert_eq!(post(form("wrong")).await.status(), StatusCode::UNAUTHORIZED);
     }
 
+    /// The body of a token request is a few short form fields, and the path is open to
+    /// anyone: it is read up to a small limit, not up to `server.body_limit_mb` (2 GiB by
+    /// default, for artifact uploads).
+    #[tokio::test]
+    async fn a_token_request_body_is_bounded() {
+        let ctx = ctx();
+        let form = "grant_type=password&username=alice&password=secret&service=nora";
+        let post = |body: String| {
+            send_with_headers(
+                &ctx.app,
+                Method::POST,
+                "/api/docker/token",
+                vec![("content-type", "application/x-www-form-urlencoded")],
+                body,
+            )
+        };
+        let padded = |len: usize| format!("{form}&pad={}", "x".repeat(len - form.len() - 5));
+        assert_eq!(
+            post(padded(8 * 1024 * 1024)).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
+            post(padded(super::BODY_LIMIT + 1)).await.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        // A form at the limit is still read, and its credentials still count.
+        assert_eq!(
+            post(padded(super::BODY_LIMIT)).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    /// An API token sent as the password, from `owner`, with this lifetime; its Docker token
+    /// and the Basic header it was asked with.
+    async fn docker_token_for_api_token(
+        ctx: &TestContext,
+        owner: &str,
+        lifetime: crate::tokens::MintLifetime,
+    ) -> (String, String) {
+        let minted = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .mint_token(owner, lifetime, None, crate::tokens::Role::Write)
+            .unwrap();
+        let auth = basic(owner, &minted.token);
+        let (status, token) = token(ctx, vec![("authorization", &auth)]).await;
+        assert_eq!(status, StatusCode::OK);
+        let token = token.unwrap();
+        assert_eq!(
+            with_bearer(ctx, Method::POST, UPLOAD, &token)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        (token, auth)
+    }
+
+    /// A Docker token issued for an API token speaks for that API token: revoking it ends the
+    /// Docker token at once on this instance, for writes and reads, as it ends the API token
+    /// sent directly. Before, the Docker token kept pushing until its own 300 s ran out.
+    #[tokio::test]
+    async fn a_revoked_api_token_does_not_keep_writing_through_its_docker_token() {
+        let ctx = ctx();
+        let store = ctx.state.tokens.as_ref().unwrap();
+        let (token, auth) =
+            docker_token_for_api_token(&ctx, "bob", crate::tokens::MintLifetime::days(1, None))
+                .await;
+        assert_eq!(store.revoke_all_for_user("bob").await, 1);
+        // Control: the API token itself is refused at once after revocation.
+        assert_eq!(
+            send_with_headers(
+                &ctx.app,
+                Method::POST,
+                UPLOAD,
+                vec![("authorization", &auth)],
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        for (method, path) in [
+            (Method::POST, UPLOAD),
+            (Method::GET, "/v2/_catalog"),
+            (Method::GET, "/v2/alpine/manifests/latest"),
+        ] {
+            let resp = with_bearer(&ctx, method.clone(), path, &token).await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::UNAUTHORIZED,
+                "{method} {path}: the Docker token still works after its API token was revoked"
+            );
+            // Sent back to the token service, where the revoked token gets nothing.
+            assert!(
+                challenge(&resp).starts_with("Bearer realm="),
+                "{method} {path}"
+            );
+        }
+        assert_eq!(
+            token_status(&ctx, &auth).await,
+            StatusCode::UNAUTHORIZED,
+            "a revoked API token gets no new Docker token"
+        );
+    }
+
+    /// The same through the revoke of one token (`/api/tokens/revoke`, the UI), which leaves
+    /// the owner's other tokens, and their Docker tokens, working.
+    #[tokio::test]
+    async fn revoking_one_api_token_ends_only_its_docker_token() {
+        let ctx = ctx();
+        let store = ctx.state.tokens.as_ref().unwrap();
+        let lifetime = crate::tokens::MintLifetime::days(1, None);
+        let (revoked, _) = docker_token_for_api_token(&ctx, "bob", lifetime).await;
+        let (kept, _) = docker_token_for_api_token(&ctx, "bob", lifetime).await;
+        let listed = store.list_tokens("bob");
+        assert_eq!(listed.len(), 2);
+        // Which file is which: revoke one, see which Docker token stops.
+        store.revoke_token(&listed[0].file_id).await.unwrap();
+        let statuses = [
+            with_bearer(&ctx, Method::POST, UPLOAD, &revoked)
+                .await
+                .status(),
+            with_bearer(&ctx, Method::POST, UPLOAD, &kept)
+                .await
+                .status(),
+        ];
+        assert!(
+            statuses == [StatusCode::UNAUTHORIZED, StatusCode::ACCEPTED]
+                || statuses == [StatusCode::ACCEPTED, StatusCode::UNAUTHORIZED],
+            "exactly the revoked token's Docker token stops: {statuses:?}"
+        );
+    }
+
+    /// An API token that expires takes its Docker token with it, though the Docker token was
+    /// issued for 300 s.
+    #[tokio::test]
+    async fn an_expired_api_token_does_not_keep_writing_through_its_docker_token() {
+        let ctx = ctx();
+        let (token, _) =
+            docker_token_for_api_token(&ctx, "bob", crate::tokens::MintLifetime::days(1, Some(1)))
+                .await;
+        // The store refuses a token once a whole second is past its expiry.
+        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        assert_eq!(
+            with_bearer(&ctx, Method::POST, UPLOAD, &token)
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED,
+            "the Docker token still writes after its API token expired"
+        );
+    }
+
+    /// A Docker token issued for an htpasswd user does not depend on the token store.
+    #[tokio::test]
+    async fn an_htpasswd_docker_token_keeps_working_after_the_users_api_tokens_go() {
+        let ctx = ctx();
+        let auth = basic("alice", "secret");
+        let (_, token) = token(&ctx, vec![("authorization", &auth)]).await;
+        let token = token.unwrap();
+        ctx.state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .revoke_all_for_user("alice")
+            .await;
+        assert_eq!(
+            with_bearer(&ctx, Method::POST, UPLOAD, &token)
+                .await
+                .status(),
+            StatusCode::ACCEPTED
+        );
+    }
+
+    /// One wrong password from containerd: if it falls back from the POST form to a GET with
+    /// Basic after the 401, the pair must count once toward the lockout, not twice.
+    #[tokio::test]
+    async fn a_post_then_get_of_one_wrong_password_counts_once() {
+        let ctx = ctx();
+        let wrong = basic("alice", "wrong");
+        let mut attempts = 0;
+        loop {
+            let resp = send_with_headers(
+                &ctx.app,
+                Method::POST,
+                "/api/docker/token",
+                vec![("content-type", "application/x-www-form-urlencoded")],
+                "grant_type=password&username=alice&password=wrong&service=nora".to_string(),
+            )
+            .await;
+            if resp.status() == StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+            attempts += 1;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            let (status, _) = token(&ctx, vec![("authorization", &wrong)]).await;
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                break;
+            }
+            assert!(attempts < 20, "never locked out");
+        }
+        assert_eq!(attempts, 5, "wrong logins before the lockout");
+    }
+
+    /// A token store that cannot be read is an outage, not a verdict on the Docker token: 503,
+    /// so the client retries, as for an API token sent directly.
+    #[tokio::test]
+    async fn an_unreadable_token_store_is_503_for_a_docker_token_on_an_api_token() {
+        let ctx = ctx();
+        let minted = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .mint_token(
+                "bob",
+                crate::tokens::MintLifetime::days(1, None),
+                None,
+                crate::tokens::Role::Write,
+            )
+            .unwrap();
+        let auth = basic("bob", &minted.token);
+        let (_, token) = token(&ctx, vec![("authorization", &auth)]).await;
+        let file = ctx
+            ._tempdir
+            .path()
+            .join("tokens")
+            .join(format!("{}.json", crate::tokens::file_id(&minted.token)));
+        std::fs::write(&file, "{ torn").unwrap();
+        assert_eq!(
+            with_bearer(&ctx, Method::POST, UPLOAD, &token.unwrap())
+                .await
+                .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    /// Only a retry of the same credentials is spared: a client that only POSTs wrong
+    /// passwords, or follows a refused grant with another password, is counted every time.
+    #[tokio::test]
+    async fn every_other_wrong_password_still_counts() {
+        let post = |app: axum::Router, password: String| async move {
+            send_with_headers(
+                &app,
+                Method::POST,
+                "/api/docker/token",
+                vec![("content-type", "application/x-www-form-urlencoded")],
+                format!("grant_type=password&username=alice&password={password}&service=nora"),
+            )
+            .await
+            .status()
+        };
+        // The same wrong password POSTed again and again.
+        let ctx = ctx();
+        let mut statuses = Vec::new();
+        for _ in 0..6 {
+            statuses.push(post(ctx.app.clone(), "wrong".into()).await);
+        }
+        assert_eq!(statuses[..5], [StatusCode::UNAUTHORIZED; 5]);
+        assert_eq!(statuses[5], StatusCode::TOO_MANY_REQUESTS, "{statuses:?}");
+        // A refused grant, then a GET with another wrong password.
+        let ctx = self::ctx();
+        let mut statuses = Vec::new();
+        for i in 0..3 {
+            statuses.push(post(ctx.app.clone(), format!("wrong{i}")).await);
+            let other = basic("alice", &format!("other{i}"));
+            statuses.push(token(&ctx, vec![("authorization", &other)]).await.0);
+        }
+        assert_eq!(statuses[..5], [StatusCode::UNAUTHORIZED; 5]);
+        assert_eq!(statuses[5], StatusCode::TOO_MANY_REQUESTS, "{statuses:?}");
+        // A refused grant spares one retry, not every GET of that password after it.
+        let ctx = self::ctx();
+        let mut statuses = vec![post(ctx.app.clone(), "wrong".into()).await];
+        let wrong = basic("alice", "wrong");
+        for _ in 0..6 {
+            statuses.push(token(&ctx, vec![("authorization", &wrong)]).await.0);
+        }
+        assert_eq!(statuses[..6], [StatusCode::UNAUTHORIZED; 6]);
+        assert_eq!(statuses[6], StatusCode::TOO_MANY_REQUESTS, "{statuses:?}");
+    }
+
+    async fn token_status(ctx: &TestContext, auth: &str) -> StatusCode {
+        token(ctx, vec![("authorization", auth)]).await.0
+    }
+
     /// A wrong password gets no token (so `docker login` fails), and counts toward the
     /// lockout as on any Basic request.
     #[tokio::test]
@@ -643,7 +1037,17 @@ mod tests {
         let grant = super::Grant::User {
             user: "alice".into(),
             role: crate::tokens::Role::Write,
+            api_token: None,
         };
+        let bound = super::Grant::User {
+            user: "bob".into(),
+            role: crate::tokens::Role::Write,
+            api_token: Some("0123456789abcdef".into()),
+        };
+        assert_eq!(
+            tokens.verify(&tokens.mint(&bound, 1_000), 1_000),
+            Some(bound)
+        );
         let token = tokens.mint(&grant, 1_000);
         assert_eq!(tokens.verify(&token, 1_000), Some(grant.clone()));
         assert_eq!(
@@ -680,6 +1084,25 @@ mod tests {
         let forged = super::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&forged).unwrap());
         let token = format!("{}{forged}.{mac}", super::PREFIX);
         assert_eq!(tokens.verify(&token, 1_000), None);
+        // A token issued on an API token, with that token cut out of its claims, is refused:
+        // it would speak for its user past the API token's revoke.
+        let bound = tokens.mint(
+            &super::Grant::User {
+                user: "bob".into(),
+                role: crate::tokens::Role::Write,
+                api_token: Some("0123456789abcdef".into()),
+            },
+            1_000,
+        );
+        let (claims, mac) = bound[super::PREFIX.len()..].split_once('.').unwrap();
+        let mut unbound: serde_json::Value =
+            serde_json::from_slice(&super::URL_SAFE_NO_PAD.decode(claims).unwrap()).unwrap();
+        assert!(unbound.as_object_mut().unwrap().remove("tok").is_some());
+        let unbound = super::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&unbound).unwrap());
+        assert_eq!(
+            tokens.verify(&format!("{}{unbound}.{mac}", super::PREFIX), 1_000),
+            None
+        );
         let short = &anonymous[..anonymous.len() - 4];
         assert_eq!(tokens.verify(short, 1_000), None);
         assert_eq!(

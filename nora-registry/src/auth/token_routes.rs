@@ -102,6 +102,7 @@ async fn check_password(
             BasicDecision::Authenticated {
                 user: username.to_string(),
                 role: Role::Write,
+                api_token: None,
             }
         }
         (None, Some(_)) => wrong(),

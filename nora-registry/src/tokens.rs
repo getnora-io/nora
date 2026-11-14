@@ -334,6 +334,9 @@ pub struct TokenStore {
     storage_path: PathBuf,
     /// In-memory cache: SHA256(token) -> verified result (avoids Argon2 per request)
     cache: Arc<RwLock<HashMap<String, CachedToken>>>,
+    /// The tokens still on disk, by file id, for what speaks for a token verified before
+    /// (a Docker token, #1226): filled and purged like `cache`.
+    live: Arc<RwLock<HashMap<String, CachedToken>>>,
     /// How long a cached verification is trusted before the slow path re-checks
     /// disk. Shorter = smaller cross-replica revocation window.
     cache_ttl: Duration,
@@ -378,6 +381,7 @@ impl TokenStore {
         Self {
             storage_path: storage_path.to_path_buf(),
             cache: Arc::new(RwLock::new(HashMap::new())),
+            live: Arc::new(RwLock::new(HashMap::new())),
             cache_ttl,
             pending_last_used: Arc::new(RwLock::new(HashMap::new())),
             file_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -485,17 +489,7 @@ impl TokenStore {
         // Slow path: read from disk and verify Argon2. A revoke after the
         // read keeps the result out of the cache (see `revocations`).
         let file_path = self.storage_path.join(format!("{}.json", &cache_key[..16]));
-
-        let read = match files::read(&self.revocations, &file_path) {
-            Ok(read) => read,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(TokenError::NotFound);
-            }
-            Err(e) => return Err(TokenError::Storage(e.to_string())),
-        };
-
-        let mut info: TokenInfo =
-            serde_json::from_str(read.content()).map_err(|e| TokenError::Storage(e.to_string()))?;
+        let (read, mut info) = self.read_token_file(&file_path)?;
 
         // Verify hash: try Argon2id first, fall back to legacy SHA256
         let hash_valid = if info.token_hash.starts_with("$argon2") {
@@ -556,6 +550,68 @@ impl TokenStore {
             .insert(cache_key[..16].to_string(), now);
 
         Ok((info.user, info.role))
+    }
+
+    /// The token file at `path` as a verify reads it (see [`files::read`]), and what it holds:
+    /// `NotFound` when there is no such token, `Storage` when it cannot be read or parsed.
+    fn read_token_file(&self, path: &Path) -> Result<(files::Read, TokenInfo), TokenError> {
+        let read = match files::read(&self.revocations, path) {
+            Ok(read) => read,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(TokenError::NotFound);
+            }
+            Err(e) => return Err(TokenError::Storage(e.to_string())),
+        };
+        let info: TokenInfo =
+            serde_json::from_str(read.content()).map_err(|e| TokenError::Storage(e.to_string()))?;
+        Ok((read, info))
+    }
+
+    /// Whether the token with file id `file_id` (from [`file_id`]) is still valid: not revoked,
+    /// not expired. Its owner and role when it is. For what was issued on a token verified
+    /// before and speaks for it since, a Docker token (#1226): the hash is not checked again,
+    /// the file is. A revoke on this instance is seen at once, as by [`TokenStore::verify_token`]:
+    /// the check is cached like a verification, under the same revocation count and purge.
+    pub fn verify_token_id(&self, file_id: &str) -> Result<(String, Role), TokenError> {
+        if !is_valid_hash_prefix(file_id) {
+            return Err(TokenError::InvalidFormat);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let cached = self
+            .live
+            .read()
+            .get(file_id)
+            .filter(|cached| cached.cached_at.elapsed() < self.cache_ttl)
+            .map(|cached| (cached.user.clone(), cached.role.clone(), cached.expires_at));
+        let (user, role, expires_at) = match cached {
+            Some(cached) => cached,
+            None => {
+                let path = self.storage_path.join(format!("{file_id}.json"));
+                let (read, info) = self.read_token_file(&path)?;
+                read.cache_unless_revoked(
+                    &self.revocations,
+                    &mut self.live.write(),
+                    file_id.to_string(),
+                    CachedToken {
+                        user: info.user.clone(),
+                        role: info.role.clone(),
+                        expires_at: info.expires_at,
+                        cached_at: Instant::now(),
+                    },
+                );
+                (info.user, info.role, info.expires_at)
+            }
+        };
+        if now > expires_at {
+            return Err(TokenError::Expired);
+        }
+        self.pending_last_used
+            .write()
+            .insert(file_id.to_string(), now);
+        Ok((user, role))
     }
 
     /// List all tokens for a user (returns TokenListEntry with file_id)
@@ -662,6 +718,7 @@ impl TokenStore {
     fn evict(&self, removed: files::Removed) -> usize {
         let counted = removed.counted(&self.revocations);
         counted.purge(&mut self.cache.write());
+        counted.purge(&mut self.live.write());
         pause(Step::Evicted);
         counted.len()
     }
@@ -739,6 +796,11 @@ fn verify_token_argon2(token: &str, hash: &str) -> bool {
             .is_ok(),
         Err(_) => false,
     }
+}
+
+/// The file id of an API token: what names it on disk, in the token list and in a revoke.
+pub fn file_id(token: &str) -> String {
+    sha256_hex(token)[..16].to_string()
 }
 
 /// SHA256 hex digest (used for file naming and legacy hash verification)
