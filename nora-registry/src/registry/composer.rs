@@ -734,6 +734,25 @@ fn resolve_root_url(base: &str, url: &str) -> Option<String> {
     }
 }
 
+/// Whether `body` is a Composer repository root: a JSON object naming at least one thing a
+/// root offers. `null`, `[]` or an error object answered with a 200 are not one — read as a
+/// root, they would make an outage look like a repository without an advisories API.
+fn is_root_document(body: &[u8]) -> bool {
+    const ROOT_KEYS: [&str; 7] = [
+        "packages",
+        "includes",
+        "metadata-url",
+        "providers-url",
+        "provider-includes",
+        "security-advisories",
+        "available-packages",
+    ];
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|doc| doc.as_object().cloned())
+        .is_some_and(|root| ROOT_KEYS.iter().any(|k| root.contains_key(*k)))
+}
+
 /// The root an upstream's `packages.json` describes; without one (unreachable and never
 /// cached, or not a Composer 2 root) the layout of every Composer 2 repository NORA knows,
 /// `{upstream}/p2/%package%.json`.
@@ -791,14 +810,18 @@ async fn root_of(state: &AppState, up: &ComposerProxyEntry) -> (UpstreamRoot, bo
     )
     .await
     {
-        Ok(body) if serde_json::from_slice::<Value>(&body).is_ok() => {
+        Ok(body) if is_root_document(&body) => {
             if let Err(e) = state.storage.put(&key, &body).await {
                 tracing::warn!(registry = REGISTRY, key, error = %e, "failed to cache upstream root");
             }
             (parse_root(base, Some(&body)), true)
         }
         Ok(_) => {
-            tracing::warn!(registry = REGISTRY, url, "upstream root is not JSON");
+            tracing::warn!(
+                registry = REGISTRY,
+                url,
+                "upstream root is not a Composer repository root"
+            );
             (parse_root(base, cached.as_deref()), cached.is_some())
         }
         Err(e) => {
@@ -954,6 +977,32 @@ async fn first_seen_date(state: &AppState, metadata_key: &str, version: &str) ->
     ledger.get(version).copied()
 }
 
+/// When `version` of `name` was first seen, for its release age. The ledger's record first;
+/// without one, the stored document's write time — only when that document lists the version,
+/// since an age borrowed from a listing that does not hold it would let a release through
+/// early (an upstream added it and neither the ledger nor the new listing could be stored).
+/// Otherwise the release is new now.
+async fn release_first_seen(
+    state: &AppState,
+    metadata_key: &str,
+    name: &str,
+    version: &str,
+) -> i64 {
+    if let Some(date) = first_seen_date(state, metadata_key, version).await {
+        return date;
+    }
+    if let Ok(stored) = state.storage.get(metadata_key).await {
+        if listed_versions(&stored, name).iter().any(|v| v == version) {
+            if let Some(date) =
+                crate::curation::extract_mtime_as_publish_date(&state.storage, metadata_key).await
+            {
+                return date;
+            }
+        }
+    }
+    chrono::Utc::now().timestamp()
+}
+
 /// Whether two spellings of an upstream URL name the same upstream (`…/` is `…`).
 fn same_upstream(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
@@ -1072,21 +1121,28 @@ async fn upstream_document(
                 let seed = from_here.and_then(|c| c.written.map(|w| (&c.body[..], w)));
                 record_first_seen(state, &key, name, &body, seed).await;
                 // Body first, then where it came from, then its validators: a sidecar never
-                // describes bytes that are not there.
-                if let Err(e) = state.storage.put(&key, &body).await {
-                    tracing::warn!(registry = REGISTRY, key, error = %e, "failed to cache metadata");
-                }
-                if let Err(e) = state
-                    .storage
-                    .put(&origin_key(&key), up.url().as_bytes())
-                    .await
-                {
-                    tracing::warn!(registry = REGISTRY, key, error = %e, "failed to record metadata origin");
-                }
-                if validators.is_some() {
-                    write_validators(&state.storage, &key, &validators).await;
-                } else {
-                    let _ = state.storage.delete(&validators_key(&key)).await;
+                // describes bytes that are not there. A body that could not be stored leaves
+                // the sidecars of the copy before it, which still describe that copy: the next
+                // revalidation asks with the old validators and gets the new body again, where
+                // the new ones would get a 304 that keeps the old copy for good.
+                match state.storage.put(&key, &body).await {
+                    Ok(()) => {
+                        if let Err(e) = state
+                            .storage
+                            .put(&origin_key(&key), up.url().as_bytes())
+                            .await
+                        {
+                            tracing::warn!(registry = REGISTRY, key, error = %e, "failed to record metadata origin");
+                        }
+                        if validators.is_some() {
+                            write_validators(&state.storage, &key, &validators).await;
+                        } else {
+                            let _ = state.storage.delete(&validators_key(&key)).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(registry = REGISTRY, key, error = %e, "failed to cache metadata");
+                    }
                 }
                 state.repo_index.invalidate(REGISTRY);
                 let last_modified = validators
@@ -1526,25 +1582,16 @@ async fn download_dist(
     };
     // Without trusted dates a release is as old as NORA's first sight of it in a listing: the
     // document's mtime restarts at every revalidation, so a client that asks more often than
-    // the minimum age would never see its release mature. A version the ledger lacks keeps the
-    // mtime date.
+    // the minimum age would never see its release mature.
     let publish_date = if state.config.server.trust_upstream_dates {
         listed
             .time
             .as_deref()
             .and_then(crate::curation::parse_iso8601_to_unix)
+    } else if first_seen_tracked(&state) {
+        Some(release_first_seen(&state, &metadata_key, &name, &listed.version).await)
     } else {
-        let first_seen = if first_seen_tracked(&state) {
-            first_seen_date(&state, &metadata_key, &listed.version).await
-        } else {
-            None
-        };
-        match first_seen {
-            Some(date) => Some(date),
-            None => {
-                crate::curation::extract_mtime_as_publish_date(&state.storage, &metadata_key).await
-            }
-        }
+        crate::curation::extract_mtime_as_publish_date(&state.storage, &metadata_key).await
     };
     // An internal package is the operator's own: not curated, as its uploads are not (#733).
     if !internal {
@@ -2064,6 +2111,14 @@ async fn security_advisories(
 // PUT /composer/packages/upload/{vendor}/{package}/{version}
 // ============================================================================
 
+/// Why an upload is not acknowledged.
+enum Unpublished {
+    /// The stored document does not list the version: it is taken back.
+    NotListed(String),
+    /// Whether the stored document lists the version is not known: it is kept.
+    Unknown(String),
+}
+
 /// On a re-upload of an existing version: when the stored document does not list it (an
 /// upload stopped between its version document and the listing), list it now. Under the
 /// package's publish lock, which the caller holds.
@@ -2235,25 +2290,52 @@ async fn upload(
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
     // A 201 means the version is listed in what is served: the document holding it is stored.
-    // Otherwise the version is taken back, so a retry publishes it instead of a 409.
+    // A version the stored document does not hold is taken back, so a retry publishes it
+    // instead of a 409. A write that failed may still have landed (a store can publish the
+    // body and fail after it): then the version is only taken back once the stored document is
+    // read and does not list it — a listed version is never offered for upload again.
     let listed = match build_hosted(&state, &name).await {
         Ok(body) if lists_version(&body, &name, &version) => {
             match state.storage.put(&document_key, &body).await {
                 Ok(()) => Ok(()),
-                Err(e) => Err(format!("failed to store hosted metadata: {e}")),
+                Err(e) => match state.storage.get(&document_key).await {
+                    Ok(stored) if !lists_version(&stored, &name, &version) => Err(
+                        Unpublished::NotListed(format!("failed to store hosted metadata: {e}")),
+                    ),
+                    Ok(_) => Err(Unpublished::Unknown(format!(
+                        "hosted metadata stored, the store reported: {e}"
+                    ))),
+                    Err(read) => Err(Unpublished::Unknown(format!(
+                        "failed to store hosted metadata: {e}; reading it back: {read}"
+                    ))),
+                },
             }
         }
-        Ok(_) => Err("uploaded version is not listed by the regenerated metadata".to_string()),
-        Err(_) => Err("hosted metadata could not be rebuilt".to_string()),
+        Ok(_) => Err(Unpublished::NotListed(
+            "uploaded version is not listed by the regenerated metadata".to_string(),
+        )),
+        Err(_) => Err(Unpublished::NotListed(
+            "hosted metadata could not be rebuilt".to_string(),
+        )),
     };
-    if let Err(reason) = listed {
-        tracing::error!(registry = REGISTRY, package = name, version, reason = %reason, "upload not published");
-        if let Err(e) = state.storage.delete(&version_key).await {
-            // Left listed nowhere: the next upload of this package lists it (the document is
-            // rebuilt from every version), as does a retry of this one.
-            tracing::error!(registry = REGISTRY, key = version_key, error = %e, "failed to take back an unlisted version");
+    match listed {
+        Ok(()) => {}
+        Err(Unpublished::NotListed(reason)) => {
+            tracing::error!(registry = REGISTRY, package = name, version, reason = %reason, "upload not published");
+            if let Err(e) = state.storage.delete(&version_key).await {
+                // Left listed nowhere: the next upload of this package lists it (the document
+                // is rebuilt from every version), as does a retry of this one.
+                tracing::error!(registry = REGISTRY, key = version_key, error = %e, "failed to take back an unlisted version");
+            }
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        Err(Unpublished::Unknown(reason)) => {
+            tracing::error!(registry = REGISTRY, package = name, version, reason = %reason, "upload outcome unknown; the version is kept");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("{name} {version} may be published: the store did not confirm it"),
+            );
+        }
     }
 
     state.metrics.record_upload(REGISTRY);

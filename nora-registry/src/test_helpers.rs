@@ -736,6 +736,8 @@ struct Faults {
     writes: Vec<String>,
     /// Key suffixes `stat` cannot answer for.
     stats: Vec<String>,
+    /// Key suffixes whose writes land but report a failure.
+    landed_writes: Vec<String>,
 }
 
 /// How the read of a key fails.
@@ -804,6 +806,13 @@ impl StorageOutage {
         self.faults().writes.push(suffix.to_string());
     }
 
+    /// Store the writes of the keys ending with `suffix`, then report a network error — as
+    /// `LocalStorage::put` does when the rename published the body and the directory sync or
+    /// the pin after it fails: the caller cannot tell the write landed.
+    pub fn fail_writes_after_landing_of(&self, suffix: &str) {
+        self.faults().landed_writes.push(suffix.to_string());
+    }
+
     /// Make `stat` of the keys ending with `suffix` find nothing, as a backend that cannot ask
     /// the store answers; other keys and every read answer.
     pub fn fail_stats_of(&self, suffix: &str) {
@@ -841,6 +850,14 @@ impl StorageOutage {
             .any(|suffix| key.ends_with(suffix.as_str()))
     }
 
+    /// Whether a write of `key` lands and then reports a failure.
+    fn write_lands_then_fails(&self, key: &str) -> bool {
+        self.faults()
+            .landed_writes
+            .iter()
+            .any(|suffix| key.ends_with(suffix.as_str()))
+    }
+
     /// Whether `stat` of `key` fails now.
     fn stat_fails(&self, key: &str) -> bool {
         self.faults()
@@ -873,7 +890,7 @@ impl StorageOutage {
 /// fails with a network error and `stat` finds nothing, as an object store behind a dropped
 /// connection answers: the store holds what was written, but cannot say so.
 pub struct OutageBackend {
-    inner: crate::storage::ObjectStorage,
+    inner: Arc<dyn crate::storage::StorageBackend>,
     outage: StorageOutage,
 }
 
@@ -881,7 +898,19 @@ pub struct OutageBackend {
 pub fn outage_storage() -> (Storage, StorageOutage) {
     let outage = StorageOutage(Arc::default(), Arc::default());
     let backend = OutageBackend {
-        inner: crate::storage::ObjectStorage::in_memory(),
+        inner: Arc::new(crate::storage::ObjectStorage::in_memory()),
+        outage: outage.clone(),
+    };
+    (Storage::from_backend(Arc::new(backend)), outage)
+}
+
+/// A local [`Storage`] at `path` with the same outage switch: for a test that needs what only
+/// a filesystem has, such as a file's modification time ([`put_written_days_ago`] — the
+/// context's `storage.path` must be `path`).
+pub fn local_outage_storage(path: &str) -> (Storage, StorageOutage) {
+    let outage = StorageOutage(Arc::default(), Arc::default());
+    let backend = OutageBackend {
+        inner: Arc::new(crate::storage::LocalStorage::new(path)),
         outage: outage.clone(),
     };
     (Storage::from_backend(Arc::new(backend)), outage)
@@ -918,7 +947,11 @@ impl crate::storage::StorageBackend for OutageBackend {
         if self.outage.write_fails(key) {
             return Err(network_error());
         }
-        self.inner.put(key, data, sha256).await
+        self.inner.put(key, data, sha256).await?;
+        if self.outage.write_lands_then_fails(key) {
+            return Err(network_error());
+        }
+        Ok(())
     }
 
     async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {

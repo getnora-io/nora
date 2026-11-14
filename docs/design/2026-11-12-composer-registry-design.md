@@ -73,7 +73,9 @@ read. Private Packagist (`/org/p2/…`), Satis and Packagist mirrors work unchan
 - Cached **as the upstream sent it** at `composer/p2/{name}[~dev].json`, with the
   validators (`.meta`) and the upstream that served it (`.origin`).
 - Fresh within `metadata_ttl`; then revalidated with `If-None-Match` /
-  `If-Modified-Since` (Packagist sends both); a 304 restarts the TTL.
+  `If-Modified-Since` (Packagist sends both); a 304 restarts the TTL. Validators
+  are stored only with the body they describe: a new body that cannot be stored
+  leaves the old copy's, so the next revalidation fetches the new body again.
 - Served stale (`x-nora-stale: true`) when every upstream that did not answer
   "not found" failed; a 404 from every upstream is a 404.
 - Rewritten on the way out: every `dist.url` points at NORA, `dist.mirrors` is
@@ -141,7 +143,10 @@ Composer has no publish command; the upload follows the Nexus Composer API shape
   read-modify-write, as npm since #39). A 201 is answered only once the
   regenerated document lists the version and is stored; when it cannot be stored
   the version document is taken back and the upload fails, so a retry publishes
-  it. A re-upload of a stored version the listing lacks (an upload stopped
+  it. A write can fail after it landed (a local store publishes the file, then its
+  directory sync fails): the version is taken back only when the stored document,
+  read again, does not list it; when it does, or cannot be read, the version is
+  kept and the answer is 503 — a listed version is never offered for upload again. A re-upload of a stored version the listing lacks (an upload stopped
   between the two) lists it again before its 409. Whether a version exists is
   read, not `stat`ed: a store that cannot answer refuses the upload. A missing
   `p2.json` is rebuilt on read.
@@ -154,7 +159,8 @@ Composer has no publish command; the upload follows the Nexus Composer API shape
 `composer audit` posts `packages[]=…` to the root's `api-url`. NORA strips every
 hosted or internal name, answers `{"advisories":{}}` itself when none is left,
 and forwards the rest to the first upstream whose root names an advisories API.
-When an upstream's root cannot be read (no answer, no cached copy) and no other
+When an upstream's root cannot be read (no answer, no cached copy, or a 200
+that is not a repository root: `null`, `[]`, an error object) and no other
 names an API, the answer is 502, not an empty result. A query names at most 1000
 distinct packages (413), and costs one listing of the hosted space whatever its
 size.
@@ -172,7 +178,9 @@ cache (stale or not), as the other formats serve a local copy of an internal nam
 Metadata requests are checked by name; downloads by name, version and date.
 Without trusted upstream dates a version's age runs from when NORA first saw it
 listed (a first-seen ledger beside the p2 document, as npm keeps), so revalidating
-the document does not restart it.
+the document does not restart it. A version the ledger has no record of takes the
+stored document's write time only when that document lists it; otherwise it is
+new now (an upstream added it and neither the ledger nor the listing was stored).
 
 ## Client Configuration
 
