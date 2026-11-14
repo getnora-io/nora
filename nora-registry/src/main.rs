@@ -389,6 +389,8 @@ pub struct AppState {
     pub activity: Arc<ActivityLog>,
     pub audit: Arc<AuditLog>,
     pub docker_auth: Arc<registry::DockerAuth>,
+    /// The Docker token service's signing key, when `docker_anon_pull` runs it (#1226).
+    pub(crate) docker_tokens: Option<Arc<auth::docker_token::DockerTokens>>,
     pub repo_index: Arc<RepoIndex>,
     pub http_client: reqwest::Client,
     /// The same client, except that it never follows a redirect: for a format whose answer
@@ -3348,6 +3350,28 @@ async fn run_server(mut config: Config, storage: Storage) {
         None
     };
 
+    // The Docker token service under anonymous pull (#1226): its key lives beside the API
+    // tokens, so replicas sharing token_storage share it. Fail fast like the token store: a
+    // key that cannot be read or created leaves authenticated push without a token.
+    let docker_tokens = if config.auth.enabled && config.auth.docker_anon_pull {
+        match auth::docker_token::DockerTokens::load_or_create(Path::new(
+            &config.auth.token_storage,
+        )) {
+            Ok(tokens) => Some(Arc::new(tokens)),
+            Err(e) => {
+                error!(
+                    path = %config.auth.token_storage,
+                    error = %e,
+                    "Cannot read or create the Docker token key in token storage — \
+                     auth.docker_anon_pull needs it for authenticated push"
+                );
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
+
     let storage_path = config.storage.path.clone();
     let rate_limit_enabled = config.rate_limit.enabled;
 
@@ -3539,6 +3563,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         activity: Arc::new(ActivityLog::new(50)),
         audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
+        docker_tokens,
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
         http_client_no_redirect,
@@ -5180,8 +5205,13 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
     let mut registry_routes = Router::new();
     for reg in enabled {
         match reg {
+            // The Docker token service rides with the registry routes, under their read and
+            // write quotas, not the auth quota: clients ask it for a token on nearly every
+            // repository operation (#1226), as a Basic request on /v2 is checked under them too.
             RegistryType::Docker => {
-                registry_routes = registry_routes.merge(registry::docker_routes())
+                registry_routes = registry_routes
+                    .merge(registry::docker_routes())
+                    .merge(auth::docker_token::routes())
             }
             RegistryType::Maven => {
                 registry_routes = registry_routes.merge(registry::maven_routes())

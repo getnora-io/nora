@@ -318,7 +318,8 @@ async fn maven_list(
     let auth_enabled = state.auth.is_some();
 
     // Show top-level namespace directories (com, org, io, etc.)
-    let (entries, _) = api::get_maven_dir_listing(&state.storage, "").await;
+    let index = state.repo_index.get("maven", &state.storage).await;
+    let (entries, _) = api::maven_dir_listing(&index, "");
     let total = entries.len();
 
     Html(templates::render_maven_dir(
@@ -343,7 +344,8 @@ async fn maven_detail(
     let auth_enabled = state.auth.is_some();
 
     // Try hierarchical browsing: check if this is a directory or leaf artifact
-    let (entries, is_leaf) = api::get_maven_dir_listing(&state.storage, &path).await;
+    let index = state.repo_index.get("maven", &state.storage).await;
+    let (entries, is_leaf) = api::maven_dir_listing(&index, &path);
 
     if is_leaf || entries.is_empty() {
         // Leaf artifact — show files (JARs, POMs, etc.)
@@ -1476,5 +1478,242 @@ mod composer_pages {
             let (status, _) = page(&ctx, uri).await;
             assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
         }
+    }
+}
+
+#[cfg(test)]
+mod maven_pages_from_index {
+    use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
+    use crate::test_helpers::{body_bytes, create_test_context_with_storage, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// An in-memory object store counting the calls that walk storage: listings and stats.
+    struct Counting {
+        inner: ObjectStorage,
+        walks: Arc<AtomicUsize>,
+        stats: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for Counting {
+        async fn stat(&self, key: &str) -> Option<FileMeta> {
+            self.stats.fetch_add(1, Ordering::SeqCst);
+            self.inner.stat(key).await
+        }
+        async fn put(&self, k: &str, d: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(k, d, sha256).await
+        }
+        async fn get(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            self.inner.get(k).await
+        }
+        async fn pin(&self, k: &str) -> Option<String> {
+            self.inner.pin(k).await
+        }
+        async fn delete(&self, k: &str) -> crate::storage::Result<()> {
+            self.inner.delete(k).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            self.walks.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(prefix).await
+        }
+        async fn list_with_meta(
+            &self,
+            prefix: &str,
+        ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
+            self.walks.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_with_meta(prefix).await
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "walk-counting-test"
+        }
+        async fn put_from_path(
+            &self,
+            k: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(k, src, sha256).await
+        }
+        async fn copy(
+            &self,
+            src: &str,
+            dst: &str,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            k: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(k).await
+        }
+    }
+
+    struct Fixture {
+        ctx: TestContext,
+        walks: Arc<AtomicUsize>,
+        stats: Arc<AtomicUsize>,
+    }
+
+    impl Fixture {
+        fn reset(&self) {
+            self.walks.store(0, Ordering::SeqCst);
+            self.stats.store(0, Ordering::SeqCst);
+        }
+        fn walks_and_stats(&self) -> (usize, usize) {
+            (
+                self.walks.load(Ordering::SeqCst),
+                self.stats.load(Ordering::SeqCst),
+            )
+        }
+        async fn page(&self, uri: &str) -> String {
+            let resp = send(&self.ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            String::from_utf8(body_bytes(resp).await.to_vec()).unwrap()
+        }
+    }
+
+    async fn fixture() -> Fixture {
+        let walks = Arc::new(AtomicUsize::new(0));
+        let stats = Arc::new(AtomicUsize::new(0));
+        let ctx = create_test_context_with_storage(Storage::from_backend(Arc::new(Counting {
+            inner: ObjectStorage::in_memory(),
+            walks: Arc::clone(&walks),
+            stats: Arc::clone(&stats),
+        })));
+        for (key, len) in [
+            ("maven/com/acme/lib/maven-metadata.xml", 100),
+            ("maven/com/acme/lib/1.0/lib-1.0.jar", 1000),
+            ("maven/com/acme/lib/1.0/lib-1.0.jar.sha1", 40),
+            ("maven/com/acme/lib/1.0/lib-1.0.pom", 200),
+            ("maven/com/acme/lib/2.0/lib-2.0.jar", 2000),
+            ("maven/org/x/y/1/y-1.jar", 10),
+        ] {
+            ctx.state.storage.put(key, &vec![b'x'; len]).await.unwrap();
+        }
+        Fixture { ctx, walks, stats }
+    }
+
+    /// #1216: once the index is built, a Maven directory page is answered from it: no listing
+    /// and no stat per stored file on each visit.
+    #[tokio::test]
+    async fn a_maven_directory_page_does_not_walk_storage_on_each_visit() {
+        let f = fixture().await;
+        f.page("/ui/maven").await;
+        f.reset();
+        let root = f.page("/ui/maven").await;
+        let dir = f.page("/ui/maven/com/acme").await;
+        assert!(
+            root.contains(">com</a>") && root.contains(">org</a>"),
+            "{root}"
+        );
+        assert!(dir.contains(">lib</a>"), "{dir}");
+        assert_eq!(f.walks_and_stats(), (0, 0));
+    }
+
+    /// #1216: the files of one version come from one listing that carries their sizes,
+    /// not a stat per file.
+    #[tokio::test]
+    async fn a_version_page_lists_its_files_without_a_stat_per_file() {
+        let f = fixture().await;
+        f.page("/ui/maven").await;
+        f.reset();
+        let page = f.page("/ui/maven/com/acme/lib/1.0").await;
+        assert!(
+            page.contains("lib-1.0.jar") && page.contains("lib-1.0.pom"),
+            "{page}"
+        );
+        assert!(page.contains("1000 B") && page.contains("200 B"), "{page}");
+        assert_eq!(f.walks_and_stats().1, 0);
+    }
+
+    /// #1216: what the Maven directory pages show, folded from the index: per child the count
+    /// of primary files (sidecars and maven-metadata.xml not counted, as on the dashboard),
+    /// their bytes with sidecars, and leaf or not. Before #1216 the count was every stored file.
+    #[tokio::test]
+    async fn the_maven_directory_pages_fold_the_index() {
+        let f = fixture().await;
+        let index = f
+            .ctx
+            .state
+            .repo_index
+            .get("maven", &f.ctx.state.storage)
+            .await;
+        let pages: Vec<serde_json::Value> = [
+            "",
+            "com",
+            "com/acme",
+            "com/acme/lib",
+            "com/acme/lib/1.0",
+            "com/ac",
+            "nope",
+        ]
+        .into_iter()
+        .map(|path| {
+            let (entries, leaf) = super::api::maven_dir_listing(&index, path);
+            let children: Vec<_> = entries
+                .iter()
+                .map(|e| serde_json::json!({"name": e.name, "files": e.versions, "bytes": e.size}))
+                .collect();
+            serde_json::json!({"path": path, "leaf": leaf, "children": children})
+        })
+        .collect();
+        insta::assert_json_snapshot!("maven_ui_directory_pages", pages);
+    }
+
+    /// #1216: a folded directory is as recent as the newest directory below it.
+    #[test]
+    fn a_folded_directory_is_as_recent_as_its_newest_entry() {
+        let dir = |name: &str, modified| crate::repo_index::RepoInfo {
+            name: name.to_string(),
+            versions: 1,
+            modified,
+            ..Default::default()
+        };
+        // The newest comes first: the last one seen would answer 100.
+        let index = [
+            dir("com/a/1", 300),
+            dir("com/a/2", 100),
+            dir("com/b/1", 200),
+        ];
+        let (entries, _) = super::api::maven_dir_listing(&index, "com");
+        let newest: Vec<_> = entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.modified))
+            .collect();
+        assert_eq!(newest, [("a", 300), ("b", 200)]);
+    }
+
+    /// #1216: an artifact uploaded after the index was built is on the page at once: the upload
+    /// marks the index for rebuild, so the page is not served from a stale one.
+    #[tokio::test]
+    async fn an_uploaded_artifact_is_on_the_directory_page_at_once() {
+        let f = fixture().await;
+        assert!(!f.page("/ui/maven/com/acme").await.contains(">tool</a>"));
+        let resp = send(
+            &f.ctx.app,
+            Method::PUT,
+            "/maven2/com/acme/tool/3.0/tool-3.0.jar",
+            vec![b'x'; 5],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(f.page("/ui/maven/com/acme").await.contains(">tool</a>"));
     }
 }

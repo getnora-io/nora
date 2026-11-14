@@ -1,0 +1,14 @@
+---
+source: nora-registry/src/registry/nuget.rs
+expression: resources
+---
+[
+  "PackageBaseAddress/3.0.0 http://nora:4000/nuget/v3/flatcontainer/",
+  "RegistrationsBaseUrl/3.6.0 http://nora:4000/nuget/v3/registration/",
+  "SearchQueryService http://nora:4000/nuget/v3/query",
+  "SearchQueryService/3.0.0-beta http://nora:4000/nuget/v3/query",
+  "SearchQueryService/3.0.0-rc http://nora:4000/nuget/v3/query",
+  "SearchAutocompleteService http://nora:4000/nuget/v3/autocomplete",
+  "SearchAutocompleteService/3.0.0-beta http://nora:4000/nuget/v3/autocomplete",
+  "SearchAutocompleteService/3.0.0-rc http://nora:4000/nuget/v3/autocomplete"
+]
