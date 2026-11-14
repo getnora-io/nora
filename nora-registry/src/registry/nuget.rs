@@ -48,6 +48,8 @@ struct SearchParams {
     prerelease: Option<bool>,
     #[serde(rename = "semVerLevel")]
     sem_ver_level: Option<String>,
+    /// Autocomplete's package-versions form: `?id=<package>` lists that package's versions.
+    id: Option<String>,
 }
 
 /// Storage prefix and file suffix for repo index scanning.
@@ -331,12 +333,15 @@ async fn autocomplete_query(
     let take = params.take.unwrap_or(20);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
+    // An empty `?id=` is the package-ID form, not the versions form.
+    let id = params.id.as_deref().filter(|s| !s.is_empty());
 
     // No upstream proxy configured → local autocomplete from cache
     if upstream_url(&state).is_none() {
         let data = local_autocomplete_results(
             &state,
             &query,
+            id,
             skip,
             take,
             prerelease,
@@ -346,15 +351,17 @@ async fn autocomplete_query(
         return with_json(data);
     }
 
-    // #68 namespace isolation: don't forward an internal-namespace autocomplete term.
+    // #68 namespace isolation: don't forward an internal-namespace autocomplete term — for the
+    // versions form the term is the package id.
     if crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Nuget,
-        &query,
+        id.unwrap_or(&query),
     ) {
         let data = local_autocomplete_results(
             &state,
             &query,
+            id,
             skip,
             take,
             prerelease,
@@ -407,6 +414,7 @@ async fn autocomplete_query(
             let data = local_autocomplete_results(
                 &state,
                 &query,
+                id,
                 skip,
                 take,
                 prerelease,
@@ -1802,14 +1810,47 @@ async fn local_search_results(
 ///
 /// When `prerelease` is false, packages that have only pre-release versions are omitted.
 /// When `sem_ver_level` is not `"2.0.0"`, packages with only SemVer 2.0 versions are hidden.
+/// Whether a version is listed for the autocomplete filters: pre-releases only when asked for,
+/// SemVer 2.0 versions only when `semVerLevel=2.0.0` is asked for.
+fn autocomplete_version_visible(
+    version: &str,
+    prerelease: bool,
+    sem_ver_level: Option<&str>,
+) -> bool {
+    (prerelease || !version.contains('-'))
+        && (sem_ver_level == Some("2.0.0") || !is_semver2_version(version))
+}
+
+/// Local answer to the autocomplete versions form (`?id=`): the versions of `id` the filters
+/// allow, in index order. Shape per the NuGet Autocomplete resource: a root object with `data`
+/// only, no `totalHits`.
+async fn local_autocomplete_versions(
+    state: &AppState,
+    id: &str,
+    prerelease: bool,
+    sem_ver_level: Option<&str>,
+) -> Vec<u8> {
+    let data: Vec<String> = get_cached_versions(&state.storage, id)
+        .await
+        .into_iter()
+        .filter(|v| autocomplete_version_visible(v, prerelease, sem_ver_level))
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "data": data }))
+        .unwrap_or_else(|_| br#"{"data":[]}"#.to_vec())
+}
+
 async fn local_autocomplete_results(
     state: &AppState,
     query: &str,
+    id: Option<&str>,
     skip: usize,
     take: usize,
     prerelease: bool,
     sem_ver_level: Option<&str>,
 ) -> Vec<u8> {
+    if let Some(id) = id {
+        return local_autocomplete_versions(state, id, prerelease, sem_ver_level).await;
+    }
     let packages = state.repo_index.get("nuget", &state.storage).await;
 
     let query_lower = query.to_lowercase();
@@ -1895,9 +1936,120 @@ fn generate_service_index(base_url: &str) -> String {
 /// Catch-all handler for unhandled NuGet v3 resource paths.
 /// Returns 404 with diagnostic logging so operators can see which resources
 /// clients are requesting that NORA doesn't implement yet. (#404)
-async fn nuget_catchall(Path(path): Path<String>) -> Response {
+/// Catch-all under `/v3/`. Registration leaves (`registration/{id}/{version}.json`) come here:
+/// a `{version}.json` segment cannot be a route of its own beside `index.json` and `page/…`.
+async fn nuget_catchall(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
+    if let Some((id, file)) = path
+        .strip_prefix("registration/")
+        .and_then(|rest| rest.split_once('/'))
+    {
+        if let Some(version) = file.strip_suffix(".json") {
+            return registration_leaf(&state, &headers, id, version).await;
+        }
+    }
     tracing::debug!(path = %path, "NuGet: unhandled resource requested");
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// `GET /v3/registration/{id}/{version}.json` — the registration leaf of one version: the
+/// `@id` a search result gives for it. Shape per the NuGet registration resource (RegistrationLeaf):
+/// `@id`, `listed`, `packageContent`, `registration`; `catalogEntry` is an optional URL we have no
+/// catalog document for, so it is left out. A version NORA has is answered from its own index;
+/// one it does not have is asked of the upstream, as the registration index is.
+async fn registration_leaf(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    id: &str,
+    version: &str,
+) -> Response {
+    let id_lower = id.to_lowercase();
+    if !is_valid_package_id(&id_lower) || !is_valid_version(version) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Nuget,
+        &id_lower,
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            headers,
+            crate::curation::RegistryType::Nuget,
+            &id_lower,
+            crate::curation::RequestVersion::Unspecified,
+            None,
+        ) {
+            return response;
+        }
+    }
+
+    let base_url = nora_base_url(state);
+    let nuget = format!("{}/nuget/v3", base_url.trim_end_matches('/'));
+    let leaf_for = |listed: bool| {
+        serde_json::json!({
+            "@id": format!("{nuget}/registration/{id_lower}/{version}.json"),
+            "listed": listed,
+            "packageContent": format!("{nuget}/flatcontainer/{id_lower}/{version}/{id_lower}.{version}.nupkg"),
+            "registration": format!("{nuget}/registration/{id_lower}/index.json"),
+        })
+    };
+
+    // A hosted package is its own: only its listed versions have a leaf, and no upstream is asked.
+    let hosted = hosted_versions(&state.storage, &id_lower).await;
+    if let Some(versions) = hosted.as_ref().filter(|v| v.hosted()) {
+        return if versions.listed().iter().any(|v| v == version) {
+            with_json(serde_json::to_vec(&leaf_for(true)).unwrap_or_default())
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        };
+    }
+
+    if get_cached_versions(&state.storage, &id_lower)
+        .await
+        .iter()
+        .any(|v| v == version)
+    {
+        return with_json(serde_json::to_vec(&leaf_for(true)).unwrap_or_default());
+    }
+
+    // Not NORA's: asked of the upstream, as the registration index is — never for an
+    // internal-namespace package.
+    let Some(upstream) = upstream_url(state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if internal {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let url = format!(
+        "{}/v3/registration5-gz-semver2/{}/{}.json",
+        upstream.trim_end_matches('/'),
+        id_lower,
+        version
+    );
+    match proxy_fetch_text(
+        &state.http_client,
+        &url,
+        Duration::from_secs(SEARCH_TIMEOUT_SECS),
+        None,
+        None,
+        &state.circuit_breaker,
+        RegistryType::Nuget,
+    )
+    .await
+    {
+        Ok(text) => {
+            let rewritten = rewrite_registration_urls(&text, &rewrite_host(state), &base_url);
+            with_json(rewritten.into_bytes())
+        }
+        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 /// Rewrite upstream registration URLs in NuGet registration index/page responses: registration5-*
@@ -5162,5 +5314,153 @@ mod nuget_release_dates {
             assert_eq!(nuget_version_order(a, b), Some(want), "{a} vs {b}");
         }
         assert_eq!(nuget_version_order("not.a.version.x", "1.0.0"), None);
+    }
+}
+
+/// Проверка находок ревью #1233 (session-3): каждый тест описывает ожидаемое поведение и падает,
+/// если находка верна.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_1233_findings {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+
+    async fn seed(ctx: &crate::test_helpers::TestContext, id: &str, versions: &[&str]) {
+        let index = serde_json::json!({ "versions": versions });
+        ctx.state
+            .storage
+            .put(
+                &format!("nuget/flatcontainer/{id}/index.json"),
+                serde_json::to_vec(&index).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        for ver in versions {
+            ctx.state
+                .storage
+                .put(
+                    &format!("nuget/flatcontainer/{id}/{ver}/{id}.{ver}.nupkg"),
+                    b"fake-nupkg",
+                )
+                .await
+                .unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+    }
+
+    /// F3: `?id=` on the autocomplete resource enumerates the versions of that package.
+    #[tokio::test]
+    async fn f3_autocomplete_by_id_enumerates_versions() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        seed(&ctx, "testpkg", &["1.0.0", "2.0.0"]).await;
+        seed(&ctx, "otherpkg", &["3.0.0"]).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?id=testpkg&prerelease=true",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(
+            json["data"],
+            serde_json::json!(["1.0.0", "2.0.0"]),
+            "{json}"
+        );
+    }
+
+    /// F4: the `@id` a search result gives for a version answers.
+    #[tokio::test]
+    async fn f4_search_version_id_resolves() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        seed(&ctx, "testpkg", &["1.0.0", "2.0.0"]).await;
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=testpkg", "").await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let id = json["data"][0]["versions"][0]["@id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let path = id.strip_prefix("http://nora.example").unwrap().to_string();
+        let resp = send(&ctx.app, Method::GET, &path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{id}");
+    }
+
+    /// F3 shape: the versions form is `{"data": [...]}` only, and a pre-release is listed only
+    /// when `prerelease=true` asks for it.
+    #[tokio::test]
+    async fn f3_autocomplete_versions_shape_and_prerelease_filter() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        seed(&ctx, "testpkg", &["1.0.0", "2.0.0-beta"]).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?id=testpkg",
+            "",
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json, serde_json::json!({ "data": ["1.0.0"] }));
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?id=testpkg&prerelease=true",
+            "",
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json, serde_json::json!({ "data": ["1.0.0", "2.0.0-beta"] }));
+    }
+
+    /// F4 negative: a leaf for a version NORA does not have is not found (no upstream here), and
+    /// a leaf for a version it has carries the RegistrationLeaf fields with URLs that resolve.
+    #[tokio::test]
+    async fn f4_registration_leaf_known_and_unknown_versions() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        seed(&ctx, "testpkg", &["1.0.0"]).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/9.9.9.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(
+            json["@id"],
+            "http://nora.example/nuget/v3/registration/testpkg/1.0.0.json"
+        );
+        assert_eq!(json["listed"], true);
+        assert!(json.get("catalogEntry").is_none(), "{json}");
+        let content = json["packageContent"].as_str().unwrap().to_string();
+        let path = content
+            .strip_prefix("http://nora.example")
+            .unwrap()
+            .to_string();
+        let resp = send(&ctx.app, Method::GET, &path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{content}");
     }
 }
