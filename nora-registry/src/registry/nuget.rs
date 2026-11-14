@@ -336,6 +336,25 @@ async fn autocomplete_query(
     // An empty `?id=` is the package-ID form, not the versions form.
     let id = params.id.as_deref().filter(|s| !s.is_empty());
 
+    // The versions of a hosted package are its own records, as its registration is: the upstream
+    // is not asked, and the stored index (which may hold a stale upstream listing) is not read.
+    if let Some(id_lower) = id.map(str::to_lowercase) {
+        match hosted_versions(&state.storage, &id_lower).await {
+            None => {
+                return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower))
+            }
+            Some(versions) if versions.hosted() => {
+                let data = autocomplete_versions_answer(
+                    versions.listed().to_vec(),
+                    prerelease,
+                    sem_ver_level.as_deref(),
+                );
+                return with_json(data);
+            }
+            Some(_) => {}
+        }
+    }
+
     // No upstream proxy configured → local autocomplete from cache
     if upstream_url(&state).is_none() {
         let data = local_autocomplete_results(
@@ -1830,8 +1849,20 @@ async fn local_autocomplete_versions(
     prerelease: bool,
     sem_ver_level: Option<&str>,
 ) -> Vec<u8> {
-    let data: Vec<String> = get_cached_versions(&state.storage, id)
-        .await
+    autocomplete_versions_answer(
+        get_cached_versions(&state.storage, id).await,
+        prerelease,
+        sem_ver_level,
+    )
+}
+
+/// The versions-form answer for `versions`, filtered as the autocomplete query asks.
+fn autocomplete_versions_answer(
+    versions: Vec<String>,
+    prerelease: bool,
+    sem_ver_level: Option<&str>,
+) -> Vec<u8> {
+    let data: Vec<String> = versions
         .into_iter()
         .filter(|v| autocomplete_version_visible(v, prerelease, sem_ver_level))
         .collect();
@@ -2001,9 +2032,13 @@ async fn registration_leaf(
     };
 
     // A hosted package is its own: only its listed versions have a leaf, and no upstream is asked.
-    let hosted = hosted_versions(&state.storage, &id_lower).await;
-    if let Some(versions) = hosted.as_ref().filter(|v| v.hosted()) {
-        return if versions.listed().iter().any(|v| v == version) {
+    // Records that cannot be listed decide nothing: 503, and the upstream is not asked (it may name
+    // another package under this id), as the registration index does.
+    let Some(hosted) = hosted_versions(&state.storage, &id_lower).await else {
+        return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower));
+    };
+    if hosted.hosted() {
+        return if hosted.listed().iter().any(|v| v == version) {
             with_json(serde_json::to_vec(&leaf_for(true)).unwrap_or_default())
         } else {
             StatusCode::NOT_FOUND.into_response()
@@ -2032,11 +2067,12 @@ async fn registration_leaf(
         id_lower,
         version
     );
+    // The configured credential goes with it, as the registration index and pages send theirs.
     match proxy_fetch_text(
         &state.http_client,
         &url,
         Duration::from_secs(SEARCH_TIMEOUT_SECS),
-        None,
+        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
         None,
         &state.circuit_breaker,
         RegistryType::Nuget,
@@ -5462,5 +5498,295 @@ mod review_1233_findings {
             .to_string();
         let resp = send(&ctx.app, Method::GET, &path, "").await;
         assert_eq!(resp.status(), StatusCode::OK, "{content}");
+    }
+}
+
+/// Second pass over #1233 (review of f5b3fbe): autocomplete versions of a hosted package, the leaf
+/// when hosted records cannot be listed, the leaf's upstream auth, and the upstream leaf branch.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_1233_second_pass {
+    use crate::secrets::ProtectedString;
+    use crate::storage::{FileMeta, Storage, StorageBackend, StorageError};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, create_test_context_with_storage_and_config,
+        send,
+    };
+    use axum::http::{Method, StatusCode};
+    use std::path::Path;
+    use std::sync::Arc;
+    use wiremock::matchers::{any, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A storage whose listing of hosted records fails; every other operation is the real one.
+    struct HostedListingFails {
+        inner: Storage,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for HostedListingFails {
+        async fn put(&self, key: &str, data: &[u8], _sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(key, data).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            Ok((self.inner.get(key).await?, None))
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+        async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            if prefix.starts_with("nuget/hosted/") {
+                return Err(StorageError::Network("hosted listing unavailable".into()));
+            }
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<FileMeta> {
+            self.inner.stat(key).await
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "hosted-listing-fails"
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+        async fn copy(
+            &self,
+            src: &str,
+            dst: &str,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+    }
+
+    fn leaf_body(upstream: &str, id: &str, version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "@id": format!("{upstream}/v3/registration5-gz-semver2/{id}/{version}.json"),
+            "listed": true,
+            "packageContent": format!("{upstream}/v3-flatcontainer/{id}/{version}/{id}.{version}.nupkg"),
+            "registration": format!("{upstream}/v3/registration5-gz-semver2/{id}/index.json"),
+        })
+    }
+
+    /// Finding 1: a hosted package's autocomplete versions are its own records. The stale upstream
+    /// index names 9.0.0, which must not appear, and the upstream must not be asked.
+    #[tokio::test]
+    async fn s2_f1_autocomplete_versions_of_a_hosted_package_are_its_own() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": ["9.0.0"] })),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.autocomplete = format!("{uri}/v3/autocomplete");
+        });
+        ctx.state
+            .storage
+            .put(
+                "nuget/hosted/corp.lib/1.0.0.json",
+                br#"{"id":"corp.lib","version":"1.0.0"}"#,
+            )
+            .await
+            .unwrap();
+        let index = serde_json::json!({ "versions": ["9.0.0"] });
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/corp.lib/index.json",
+                serde_json::to_vec(&index).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        ctx.state.repo_index.invalidate("nuget");
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?id=corp.lib&prerelease=true",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["data"], serde_json::json!(["1.0.0"]), "{json}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            0
+        );
+    }
+
+    /// Finding 2: hosted records that cannot be listed give 503 for the leaf, and the upstream is
+    /// not asked — a foreign package must not be served as this one.
+    #[tokio::test]
+    async fn s2_f2_leaf_with_unlistable_hosted_records_is_503_without_upstream() {
+        let upstream = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(leaf_body(
+                &upstream.uri(),
+                "testpkg",
+                "1.0.0",
+            )))
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::from_backend(Arc::new(HostedListingFails {
+            inner: Storage::new_local(dir.path().to_str().unwrap()),
+        }));
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            0
+        );
+    }
+
+    /// Finding 3: the leaf's upstream request carries the configured proxy credential, as the
+    /// registration index and pages do.
+    #[tokio::test]
+    async fn s2_f3_leaf_upstream_request_carries_proxy_auth() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(leaf_body(
+                &upstream.uri(),
+                "testpkg",
+                "1.0.0",
+            )))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.proxy_auth = Some(ProtectedString::from("user:pass"));
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Branch B(a): a cold miss goes to the upstream leaf and comes back with its URLs rewritten
+    /// to NORA — no upstream host survives in the body.
+    #[tokio::test]
+    async fn s2_b_leaf_cold_miss_is_rewritten_to_nora() {
+        let upstream = MockServer::start().await;
+        let up = upstream.uri();
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(leaf_body(&up, "testpkg", "1.0.0")),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = up.clone();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(!text.contains(&up), "upstream host leaked: {text}");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            json["packageContent"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://nora.example/nuget/v3/"),
+            "{json}"
+        );
+    }
+
+    /// Branch B(a): an upstream failure is not a missing version — 500 gives 503, 404 gives 404.
+    #[tokio::test]
+    async fn s2_b_leaf_upstream_error_is_503_and_not_found_is_404() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/testpkg/2.0.0.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/2.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 }
