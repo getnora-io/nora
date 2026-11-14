@@ -2045,15 +2045,14 @@ async fn registration_leaf(
         };
     }
 
-    if get_cached_versions(&state.storage, &id_lower)
-        .await
-        .iter()
-        .any(|v| v == version)
-    {
-        return with_json(serde_json::to_vec(&leaf_for(true)).unwrap_or_default());
+    // The version's own listing, as the registration NORA stored gives it — served without the
+    // upstream, internal package or not. The flatcontainer index names the version but not whether
+    // it is listed, so it decides nothing here.
+    if let Some(listed) = stored_listing(state, &id_lower, version).await {
+        return with_json(serde_json::to_vec(&leaf_for(listed)).unwrap_or_default());
     }
 
-    // Not NORA's: asked of the upstream, as the registration index is — never for an
+    // Not stored: asked of the upstream, as the registration index is — never for an
     // internal-namespace package.
     let Some(upstream) = upstream_url(state) else {
         return StatusCode::NOT_FOUND.into_response();
@@ -2085,6 +2084,74 @@ async fn registration_leaf(
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+/// Where a stored registration document (the index, or a page) gives version `version`'s leaf.
+enum StoredLeaf {
+    /// Inline in the document, with its `listed` flag.
+    Inline(bool),
+    /// On the page the index names for the version's bounds.
+    OnPage { lower: String, upper: String },
+    /// Not in the document.
+    Absent,
+}
+
+/// The `listed` flag of `version` when the document holds its leaf inline. `catalogEntry.listed`
+/// absent means listed (NuGet's registration resource).
+fn inline_listing(doc: &[u8], version: &str) -> Option<bool> {
+    let json = serde_json::from_slice::<serde_json::Value>(doc).ok()?;
+    let items = json.get("items")?.as_array()?;
+    let find = |leaves: &[serde_json::Value]| {
+        leaves.iter().find_map(|item| {
+            let entry = item.get("catalogEntry")?;
+            let listed_version = entry.get("version")?.as_str()?;
+            let same = nuget_version_order(listed_version, version).map_or_else(
+                || listed_version.eq_ignore_ascii_case(version),
+                |o| o.is_eq(),
+            );
+            same.then(|| {
+                entry
+                    .get("listed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true)
+            })
+        })
+    };
+    if items.iter().any(|item| item.get("catalogEntry").is_some()) {
+        return find(items);
+    }
+    items
+        .iter()
+        .find_map(|page| find(page.get("items")?.as_array()?))
+}
+
+fn stored_leaf(doc: &[u8], version: &str) -> StoredLeaf {
+    if let Some(listed) = inline_listing(doc, version) {
+        return StoredLeaf::Inline(listed);
+    }
+    match registered(doc, version) {
+        Registered::OnPage { lower, upper } => StoredLeaf::OnPage { lower, upper },
+        _ => StoredLeaf::Absent,
+    }
+}
+
+/// The `listed` flag the registration NORA stored gives `version`: the index's leaf, or the leaf
+/// on the page the index names for it. `None` when nothing stored says it, or it cannot be read.
+async fn stored_listing(state: &AppState, id_lower: &str, version: &str) -> Option<bool> {
+    let index_key = format!("nuget/registration/{id_lower}/index.json");
+    let doc = state.storage.get(&index_key).await.ok()?;
+    match stored_leaf(&doc, version) {
+        StoredLeaf::Inline(listed) => Some(listed),
+        StoredLeaf::OnPage { lower, upper } => {
+            let page_key = format!("nuget/registration/{id_lower}/page/{lower}/{upper}.json");
+            let page = state.storage.get(&page_key).await.ok()?;
+            match stored_leaf(&page, version) {
+                StoredLeaf::Inline(listed) => Some(listed),
+                _ => None,
+            }
+        }
+        StoredLeaf::Absent => None,
     }
 }
 
@@ -5384,6 +5451,24 @@ mod review_1233_findings {
         ctx.state.repo_index.invalidate("nuget");
     }
 
+    /// The stored registration of `testpkg` listing `versions` as listed leaves: the state a
+    /// registration index leaves behind, which the leaf reads its `listed` from.
+    async fn store_registration(ctx: &crate::test_helpers::TestContext, versions: &[&str]) {
+        let items: Vec<_> = versions
+            .iter()
+            .map(|v| serde_json::json!({ "catalogEntry": { "version": v, "listed": true } }))
+            .collect();
+        let doc = serde_json::json!({ "count": items.len(), "items": items });
+        ctx.state
+            .storage
+            .put(
+                "nuget/registration/testpkg/index.json",
+                serde_json::to_vec(&doc).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+    }
+
     /// F3: `?id=` on the autocomplete resource enumerates the versions of that package.
     #[tokio::test]
     async fn f3_autocomplete_by_id_enumerates_versions() {
@@ -5418,6 +5503,7 @@ mod review_1233_findings {
             cfg.server.public_url = Some("http://nora.example".to_string());
         });
         seed(&ctx, "testpkg", &["1.0.0", "2.0.0"]).await;
+        store_registration(&ctx, &["1.0.0", "2.0.0"]).await;
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=testpkg", "").await;
         let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         let id = json["data"][0]["versions"][0]["@id"]
@@ -5468,6 +5554,7 @@ mod review_1233_findings {
             cfg.server.public_url = Some("http://nora.example".to_string());
         });
         seed(&ctx, "testpkg", &["1.0.0"]).await;
+        store_registration(&ctx, &["1.0.0"]).await;
         let resp = send(
             &ctx.app,
             Method::GET,
@@ -5788,5 +5875,195 @@ mod review_1233_second_pass {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+/// Third pass over #1233 (review of f8a5d87): the leaf's `listed` comes from the registration
+/// NORA has stored or the upstream's leaf, not from the flatcontainer index; a stored registration
+/// serves its leaf without the flatcontainer index or the proxy.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_1233_third_pass {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A stored registration index with one version inline in a page, as the upstream writes it.
+    fn stored_registration(version: &str, listed: bool) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "count": 1,
+            "items": [{
+                "@id": "https://api.nuget.org/v3/registration5-gz-semver2/testpkg/index.json#page",
+                "count": 1,
+                "lower": version,
+                "upper": version,
+                "items": [{
+                    "@id": format!("https://api.nuget.org/v3/registration5-gz-semver2/testpkg/{version}.json"),
+                    "catalogEntry": {
+                        "@id": "https://api.nuget.org/v3/catalog0/data/x.json",
+                        "id": "testpkg",
+                        "version": version,
+                        "listed": listed
+                    },
+                    "packageContent": format!("https://api.nuget.org/v3-flatcontainer/testpkg/{version}/testpkg.{version}.nupkg"),
+                    "registration": "https://api.nuget.org/v3/registration5-gz-semver2/testpkg/index.json"
+                }]
+            }]
+        }))
+        .unwrap()
+    }
+
+    async fn put_flatcontainer(
+        ctx: &crate::test_helpers::TestContext,
+        id: &str,
+        versions: &[&str],
+    ) {
+        let index = serde_json::json!({ "versions": versions });
+        ctx.state
+            .storage
+            .put(
+                &format!("nuget/flatcontainer/{id}/index.json"),
+                serde_json::to_vec(&index).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        for ver in versions {
+            ctx.state
+                .storage
+                .put(
+                    &format!("nuget/flatcontainer/{id}/{ver}/{id}.{ver}.nupkg"),
+                    b"fake-nupkg",
+                )
+                .await
+                .unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+    }
+
+    async fn put_stored_registration(
+        ctx: &crate::test_helpers::TestContext,
+        version: &str,
+        listed: bool,
+    ) {
+        ctx.state
+            .storage
+            .put(
+                "nuget/registration/testpkg/index.json",
+                &stored_registration(version, listed),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn leaf(
+        ctx: &crate::test_helpers::TestContext,
+        version: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/nuget/v3/registration/testpkg/{version}.json"),
+            "",
+        )
+        .await;
+        let status = resp.status();
+        let json =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// Finding 1, stored registration: the flatcontainer index is warm and the stored registration
+    /// says 1.0.0 is unlisted — the leaf says so, and the upstream is not asked.
+    #[tokio::test]
+    async fn t3_f1_stored_unlisted_version_is_not_listed() {
+        let upstream = MockServer::start().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        put_flatcontainer(&ctx, "testpkg", &["1.0.0"]).await;
+        put_stored_registration(&ctx, "1.0.0", false).await;
+        let (status, json) = leaf(&ctx, "1.0.0").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["listed"], false, "{json}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            0
+        );
+    }
+
+    /// Finding 1, upstream leaf: the flatcontainer index is warm but nothing is stored; the leaf is
+    /// the upstream's, so an unlisted version stays unlisted.
+    #[tokio::test]
+    async fn t3_f1_upstream_unlisted_version_after_warm_flatcontainer() {
+        let upstream = MockServer::start().await;
+        let up = upstream.uri();
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "@id": format!("{up}/v3/registration5-gz-semver2/testpkg/1.0.0.json"),
+                "listed": false,
+                "packageContent": format!("{up}/v3-flatcontainer/testpkg/1.0.0/testpkg.1.0.0.nupkg"),
+                "registration": format!("{up}/v3/registration5-gz-semver2/testpkg/index.json"),
+            })))
+            .mount(&upstream)
+            .await;
+        let uri = up.clone();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        put_flatcontainer(&ctx, "testpkg", &["1.0.0"]).await;
+        let (status, json) = leaf(&ctx, "1.0.0").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["listed"], false, "{json}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            1
+        );
+    }
+
+    /// Finding 2: a stored registration with no flatcontainer index and no proxy serves its leaf.
+    #[tokio::test]
+    async fn t3_f2_stored_registration_serves_leaf_without_flatcontainer_or_proxy() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        put_stored_registration(&ctx, "1.0.0", true).await;
+        let (status, json) = leaf(&ctx, "1.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["listed"], true);
+        assert_eq!(
+            json["@id"],
+            "http://nora.example/nuget/v3/registration/testpkg/1.0.0.json"
+        );
+    }
+
+    /// Finding 2 for an internal package: the stored registration serves the leaf, the upstream
+    /// is never asked.
+    #[tokio::test]
+    async fn t3_f2_internal_stored_registration_serves_leaf_without_upstream() {
+        let upstream = MockServer::start().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["testpkg*".to_string()];
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        put_stored_registration(&ctx, "1.0.0", true).await;
+        let (status, json) = leaf(&ctx, "1.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["listed"], true);
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            0
+        );
     }
 }
