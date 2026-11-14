@@ -732,6 +732,10 @@ struct Faults {
     reads: Vec<(String, ReadFault)>,
     /// Prefixes whose listings fail.
     listings: Vec<String>,
+    /// Key suffixes whose writes fail.
+    writes: Vec<String>,
+    /// Key suffixes `stat` cannot answer for.
+    stats: Vec<String>,
 }
 
 /// How the read of a key fails.
@@ -794,6 +798,18 @@ impl StorageOutage {
         self.faults().listings.push(prefix.to_string());
     }
 
+    /// Fail the writes of the keys ending with `suffix` with a network error; other writes and
+    /// every read answer.
+    pub fn fail_writes_of(&self, suffix: &str) {
+        self.faults().writes.push(suffix.to_string());
+    }
+
+    /// Make `stat` of the keys ending with `suffix` find nothing, as a backend that cannot ask
+    /// the store answers; other keys and every read answer.
+    pub fn fail_stats_of(&self, suffix: &str) {
+        self.faults().stats.push(suffix.to_string());
+    }
+
     /// Bring the store back and clear every fault: operations waiting on a silent store go on,
     /// and every later one is answered.
     pub fn end(&self) {
@@ -815,6 +831,22 @@ impl StorageOutage {
         while self.mode() == STORE_SILENT {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+    }
+
+    /// Whether a write of `key` fails now.
+    fn write_fails(&self, key: &str) -> bool {
+        self.faults()
+            .writes
+            .iter()
+            .any(|suffix| key.ends_with(suffix.as_str()))
+    }
+
+    /// Whether `stat` of `key` fails now.
+    fn stat_fails(&self, key: &str) -> bool {
+        self.faults()
+            .stats
+            .iter()
+            .any(|suffix| key.ends_with(suffix.as_str()))
     }
 
     /// Whether a listing of `prefix` fails now.
@@ -883,6 +915,9 @@ impl crate::storage::StorageBackend for OutageBackend {
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
         self.outage.wait_answer().await;
         self.check()?;
+        if self.outage.write_fails(key) {
+            return Err(network_error());
+        }
         self.inner.put(key, data, sha256).await
     }
 
@@ -924,6 +959,9 @@ impl crate::storage::StorageBackend for OutageBackend {
     async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
         self.outage.wait_answer().await;
         self.check().ok()?;
+        if self.outage.stat_fails(key) {
+            return None;
+        }
         self.inner.stat(key).await
     }
 
