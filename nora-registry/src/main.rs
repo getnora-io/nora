@@ -3075,6 +3075,7 @@ mod rate_limited_routes_tests {
             (RegistryType::Rpm, "/rpm/x/x.html"),
             (RegistryType::Deb, "/deb/x/x.html"),
             (RegistryType::Cpan, "/cpan/modules/03modlist.data.gz"),
+            (RegistryType::Composer, "/composer/packages.json"),
             (RegistryType::HuggingFace, "/hf/api/models/x/y"),
         ];
         let covered: std::collections::HashSet<_> = routes.iter().map(|(rt, _)| *rt).collect();
@@ -5243,6 +5244,9 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
             RegistryType::Rpm => registry_routes = registry_routes.merge(registry::rpm_routes()),
             RegistryType::Deb => registry_routes = registry_routes.merge(registry::deb_routes()),
             RegistryType::Cpan => registry_routes = registry_routes.merge(registry::cpan_routes()),
+            RegistryType::Composer => {
+                registry_routes = registry_routes.merge(registry::composer_routes())
+            }
             RegistryType::HuggingFace => {
                 tracing::info!(
                     "Hugging Face proxy enabled: public models only (datasets answer 501), \

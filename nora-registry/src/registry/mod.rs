@@ -5,6 +5,7 @@
 
 pub(crate) mod ansible;
 mod cargo_registry;
+pub(crate) mod composer;
 mod conan;
 pub(crate) mod cpan;
 pub(crate) mod deb;
@@ -31,6 +32,7 @@ pub use ansible::routes as ansible_routes;
 pub(crate) use cargo_registry::canonical_crate_name;
 pub use cargo_registry::rebuild_crate_name_records as rebuild_cargo_name_records;
 pub use cargo_registry::routes as cargo_routes;
+pub use composer::routes as composer_routes;
 pub use conan::routes as conan_routes;
 pub use cpan::routes as cpan_routes;
 pub use deb::routes as deb_routes;
@@ -3848,6 +3850,11 @@ mod curation_label_whitelist {
             "cargo_registry.rs",
             RegistryType::Cargo,
             include_str!("cargo_registry.rs"),
+        ),
+        (
+            "composer.rs",
+            RegistryType::Composer,
+            include_str!("composer.rs"),
         ),
         ("conan.rs", RegistryType::Conan, include_str!("conan.rs")),
         ("cpan.rs", RegistryType::Cpan, include_str!("cpan.rs")),
