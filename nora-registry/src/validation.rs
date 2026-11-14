@@ -90,6 +90,8 @@ const MAX_REFERENCE_LENGTH: usize = 128;
 /// - Leading `/` or `\` (absolute paths)
 /// - Null bytes
 /// - Empty segments
+/// - Control bytes (`\t`, `\n`, `\r`, …) and the URL delimiters `?` and `#`: a key becomes an
+///   upstream URL, and the URL parser drops or cuts at them
 pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
     if key.is_empty() {
         return Err(ValidationError::EmptyInput);
@@ -110,6 +112,16 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
     // Check for null bytes
     if key.contains('\0') {
         return Err(ValidationError::ForbiddenCharacter('\0'));
+    }
+
+    // Control bytes and the URL delimiters `?` / `#`. A key goes on into an upstream URL, and
+    // the URL parser drops `\t\n\r` and ends the path at `?` or `#`: `ev%09il` would reach the
+    // upstream as `evil`, and curation (which saw `ev\til`) would not match a rule for `evil`.
+    if let Some(ch) = key
+        .chars()
+        .find(|c| c.is_ascii_control() || matches!(c, '?' | '#'))
+    {
+        return Err(ValidationError::ForbiddenCharacter(ch));
     }
 
     // The local backend's staging directory: a start deletes what dead instances
@@ -693,6 +705,41 @@ mod tests {
         // ASCII-only paths remain valid
         assert!(validate_storage_key("maven/com/example/1.0/file.jar").is_ok());
         assert!(validate_storage_key("raw/file-name_v2.0.tar.gz").is_ok());
+    }
+
+    /// A control byte, `?` or `#` is dropped or cut by the URL parser of the upstream URL built
+    /// from the key: refused, whatever the format (the handlers refuse them first, too).
+    #[test]
+    fn test_storage_key_url_delimiters_and_control_bytes() {
+        for key in [
+            "npm/ev\til/-/x.tgz",
+            "maven/com/ev\nil/x.jar",
+            "go/example.com/ev\ril/@v/v1.zip",
+            "pypi/evil/ev\x7fil.tar.gz",
+            "npm/evil?x",
+            "go/example.com/evil#x",
+            "cargo/evil/1.0\x00",
+        ] {
+            assert!(validate_storage_key(key).is_err(), "{key:?} accepted");
+        }
+        assert!(matches!(
+            validate_storage_key("npm/ev\til/-/x.tgz"),
+            Err(ValidationError::ForbiddenCharacter('\t'))
+        ));
+        assert!(matches!(
+            validate_storage_key("npm/evil?x"),
+            Err(ValidationError::ForbiddenCharacter('?'))
+        ));
+        // Legitimate keys of each format keep their characters.
+        for key in [
+            "npm/@scope/pkg/-/pkg-1.0.0+build.5.tgz",
+            "go/github.com/!azure/sdk/@v/v2.0.0+incompatible.zip",
+            "pypi/my-pkg/My_Pkg-1.0-py3-none-any.whl",
+            "cpan/authors/id/F/FO/FOO/Foo-Bar-1.00_01.tar.gz",
+            "nuget/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
+        ] {
+            assert!(validate_storage_key(key).is_ok(), "{key:?} refused");
+        }
     }
 
     #[test]
