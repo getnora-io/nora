@@ -51,7 +51,8 @@ fn registry_of(key: &str) -> &str {
 
 /// Breaker keys whose `nora_circuit_breaker_state` series is exported at
 /// startup (#441): one per configured upstream for the formats keyed per
-/// upstream (Docker, PyPI, npm, Maven, Composer), the format name for every other format. A format
+/// upstream (Docker, PyPI, npm, Maven, Composer), the format name for every other format, and for
+/// NuGet also its search and autocomplete hosts. A format
 /// keyed per upstream gets no format-named series — it would sit at 0 (closed)
 /// forever while the real state moves on the per-upstream series.
 pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> {
@@ -93,6 +94,13 @@ pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> 
                     .iter()
                     .map(|up| upstream_key(rt.as_str(), up.url())),
             ),
+            // The package source under the format's key, search and autocomplete under the
+            // keys of their own hosts.
+            RegistryType::Nuget => keys.extend([
+                rt.as_str().to_string(),
+                upstream_key(rt.as_str(), &config.nuget.search_service),
+                upstream_key(rt.as_str(), &config.nuget.autocomplete),
+            ]),
             _ => keys.push(rt.as_str().to_string()),
         }
     }
@@ -1208,6 +1216,14 @@ mod tests {
             keys.contains(&"cargo".to_string()),
             "formats without per-upstream keys"
         );
+        // NuGet: the package source under the format, search and autocomplete apart.
+        for key in [
+            "nuget",
+            "nuget:https://azuresearch-usnc.nuget.org/query",
+            "nuget:https://azuresearch-usnc.nuget.org/autocomplete",
+        ] {
+            assert!(keys.contains(&key.to_string()), "{key}: {keys:?}");
+        }
         assert!(
             !keys.iter().any(|k| k == "pypi"
                 || k == "docker"
