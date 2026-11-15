@@ -139,6 +139,7 @@ mod repo_proxy_tests {
 
 mod ansible;
 mod cargo;
+mod composer;
 mod conan;
 mod cpan;
 mod deb;
@@ -157,6 +158,8 @@ mod terraform;
 
 pub use self::ansible::AnsibleConfig;
 pub use self::cargo::CargoConfig;
+#[allow(unused_imports)]
+pub use self::composer::{ComposerConfig, ComposerProxy, ComposerProxyEntry};
 pub use self::conan::ConanConfig;
 pub use self::cpan::CpanConfig;
 pub use self::deb::DebConfig;

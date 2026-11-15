@@ -55,6 +55,7 @@ pub fn imported_since(rt: RegistryType) -> u32 {
         | RegistryType::Rpm
         | RegistryType::Deb
         | RegistryType::Cpan
+        | RegistryType::Composer
         | RegistryType::HuggingFace => 1,
     }
 }
@@ -84,6 +85,7 @@ pub fn compat(rt: RegistryType) -> Compat {
         | RegistryType::Rpm
         | RegistryType::Deb
         | RegistryType::Cpan
+        | RegistryType::Composer
         | RegistryType::HuggingFace => Compat::Unsupported,
     }
 }
@@ -108,6 +110,7 @@ pub fn note(rt: RegistryType) -> &'static str {
         | RegistryType::Rpm
         | RegistryType::Deb
         | RegistryType::Cpan
+        | RegistryType::Composer
         | RegistryType::HuggingFace => "no NORA import layout — will be skipped",
     }
 }
@@ -182,6 +185,7 @@ pub(super) fn action(rt: RegistryType, under: UnderKey) -> Action {
         | RegistryType::Rpm
         | RegistryType::Deb
         | RegistryType::Cpan
+        | RegistryType::Composer
         | RegistryType::HuggingFace => Transfer,
     }
 }
@@ -221,6 +225,7 @@ pub(super) fn own_by(rt: RegistryType, key: &str) -> Own {
         | RegistryType::Rpm
         | RegistryType::Deb
         | RegistryType::Cpan
+        | RegistryType::Composer
         | RegistryType::HuggingFace => Own::Unknown,
     }
 }
@@ -287,6 +292,7 @@ pub fn map_artifact(rt: RegistryType, art: &ArtifactRef) -> Mapping {
         | RegistryType::Rpm
         | RegistryType::Deb
         | RegistryType::Cpan
+        | RegistryType::Composer
         | RegistryType::HuggingFace => return Mapping::Skip("format not hosted by NORA import"),
     };
 
@@ -442,6 +448,7 @@ mod tests {
             (R::Rpm, [Transfer, Transfer, Transfer, Transfer]),
             (R::Deb, [Transfer, Transfer, Transfer, Transfer]),
             (R::Cpan, [Transfer, Transfer, Transfer, Transfer]),
+            (R::Composer, [Transfer, Transfer, Transfer, Transfer]),
             (R::HuggingFace, [Transfer, Transfer, Transfer, Transfer]),
         ];
         let states = [
@@ -539,6 +546,7 @@ mod tests {
             (R::Rpm, Unsupported, 1, false),
             (R::Deb, Unsupported, 1, false),
             (R::Cpan, Unsupported, 1, false),
+            (R::Composer, Unsupported, 1, false),
             (R::HuggingFace, Unsupported, 1, false),
         ];
         let rows: Vec<RegistryType> = table.iter().map(|row| row.0).collect();

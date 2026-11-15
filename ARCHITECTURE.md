@@ -55,7 +55,7 @@ plugin runtime. The filesystem (or S3) is the only source of truth.
           │                           │                           │
    ┌──────▼──────┐           ┌───────▼───────┐          ┌───────▼───────┐
    │   Docker    │           │     Maven     │   ...    │    Debian     │
-   │  /v2/*      │           │  /maven2/*    │  (x17)   │    /deb/*     │
+   │  /v2/*      │           │  /maven2/*    │  (x18)   │    /deb/*     │
    └──────┬──────┘           └───────┬───────┘          └───────┬───────┘
           │                           │                           │
           └───────────────────────────┼───────────────────────────┘
@@ -155,6 +155,7 @@ nora/
 │   │   ├── pub_dart.rs      #   Pub (Dart/Flutter)
 │   │   ├── conan.rs         #   Conan v2 (revisions API)
 │   │   ├── cpan.rs          #   CPAN (Perl Archive)
+│   │   ├── composer.rs      #   Composer (PHP): hosted + caching proxy (Composer 2 `p2` metadata)
 │   │   ├── rpm.rs           #   RPM hosted repos (server-generated repodata)
 │   │   ├── deb.rs           #   Debian/APT flat repos (server-generated indexes)
 │   │   ├── hf.rs            #   Hugging Face Hub models (caching proxy, opt-in)
@@ -239,7 +240,7 @@ is available to handlers.
 
 ### ADR-1: Single Binary
 
-**Decision:** NORA ships as one statically-linked binary. All 17 registry
+**Decision:** NORA ships as one statically-linked binary. All 18 registry
 handlers, the UI, the curation engine, and the CLI tools are compiled into
 a single executable.
 
@@ -370,14 +371,14 @@ consideration for the future.
 registries consume zero resources — no routes are mounted, no background
 tasks run.
 
-**Context:** With 17 formats available, most users need only 2-5.
+**Context:** With 18 formats available, most users need only 2-5.
 Mounting all routes unconditionally wastes memory and widens the attack
 surface.
 
 **Rationale:** The original 7 formats (Docker, Maven, npm, Cargo, PyPI,
-Go, Raw) default to enabled for backward compatibility. The 10 newer
-formats (RubyGems, Terraform, Ansible, NuGet, Pub, Conan, CPAN, RPM, Debian,
-Hugging Face) default to disabled; Hugging Face is not part of `all` either —
+Go, Raw) default to enabled for backward compatibility. The 11 newer
+formats (RubyGems, Terraform, Ansible, NuGet, Pub, Conan, CPAN, Composer, RPM,
+Debian, Hugging Face) default to disabled; Hugging Face is not part of `all` either —
 only named (`NORA_HF_ENABLED=true`). Any combination is valid — you can run
 NORA with only Docker and PyPI by setting `NORA_MAVEN_ENABLED=false`, `NORA_NPM_ENABLED=false`,
 etc. The `RegistryType::all()` iterator and `enabled_registries()` method
