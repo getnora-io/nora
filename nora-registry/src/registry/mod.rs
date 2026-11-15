@@ -1242,8 +1242,52 @@ pub(crate) async fn proxy_fetch_conditional(
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
+    conditional_fetch(
+        client,
+        url,
+        (timeout, auth, validators),
+        (cb, scope.into()),
+        false,
+    )
+    .await
+}
+
+/// [`proxy_fetch_conditional`] keeping what a 4xx other than "not found" says: a 401 or 403 is
+/// the upstream refusing NORA's credential, or asking for one (`CredentialsRefused`, #1196); a
+/// 429 is a rate limit (`RateLimited`, #1191), recorded so the upstream is not asked again
+/// before its `Retry-After`, and an upstream still inside such a window is not asked at all.
+/// For a format whose callers tell those apart from a missing document.
+pub(crate) async fn proxy_fetch_conditional_refusals(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    validators: &Validators,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<Revalidation, ProxyError> {
+    conditional_fetch(
+        client,
+        url,
+        (timeout, auth, validators),
+        (cb, scope.into()),
+        true,
+    )
+    .await
+}
+
+async fn conditional_fetch(
+    client: &reqwest::Client,
+    url: &str,
+    (timeout, auth, validators): (Duration, Option<UpstreamAuth<'_>>, &Validators),
+    (cb, scope): (&CircuitBreakerRegistry, BreakerScope<'_>),
+    refusals: bool,
+) -> Result<Revalidation, ProxyError> {
     let auth_header = upstream_auth_header(auth)?;
-    let cb_key = scope.into().key();
+    let cb_key = scope.key();
+    if refusals {
+        cb.rate_limits().check(&cb_key)?;
+    }
     let probe = cb.check(&cb_key)?;
 
     let mut request = client.get(url).timeout(timeout);
@@ -1292,6 +1336,18 @@ pub(crate) async fn proxy_fetch_conditional(
                 // 4xx — upstream alive; recover the breaker without clearing a
                 // real failure tally, consistent with proxy_fetch_core (#606).
                 cb.record_alive(&cb_key, probe);
+                if refusals {
+                    match code {
+                        401 | 403 => return Err(ProxyError::CredentialsRefused),
+                        429 => {
+                            let retry_after = response.headers().get(header::RETRY_AFTER);
+                            return Err(cb
+                                .rate_limits()
+                                .limited(&cb_key, retry_after.map(|v| v.as_bytes())));
+                        }
+                        _ => {}
+                    }
+                }
                 return Err(ProxyError::NotFound);
             }
             if status.is_redirection() {

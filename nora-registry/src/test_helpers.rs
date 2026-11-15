@@ -756,6 +756,38 @@ struct Faults {
     stats: Vec<String>,
     /// Key suffixes whose writes land but report a failure.
     landed_writes: Vec<String>,
+    /// Writes held at the store until released, each once.
+    held: Vec<WriteHold>,
+}
+
+/// A write [`StorageOutage::hold_write_of`] stops at the store, before anything is stored,
+/// until it is released: for a test that orders the writes of concurrent requests by the
+/// writes themselves, not by timing them.
+#[derive(Clone)]
+pub struct WriteHold {
+    suffix: String,
+    containing: Vec<u8>,
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl WriteHold {
+    /// Wait until the held write has reached the store.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Let the held write go on.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+
+    fn holds(&self, key: &str, data: &[u8]) -> bool {
+        key.ends_with(self.suffix.as_str())
+            && data
+                .windows(self.containing.len().max(1))
+                .any(|w| w == self.containing.as_slice())
+    }
 }
 
 /// How the read of a key fails.
@@ -835,6 +867,27 @@ impl StorageOutage {
     /// the store answers; other keys and every read answer.
     pub fn fail_stats_of(&self, suffix: &str) {
         self.faults().stats.push(suffix.to_string());
+    }
+
+    /// Hold the next write of a key ending with `suffix` whose bytes contain `containing`: it
+    /// waits at the store until [`WriteHold::release`], and [`WriteHold::reached`] tells the
+    /// test it is there. Other writes go on.
+    pub fn hold_write_of(&self, suffix: &str, containing: &[u8]) -> WriteHold {
+        let hold = WriteHold {
+            suffix: suffix.to_string(),
+            containing: containing.to_vec(),
+            reached: Arc::default(),
+            release: Arc::default(),
+        };
+        self.faults().held.push(hold.clone());
+        hold
+    }
+
+    /// The hold the write of `key` with `data` meets, taken so it holds once.
+    fn take_hold(&self, key: &str, data: &[u8]) -> Option<WriteHold> {
+        let mut faults = self.faults();
+        let at = faults.held.iter().position(|h| h.holds(key, data))?;
+        Some(faults.held.remove(at))
     }
 
     /// Bring the store back and clear every fault: operations waiting on a silent store go on,
@@ -962,6 +1015,10 @@ impl crate::storage::StorageBackend for OutageBackend {
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
         self.outage.wait_answer().await;
         self.check()?;
+        if let Some(hold) = self.outage.take_hold(key, data) {
+            hold.reached.notify_one();
+            hold.release.notified().await;
+        }
         if self.outage.write_fails(key) {
             return Err(network_error());
         }
