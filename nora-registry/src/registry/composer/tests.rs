@@ -918,7 +918,7 @@ async fn an_uploaded_package_is_listed_and_downloads_with_its_sha1() {
 
     let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/greeter.json", "").await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(resp.headers().contains_key(header::LAST_MODIFIED));
+    // Its date: a_hosted_listing_changed_within_its_second_is_never_a_304.
     let doc = json_of(resp).await;
     let versions = versions_of(&doc, "acme/greeter");
     let listed: Vec<&str> = versions
@@ -2788,4 +2788,79 @@ async fn a_document_whose_origin_was_not_stored_is_not_another_upstream_s() {
         "the archive went out under the other upstream's credential"
     );
     assert_eq!(&body_bytes(resp).await[..], ZIP_1);
+}
+
+// ── xhigh-7: a hosted listing changed within the second its date names ────────────────
+
+/// Two uploads within one second leave the listing's date at that second. A client given that
+/// date before the second upload would get a 304 for it and never see the new version, so a
+/// date the clock has not yet left is not given. A listing last changed in an earlier second
+/// keeps its date, and that date revalidates. (A date ahead of the clock stands for "this
+/// second", whatever second the test runs in.)
+#[tokio::test]
+async fn a_hosted_listing_changed_within_its_second_is_never_a_304() {
+    let ctx = hosted_ctx();
+    let key = hosted_document_key("acme/lib");
+    let file = std::path::Path::new(&ctx.state.config.storage.path).join(&key);
+    let date = |t: std::time::SystemTime| {
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(t)
+            .unwrap()
+    };
+    let p2 = "/composer/p2/acme/lib.json";
+    let this_second = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    assert_eq!(put_lib(&ctx, "1.0.0").await.status(), StatusCode::CREATED);
+    date(this_second);
+    let first = send(&ctx.app, Method::GET, p2, "").await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let given = first
+        .headers()
+        .get(header::LAST_MODIFIED)
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(put_lib(&ctx, "2.0.0").await.status(), StatusCode::CREATED);
+    date(this_second);
+    if let Some(given) = given {
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            p2,
+            vec![("if-modified-since", &given)],
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a 304 left the client without 2.0.0"
+        );
+    }
+    // An earlier second: the date is given, and it revalidates.
+    date(std::time::SystemTime::now() - std::time::Duration::from_secs(10));
+    let resp = send(&ctx.app, Method::GET, p2, "").await;
+    let given = resp.headers()[header::LAST_MODIFIED]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        p2,
+        vec![("if-modified-since", &given)],
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+}
+
+/// The boundary itself: the second a listing was written in gets no date, the one after does.
+#[test]
+fn a_hosted_listing_is_dated_once_the_clock_leaves_its_second() {
+    let t = 1_700_000_000;
+    assert_eq!(hosted_date(t, t), None);
+    assert_eq!(hosted_date(t + 5, t), None);
+    assert_eq!(hosted_date(t, t + 1), Some(t));
+    assert_eq!(hosted_date(t - 10, t), Some(t - 10));
 }

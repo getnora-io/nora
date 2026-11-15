@@ -1572,11 +1572,17 @@ async fn hosted_metadata(
         }
         Err(e) => return crate::registry::local_copy_unreadable(REGISTRY, &key, &e),
     };
+    // A date the clock has not left yet is not given: an upload later in the same second
+    // leaves it unchanged, and a client revalidating with it would get a 304 for a listing it
+    // does not have (Composer revalidates with `If-Modified-Since` alone). Without a date it
+    // asks for the listing again; the next answer, a second on, has one.
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
     let last_modified = state
         .storage
         .stat(&key)
         .await
-        .map(|m| http_date(m.modified));
+        .and_then(|m| hosted_date(m.modified, now))
+        .map(http_date);
     match rewrite_document(&body, name, base, true, Sources::Keep) {
         Some(body) => metadata_response(
             headers,
@@ -1590,6 +1596,12 @@ async fn hosted_metadata(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// The date a hosted listing last written at `modified` is given at `now`: none while the clock
+/// is still in that second, since an upload later in the same second would leave it unchanged.
+fn hosted_date(modified: u64, now: u64) -> Option<u64> {
+    (modified < now).then_some(modified)
 }
 
 /// A hosted package's p2 document, built from its version documents, newest first. Not
