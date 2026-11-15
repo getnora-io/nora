@@ -3012,6 +3012,99 @@ mod integration_tests {
         assert!(held(&body), "{body}");
     }
 
+    /// A page NORA's own packages fill asks the host once, for its total, and nothing more: a
+    /// run of entries NORA does not show at the start of a large host result does not make it
+    /// a page NORA cannot compose.
+    #[tokio::test]
+    async fn a_page_nora_own_packages_fill_reads_the_host_once() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let mut ids: Vec<&'static str> = (0..32)
+            .map(|n| &*Box::leak(format!("Internal.Lib{n:02}").into_boxed_str()))
+            .collect();
+        ids.extend((0..69).map(|n| &*Box::leak(format!("Lib{n:03}").into_boxed_str())));
+        let search = paging_search_host(Box::leak(ids.into_boxed_slice())).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/query?q=lib&skip=0&take=1",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let first = page["data"][0]["id"].as_str().map(str::to_lowercase);
+        assert_eq!(first.as_deref(), Some("corp.lib"), "{page}");
+        assert!(page["totalHits"].as_u64().unwrap() >= 70, "{page}");
+        let asked = search.received_requests().await.unwrap().len();
+        assert_eq!(asked, 1, "the host asked {asked} times for a full page");
+    }
+
+    /// After the host's first page, a request for more of its result that fails — a 429, a 404
+    /// — is the host unavailable, not the end of its result: 503, not an empty page.
+    #[tokio::test]
+    async fn a_failed_read_past_the_first_is_not_the_end_of_results() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        for code in [429, 404, 400] {
+            let search = MockServer::builder().start().await;
+            let entry = |id: &str| json!({ "id": id, "version": "9.9.9", "versions": [{ "version": "9.9.9" }] });
+            Mock::given(wiremock::matchers::query_param("skip", "0"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "totalHits": 3,
+                    "data": [entry("Internal.Lib")],
+                })))
+                .with_priority(1)
+                .mount(&search)
+                .await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(code))
+                .with_priority(2)
+                .mount(&search)
+                .await;
+            let uri = search.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = Some(uri.clone());
+                cfg.nuget.search_service = format!("{uri}/query");
+                cfg.nuget.serve_stale = false;
+                cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+            });
+            let status = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib&take=1", "")
+                .await
+                .status();
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "continuation {code}"
+            );
+            assert!(
+                search.received_requests().await.unwrap().len() >= 2,
+                "continuation {code}: not asked past the first page"
+            );
+        }
+    }
+
     /// When the records cannot be listed, which packages are NORA's own is not known: search
     /// answers 503 rather than show the list an upstream gave for the id, as the flat container
     /// does.

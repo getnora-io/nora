@@ -1965,9 +1965,10 @@ impl PageWindow {
     }
 
     /// How many of the host's entries NORA shows must be read for the page: those before it
-    /// and those on it, one at least (for the host's total).
+    /// and those on it. None when NORA's own packages fill the page; the host is still asked
+    /// once, for its total.
     fn upstream_need(&self) -> usize {
-        self.upstream_skip.saturating_add(self.upstream_room).max(1)
+        self.upstream_skip.saturating_add(self.upstream_room)
     }
 }
 
@@ -2094,11 +2095,10 @@ async fn read_search_host(
         .await
         {
             Ok(text) => rewrite_registration_urls(&text, &upstream, &base_url),
-            // Nothing past what was read.
-            Err(ProxyError::NotFound) if round > 0 => {
-                whole = true;
-                break;
-            }
+            // Past the first page, a failed read (any 4xx included, which proxy_fetch_text gives
+            // as NotFound) leaves the rest of the result unread: the host is unavailable, not
+            // at its end, which `totalHits` or a short page tells.
+            Err(ProxyError::NotFound) if round > 0 => return Err(ProxyError::Upstream(503)),
             Err(e) => return Err(e),
         };
         let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
