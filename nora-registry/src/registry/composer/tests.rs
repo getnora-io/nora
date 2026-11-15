@@ -2997,3 +2997,126 @@ async fn a_package_the_first_upstream_lacks_comes_from_the_next() {
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ── third review: a held archive keeps its age and stays reachable; one owner per package ─
+
+/// `dev-main` at `reference`, released at `time`, its archive `bytes`.
+async fn mount_dated_branch(up: &MockServer, reference: &str, time: &str, bytes: &[u8]) {
+    Mock::given(wm_path("/p2/acme/lib~dev.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages": {"acme/lib": [
+            {"name": "acme/lib", "version": "dev-main", "time": time,
+             "dist": {"type": "zip", "url": format!("{}/archives/main-{reference}.zip", up.uri()), "reference": reference}}
+        ]}})))
+        .mount(up)
+        .await;
+    Mock::given(wm_path(format!("/archives/main-{reference}.zip")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+        .mount(up)
+        .await;
+}
+
+/// A held archive is as old as it was when NORA fetched it. One fetched young (with the bypass
+/// token) is refused for its age after its branch moved on, as it was before; one fetched old
+/// is served.
+#[tokio::test]
+async fn a_held_archive_keeps_its_release_age() {
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string();
+    for (released, expected) in [
+        (now.as_str(), StatusCode::FORBIDDEN),
+        ("2020-01-01T00:00:00+00:00", StatusCode::OK),
+    ] {
+        let up = MockServer::start().await;
+        mount_root(&up).await;
+        mount_dated_branch(&up, "aaaa", released, ZIP_1).await;
+        let ctx = proxy_ctx(&up.uri(), |c| {
+            c.composer.metadata_ttl = 0;
+            c.server.trust_upstream_dates = true;
+            c.curation.mode = crate::config::CurationMode::Enforce;
+            c.curation.min_release_age = Some("7d".into());
+            c.curation.bypass_token = Some(crate::secrets::ProtectedString::from("let-me-in"));
+        });
+        let locked = "/composer/dists/acme/lib/dev-main/aaaa.zip";
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            locked,
+            vec![("x-nora-bypass-token", "let-me-in")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{released}: fetched");
+        assert_eq!(
+            send(&ctx.app, Method::GET, locked, "").await.status(),
+            expected,
+            "{released}: listed"
+        );
+        up.reset().await;
+        mount_root(&up).await;
+        mount_dated_branch(&up, "bbbb", "2020-01-01T00:00:00+00:00", b"PK\x03\x04 two").await;
+        assert_eq!(
+            send(&ctx.app, Method::GET, "/composer/p2/acme/lib~dev.json", "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&ctx.app, Method::GET, locked, "").await.status(),
+            expected,
+            "{released}: held after the branch moved"
+        );
+        // Without the record of its date, a held archive is young.
+        let record = first_seen_key(&proxied_dist_key("acme/lib", "dev-main", "aaaa", "zip"));
+        ctx.state.storage.delete(&record).await.unwrap();
+        assert_eq!(
+            send(&ctx.app, Method::GET, locked, "").await.status(),
+            StatusCode::FORBIDDEN,
+            "{released}: held without a recorded date"
+        );
+    }
+}
+
+/// A held archive does not depend on the metadata being reachable: the upstream down and
+/// stale metadata not served, the archive a lock file names is still served from the cache;
+/// a reference NORA never held is not.
+#[tokio::test]
+async fn a_held_archive_is_served_while_the_metadata_cannot_be_read() {
+    let up = MockServer::start().await;
+    mount_root(&up).await;
+    mount_branch(&up, "aaaa", ZIP_1).await;
+    let ctx = proxy_ctx(&up.uri(), |c| {
+        c.composer.metadata_ttl = 0;
+        c.composer.serve_stale = false;
+    });
+    let locked = "/composer/dists/acme/lib/dev-main/aaaa.zip";
+    assert_eq!(
+        send(&ctx.app, Method::GET, locked, "").await.status(),
+        StatusCode::OK
+    );
+    up.reset().await;
+    mount_root(&up).await;
+    mount_branch(&up, "bbbb", b"PK\x03\x04 two").await;
+    assert_eq!(
+        send(&ctx.app, Method::GET, "/composer/p2/acme/lib~dev.json", "")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    up.reset().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&up)
+        .await;
+    let resp = send(&ctx.app, Method::GET, locked, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(resp).await[..], ZIP_1);
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/dev-main/cccc.zip",
+        "",
+    )
+    .await;
+    assert_ne!(resp.status(), StatusCode::OK);
+}

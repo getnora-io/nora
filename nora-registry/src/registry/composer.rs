@@ -1774,6 +1774,19 @@ async fn listed_dist(
     Err(miss.unwrap_or_else(|| StatusCode::NOT_FOUND.into_response()))
 }
 
+/// Where the release date a cached archive was served under is kept: beside the first-seen
+/// ledgers, under the internal prefix no listing, retention or GC walk of `composer/` reaches
+/// (a key beside the archive would be counted as one).
+fn archive_date_key(archive_key: &str) -> String {
+    first_seen_key(archive_key)
+}
+
+/// The release date the archive at `key` was served under when NORA fetched it.
+async fn held_date(state: &AppState, key: &str) -> Option<i64> {
+    let bytes = state.storage.get(&archive_date_key(key)).await.ok()?;
+    std::str::from_utf8(&bytes).ok()?.trim().parse().ok()
+}
+
 /// An archive NORA holds under a URL the metadata no longer lists: a branch that moved on, or a
 /// tag pointed elsewhere, since a lock file recorded the URL (Composer installs from the URL
 /// and reference it locked). The URL names one reference, so what is stored under it is what
@@ -1864,8 +1877,9 @@ async fn download_dist(
     };
     let (listed, origin, metadata_key) = match found {
         Ok(found) => found,
-        // Not listed any more, but held: a lock file names it (a branch moved on since).
-        Err(response) if !internal && response.status() == StatusCode::NOT_FOUND => {
+        // Not listed any more (a branch moved on since a lock file named it), or the metadata
+        // cannot be read now: an archive NORA holds is still served from the cache.
+        Err(response) if !internal => {
             match held_archive(&state, &name, &segment, token, ext).await {
                 Some((listed, metadata_key)) => (listed, String::new(), metadata_key),
                 None => return response,
@@ -1873,10 +1887,18 @@ async fn download_dist(
         }
         Err(response) => return response,
     };
+    let key = proxied_dist_key(&name, &segment, token, ext);
     // Without trusted dates a release is as old as NORA's first sight of it in a listing: the
     // document's mtime restarts at every revalidation, so a client that asks more often than
-    // the minimum age would never see its release mature.
-    let publish_date = if state.config.server.trust_upstream_dates {
+    // the minimum age would never see its release mature. A held archive no listing names any
+    // more is as old as it was when NORA fetched it; without that record, young.
+    let publish_date = if listed.url.is_empty() {
+        Some(
+            held_date(&state, &key)
+                .await
+                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        )
+    } else if state.config.server.trust_upstream_dates {
         listed
             .time
             .as_deref()
@@ -1920,7 +1942,6 @@ async fn download_dist(
         publish_date,
     );
     let display = format!("{name}@{}", listed.version);
-    let key = proxied_dist_key(&name, &segment, token, ext);
 
     let (cached, _) = crate::registry::cached_read(state.storage.get_verified(&key).await);
     let cached = match cached {
@@ -2045,12 +2066,24 @@ async fn download_dist(
     let hash = hex::encode(sha2::Sha256::digest(&data));
     if let Err(e) = state.storage.put(&key, &data).await {
         tracing::warn!(registry = REGISTRY, key, error = %e, "failed to cache archive");
-    } else if let Err(e) = state
-        .storage
-        .put(&format!("{key}.sha256"), hash.as_bytes())
-        .await
-    {
-        tracing::warn!(registry = REGISTRY, key, error = %e, "failed to store archive digest");
+    } else {
+        if let Err(e) = state
+            .storage
+            .put(&format!("{key}.sha256"), hash.as_bytes())
+            .await
+        {
+            tracing::warn!(registry = REGISTRY, key, error = %e, "failed to store archive digest");
+        }
+        // The date it is served under, for when no listing names it any more.
+        if let Some(date) = publish_date {
+            if let Err(e) = state
+                .storage
+                .put(&archive_date_key(&key), date.to_string().as_bytes())
+                .await
+            {
+                tracing::warn!(registry = REGISTRY, key, error = %e, "failed to record the archive's release date");
+            }
+        }
     }
     state.repo_index.invalidate(REGISTRY);
     state.metrics.record_download(REGISTRY);
