@@ -1157,6 +1157,16 @@ async fn upstream_has(
     )
     .await
     {
+        // An answer that is not Composer metadata (a sign-in page) is a failure, as it is for
+        // the document asked for: it says nothing of the package.
+        Ok(Revalidation::Modified { body, .. }) if !is_metadata_document(&body) => {
+            tracing::warn!(
+                registry = REGISTRY,
+                url,
+                "upstream answered with something that is not Composer metadata"
+            );
+            Err(ProxyError::Network("not Composer metadata".into()))
+        }
         Ok(Revalidation::Modified { body, .. }) => Ok(names_package(&body, name)),
         Ok(Revalidation::NotModified) => Err(ProxyError::Upstream(304)),
         Err(ProxyError::NotFound) => Ok(false),
@@ -1351,10 +1361,14 @@ async fn upstream_document(
                 if !matches!(e, ProxyError::NotFound) {
                     break;
                 }
-                // An upstream without this document that has the package's other one has the
-                // package: Composer finds a package in a repository by either document and asks
-                // no later repository for it, so no later upstream answers for this one.
+                // An upstream without this document that has the package has it all: Composer
+                // finds a package in a repository by either document and asks no later
+                // repository for it, so no later upstream answers for this one. A copy of this
+                // very document it served says so, past its TTL too; else its other document.
                 if matches!(e, ProxyError::NotFound) && i + 1 < upstreams.len() {
+                    if from_here.is_some_and(|c| names_package(&c.body, name)) {
+                        break;
+                    }
                     match upstream_has(state, up, &root, name, !dev).await {
                         Ok(true) => break,
                         Ok(false) => {}

@@ -2948,6 +2948,19 @@ async fn a_failed_upstream_is_not_skipped_for_a_later_one() {
                 answers("/p2/acme/lib~dev.json", ResponseTemplate::new(503)),
             ]
         }),
+        (
+            "other document not metadata",
+            StatusCode::BAD_GATEWAY,
+            || {
+                vec![
+                    answers("/p2/acme/lib.json", ResponseTemplate::new(404)),
+                    answers(
+                        "/p2/acme/lib~dev.json",
+                        ResponseTemplate::new(200).set_body_string("<html>sign in</html>"),
+                    ),
+                ]
+            },
+        ),
     ];
     for (failure, expected, mount) in failures {
         let (_private, public, ctx) = private_before_public(|_| mount()).await;
@@ -3181,6 +3194,70 @@ async fn a_stale_copy_of_the_other_document_keeps_the_package_its_upstream_s() {
     let resp = send(&ctx.app, Method::GET, releases, "").await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()["x-nora-stale"], "true");
+    let asked = upstream_paths(&public).await;
+    assert!(!asked.iter().any(|p| p.contains("acme/lib")), "{asked:?}");
+}
+
+/// The copy of the very document asked for, past its TTL, keeps the package its upstream's
+/// too. The private upstream served the releases (cached, now stale) and answers 404 for both
+/// documents: the releases are its answer — none — not the public upstream's package.
+#[tokio::test]
+async fn a_stale_copy_of_the_document_asked_for_keeps_the_package_its_upstream_s() {
+    let private = MockServer::start().await;
+    mount_root(&private).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &private.uri(),
+            "1.0.0",
+            "privaterel",
+        )))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&private)
+        .await;
+    Mock::given(wm_path_regex("^/p2/acme/lib"))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(2)
+        .mount(&private)
+        .await;
+    let public = MockServer::start().await;
+    mount_root(&public).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &public.uri(),
+            "6.6.6",
+            "publicrel",
+        )))
+        .mount(&public)
+        .await;
+    let (a, b) = (private.uri(), public.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.metadata_ttl = 0;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    let releases = "/composer/p2/acme/lib.json";
+    assert_eq!(
+        send(&ctx.app, Method::GET, releases, "").await.status(),
+        StatusCode::OK
+    );
+    let resp = send(&ctx.app, Method::GET, releases, "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the releases are the private upstream's answer"
+    );
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/6.6.6/publicrel.zip",
+        "",
+    )
+    .await;
+    assert_ne!(resp.status(), StatusCode::OK);
     let asked = upstream_paths(&public).await;
     assert!(!asked.iter().any(|p| p.contains("acme/lib")), "{asked:?}");
 }
