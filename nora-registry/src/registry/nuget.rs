@@ -38,6 +38,9 @@ use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";
 const SEARCH_TIMEOUT_SECS: u64 = 5;
+/// The most entries a search or autocomplete page holds, whatever `take` asks: nuget.org's limit
+/// (it answers a larger `take` with its default page, measured 15.11.2026).
+const SEARCH_TAKE_MAX: usize = 1000;
 const DEFAULT_SEARCH: &str = "https://azuresearch-usnc.nuget.org/query";
 const DEFAULT_AUTOCOMPLETE: &str = "https://azuresearch-usnc.nuget.org/autocomplete";
 
@@ -230,7 +233,7 @@ async fn search_query(
 ) -> Response {
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
-    let take = params.take.unwrap_or(20);
+    let take = params.take.unwrap_or(20).min(SEARCH_TAKE_MAX);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
 
@@ -281,30 +284,23 @@ async fn search_query(
 
     // Try upstream with short timeout (UX-critical path)
     let qs = raw_query.0.unwrap_or_default();
-    let url = format!(
-        "{}?{}",
-        state.config.nuget.search_service,
-        with_page(&qs, window.upstream_skip, window.upstream_take)
-    );
 
-    match proxy_fetch_text(
-        &state.http_client,
-        &url,
-        Duration::from_secs(SEARCH_TIMEOUT_SECS),
-        None, // search endpoint is public
-        None,
-        &state.circuit_breaker,
-        // Its own breaker: the search host is not the package source, and its failures
-        // must not stop restore (nor the reverse).
-        BreakerScope::upstream(RegistryType::Nuget, &state.config.nuget.search_service),
+    let need = window.upstream_need();
+    match read_search_host(
+        &state,
+        HostResource::Search,
+        &hosted,
+        &own,
+        &qs,
+        need,
+        shown,
     )
     .await
     {
-        Ok(text) => {
-            let base_url = nora_base_url(&state);
-            let upstream = rewrite_host(&state);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            let merged = merge_search_page(&state, &hosted, &own, rewritten, window, shown).await;
+        Ok(host) => {
+            let Some(merged) = merge_search_page(&own, host, window) else {
+                return page_too_deep();
+            };
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -317,8 +313,8 @@ async fn search_query(
         }
         Err(ProxyError::NotFound) => {
             // The host knows nothing of the query: NORA's own packages may still match.
-            let none = r#"{"totalHits":0,"data":[]}"#.to_string();
-            with_json(merge_search_page(&state, &hosted, &own, none, window, shown).await)
+            let merged = merge_search_page(&own, HostRead::nothing(), window);
+            merged.map_or_else(page_too_deep, with_json)
         }
         Err(
             e @ (ProxyError::CircuitOpen(_)
@@ -361,7 +357,7 @@ async fn autocomplete_query(
 ) -> Response {
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
-    let take = params.take.unwrap_or(20);
+    let take = params.take.unwrap_or(20).min(SEARCH_TAKE_MAX);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
     // An empty `?id=` is the package-ID form, not the versions form.
@@ -422,23 +418,53 @@ async fn autocomplete_query(
     }
 
     let qs = raw_query.0.unwrap_or_default();
-    let url = format!("{}?{}", state.config.nuget.autocomplete, qs);
-
-    match proxy_fetch_text(
-        &state.http_client,
-        &url,
-        Duration::from_secs(SEARCH_TIMEOUT_SECS),
-        None, // autocomplete endpoint is public
-        None,
-        &state.circuit_breaker,
-        BreakerScope::upstream(RegistryType::Nuget, &state.config.nuget.autocomplete),
-    )
-    .await
-    {
-        Ok(text) => {
+    let host = if id.is_some() {
+        // The versions form of an id NORA does not host: the host's answer as it is.
+        let url = format!("{}?{}", state.config.nuget.autocomplete, qs);
+        proxy_fetch_text(
+            &state.http_client,
+            &url,
+            Duration::from_secs(SEARCH_TIMEOUT_SECS),
+            None, // autocomplete endpoint is public
+            None,
+            &state.circuit_breaker,
+            BreakerScope::upstream(RegistryType::Nuget, &state.config.nuget.autocomplete),
+        )
+        .await
+        .map(|text| {
             let base_url = nora_base_url(&state);
-            let upstream = rewrite_host(&state);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
+            rewrite_registration_urls(&text, &rewrite_host(&state), &base_url).into_bytes()
+        })
+    } else {
+        // The package-id form: NORA's own ids first and the host's after them, as search.
+        let Some(hosted) = state.repo_index.nuget_hosted(&state.storage).await else {
+            return records_unavailable();
+        };
+        let shown = SearchFilter {
+            prerelease,
+            sem_ver_level: sem_ver_level.as_deref(),
+        };
+        let own: Vec<serde_json::Value> = own_matches(&state, &hosted, &query, shown)
+            .await
+            .into_iter()
+            .map(|entry| HostResource::Autocomplete.own_entry(entry))
+            .collect();
+        let window = PageWindow::new(skip, take, own.len());
+        let need = window.upstream_need();
+        let resource = HostResource::Autocomplete;
+        let read = match read_search_host(&state, resource, &hosted, &own, &qs, need, shown).await {
+            Err(ProxyError::NotFound) => Ok(HostRead::nothing()),
+            read => read,
+        };
+        match read.map(|read| merge_search_page(&own, read, window)) {
+            Ok(None) => return page_too_deep(),
+            Ok(Some(merged)) => Ok(merged),
+            Err(e) => Err(e),
+        }
+    };
+
+    match host {
+        Ok(merged) => {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -447,7 +473,7 @@ async fn autocomplete_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(rewritten.into_bytes())
+            with_json(merged)
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(
@@ -1916,10 +1942,9 @@ struct PageWindow {
     /// NORA's own packages on the page: `own[own_from..own_from + own_take]`.
     own_from: usize,
     own_take: usize,
-    /// What the host is asked for.
+    /// Where the page starts among the host's entries NORA shows, and how many of them it has
+    /// room for.
     upstream_skip: usize,
-    upstream_take: usize,
-    /// How many of the host's entries the page has room for.
     upstream_room: usize,
     /// NORA's own packages in all.
     own_total: usize,
@@ -1934,12 +1959,215 @@ impl PageWindow {
             own_from,
             own_take,
             upstream_skip: skip.saturating_sub(own_total),
-            // The host is asked for one entry at least, for its total.
-            upstream_take: upstream_room.max(1),
             upstream_room,
             own_total,
         }
     }
+
+    /// How many of the host's entries NORA shows must be read for the page: those before it
+    /// and those on it. None when NORA's own packages fill the page; the host is still asked
+    /// once, for its total.
+    fn upstream_need(&self) -> usize {
+        self.upstream_skip.saturating_add(self.upstream_room)
+    }
+}
+
+/// A host result of at most this many entries is read whole, on every page, so that
+/// `totalHits` counts exactly what the pages hold. Above it `totalHits` is NORA's own plus the
+/// host's total: never fewer than the pages hold, more by the host's entries NORA does not show.
+const SEARCH_HOST_READ_WHOLE: usize = 100;
+/// The most entries asked of the search host in one request (nuget.org's `take` limit), and the
+/// most requests one search makes.
+const SEARCH_HOST_TAKE_MAX: usize = 1000;
+const SEARCH_HOST_READS_MAX: usize = 6;
+
+/// Which host a merged search reads: search answers entries (objects with an `id`),
+/// autocomplete answers package ids.
+#[derive(Clone, Copy, PartialEq)]
+enum HostResource {
+    Search,
+    Autocomplete,
+}
+
+impl HostResource {
+    fn url(self, state: &AppState) -> &str {
+        match self {
+            HostResource::Search => &state.config.nuget.search_service,
+            HostResource::Autocomplete => &state.config.nuget.autocomplete,
+        }
+    }
+
+    fn id_of(self, entry: &serde_json::Value) -> Option<&str> {
+        match self {
+            HostResource::Search => entry["id"].as_str(),
+            HostResource::Autocomplete => entry.as_str(),
+        }
+    }
+
+    /// The entry NORA shows for its own package, from its search entry.
+    fn own_entry(self, search_entry: serde_json::Value) -> serde_json::Value {
+        match self {
+            HostResource::Search => search_entry,
+            HostResource::Autocomplete => search_entry["id"].clone(),
+        }
+    }
+}
+
+/// What a merged search read of the search host.
+enum HostRead {
+    /// The host's entries NORA shows, in the host's order from its first, as NORA shows them;
+    /// `total` is the host's part of `totalHits`; `envelope` is the host's result object.
+    Entries {
+        shown: Vec<serde_json::Value>,
+        total: u64,
+        envelope: serde_json::Value,
+    },
+    /// A host result that is not the search JSON, passed on as it is.
+    Verbatim(String),
+    /// The page lies deeper than NORA reads the host for: it cannot be told which entries are
+    /// on it, and a short or empty page would read as the end of the results.
+    TooDeep,
+}
+
+impl HostRead {
+    fn nothing() -> Self {
+        HostRead::Entries {
+            shown: Vec::new(),
+            total: 0,
+            envelope: serde_json::json!({ "totalHits": 0, "data": [] }),
+        }
+    }
+}
+
+/// Reads the search host's result from its first entry, as many entries as it takes to have
+/// `need` that NORA shows, and the whole result when it is small (see
+/// [`SEARCH_HOST_READ_WHOLE`]). An entry of the host whose id is NORA's own — hosted, or in an
+/// internal namespace — is never shown as the host has it: one NORA already shows among its own
+/// (`own`) is dropped, another is replaced by NORA's entry of it, or dropped when NORA holds
+/// none. A dropped entry takes no place: the page is cut from what NORA shows, so no page is
+/// empty or short before the end. A request after the first asks for twice what was read
+/// before it at least, so a run of dropped entries is read past; a page that
+/// [`SEARCH_HOST_READS_MAX`] requests do not reach is [`HostRead::TooDeep`]. The first
+/// request's failure is the search's; a later one fails the search too, since the page cannot
+/// be told without it.
+async fn read_search_host(
+    state: &AppState,
+    resource: HostResource,
+    hosted: &std::collections::HashMap<String, Vec<String>>,
+    own: &[serde_json::Value],
+    qs: &str,
+    need: usize,
+    shown: SearchFilter<'_>,
+) -> Result<HostRead, ProxyError> {
+    let packages = state.repo_index.get("nuget", &state.storage).await;
+    let engine = &state.curation().curation_engine;
+    let base_url = nora_base_url(state);
+    let upstream = rewrite_host(state);
+    let mut seen: std::collections::HashSet<String> = own
+        .iter()
+        .filter_map(|entry| resource.id_of(entry).map(str::to_lowercase))
+        .collect();
+    let mut kept: Vec<serde_json::Value> = Vec::new();
+    let mut envelope: Option<serde_json::Value> = None;
+    let (mut read, mut host_total, mut whole) = (0usize, 0usize, false);
+
+    for round in 0..SEARCH_HOST_READS_MAX {
+        let take = if round == 0 {
+            need
+        } else if host_total <= SEARCH_HOST_READ_WHOLE {
+            host_total - read
+        } else {
+            need.saturating_sub(kept.len()).max(read)
+        }
+        .clamp(1, SEARCH_HOST_TAKE_MAX);
+        let url = format!("{}?{}", resource.url(state), with_page(qs, read, take));
+        let text = match proxy_fetch_text(
+            &state.http_client,
+            &url,
+            Duration::from_secs(SEARCH_TIMEOUT_SECS),
+            None, // search and autocomplete endpoints are public
+            None,
+            &state.circuit_breaker,
+            // Its own breaker: the search host is not the package source, and its failures
+            // must not stop restore (nor the reverse).
+            BreakerScope::upstream(RegistryType::Nuget, resource.url(state)),
+        )
+        .await
+        {
+            Ok(text) => rewrite_registration_urls(&text, &upstream, &base_url),
+            // Past the first page, a failed read (any 4xx included, which proxy_fetch_text gives
+            // as NotFound) leaves the rest of the result unread: the host is unavailable, not
+            // at its end, which `totalHits` or a short page tells.
+            Err(ProxyError::NotFound) if round > 0 => return Err(ProxyError::Upstream(503)),
+            Err(e) => return Err(e),
+        };
+        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+        let Some((mut result, entries)) = parsed.and_then(|mut result| {
+            let entries = result
+                .get_mut("data")
+                .and_then(|data| data.as_array_mut())
+                .map(std::mem::take)?;
+            Some((result, entries))
+        }) else {
+            if round == 0 {
+                return Ok(HostRead::Verbatim(text));
+            }
+            return Err(ProxyError::Upstream(502));
+        };
+        if round == 0 {
+            let total = result["totalHits"].as_u64().unwrap_or(0);
+            host_total = usize::try_from(total).unwrap_or(usize::MAX);
+        }
+        let got = entries.len();
+        for entry in entries {
+            let Some(id) = resource.id_of(&entry).map(str::to_lowercase) else {
+                kept.push(entry);
+                continue;
+            };
+            if !seen.insert(id.clone()) {
+                // NORA's own, shown among NORA's, or the host's twice.
+                continue;
+            }
+            let nora_own = hosted.contains_key(&id)
+                || crate::curation::is_internal_namespace(
+                    engine,
+                    crate::curation::RegistryType::Nuget,
+                    &id,
+                );
+            if !nora_own {
+                kept.push(entry);
+            } else if let Some(pkg) = packages.iter().find(|pkg| pkg.name.to_lowercase() == id) {
+                if let Some(held) = local_search_entry(state, hosted, &base_url, pkg, shown).await {
+                    kept.push(resource.own_entry(held));
+                }
+            }
+        }
+        read += got;
+        if envelope.is_none() {
+            result["data"] = serde_json::Value::Array(Vec::new());
+            envelope = Some(result);
+        }
+        if got == 0 || read >= host_total {
+            whole = true;
+            break;
+        }
+        if kept.len() >= need && host_total > SEARCH_HOST_READ_WHOLE {
+            break;
+        }
+    }
+    if !whole && kept.len() < need {
+        return Ok(HostRead::TooDeep);
+    }
+    let total = if whole && host_total <= SEARCH_HOST_READ_WHOLE {
+        kept.len() as u64
+    } else {
+        u64::try_from(host_total).unwrap_or(u64::MAX)
+    };
+    Ok(HostRead::Entries {
+        shown: kept,
+        total,
+        envelope: envelope.unwrap_or_else(|| serde_json::json!({})),
+    })
 }
 
 /// The query string `qs` with `skip` and `take` set to these.
@@ -1960,72 +2188,48 @@ fn with_page(qs: &str, skip: usize, take: usize) -> String {
 }
 
 /// One page of a merged search: NORA's own packages of the page (`own`, from [`own_matches`])
-/// first, then the search host's entries (`upstream`, its URLs already NORA's, asked for the
-/// window of [`PageWindow`]). An entry of the host whose id is NORA's own — hosted, or in an
-/// internal namespace — is never shown as the host has it: one NORA already shows among its
-/// own is dropped, another is replaced by NORA's entry of it, or dropped when NORA holds none.
-/// The page holds `take` entries at most; `totalHits` is NORA's own plus the host's total, the
-/// same on every page (it counts the host's entries a page drops). A host result that is not
-/// the search JSON is passed on as it is.
-async fn merge_search_page(
-    state: &AppState,
-    hosted: &std::collections::HashMap<String, Vec<String>>,
+/// first, then the host's entries NORA shows (from [`read_search_host`]) of the window of
+/// [`PageWindow`]. The page holds `take` entries at most; `totalHits` is NORA's own plus the
+/// host's part, the same on every page. A host result that is not the search JSON is passed on
+/// as it is; a page NORA could not read the host for is `None`.
+fn merge_search_page(
     own: &[serde_json::Value],
-    upstream: String,
+    host: HostRead,
     window: PageWindow,
-    shown: SearchFilter<'_>,
-) -> Vec<u8> {
-    let Ok(mut result) = serde_json::from_str::<serde_json::Value>(&upstream) else {
-        return upstream.into_bytes();
+) -> Option<Vec<u8>> {
+    let (shown, total, mut result) = match host {
+        HostRead::TooDeep => return None,
+        HostRead::Verbatim(text) => return Some(text.into_bytes()),
+        HostRead::Entries {
+            shown,
+            total,
+            envelope,
+        } => (shown, total, envelope),
     };
-    let Some(entries) = result
-        .get_mut("data")
-        .and_then(|data| data.as_array_mut())
-        .map(std::mem::take)
-    else {
-        return upstream.into_bytes();
-    };
-    let packages = state.repo_index.get("nuget", &state.storage).await;
-    let engine = &state.curation().curation_engine;
-    let base_url = nora_base_url(state);
-    let own_ids: std::collections::HashSet<String> = own
-        .iter()
-        .filter_map(|entry| entry["id"].as_str().map(str::to_lowercase))
-        .collect();
-
     let mut page: Vec<serde_json::Value> = own
         .iter()
         .skip(window.own_from)
         .take(window.own_take)
         .cloned()
         .collect();
-    let mut from_host = Vec::new();
-    for entry in entries {
-        let Some(id) = entry["id"].as_str().map(str::to_lowercase) else {
-            from_host.push(entry);
-            continue;
-        };
-        let nora_own = hosted.contains_key(&id)
-            || crate::curation::is_internal_namespace(
-                engine,
-                crate::curation::RegistryType::Nuget,
-                &id,
-            );
-        if !nora_own {
-            from_host.push(entry);
-        } else if !own_ids.contains(&id) {
-            if let Some(pkg) = packages.iter().find(|pkg| pkg.name.to_lowercase() == id) {
-                if let Some(held) = local_search_entry(state, hosted, &base_url, pkg, shown).await {
-                    from_host.push(held);
-                }
-            }
-        }
-    }
-    page.extend(from_host.into_iter().take(window.upstream_room));
-    let host_total = result["totalHits"].as_u64().unwrap_or(0);
-    result["totalHits"] = (window.own_total as u64 + host_total).into();
+    page.extend(
+        shown
+            .into_iter()
+            .skip(window.upstream_skip)
+            .take(window.upstream_room),
+    );
+    result["totalHits"] = (window.own_total as u64).saturating_add(total).into();
     result["data"] = page.into();
-    serde_json::to_vec(&result).unwrap_or_else(|_| upstream.into_bytes())
+    Some(serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec()))
+}
+
+/// A merged search page NORA could not read the search host for ([`HostRead::TooDeep`]).
+fn page_too_deep() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "nuget: this page lies deeper than NORA reads the search host for",
+    )
+        .into_response()
 }
 
 /// Build local search results from the in-memory repo index.
@@ -2301,8 +2505,16 @@ async fn registration_leaf(
     // The version's own listing, as the registration NORA stored gives it — served without the
     // upstream, internal package or not. The flatcontainer index names the version but not whether
     // it is listed, so it decides nothing here.
-    if let Some(listed) = stored_listing(state, &id_lower, version).await {
-        return with_json(serde_json::to_vec(&leaf_for(listed)).unwrap_or_default());
+    match stored_listing(state, &id_lower, version).await {
+        Ok(Some(listed)) => {
+            return with_json(serde_json::to_vec(&leaf_for(listed)).unwrap_or_default());
+        }
+        Ok(None) => {}
+        // A stored registration that cannot be read decides nothing, and neither does the
+        // upstream in its place: it may list the version otherwise.
+        Err(UnreadableDocument(key)) => {
+            return crate::registry::storage_unavailable("nuget", &key);
+        }
     }
 
     // Not stored: asked of the upstream, as the registration index is — never for an
@@ -2389,23 +2601,42 @@ fn stored_leaf(doc: &[u8], version: &str) -> StoredLeaf {
     }
 }
 
+/// A stored document that exists but cannot be read, by its storage key.
+struct UnreadableDocument(String);
+
 /// The `listed` flag the registration NORA stored gives `version`: the index's leaf, or the leaf
-/// on the page the index names for it. `None` when nothing stored says it, or it cannot be read.
-async fn stored_listing(state: &AppState, id_lower: &str, version: &str) -> Option<bool> {
+/// on the page the index names for it. `Ok(None)` when nothing stored says it (no document, or
+/// none naming the version); an error when a stored document cannot be read.
+async fn stored_listing(
+    state: &AppState,
+    id_lower: &str,
+    version: &str,
+) -> Result<Option<bool>, UnreadableDocument> {
+    let read = |key: String| async move {
+        match state.storage.get(&key).await {
+            Ok(doc) => Ok(Some(doc)),
+            Err(crate::storage::StorageError::NotFound) => Ok(None),
+            Err(_) => Err(UnreadableDocument(key)),
+        }
+    };
     let index_key = format!("nuget/registration/{id_lower}/index.json");
-    let doc = state.storage.get(&index_key).await.ok()?;
-    match stored_leaf(&doc, version) {
+    let Some(doc) = read(index_key).await? else {
+        return Ok(None);
+    };
+    Ok(match stored_leaf(&doc, version) {
         StoredLeaf::Inline(listed) => Some(listed),
         StoredLeaf::OnPage { lower, upper } => {
             let page_key = format!("nuget/registration/{id_lower}/page/{lower}/{upper}.json");
-            let page = state.storage.get(&page_key).await.ok()?;
-            match stored_leaf(&page, version) {
-                StoredLeaf::Inline(listed) => Some(listed),
-                _ => None,
+            match read(page_key).await? {
+                Some(page) => match stored_leaf(&page, version) {
+                    StoredLeaf::Inline(listed) => Some(listed),
+                    _ => None,
+                },
+                None => None,
             }
         }
         StoredLeaf::Absent => None,
-    }
+    })
 }
 
 /// Rewrite upstream registration URLs in NuGet registration index/page responses: registration5-*
@@ -6625,6 +6856,51 @@ mod review_1233_third_pass {
             json["@id"],
             "http://nora.example/nuget/v3/registration/testpkg/1.0.0.json"
         );
+    }
+
+    /// A stored registration (index, or the page the index names for the version) that cannot
+    /// be read decides nothing: the leaf is a 503, not a 404 that tells the client the version
+    /// does not exist.
+    #[tokio::test]
+    async fn a_stored_registration_that_cannot_be_read_is_not_a_missing_leaf() {
+        use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+
+        let paged = serde_json::to_vec(&serde_json::json!({
+            "count": 1,
+            "items": [{
+                "@id": "https://api.nuget.org/v3/registration5-gz-semver2/testpkg/page/1.0.0/2.0.0.json",
+                "lower": "1.0.0",
+                "upper": "2.0.0",
+                "count": 2,
+            }],
+        }))
+        .unwrap();
+        let page = stored_registration("1.0.0", true);
+        for (failing, index) in [
+            (
+                "nuget/registration/testpkg/index.json",
+                stored_registration("1.0.0", true),
+            ),
+            ("nuget/registration/testpkg/page/1.0.0/2.0.0.json", paged),
+        ] {
+            let (storage, outage) = outage_storage();
+            let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = None;
+                cfg.curation.internal_namespaces = vec!["testpkg*".to_string()];
+            });
+            for (key, doc) in [
+                ("nuget/registration/testpkg/index.json", &index),
+                ("nuget/registration/testpkg/page/1.0.0/2.0.0.json", &page),
+            ] {
+                ctx.state.storage.put(key, doc).await.unwrap();
+            }
+            let (status, json) = leaf(&ctx, "1.0.0").await;
+            assert_eq!(status, StatusCode::OK, "{failing} readable: {json}");
+            outage.fail_reads_of(failing);
+            let (status, _) = leaf(&ctx, "1.0.0").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failing}");
+        }
     }
 
     /// Finding 2 for an internal package: the stored registration serves the leaf, the upstream
