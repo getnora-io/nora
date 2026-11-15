@@ -256,6 +256,12 @@ fn build_context_full(
             ..crate::config::DebConfig::default()
         },
         cpan: crate::config::CpanConfig::default(),
+        // Off, and no upstream: a test turns it on and names its own.
+        composer: crate::config::ComposerConfig {
+            proxy: None,
+            proxy_timeout: 5,
+            ..crate::config::ComposerConfig::default()
+        },
         hf: crate::config::HfConfig::default(),
         auth: AuthConfig {
             enabled: auth_enabled,

@@ -51,7 +51,7 @@ fn registry_of(key: &str) -> &str {
 
 /// Breaker keys whose `nora_circuit_breaker_state` series is exported at
 /// startup (#441): one per configured upstream for the formats keyed per
-/// upstream (Docker, PyPI, npm, Maven), the format name for every other format. A format
+/// upstream (Docker, PyPI, npm, Maven, Composer), the format name for every other format. A format
 /// keyed per upstream gets no format-named series — it would sit at 0 (closed)
 /// forever while the real state moves on the per-upstream series.
 pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> {
@@ -85,6 +85,13 @@ pub(crate) fn initial_gauge_keys(config: &crate::config::Config) -> Vec<String> 
                     .proxies
                     .iter()
                     .map(|proxy| upstream_key(rt.as_str(), proxy.url())),
+            ),
+            RegistryType::Composer => keys.extend(
+                config
+                    .composer
+                    .upstreams()
+                    .iter()
+                    .map(|up| upstream_key(rt.as_str(), up.url())),
             ),
             _ => keys.push(rt.as_str().to_string()),
         }
@@ -1173,7 +1180,7 @@ mod tests {
         assert!(cb.health_snapshot("py").is_none(), "format matched whole");
     }
 
-    /// Startup series: per configured upstream for Docker, PyPI, npm and Maven, the format
+    /// Startup series: per configured upstream for Docker, PyPI, npm, Maven and Composer, the format
     /// name for the rest — never a format-named series that cannot move.
     #[test]
     fn initial_gauge_keys_follow_the_breaker_keys() {
@@ -1196,14 +1203,17 @@ mod tests {
         assert!(keys.contains(&"npm:https://registry.npmjs.org".to_string()));
         assert!(keys.contains(&"maven:https://repo1.maven.org/maven2".to_string()));
         assert!(keys.contains(&"maven:https://nora.example/maven2".to_string()));
+        assert!(keys.contains(&"composer:https://repo.packagist.org".to_string()));
         assert!(
             keys.contains(&"cargo".to_string()),
             "formats without per-upstream keys"
         );
         assert!(
-            !keys
-                .iter()
-                .any(|k| k == "pypi" || k == "docker" || k == "npm" || k == "maven"),
+            !keys.iter().any(|k| k == "pypi"
+                || k == "docker"
+                || k == "npm"
+                || k == "maven"
+                || k == "composer"),
             "{keys:?}"
         );
     }
