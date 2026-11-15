@@ -1113,12 +1113,16 @@ fn is_configured(state: &AppState, origin: Option<&str>) -> bool {
     })
 }
 
-/// Whether an answer is a Composer package list at all: a JSON object whose `packages` is an
-/// object or an array (an empty list is `[]` once PHP has encoded it), whatever it names.
+/// Whether an answer is a Composer package list at all: a JSON object whose `packages` maps
+/// names to versions, whatever it names. PHP encodes an empty map as `[]`, so an empty array is
+/// a list too; a non-empty array is not one.
 fn is_package_list(body: &[u8]) -> bool {
     serde_json::from_slice::<Value>(body)
         .ok()
-        .and_then(|doc| doc.get("packages").map(|p| p.is_object() || p.is_array()))
+        .and_then(|doc| {
+            doc.get("packages")
+                .map(|p| p.is_object() || p.as_array().is_some_and(Vec::is_empty))
+        })
         .unwrap_or(false)
 }
 

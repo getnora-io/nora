@@ -3265,7 +3265,8 @@ async fn a_stale_copy_of_the_document_asked_for_keeps_the_package_its_upstream_s
 /// Metadata that names no package — `{"packages":[]}`, `{"packages":{}}`, another package's
 /// document — is an upstream saying it does not have the package, as a 404 is: the next
 /// upstream is asked, and with none having it the answer is 404. An answer that is not
-/// metadata at all (a sign-in page, JSON without `packages`) is still a failure: 502.
+/// metadata at all (a sign-in page, JSON without `packages`, `packages` that is a non-empty array
+/// or not a list) is still a failure: 502.
 #[tokio::test]
 async fn metadata_naming_no_package_is_not_a_failure() {
     let no_package = [
@@ -3324,6 +3325,11 @@ async fn metadata_naming_no_package_is_not_a_failure() {
     for (failure, body) in [
         ("sign-in page", "<html>sign in</html>"),
         ("JSON without packages", r#"{"error":"forbidden"}"#),
+        (
+            "a non-empty array",
+            r#"{"packages":["authentication required"]}"#,
+        ),
+        ("packages that are not a list", r#"{"packages":"acme/lib"}"#),
     ] {
         let (_private, public, ctx) = private_before_public(|_| {
             vec![
