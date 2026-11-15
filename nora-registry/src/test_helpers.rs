@@ -256,6 +256,12 @@ fn build_context_full(
             ..crate::config::DebConfig::default()
         },
         cpan: crate::config::CpanConfig::default(),
+        // Off, and no upstream: a test turns it on and names its own.
+        composer: crate::config::ComposerConfig {
+            proxy: None,
+            proxy_timeout: 5,
+            ..crate::config::ComposerConfig::default()
+        },
         hf: crate::config::HfConfig::default(),
         auth: AuthConfig {
             enabled: auth_enabled,
@@ -348,6 +354,7 @@ fn build_context_full(
     let reloadable = Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {
         curation_engine,
         bypass_token,
+        loaded_at: chrono::Utc::now().timestamp(),
     }));
 
     let leak_finders = crate::metrics::LeakFinders::new(config.upstream_hostnames());
@@ -543,6 +550,9 @@ const COUNTED_METHODS: [&str; 11] = [
 #[derive(Default)]
 pub struct OpCounts {
     counts: [AtomicUsize; COUNTED_METHODS.len()],
+    /// Keys the listings returned: a listing is one round-trip, but its cost grows with what
+    /// it enumerates (an object store pages it, a local store walks it).
+    listed: AtomicUsize,
 }
 
 impl OpCounts {
@@ -560,6 +570,16 @@ impl OpCounts {
         for count in &self.counts {
             count.store(0, Ordering::Relaxed);
         }
+        self.listed.store(0, Ordering::Relaxed);
+    }
+
+    /// Keys every listing since the last [`reset`](Self::reset) returned, together.
+    pub fn listed_keys(&self) -> usize {
+        self.listed.load(Ordering::Relaxed)
+    }
+
+    fn enumerated(&self, keys: usize) {
+        self.listed.fetch_add(keys, Ordering::Relaxed);
     }
 
     /// Round-trips counted since the last [`reset`](Self::reset).
@@ -631,7 +651,9 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
     async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
         self.counts.hit("list");
-        self.inner.list(prefix).await
+        let keys = self.inner.list(prefix).await?;
+        self.counts.enumerated(keys.len());
+        Ok(keys)
     }
 
     async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
@@ -644,7 +666,9 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         prefix: &str,
     ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
         self.counts.hit("list_with_meta");
-        self.inner.list_with_meta(prefix).await
+        let keys = self.inner.list_with_meta(prefix).await?;
+        self.counts.enumerated(keys.len());
+        Ok(keys)
     }
 
     async fn health_check(&self) -> bool {
@@ -726,6 +750,12 @@ struct Faults {
     reads: Vec<(String, ReadFault)>,
     /// Prefixes whose listings fail.
     listings: Vec<String>,
+    /// Key suffixes whose writes fail.
+    writes: Vec<String>,
+    /// Key suffixes `stat` cannot answer for.
+    stats: Vec<String>,
+    /// Key suffixes whose writes land but report a failure.
+    landed_writes: Vec<String>,
 }
 
 /// How the read of a key fails.
@@ -788,6 +818,25 @@ impl StorageOutage {
         self.faults().listings.push(prefix.to_string());
     }
 
+    /// Fail the writes of the keys ending with `suffix` with a network error; other writes and
+    /// every read answer.
+    pub fn fail_writes_of(&self, suffix: &str) {
+        self.faults().writes.push(suffix.to_string());
+    }
+
+    /// Store the writes of the keys ending with `suffix`, then report a network error — as
+    /// `LocalStorage::put` does when the rename published the body and the directory sync or
+    /// the pin after it fails: the caller cannot tell the write landed.
+    pub fn fail_writes_after_landing_of(&self, suffix: &str) {
+        self.faults().landed_writes.push(suffix.to_string());
+    }
+
+    /// Make `stat` of the keys ending with `suffix` find nothing, as a backend that cannot ask
+    /// the store answers; other keys and every read answer.
+    pub fn fail_stats_of(&self, suffix: &str) {
+        self.faults().stats.push(suffix.to_string());
+    }
+
     /// Bring the store back and clear every fault: operations waiting on a silent store go on,
     /// and every later one is answered.
     pub fn end(&self) {
@@ -809,6 +858,30 @@ impl StorageOutage {
         while self.mode() == STORE_SILENT {
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }
+    }
+
+    /// Whether a write of `key` fails now.
+    fn write_fails(&self, key: &str) -> bool {
+        self.faults()
+            .writes
+            .iter()
+            .any(|suffix| key.ends_with(suffix.as_str()))
+    }
+
+    /// Whether a write of `key` lands and then reports a failure.
+    fn write_lands_then_fails(&self, key: &str) -> bool {
+        self.faults()
+            .landed_writes
+            .iter()
+            .any(|suffix| key.ends_with(suffix.as_str()))
+    }
+
+    /// Whether `stat` of `key` fails now.
+    fn stat_fails(&self, key: &str) -> bool {
+        self.faults()
+            .stats
+            .iter()
+            .any(|suffix| key.ends_with(suffix.as_str()))
     }
 
     /// Whether a listing of `prefix` fails now.
@@ -835,7 +908,7 @@ impl StorageOutage {
 /// fails with a network error and `stat` finds nothing, as an object store behind a dropped
 /// connection answers: the store holds what was written, but cannot say so.
 pub struct OutageBackend {
-    inner: crate::storage::ObjectStorage,
+    inner: Arc<dyn crate::storage::StorageBackend>,
     outage: StorageOutage,
 }
 
@@ -843,7 +916,19 @@ pub struct OutageBackend {
 pub fn outage_storage() -> (Storage, StorageOutage) {
     let outage = StorageOutage(Arc::default(), Arc::default());
     let backend = OutageBackend {
-        inner: crate::storage::ObjectStorage::in_memory(),
+        inner: Arc::new(crate::storage::ObjectStorage::in_memory()),
+        outage: outage.clone(),
+    };
+    (Storage::from_backend(Arc::new(backend)), outage)
+}
+
+/// A local [`Storage`] at `path` with the same outage switch: for a test that needs what only
+/// a filesystem has, such as a file's modification time ([`put_written_days_ago`] — the
+/// context's `storage.path` must be `path`).
+pub fn local_outage_storage(path: &str) -> (Storage, StorageOutage) {
+    let outage = StorageOutage(Arc::default(), Arc::default());
+    let backend = OutageBackend {
+        inner: Arc::new(crate::storage::LocalStorage::new(path)),
         outage: outage.clone(),
     };
     (Storage::from_backend(Arc::new(backend)), outage)
@@ -877,7 +962,14 @@ impl crate::storage::StorageBackend for OutageBackend {
     async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
         self.outage.wait_answer().await;
         self.check()?;
-        self.inner.put(key, data, sha256).await
+        if self.outage.write_fails(key) {
+            return Err(network_error());
+        }
+        self.inner.put(key, data, sha256).await?;
+        if self.outage.write_lands_then_fails(key) {
+            return Err(network_error());
+        }
+        Ok(())
     }
 
     async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
@@ -918,6 +1010,9 @@ impl crate::storage::StorageBackend for OutageBackend {
     async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
         self.outage.wait_answer().await;
         self.check().ok()?;
+        if self.outage.stat_fails(key) {
+            return None;
+        }
         self.inner.stat(key).await
     }
 

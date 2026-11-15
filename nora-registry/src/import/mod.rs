@@ -642,6 +642,7 @@ fn curation_name(rt: crate::registry_type::RegistryType, art: &ArtifactRef, key:
         | crate::registry_type::RegistryType::Rpm
         | crate::registry_type::RegistryType::Deb
         | crate::registry_type::RegistryType::Cpan
+        | crate::registry_type::RegistryType::Composer
         | crate::registry_type::RegistryType::HuggingFace => art.path.clone(),
     }
 }
