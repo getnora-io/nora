@@ -5579,3 +5579,37 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+mod url_fold {
+    //! hf's curation decides on the repo name percent-decoded once, and the upstream gets the path as
+    //! the client encoded it. The Hub decodes that same escape to the same name, and no byte is dropped
+    //! on the way: the name curation decided on is the name the Hub resolves. This test locks that: a
+    //! change that forwards the decoded name would let a control byte fall out in the upstream URL.
+    use crate::test_helpers::{
+        answering_upstream, create_test_context_with_config, send, upstream_paths,
+    };
+    use axum::http::{Method, StatusCode};
+
+    #[tokio::test]
+    async fn upstream_receives_the_escape_curation_decided_on() {
+        let up = answering_upstream().await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.hf.enabled = true;
+            cfg.hf.proxy = Some(up.uri());
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/hf/ev%09il/repo/resolve/main/model.bin",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::BAD_REQUEST);
+        let asked = upstream_paths(&up).await;
+        assert!(
+            !asked.is_empty() && asked.iter().all(|p| p.starts_with("/ev%09il/")),
+            "the upstream was asked {asked:?}, not the escaped name"
+        );
+    }
+}
