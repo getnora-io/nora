@@ -12816,4 +12816,22 @@ mod url_fold {
     async fn legitimate_name_still_reaches_upstream() {
         assert_served_upstream("npm", "/npm/@scope/my.pkg-name_2", npm_proxy).await;
     }
+
+    /// Every version the measured npm corpus (`semver.clean`, `testdata/npm/versions/clean.tsv`)
+    /// yields for a valid input is a version a client puts in a tarball name: none may be refused.
+    #[test]
+    fn every_corpus_cleaned_version_is_accepted() {
+        let corpus = include_str!("../../testdata/npm/versions/clean.tsv");
+        let refused: Vec<String> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.contains("INVALID"))
+            .filter_map(|line| line.split('\t').nth(1))
+            .map(|version| format!("pkg/-/pkg-{version}.tgz"))
+            .filter(|path| !super::is_npm_path(path))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "legitimate versions refused: {refused:?}"
+        );
+    }
 }
