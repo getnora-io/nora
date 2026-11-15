@@ -28,9 +28,9 @@ use crate::cache_ttl::is_within_ttl;
 use crate::circuit_breaker::BreakerScope;
 use crate::config::{ComposerProxyEntry, UpstreamAuth};
 use crate::registry::{
-    method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional, proxy_fetch_hop,
-    proxy_forward_post, read_validators, validators_key, write_validators, Hopped, ProxyError,
-    Revalidation, UpstreamMiss, Validators,
+    method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional_refusals,
+    proxy_fetch_hop, proxy_forward_post, validators_key, Hopped, ProxyError, Revalidation,
+    UpstreamMiss, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -888,6 +888,50 @@ struct UpstreamDocument {
     stale: bool,
 }
 
+/// The upstream validators of a cached p2 document and the digest of the body they came with,
+/// stored beside it (`.meta`) and believed only for that body. Written apart from the body,
+/// validators may describe another one: two refetches of one document can interleave their
+/// writes (body two, body one, validators one, validators two), and validators taken for the
+/// body beside them would send the newer ETag for the older body — whose 304 keeps the older
+/// body for good. A sidecar without the digest (written before it was kept) is not believed.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BoundValidators {
+    #[serde(flatten)]
+    validators: Validators,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+}
+
+fn body_digest(body: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(body))
+}
+
+/// The validators stored for `key`, when they came with `body`.
+async fn read_bound_validators(state: &AppState, key: &str, body: &[u8]) -> Option<Validators> {
+    let data = state.storage.get(&validators_key(key)).await.ok()?;
+    let bound: BoundValidators = serde_json::from_slice(&data).ok()?;
+    (bound.body.as_deref() == Some(body_digest(body).as_str())).then_some(bound.validators)
+}
+
+/// Store `validators` for `key` as the ones `body` came with. Written after the body: a sidecar
+/// that cannot be written leaves the one before, which names the body before.
+async fn write_bound_validators(state: &AppState, key: &str, body: &[u8], validators: &Validators) {
+    let bound = BoundValidators {
+        validators: validators.clone(),
+        body: Some(body_digest(body)),
+    };
+    match serde_json::to_vec(&bound) {
+        Ok(data) => {
+            if let Err(e) = state.storage.put(&validators_key(key), &data).await {
+                tracing::warn!(registry = REGISTRY, key, error = %e, "failed to store metadata validators");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(registry = REGISTRY, key, error = %e, "metadata validators not encoded")
+        }
+    }
+}
+
 /// The cached copy of a p2 document and what is known of it.
 struct CachedDocument {
     body: Bytes,
@@ -911,7 +955,7 @@ async fn cached_document(state: &AppState, key: &str) -> Option<CachedDocument> 
         .ok()
         .map(|o| String::from_utf8_lossy(&o).into_owned());
     let written = meta.as_ref().map(|m| m.modified as i64);
-    let last_modified = read_validators(&state.storage, key)
+    let last_modified = read_bound_validators(state, key, &body)
         .await
         .and_then(|v| v.last_modified)
         .or_else(|| meta.map(|m| http_date(m.modified)));
@@ -1069,9 +1113,86 @@ fn is_configured(state: &AppState, origin: Option<&str>) -> bool {
     })
 }
 
+/// Whether an answer is a Composer package list at all: a JSON object whose `packages` maps
+/// names to versions, whatever it names. PHP encodes an empty map as `[]`, so an empty array is
+/// a list too; a non-empty array is not one.
+fn is_package_list(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|doc| {
+            doc.get("packages")
+                .map(|p| p.is_object() || p.as_array().is_some_and(Vec::is_empty))
+        })
+        .unwrap_or(false)
+}
+
+/// Whether a p2 document names `name`, as Composer reads it (`isset($response['packages'][$name])`):
+/// an empty version list names it too.
+fn names_package(body: &[u8], name: &str) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|doc| doc.get("packages")?.get(name).map(|v| !v.is_null()))
+        .unwrap_or(false)
+}
+
+/// Whether the upstream `up` has `name` by its document `dev`: a copy it served that names the
+/// package (fresh or not) or a fresh one that does not, else its answer now. An answer other
+/// than the document or "not found" is the error.
+async fn upstream_has(
+    state: &AppState,
+    up: &ComposerProxyEntry,
+    root: &UpstreamRoot,
+    name: &str,
+    dev: bool,
+) -> Result<bool, ProxyError> {
+    // A copy it served says it has the package, past its TTL too: a package does not change
+    // hands because its upstream cannot be asked now. A fresh copy says either way.
+    if let Some(c) = cached_document(state, &p2_key(name, dev)).await {
+        if c.origin
+            .as_deref()
+            .is_some_and(|o| same_upstream(o, up.url()))
+        {
+            let names = names_package(&c.body, name);
+            if names || c.fresh {
+                return Ok(names);
+            }
+        }
+    }
+    let url = root.p2_url(name, dev);
+    match proxy_fetch_conditional_refusals(
+        &state.http_client,
+        &url,
+        timeout(state),
+        auth_for(up, &url),
+        &Validators::default(),
+        &state.circuit_breaker,
+        BreakerScope::upstream(RegistryType::Composer, up.url()),
+    )
+    .await
+    {
+        // An answer that is not Composer metadata (a sign-in page, JSON without `packages`) is a
+        // failure: it says nothing of the package. Metadata that names no package
+        // (`{"packages":[]}`, another package's document) says the upstream does not have it.
+        Ok(Revalidation::Modified { body, .. }) if !is_package_list(&body) => {
+            tracing::warn!(
+                registry = REGISTRY,
+                url,
+                "upstream answered with something that is not Composer metadata"
+            );
+            Err(ProxyError::Network("not Composer metadata".into()))
+        }
+        Ok(Revalidation::Modified { body, .. }) => Ok(names_package(&body, name)),
+        Ok(Revalidation::NotModified) => Err(ProxyError::Upstream(304)),
+        Err(ProxyError::NotFound) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// The upstream p2 document of `name`: the fresh cached copy, else the first upstream that
-/// has it (a 304 keeps the cached copy), else the stale copy when every upstream that did
-/// not say "not found" failed, else the miss as a response.
+/// has the package (a 304 keeps the cached copy) — by either of its two documents, as Composer
+/// finds a package. Upstreams are asked in order while each says "not found"; the first that
+/// fails ends the walk, as it may have the package: then the stale copy, else the miss as a
+/// response.
 async fn upstream_document(
     state: &AppState,
     name: &str,
@@ -1093,7 +1214,7 @@ async fn upstream_document(
     let path = format!("/composer/p2/{name}{}.json", if dev { "~dev" } else { "" });
     let mut miss = UpstreamMiss::default();
     let mut failed = false;
-    for up in &upstreams {
+    for (i, up) in upstreams.iter().enumerate() {
         // `known`: the address comes from the upstream's root. Without it the address is the
         // usual layout's guess, and a 4xx there says nothing about the package.
         let (root, known) = root_of(state, up).await;
@@ -1104,13 +1225,15 @@ async fn upstream_document(
                 .is_some_and(|o| same_upstream(o, up.url()))
         });
         let validators = match from_here {
-            Some(_) if state.config.composer.revalidate => read_validators(&state.storage, &key)
-                .await
-                .unwrap_or_default(),
+            Some(c) if state.config.composer.revalidate => {
+                read_bound_validators(state, &key, &c.body)
+                    .await
+                    .unwrap_or_default()
+            }
             _ => Validators::default(),
         };
         let had_validators = validators.is_some();
-        match proxy_fetch_conditional(
+        match proxy_fetch_conditional_refusals(
             &state.http_client,
             &url,
             timeout(state),
@@ -1126,7 +1249,7 @@ async fn upstream_document(
                     // A 304 to a request without validators: not an answer to rely on.
                     failed = true;
                     miss.record(&ProxyError::Upstream(304));
-                    continue;
+                    break;
                 };
                 crate::metrics::PROXY_UPSTREAM_304_TOTAL
                     .with_label_values(&[REGISTRY])
@@ -1164,18 +1287,37 @@ async fn upstream_document(
                     );
                     failed = true;
                     miss.record(&ProxyError::Network("not Composer metadata".into()));
-                    continue;
+                    break;
                 }
                 // Versions first seen now; an earlier copy of this upstream's seeds a ledger
                 // that does not exist yet.
                 let seed = from_here.and_then(|c| c.written.map(|w| (&c.body[..], w)));
                 record_first_seen(state, &key, name, &body, seed).await;
+                // A copy another upstream served (or one of unknown origin) loses its origin
+                // first: a new body whose origin then cannot be stored has none, and is not
+                // trusted, rather than the other upstream's — whose credential would go with
+                // the archives this one lists. When the old origin cannot be removed, the new
+                // body is served and not stored.
+                let origin_cleared = from_here.is_some()
+                    || match state.storage.delete(&origin_key(&key)).await {
+                        Ok(()) | Err(crate::storage::StorageError::NotFound) => true,
+                        Err(e) => {
+                            tracing::warn!(registry = REGISTRY, key, error = %e, "origin of the cached metadata not removed, new metadata not cached");
+                            false
+                        }
+                    };
                 // Body first, then where it came from, then its validators: a sidecar never
                 // describes bytes that are not there. A body that could not be stored leaves
                 // the sidecars of the copy before it, which still describe that copy: the next
                 // revalidation asks with the old validators and gets the new body again, where
                 // the new ones would get a 304 that keeps the old copy for good.
-                match state.storage.put(&key, &body).await {
+                let stored = if origin_cleared {
+                    state.storage.put(&key, &body).await
+                } else {
+                    Ok(())
+                };
+                match stored {
+                    Ok(()) if !origin_cleared => {}
                     Ok(()) => {
                         if let Err(e) = state
                             .storage
@@ -1185,7 +1327,7 @@ async fn upstream_document(
                             tracing::warn!(registry = REGISTRY, key, error = %e, "failed to record metadata origin");
                         }
                         if validators.is_some() {
-                            write_validators(&state.storage, &key, &validators).await;
+                            write_bound_validators(state, &key, &body, &validators).await;
                         } else {
                             let _ = state.storage.delete(&validators_key(&key)).await;
                         }
@@ -1226,6 +1368,33 @@ async fn upstream_document(
                 }
                 tracing::debug!(registry = REGISTRY, url, error = ?e, "upstream metadata miss");
                 miss.record(&e);
+                // An upstream that failed — down, refusing NORA's credential, rate-limiting it —
+                // may have the package: no later upstream's package of the same name answers in
+                // its place. Composer stops at a repository it cannot read, too (it rejects any
+                // answer but a 404). A copy is served stale, else the failure is the answer.
+                if !matches!(e, ProxyError::NotFound) {
+                    break;
+                }
+                // An upstream without this document that has the package has it all: Composer
+                // finds a package in a repository by either document and asks no later
+                // repository for it, so no later upstream answers for this one. A copy of this
+                // very document it served says so, past its TTL too; else its other document.
+                if matches!(e, ProxyError::NotFound) && i + 1 < upstreams.len() {
+                    if from_here.is_some_and(|c| names_package(&c.body, name)) {
+                        break;
+                    }
+                    match upstream_has(state, up, &root, name, !dev).await {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        // Whether it has the package cannot be told: as a failure of its own.
+                        Err(e) => {
+                            tracing::debug!(registry = REGISTRY, package = name, error = ?e, "upstream's other document unavailable");
+                            failed = true;
+                            miss.record(&e);
+                            break;
+                        }
+                    }
+                }
             }
         }
     }
@@ -1439,11 +1608,17 @@ async fn hosted_metadata(
         }
         Err(e) => return crate::registry::local_copy_unreadable(REGISTRY, &key, &e),
     };
+    // A date the clock has not left yet is not given: an upload later in the same second
+    // leaves it unchanged, and a client revalidating with it would get a 304 for a listing it
+    // does not have (Composer revalidates with `If-Modified-Since` alone). Without a date it
+    // asks for the listing again; the next answer, a second on, has one.
+    let now = chrono::Utc::now().timestamp().max(0) as u64;
     let last_modified = state
         .storage
         .stat(&key)
         .await
-        .map(|m| http_date(m.modified));
+        .and_then(|m| hosted_date(m.modified, now))
+        .map(http_date);
     match rewrite_document(&body, name, base, true, Sources::Keep) {
         Some(body) => metadata_response(
             headers,
@@ -1457,6 +1632,12 @@ async fn hosted_metadata(
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// The date a hosted listing last written at `modified` is given at `now`: none while the clock
+/// is still in that second, since an upload later in the same second would leave it unchanged.
+fn hosted_date(modified: u64, now: u64) -> Option<u64> {
+    (modified < now).then_some(modified)
 }
 
 /// A hosted package's p2 document, built from its version documents, newest first. Not
@@ -1626,6 +1807,66 @@ async fn listed_dist(
     Err(miss.unwrap_or_else(|| StatusCode::NOT_FOUND.into_response()))
 }
 
+/// Where the release date a cached archive was served under is kept: beside the first-seen
+/// ledgers, under the internal prefix no listing, retention or GC walk of `composer/` reaches
+/// (a key beside the archive would be counted as one).
+fn archive_date_key(archive_key: &str) -> String {
+    first_seen_key(archive_key)
+}
+
+/// The release date the archive at `key` was served under when NORA fetched it.
+async fn held_date(state: &AppState, key: &str) -> Option<i64> {
+    let bytes = state.storage.get(&archive_date_key(key)).await.ok()?;
+    std::str::from_utf8(&bytes).ok()?.trim().parse().ok()
+}
+
+/// An archive NORA holds under a URL the metadata no longer lists: a branch that moved on, or a
+/// tag pointed elsewhere, since a lock file recorded the URL (Composer installs from the URL
+/// and reference it locked). The URL names one reference, so what is stored under it is what
+/// NORA fetched and checked then; it is served from the cache like any other archive, curation
+/// deciding, and never fetched again. Its version is the one a trusted listing has under that
+/// path segment, else the segment itself when it is a version as written; a digested segment
+/// whose version no listing has any more names no version curation could decide on.
+async fn held_archive(
+    state: &AppState,
+    name: &str,
+    segment: &str,
+    token: &str,
+    ext: &str,
+) -> Option<(Listed, String)> {
+    state
+        .storage
+        .stat(&proxied_dist_key(name, segment, token, ext))
+        .await?;
+    let held = |version: String| Listed {
+        version,
+        url: String::new(),
+        shasum: None,
+        time: None,
+    };
+    for dev in [false, true] {
+        let metadata_key = p2_key(name, dev);
+        let Some(c) = cached_document(state, &metadata_key).await else {
+            continue;
+        };
+        if !is_configured(state, c.origin.as_deref()) {
+            continue;
+        }
+        if let Some(version) = listed_versions(&c.body, name)
+            .into_iter()
+            .find(|v| version_segment(v) == segment)
+        {
+            return Some((held(version), metadata_key));
+        }
+    }
+    (!segment.starts_with('~')).then(|| {
+        (
+            held(segment.to_string()),
+            p2_key(name, is_dev_version(segment)),
+        )
+    })
+}
+
 async fn download_dist(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1669,12 +1910,28 @@ async fn download_dist(
     };
     let (listed, origin, metadata_key) = match found {
         Ok(found) => found,
+        // Not listed any more (a branch moved on since a lock file named it), or the metadata
+        // cannot be read now: an archive NORA holds is still served from the cache.
+        Err(response) if !internal => {
+            match held_archive(&state, &name, &segment, token, ext).await {
+                Some((listed, metadata_key)) => (listed, String::new(), metadata_key),
+                None => return response,
+            }
+        }
         Err(response) => return response,
     };
+    let key = proxied_dist_key(&name, &segment, token, ext);
     // Without trusted dates a release is as old as NORA's first sight of it in a listing: the
     // document's mtime restarts at every revalidation, so a client that asks more often than
-    // the minimum age would never see its release mature.
-    let publish_date = if state.config.server.trust_upstream_dates {
+    // the minimum age would never see its release mature. A held archive no listing names any
+    // more is as old as it was when NORA fetched it; without that record, young.
+    let publish_date = if listed.url.is_empty() {
+        Some(
+            held_date(&state, &key)
+                .await
+                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+        )
+    } else if state.config.server.trust_upstream_dates {
         listed
             .time
             .as_deref()
@@ -1718,7 +1975,6 @@ async fn download_dist(
         publish_date,
     );
     let display = format!("{name}@{}", listed.version);
-    let key = proxied_dist_key(&name, &segment, token, ext);
 
     let (cached, _) = crate::registry::cached_read(state.storage.get_verified(&key).await);
     let cached = match cached {
@@ -1795,6 +2051,10 @@ async fn download_dist(
     if internal {
         return internal_refused(&state, &name);
     }
+    // A held archive no listing names any more is never fetched: no upstream lists its URL.
+    if listed.url.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
 
     let Some(up) = state
         .config
@@ -1839,12 +2099,24 @@ async fn download_dist(
     let hash = hex::encode(sha2::Sha256::digest(&data));
     if let Err(e) = state.storage.put(&key, &data).await {
         tracing::warn!(registry = REGISTRY, key, error = %e, "failed to cache archive");
-    } else if let Err(e) = state
-        .storage
-        .put(&format!("{key}.sha256"), hash.as_bytes())
-        .await
-    {
-        tracing::warn!(registry = REGISTRY, key, error = %e, "failed to store archive digest");
+    } else {
+        if let Err(e) = state
+            .storage
+            .put(&format!("{key}.sha256"), hash.as_bytes())
+            .await
+        {
+            tracing::warn!(registry = REGISTRY, key, error = %e, "failed to store archive digest");
+        }
+        // The date it is served under, for when no listing names it any more.
+        if let Some(date) = publish_date {
+            if let Err(e) = state
+                .storage
+                .put(&archive_date_key(&key), date.to_string().as_bytes())
+                .await
+            {
+                tracing::warn!(registry = REGISTRY, key, error = %e, "failed to record the archive's release date");
+            }
+        }
     }
     state.repo_index.invalidate(REGISTRY);
     state.metrics.record_download(REGISTRY);

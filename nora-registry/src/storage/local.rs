@@ -150,6 +150,18 @@ fn readable_listing_root(root: &Path) -> std::result::Result<(), StorageError> {
     }
 }
 
+/// Whether a listing's directory is there to walk. Missing, or under a stored file, is nothing
+/// to list; a directory whose presence cannot be told — an ancestor that cannot be passed
+/// through (`EACCES`), an I/O error — is an error, where `Path::exists` would call it missing
+/// and the listing would answer "nothing here" for keys that may be stored.
+fn listing_root_present(root: &Path) -> std::result::Result<bool, StorageError> {
+    match std::fs::metadata(root) {
+        Ok(_) => readable_listing_root(root).map(|()| true),
+        Err(e) if is_missing(&e) => Ok(false),
+        Err(e) => Err(StorageError::Io(e)),
+    }
+}
+
 /// Remove the staging directories of dead instances: those whose lock can be taken,
 /// those without a lock file, and `.new-*` ones abandoned half-created. A directory
 /// whose lock is held belongs to a live instance and is left alone, and so is any
@@ -908,8 +920,10 @@ impl StorageBackend for LocalStorage {
         // Use blocking task for filesystem traversal
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
-                readable_listing_root(&root)?;
+            if let Some(root) = list_root(&base, &prefix) {
+                if !listing_root_present(&root)? {
+                    return Ok(results);
+                }
                 Self::list_files_sync(&root, &base, &prefix, &mut results);
             }
             results.sort();
@@ -925,8 +939,10 @@ impl StorageBackend for LocalStorage {
 
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
-                readable_listing_root(&root)?;
+            if let Some(root) = list_root(&base, &prefix) {
+                if !listing_root_present(&root)? {
+                    return Ok(results);
+                }
                 Self::list_files_with_meta_sync(&root, &base, &prefix, &mut results);
             }
             results.sort_by(|a, b| a.0.cmp(&b.0));
@@ -1471,6 +1487,50 @@ mod tests {
         }
         assert!(storage
             .list("npm/absent/versions/")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A listing under a directory that cannot be passed through is an error too: whether the
+    /// listed directory is there cannot be told, and "nothing here" would be a guess a caller
+    /// acts on (a hosted name taken for an upstream's). What is not there is still nothing,
+    /// a path through a stored file included.
+    #[tokio::test]
+    async fn a_listing_under_an_ancestor_that_cannot_be_entered_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        put(
+            &storage,
+            "composer/hosted/acme/lib/versions/1.0.0.0.json",
+            b"{}",
+        )
+        .await
+        .unwrap();
+        put(&storage, "raw/file.txt", b"x").await.unwrap();
+        let vendor = dir.path().join("composer/hosted/acme");
+        std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = std::fs::metadata(vendor.join("lib")).is_err();
+        let own = storage.list("composer/hosted/acme/lib/versions/").await;
+        let meta = storage
+            .list_with_meta("composer/hosted/acme/lib/versions/")
+            .await;
+        std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if blocked {
+            assert!(own.is_err(), "{own:?}");
+            assert!(meta.is_err(), "{meta:?}");
+        } else {
+            eprintln!("skipped: this user passes through a directory without permissions");
+        }
+        assert!(storage
+            .list("composer/hosted/none/versions/")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(storage.list("raw/file.txt/x/").await.unwrap().is_empty());
+        assert!(storage
+            .list_with_meta("raw/file.txt/x/")
             .await
             .unwrap()
             .is_empty());
