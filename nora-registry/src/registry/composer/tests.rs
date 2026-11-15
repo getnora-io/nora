@@ -2458,3 +2458,84 @@ async fn the_upstream_that_has_a_package_answers_for_both_of_its_documents() {
         );
     }
 }
+
+// ── xhigh-3: concurrent refetches leave a body with the validators that describe it ───
+
+/// Two requests refetch one document while the upstream moves from state one to state two.
+/// The writes interleave as the store lets them — body two, body one, validators one,
+/// validators two — ordered by holding writes at the store, not by timing. Whatever is left
+/// stored, the next revalidation must not be answered "not modified" for a body that was not
+/// the one its validators came with, or the old body stays for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_refetches_never_pin_an_old_body_under_a_new_etag() {
+    let up = MockServer::start().await;
+    mount_root(&up).await;
+    let doc = |state: &str, versions: &[&str]| {
+        let list: Vec<Value> = versions
+            .iter()
+            .map(|v| json!({"name": "acme/lib", "version": v,
+                "dist": {"type": "zip", "url": format!("{}/archives/{v}.zip", up.uri()), "reference": "aaaa"}}))
+            .collect();
+        json!({"packages": {"acme/lib": list}, "x-nora-test": state})
+    };
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .and(wm_header("if-none-match", "\"v2\""))
+        .respond_with(ResponseTemplate::new(304))
+        .with_priority(1)
+        .mount(&up)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_json(doc("state-one", &["1.0.0"])),
+        )
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&up)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v2\"")
+                .set_body_json(doc("state-two", &["2.0.0", "1.0.0"])),
+        )
+        .with_priority(3)
+        .mount(&up)
+        .await;
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let uri = up.uri();
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+        c.composer.proxy = Some(uri);
+        c.composer.metadata_ttl = 0;
+    });
+    let p2 = "/composer/p2/acme/lib.json";
+    let key = p2_key("acme/lib", false);
+    let older_body = outage.hold_write_of(&key, b"state-one");
+    let newer_validators = outage.hold_write_of(&validators_key(&key), b"v2");
+    // CANCEL-SAFETY: a watchdog over the scenario: a hang fails the test instead of stalling
+    // the run; nothing is ordered by it.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let app = ctx.app.clone();
+        let first = tokio::spawn(async move { send(&app, Method::GET, p2, "").await.status() });
+        // The first request read state one and is about to store it.
+        older_body.reached().await;
+        let app = ctx.app.clone();
+        let second = tokio::spawn(async move { send(&app, Method::GET, p2, "").await.status() });
+        // The second read state two, stored its body, and is about to store its validators.
+        newer_validators.reached().await;
+        older_body.release();
+        assert_eq!(first.await.unwrap(), StatusCode::OK);
+        newer_validators.release();
+        assert_eq!(second.await.unwrap(), StatusCode::OK);
+    })
+    .await
+    .expect("the ordered refetches finished");
+    let doc = json_of(send(&ctx.app, Method::GET, p2, "").await).await;
+    assert_eq!(
+        versions_of(&doc, "acme/lib").len(),
+        2,
+        "a 304 for the newer ETag kept the older body: {doc}"
+    );
+}

@@ -29,8 +29,7 @@ use crate::circuit_breaker::BreakerScope;
 use crate::config::{ComposerProxyEntry, UpstreamAuth};
 use crate::registry::{
     method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional, proxy_fetch_hop,
-    proxy_forward_post, read_validators, validators_key, write_validators, Hopped, ProxyError,
-    Revalidation, UpstreamMiss, Validators,
+    proxy_forward_post, validators_key, Hopped, ProxyError, Revalidation, UpstreamMiss, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -888,6 +887,50 @@ struct UpstreamDocument {
     stale: bool,
 }
 
+/// The upstream validators of a cached p2 document and the digest of the body they came with,
+/// stored beside it (`.meta`) and believed only for that body. Written apart from the body,
+/// validators may describe another one: two refetches of one document can interleave their
+/// writes (body two, body one, validators one, validators two), and validators taken for the
+/// body beside them would send the newer ETag for the older body — whose 304 keeps the older
+/// body for good. A sidecar without the digest (written before it was kept) is not believed.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BoundValidators {
+    #[serde(flatten)]
+    validators: Validators,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    body: Option<String>,
+}
+
+fn body_digest(body: &[u8]) -> String {
+    hex::encode(sha2::Sha256::digest(body))
+}
+
+/// The validators stored for `key`, when they came with `body`.
+async fn read_bound_validators(state: &AppState, key: &str, body: &[u8]) -> Option<Validators> {
+    let data = state.storage.get(&validators_key(key)).await.ok()?;
+    let bound: BoundValidators = serde_json::from_slice(&data).ok()?;
+    (bound.body.as_deref() == Some(body_digest(body).as_str())).then_some(bound.validators)
+}
+
+/// Store `validators` for `key` as the ones `body` came with. Written after the body: a sidecar
+/// that cannot be written leaves the one before, which names the body before.
+async fn write_bound_validators(state: &AppState, key: &str, body: &[u8], validators: &Validators) {
+    let bound = BoundValidators {
+        validators: validators.clone(),
+        body: Some(body_digest(body)),
+    };
+    match serde_json::to_vec(&bound) {
+        Ok(data) => {
+            if let Err(e) = state.storage.put(&validators_key(key), &data).await {
+                tracing::warn!(registry = REGISTRY, key, error = %e, "failed to store metadata validators");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(registry = REGISTRY, key, error = %e, "metadata validators not encoded")
+        }
+    }
+}
+
 /// The cached copy of a p2 document and what is known of it.
 struct CachedDocument {
     body: Bytes,
@@ -911,7 +954,7 @@ async fn cached_document(state: &AppState, key: &str) -> Option<CachedDocument> 
         .ok()
         .map(|o| String::from_utf8_lossy(&o).into_owned());
     let written = meta.as_ref().map(|m| m.modified as i64);
-    let last_modified = read_validators(&state.storage, key)
+    let last_modified = read_bound_validators(state, key, &body)
         .await
         .and_then(|v| v.last_modified)
         .or_else(|| meta.map(|m| http_date(m.modified)));
@@ -1151,9 +1194,11 @@ async fn upstream_document(
                 .is_some_and(|o| same_upstream(o, up.url()))
         });
         let validators = match from_here {
-            Some(_) if state.config.composer.revalidate => read_validators(&state.storage, &key)
-                .await
-                .unwrap_or_default(),
+            Some(c) if state.config.composer.revalidate => {
+                read_bound_validators(state, &key, &c.body)
+                    .await
+                    .unwrap_or_default()
+            }
             _ => Validators::default(),
         };
         let had_validators = validators.is_some();
@@ -1232,7 +1277,7 @@ async fn upstream_document(
                             tracing::warn!(registry = REGISTRY, key, error = %e, "failed to record metadata origin");
                         }
                         if validators.is_some() {
-                            write_validators(&state.storage, &key, &validators).await;
+                            write_bound_validators(state, &key, &body, &validators).await;
                         } else {
                             let _ = state.storage.delete(&validators_key(&key)).await;
                         }
