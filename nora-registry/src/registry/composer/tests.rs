@@ -2539,3 +2539,65 @@ async fn concurrent_refetches_never_pin_an_old_body_under_a_new_etag() {
         "a 304 for the newer ETag kept the older body: {doc}"
     );
 }
+
+// ── xhigh-4: a hosted name the store cannot be asked about is never an upstream's ─────
+
+/// After an upload, the vendor directory loses its search permission: whether `acme/private`
+/// is hosted cannot be read. It must not be taken for an upstream's name then — neither its
+/// metadata nor an audit may reach an upstream that has a public package by that name.
+#[tokio::test]
+async fn a_hosted_name_the_store_cannot_be_asked_about_is_never_an_upstream_s() {
+    use std::os::unix::fs::PermissionsExt;
+    let up = MockServer::start().await;
+    mount_root(&up).await;
+    Mock::given(wm_path("/p2/acme/private.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages": {"acme/private": [
+            {"name": "acme/private", "version": "6.6.6",
+             "dist": {"type": "zip", "url": format!("{}/archives/evil.zip", up.uri()), "reference": "eeee"}}
+        ]}})))
+        .mount(&up)
+        .await;
+    mount_advisories(&up).await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let resp = send(
+        &ctx.app,
+        Method::PUT,
+        "/composer/packages/upload/acme/private/1.0.0",
+        upload_zip("acme/private", None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let vendor = std::path::Path::new(&ctx.state.config.storage.path).join("composer/hosted/acme");
+    std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let blocked = std::fs::metadata(vendor.join("private")).is_err();
+    let p2 = send(&ctx.app, Method::GET, "/composer/p2/acme/private.json", "").await;
+    let dist = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/private/6.6.6/eeee.zip",
+        "",
+    )
+    .await;
+    let audit = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/api/security-advisories?packages[]=acme/private",
+        "",
+    )
+    .await;
+    std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !blocked {
+        eprintln!("skipped: this user passes through a directory without permissions");
+        return;
+    }
+    for (what, resp) in [("p2", &p2), ("dist", &dist), ("audit", &audit)] {
+        assert!(resp.status().is_server_error(), "{what}: {}", resp.status());
+    }
+    let asked = upstream_paths(&up).await;
+    assert!(
+        !asked.iter().any(|p| p.contains("acme/private")
+            || p.contains("advisories")
+            || p.starts_with("/archives/")),
+        "{asked:?}"
+    );
+}
