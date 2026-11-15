@@ -941,7 +941,15 @@ async fn module_source_download(
                     state.spawn_cache("terraform", source_url_key, Bytes::from(original.clone()));
                     split_subdir(&original).0
                 }
-                Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+                // A source that is not an archive (a VCS or non-HTTP one) is the client's to
+                // fetch: there is nothing here to serve.
+                Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
+                // A 2xx without the source header breaks the protocol: a failed upstream, as
+                // the module download answers it.
+                Ok(None) => {
+                    return UpstreamMiss::of(&ProxyError::Upstream(502))
+                        .response("terraform", &module)
+                }
                 Err(e) => return UpstreamMiss::of(&e).response("terraform", &module),
             }
         }
@@ -3501,6 +3509,33 @@ mod integration_tests {
             .map(|r| r.url.path().to_string())
             .collect();
         assert_eq!(asked, ["/v1/modules/acme/vpc/aws/1.0.0/download"]);
+    }
+
+    /// A module source asked for before its source URL is stored, whose upstream answers the
+    /// download without the source header, is a failed upstream (502), as the module download
+    /// answers it: not "not found", which a client would take for a missing module.
+    #[tokio::test]
+    async fn a_module_source_whose_upstream_names_no_source_is_a_failed_upstream() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/modules/acme/vpc/aws/1.0.0/download"))
+            .respond_with(ResponseTemplate::new(204))
+            .mount(&server)
+            .await;
+        let ctx = tf_ctx(server.uri());
+        // Control: the module download answers the same upstream answer with 502.
+        let resp = send(&ctx.app, Method::GET, MODULE_DL, "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "control");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/download/acme/vpc/aws/1.0.0/source",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     /// #1209: what the source URL answers is served and cached only when it is an archive: a web

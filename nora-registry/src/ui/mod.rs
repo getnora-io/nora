@@ -144,6 +144,8 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/deb/{name}", get(generic_registry_detail))
         .route("/ui/cpan", get(cpan_browse_root))
         .route("/ui/cpan/{*path}", get(cpan_browse))
+        .route("/ui/composer", get(generic_registry_list))
+        .route("/ui/composer/{*name}", get(composer_detail))
         .route("/ui/gems/{name}", get(generic_registry_detail))
         .route("/ui/terraform/{name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
@@ -689,6 +691,7 @@ async fn generic_registry_list(
         Some(crate::registry_type::RegistryType::Rpm) => "RPM (yum/dnf)",
         Some(crate::registry_type::RegistryType::Deb) => "Debian (APT)",
         Some(crate::registry_type::RegistryType::Cpan) => "CPAN",
+        Some(crate::registry_type::RegistryType::Composer) => "Composer (PHP)",
         _ => registry_key,
     };
 
@@ -847,6 +850,34 @@ async fn cpan_browse(
             .into_response()
         }
     }
+}
+
+// Composer detail: a package is `vendor/package`, linked with its slash encoded or not
+async fn composer_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    let valid = name.split_once('/').is_some_and(|(vendor, package)| {
+        crate::registry::composer::is_valid_package_name(vendor, package)
+    });
+    if !valid {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let auth_enabled = state.auth.is_some();
+    let detail = api::get_composer_detail(&state.storage, &name).await;
+    Html(templates::render_composer_detail(
+        &name,
+        &detail,
+        lang,
+        auth_enabled,
+    ))
+    .into_response()
 }
 
 // Ansible Galaxy hierarchical browsing (namespace → collection → versions)
@@ -1339,6 +1370,117 @@ mod base_path_tests {
     }
 }
 
+/// The Composer pages: a list of `vendor/package` names, and a detail page per package whose
+/// versions say whether NORA hosts them or cached them.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod composer_pages {
+    use crate::registry::composer::build_test_zip;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+
+    fn ctx() -> TestContext {
+        create_test_context_with_config(|c| c.composer.enabled = true)
+    }
+
+    async fn page(ctx: &TestContext, uri: &str) -> (StatusCode, String) {
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        let status = resp.status();
+        let body = body_bytes(resp).await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    async fn upload(ctx: &TestContext, name: &str, version: &str) {
+        let manifest = serde_json::json!({"name": name}).to_string();
+        let zip = build_test_zip(&[("composer.json", manifest.as_bytes(), false)]);
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/composer/packages/upload/{name}/{version}"),
+            zip,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    #[tokio::test]
+    async fn an_uploaded_package_is_listed_and_has_a_page_of_hosted_versions() {
+        let ctx = ctx();
+        upload(&ctx, "acme/greeter", "1.0.0").await;
+        upload(&ctx, "acme/greeter", "1.1.0").await;
+
+        let (status, list) = page(&ctx, "/ui/composer").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(list.contains("Composer (PHP)"));
+        assert!(
+            list.contains(">acme/greeter</a>"),
+            "the list names the package"
+        );
+        assert!(list.contains(r#"hx-get="/api/ui/composer/search""#));
+
+        // The list links the name as the client would write it, with the slash encoded: the
+        // page answers to that link and to the plain one alike.
+        let (_, search) = page(&ctx, "/api/ui/composer/search?q=greet").await;
+        assert!(search.contains("/ui/composer/acme%2Fgreeter"));
+        for uri in ["/ui/composer/acme/greeter", "/ui/composer/acme%2Fgreeter"] {
+            let (status, html) = page(&ctx, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(html.contains("composer require acme/greeter"), "{uri}");
+            for version in ["1.0.0", "1.1.0"] {
+                assert!(
+                    html.contains(&format!(r#"data-version="{version}""#)),
+                    "{uri}: no row for {version}"
+                );
+            }
+            assert!(
+                html.contains(">hosted<") && !html.contains(">cached<"),
+                "{uri}"
+            );
+            assert!(html.contains("(2 total)"), "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cached_archive_is_a_cached_version() {
+        let ctx = ctx();
+        ctx.state
+            .storage
+            .put("composer/dists/acme/lib/2.3.4/aaaa.zip", b"PK")
+            .await
+            .unwrap();
+        let (status, html) = page(&ctx, "/ui/composer/acme/lib").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(r#"data-version="2.3.4""#));
+        assert!(html.contains(">cached<") && !html.contains(">hosted<"));
+    }
+
+    #[tokio::test]
+    async fn a_package_nora_holds_nothing_of_has_an_empty_page() {
+        let ctx = ctx();
+        let (status, html) = page(&ctx, "/ui/composer/acme/none").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains("composer require acme/none"));
+        assert!(!html.contains("version-row"));
+    }
+
+    #[tokio::test]
+    async fn only_a_package_name_has_a_page() {
+        let ctx = ctx();
+        for uri in [
+            "/ui/composer/acme",
+            "/ui/composer/acme/greeter/extra",
+            "/ui/composer/Acme/Greeter",
+            "/ui/composer/acme/gree%20ter",
+            "/ui/composer/acme/..",
+            "/ui/composer/acme/",
+            "/ui/composer/%2F",
+        ] {
+            let (status, _) = page(&ctx, uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod maven_pages_from_index {
     use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
@@ -1352,6 +1494,16 @@ mod maven_pages_from_index {
         inner: ObjectStorage,
         walks: Arc<AtomicUsize>,
         stats: Arc<AtomicUsize>,
+        gate: Option<Arc<Gate>>,
+    }
+
+    /// Holds one listing after it has read storage, until released: the window between a
+    /// rebuild's listing and the index it stores.
+    #[derive(Default)]
+    struct Gate {
+        armed: std::sync::atomic::AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
     }
 
     #[async_trait::async_trait]
@@ -1384,7 +1536,14 @@ mod maven_pages_from_index {
             prefix: &str,
         ) -> crate::storage::Result<Vec<(String, FileMeta)>> {
             self.walks.fetch_add(1, Ordering::SeqCst);
-            self.inner.list_with_meta(prefix).await
+            let listed = self.inner.list_with_meta(prefix).await;
+            if let Some(gate) = &self.gate {
+                if gate.armed.swap(false, Ordering::SeqCst) {
+                    gate.entered.notify_one();
+                    gate.release.notified().await;
+                }
+            }
+            listed
         }
         async fn health_check(&self) -> bool {
             self.inner.health_check().await
@@ -1448,12 +1607,18 @@ mod maven_pages_from_index {
     }
 
     async fn fixture() -> Fixture {
+        gated_fixture().await.0
+    }
+
+    async fn gated_fixture() -> (Fixture, Arc<Gate>) {
+        let gate = Arc::new(Gate::default());
         let walks = Arc::new(AtomicUsize::new(0));
         let stats = Arc::new(AtomicUsize::new(0));
         let ctx = create_test_context_with_storage(Storage::from_backend(Arc::new(Counting {
             inner: ObjectStorage::in_memory(),
             walks: Arc::clone(&walks),
             stats: Arc::clone(&stats),
+            gate: Some(Arc::clone(&gate)),
         })));
         for (key, len) in [
             ("maven/com/acme/lib/maven-metadata.xml", 100),
@@ -1465,7 +1630,7 @@ mod maven_pages_from_index {
         ] {
             ctx.state.storage.put(key, &vec![b'x'; len]).await.unwrap();
         }
-        Fixture { ctx, walks, stats }
+        (Fixture { ctx, walks, stats }, gate)
     }
 
     /// #1216: once the index is built, a Maven directory page is answered from it: no listing
@@ -1558,6 +1723,41 @@ mod maven_pages_from_index {
         assert_eq!(newest, [("a", 300), ("b", 200)]);
     }
 
+    /// Client-managed metadata stored after the index was built is on the directory page at once,
+    /// as an uploaded artifact is.
+    #[tokio::test]
+    async fn stored_metadata_is_on_the_directory_page_at_once() {
+        let f = fixture().await;
+        assert!(!f.page("/ui/maven/com/acme").await.contains(">tool</a>"));
+        let resp = send(
+            &f.ctx.app,
+            Method::PUT,
+            "/maven2/com/acme/tool/maven-metadata.xml",
+            b"<metadata><plugins/></metadata>".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(f.page("/ui/maven/com/acme").await.contains(">tool</a>"));
+    }
+
+    /// Control for the test above: with the index marked for rebuild by hand, the same write is on
+    /// the page, so a red above is the missing invalidation and not a page that never shows it.
+    #[tokio::test]
+    async fn stored_metadata_is_on_the_page_once_the_index_is_rebuilt() {
+        let f = fixture().await;
+        assert!(!f.page("/ui/maven/com/acme").await.contains(">tool</a>"));
+        let resp = send(
+            &f.ctx.app,
+            Method::PUT,
+            "/maven2/com/acme/tool/maven-metadata.xml",
+            b"<metadata><plugins/></metadata>".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        f.ctx.state.repo_index.invalidate("maven");
+        assert!(f.page("/ui/maven/com/acme").await.contains(">tool</a>"));
+    }
+
     /// #1216: an artifact uploaded after the index was built is on the page at once: the upload
     /// marks the index for rebuild, so the page is not served from a stale one.
     #[tokio::test]
@@ -1573,5 +1773,162 @@ mod maven_pages_from_index {
         .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
         assert!(f.page("/ui/maven/com/acme").await.contains(">tool</a>"));
+    }
+
+    /// A write that lands while the index is being rebuilt is not lost: the rebuild that listed
+    /// storage before the write leaves the index marked, and the next visit shows the write.
+    #[tokio::test]
+    async fn a_write_during_a_rebuild_is_on_the_next_page() {
+        let (f, gate) = gated_fixture().await;
+        gate.armed.store(true, Ordering::SeqCst);
+        let app = f.ctx.app.clone();
+        let visit = tokio::spawn(async move {
+            send(&app, Method::GET, "/ui/maven/com/acme", "")
+                .await
+                .status()
+        });
+        // The rebuild has listed storage and has not stored the index yet.
+        tokio::time::timeout(std::time::Duration::from_secs(10), gate.entered.notified())
+            .await
+            .expect("the rebuild never listed storage");
+        let resp = send(
+            &f.ctx.app,
+            Method::PUT,
+            "/maven2/com/acme/tool/3.0/tool-3.0.jar",
+            vec![b'x'; 5],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        gate.release.notify_one();
+        assert_eq!(visit.await.unwrap(), StatusCode::OK);
+        // No write since: the next visit must still see the upload.
+        assert!(f.page("/ui/maven/com/acme").await.contains(">tool</a>"));
+    }
+
+    /// A checksum the client uploads for a file of a new version marks the index for rebuild, as
+    /// the file it belongs to does.
+    #[tokio::test]
+    async fn an_uploaded_checksum_is_on_the_directory_page_at_once() {
+        for rebuilt_by_hand in [true, false] {
+            let f = fixture().await;
+            assert!(!f.page("/ui/maven/com/acme").await.contains(">tool</a>"));
+            let resp = send(
+                &f.ctx.app,
+                Method::PUT,
+                "/maven2/com/acme/tool/3.0/tool-3.0.jar.sha1",
+                b"da39a3ee5e6b4b0d3255bfef95601890afd80709".to_vec(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::CREATED);
+            // Control: with the index marked by hand the checksum is on the page, so a red
+            // without it is the missing mark and not a page that never shows a checksum.
+            if rebuilt_by_hand {
+                f.ctx.state.repo_index.invalidate("maven");
+            }
+            assert!(
+                f.page("/ui/maven/com/acme").await.contains(">tool</a>"),
+                "marked by hand: {rebuilt_by_hand}"
+            );
+        }
+    }
+
+    /// Metadata fetched from the upstream and cached marks the index for rebuild, as a cached
+    /// artifact does: the directory it lands in is on the page without another write.
+    #[tokio::test]
+    async fn proxied_metadata_is_on_the_directory_page() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let up = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/newproxy/thing/maven-metadata.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<metadata><groupId>newproxy</groupId><artifactId>thing</artifactId>\
+                 <versioning><versions><version>1.0</version></versions></versioning></metadata>",
+            ))
+            .mount(&up)
+            .await;
+        let uri = up.uri();
+        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+            cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri)];
+        });
+        let page = |uri: &'static str| {
+            let app = ctx.app.clone();
+            async move {
+                let resp = send(&app, Method::GET, uri, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+                String::from_utf8(body_bytes(resp).await.to_vec()).unwrap()
+            }
+        };
+        assert!(!page("/ui/maven").await.contains(">newproxy</a>"));
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/newproxy/thing/maven-metadata.xml",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let key = "maven/newproxy/thing/maven-metadata.xml";
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while ctx.state.storage.stat(key).await.is_none() {
+            assert!(std::time::Instant::now() < deadline, "{key} never cached");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        while !page("/ui/maven").await.contains(">newproxy</a>") {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "proxied metadata never reached the directory page"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A file stored under a path that names no artifact (it is kept as uploaded) marks the index
+    /// for rebuild, as an artifact does.
+    #[tokio::test]
+    async fn an_uploaded_file_outside_an_artifact_is_on_the_directory_page_at_once() {
+        let f = fixture().await;
+        assert!(!f.page("/ui/maven").await.contains(">neworg</a>"));
+        let resp = send(
+            &f.ctx.app,
+            Method::PUT,
+            "/maven2/neworg/thing/readme.txt",
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert!(f.page("/ui/maven").await.contains(">neworg</a>"));
+    }
+
+    /// A file cached in the background (a proxied artifact) marks the index for rebuild once it
+    /// is stored, so it shows on the directory page without another write.
+    #[tokio::test]
+    async fn a_file_cached_in_the_background_is_on_the_directory_page() {
+        for immutable in [false, true] {
+            let f = fixture().await;
+            assert!(!f.page("/ui/maven").await.contains(">cached</a>"));
+            let key = "maven/cached/a/1.0/a-1.0.jar".to_string();
+            let data = axum::body::Bytes::from_static(b"jar");
+            if immutable {
+                f.ctx
+                    .state
+                    .spawn_cache_immutable("maven", key.clone(), data);
+            } else {
+                f.ctx.state.spawn_cache("maven", key.clone(), data);
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while f.ctx.state.storage.stat(&key).await.is_none() {
+                assert!(std::time::Instant::now() < deadline, "never stored");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // The mark follows the write in the same task: wait for it up to the deadline.
+            while !f.page("/ui/maven").await.contains(">cached</a>") {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "a cached file never reached the directory page (immutable: {immutable})"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
     }
 }

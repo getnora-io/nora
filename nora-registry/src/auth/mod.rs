@@ -465,6 +465,13 @@ pub async fn auth_middleware(
         && (path == "/npm/-/npm/v1/security/advisories/bulk"
             || path == "/npm/-/npm/v1/security/audits/quick");
 
+    // `composer audit` posts its query (`packages[]=…`) the same way, and is read-eligible
+    // for the same reasons: registry/composer.rs mutates nothing, caps the body, never
+    // forwards hosted or internal package names, and never forwards the client credential.
+    let is_composer_audit = *request.method() == axum::http::Method::POST
+        && (path == "/composer/api/security-advisories"
+            || path == "/composer/api/security-advisories/");
+
     // A request that presents credentials is always validated below (honest
     // `docker login`, correct audit attribution) — never short-circuited to
     // anonymous. Anonymous Docker bypass applies only when no Authorization sent.
@@ -473,7 +480,7 @@ pub async fn auth_middleware(
     // Anonymous read for non-Docker registries (Maven/raw/npm/…) if configured.
     // Token management, whoami, admin, and all Docker `/v2` paths are excluded.
     if state.config.auth.anonymous_read
-        && (is_read_method || is_npm_audit)
+        && (is_read_method || is_npm_audit || is_composer_audit)
         && !is_docker
         && !is_token_management
         && !is_whoami
@@ -556,7 +563,30 @@ pub async fn auth_middleware(
                         deny("authentication required")
                     }
                 }
-                Some(docker_token::Grant::User { user, role }) => {
+                Some(docker_token::Grant::User {
+                    user,
+                    role,
+                    api_token,
+                }) => {
+                    // Issued on an API token: it speaks for that token, so it is refused once
+                    // the store has the token revoked or expired, at once on this instance.
+                    let (user, role) = match api_token {
+                        None => (user, role),
+                        Some(file_id) => {
+                            match state.tokens.as_ref().map(|s| s.verify_token_id(&file_id)) {
+                                Some(Ok(owner)) => owner,
+                                Some(Err(crate::tokens::TokenError::Storage(e))) => {
+                                    tracing::error!(error = %e, "token store read failed during Docker token check");
+                                    return (
+                                        StatusCode::SERVICE_UNAVAILABLE,
+                                        "Token verification unavailable",
+                                    )
+                                        .into_response();
+                                }
+                                Some(Err(_)) | None => return deny("Invalid or expired token"),
+                            }
+                        }
+                    };
                     if is_write_method(request.method()) && !role.can_write() {
                         return (StatusCode::FORBIDDEN, "Read-only token").into_response();
                     }
@@ -687,7 +717,7 @@ pub async fn auth_middleware(
     let encoded = &auth_header[6..];
     let decision = authenticate_basic(&state, client_ip, encoded, request.method(), is_admin).await;
     match decision {
-        BasicDecision::Authenticated { user, role } => {
+        BasicDecision::Authenticated { user, role, .. } => {
             // Basic-auth identities and opaque (nra_) tokens are not
             // namespace-scoped (#583 is OIDC-only).
             request
@@ -780,10 +810,14 @@ pub(crate) async fn authenticate_basic(
 /// decided by [`decide_basic_auth`].
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum BasicDecision {
-    /// Valid credentials, authorized: run the request as `user` with `role`.
+    /// Valid credentials, authorized: run the request as `user` with `role`. `api_token` is
+    /// the file id of the API token the password was, `None` for an htpasswd login: what is
+    /// issued on these credentials and outlives the request (a Docker token, #1226) is
+    /// checked against that token again, so its revoke or expiry ends it.
     Authenticated {
         user: String,
         role: crate::tokens::Role,
+        api_token: Option<String>,
     },
     /// Valid credentials, not authorized for this request (403). The
     /// credentials still count as a success for the failure tracker.
@@ -924,6 +958,7 @@ where
         return BasicDecision::Authenticated {
             user: username.to_string(),
             role: crate::tokens::Role::Write,
+            api_token: None,
         };
     }
 
@@ -936,7 +971,11 @@ where
                 // identity (#737), so it must clear the admin gate too.
                 BasicDecision::Forbidden("Admin role required")
             } else {
-                BasicDecision::Authenticated { user, role }
+                BasicDecision::Authenticated {
+                    user,
+                    role,
+                    api_token: Some(crate::tokens::file_id(password)),
+                }
             }
         }
         Some(Err(crate::tokens::TokenError::Storage(e))) => BasicDecision::ServiceUnavailable(e),
@@ -1562,6 +1601,7 @@ mod basic_decision_tests {
         BasicDecision::Authenticated {
             user: user.into(),
             role,
+            api_token: None,
         }
     }
 
@@ -1639,6 +1679,19 @@ mod basic_decision_tests {
         want: BasicDecision,
         read: bool,
     ) -> Row {
+        // The identity of the token owner is the token's: the decision names the token it
+        // passed as, which an htpasswd login never does.
+        let want = match want {
+            BasicDecision::Authenticated { user, role, .. } if user == OWNER => {
+                let password = credentials.split_once(':').map_or("", |(_, p)| p);
+                BasicDecision::Authenticated {
+                    user,
+                    role,
+                    api_token: Some(crate::tokens::file_id(password)),
+                }
+            }
+            want => want,
+        };
         Row {
             setup,
             encoded: STANDARD.encode(credentials),
@@ -3741,6 +3794,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     crate::config::CurationConfig::default(),
                 ),
                 bypass_token: None,
+                loaded_at: 0,
             })),
             auth_failures: Arc::new(crate::auth::AuthFailureTracker::new(5, 900)),
             oidc: Some(Arc::new(oidc_validator)),

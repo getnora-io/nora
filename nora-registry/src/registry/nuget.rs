@@ -15,6 +15,7 @@
 
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
+use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
 use crate::registry::{
     circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_conditional, proxy_fetch_text,
@@ -37,6 +38,9 @@ use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";
 const SEARCH_TIMEOUT_SECS: u64 = 5;
+/// The most entries a search or autocomplete page holds, whatever `take` asks: nuget.org's limit
+/// (it answers a larger `take` with its default page, measured 15.11.2026).
+const SEARCH_TAKE_MAX: usize = 1000;
 const DEFAULT_SEARCH: &str = "https://azuresearch-usnc.nuget.org/query";
 const DEFAULT_AUTOCOMPLETE: &str = "https://azuresearch-usnc.nuget.org/autocomplete";
 
@@ -48,6 +52,8 @@ struct SearchParams {
     prerelease: Option<bool>,
     #[serde(rename = "semVerLevel")]
     sem_ver_level: Option<String>,
+    /// Autocomplete's package-versions form: `?id=<package>` lists that package's versions.
+    id: Option<String>,
 }
 
 /// Storage prefix and file suffix for repo index scanning.
@@ -227,7 +233,7 @@ async fn search_query(
 ) -> Response {
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
-    let take = params.take.unwrap_or(20);
+    let take = params.take.unwrap_or(20).min(SEARCH_TAKE_MAX);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
 
@@ -242,7 +248,7 @@ async fn search_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return data.map_or_else(records_unavailable, with_json);
     }
 
     // #68 namespace isolation: never forward a search term that matches an internal
@@ -261,28 +267,40 @@ async fn search_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return data.map_or_else(records_unavailable, with_json);
     }
+
+    // NORA's own packages first, the search host's after them: which ids are NORA's own must
+    // be known before the host is asked, or a package NORA hosts is shown as the host has it.
+    let Some(hosted) = state.repo_index.nuget_hosted(&state.storage).await else {
+        return records_unavailable();
+    };
+    let shown = SearchFilter {
+        prerelease,
+        sem_ver_level: sem_ver_level.as_deref(),
+    };
+    let own = own_matches(&state, &hosted, &query, shown).await;
+    let window = PageWindow::new(skip, take, own.len());
 
     // Try upstream with short timeout (UX-critical path)
     let qs = raw_query.0.unwrap_or_default();
-    let url = format!("{}?{}", state.config.nuget.search_service, qs);
 
-    match proxy_fetch_text(
-        &state.http_client,
-        &url,
-        Duration::from_secs(SEARCH_TIMEOUT_SECS),
-        None, // search endpoint is public
-        None,
-        &state.circuit_breaker,
-        RegistryType::Nuget,
+    let need = window.upstream_need();
+    match read_search_host(
+        &state,
+        HostResource::Search,
+        &hosted,
+        &own,
+        &qs,
+        need,
+        shown,
     )
     .await
     {
-        Ok(text) => {
-            let base_url = nora_base_url(&state);
-            let upstream = rewrite_host(&state);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
+        Ok(host) => {
+            let Some(merged) = merge_search_page(&own, host, window) else {
+                return page_too_deep();
+            };
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -291,30 +309,41 @@ async fn search_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(rewritten.into_bytes())
+            with_json(merged)
         }
-        Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
+        Err(ProxyError::NotFound) => {
+            // The host knows nothing of the query: NORA's own packages may still match.
+            let merged = merge_search_page(&own, HostRead::nothing(), window);
+            merged.map_or_else(page_too_deep, with_json)
+        }
         Err(
-            ProxyError::CircuitOpen(_)
+            e @ (ProxyError::CircuitOpen(_)
             | ProxyError::Network(_)
             | ProxyError::Upstream(_)
             | ProxyError::CredentialsRefused
-            | ProxyError::RateLimited { .. },
+            | ProxyError::RateLimited { .. }),
         ) => {
-            if !state.config.nuget.serve_stale {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            if state.config.nuget.serve_stale {
+                match local_search_results(
+                    &state,
+                    &query,
+                    skip,
+                    take,
+                    prerelease,
+                    sem_ver_level.as_deref(),
+                )
+                .await
+                {
+                    // NORA's own packages cannot be told apart: no answer is safe.
+                    None => return records_unavailable(),
+                    Some(data) if has_hits(&data) => {
+                        tracing::info!("NuGet search: upstream unavailable, using local index");
+                        return with_json_stale(data);
+                    }
+                    Some(_) => {}
+                }
             }
-            tracing::info!("NuGet search: upstream unavailable, using local index");
-            let data = local_search_results(
-                &state,
-                &query,
-                skip,
-                take,
-                prerelease,
-                sem_ver_level.as_deref(),
-            )
-            .await;
-            with_json_stale(data)
+            search_unavailable(&e)
         }
     }
 }
@@ -328,60 +357,114 @@ async fn autocomplete_query(
 ) -> Response {
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
-    let take = params.take.unwrap_or(20);
+    let take = params.take.unwrap_or(20).min(SEARCH_TAKE_MAX);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
+    // An empty `?id=` is the package-ID form, not the versions form.
+    let id = params.id.as_deref().filter(|s| !s.is_empty());
+
+    // The versions of a hosted package are its own records, as its registration is: the upstream
+    // is not asked, and the stored index (which may hold a stale upstream listing) is not read.
+    if let Some(id_lower) = id.map(str::to_lowercase) {
+        match hosted_versions(&state.storage, &id_lower).await {
+            None => {
+                return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower))
+            }
+            Some(versions) if versions.hosted() => {
+                let data = autocomplete_versions_answer(
+                    versions.listed().to_vec(),
+                    prerelease,
+                    sem_ver_level.as_deref(),
+                );
+                return with_json(data);
+            }
+            Some(_) => {}
+        }
+    }
 
     // No upstream proxy configured → local autocomplete from cache
     if upstream_url(&state).is_none() {
         let data = local_autocomplete_results(
             &state,
             &query,
+            id,
             skip,
             take,
             prerelease,
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return data.map_or_else(records_unavailable, with_json);
     }
 
-    // #68 namespace isolation: don't forward an internal-namespace autocomplete term.
+    // #68 namespace isolation: don't forward an internal-namespace autocomplete term — for the
+    // versions form the term is the package id.
     if crate::curation::is_internal_namespace(
         &state.curation().curation_engine,
         crate::curation::RegistryType::Nuget,
-        &query,
+        id.unwrap_or(&query),
     ) {
         let data = local_autocomplete_results(
             &state,
             &query,
+            id,
             skip,
             take,
             prerelease,
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return data.map_or_else(records_unavailable, with_json);
     }
 
     let qs = raw_query.0.unwrap_or_default();
-    let url = format!("{}?{}", state.config.nuget.autocomplete, qs);
-
-    match proxy_fetch_text(
-        &state.http_client,
-        &url,
-        Duration::from_secs(SEARCH_TIMEOUT_SECS),
-        None, // autocomplete endpoint is public
-        None,
-        &state.circuit_breaker,
-        RegistryType::Nuget,
-    )
-    .await
-    {
-        Ok(text) => {
+    let host = if id.is_some() {
+        // The versions form of an id NORA does not host: the host's answer as it is.
+        let url = format!("{}?{}", state.config.nuget.autocomplete, qs);
+        proxy_fetch_text(
+            &state.http_client,
+            &url,
+            Duration::from_secs(SEARCH_TIMEOUT_SECS),
+            None, // autocomplete endpoint is public
+            None,
+            &state.circuit_breaker,
+            BreakerScope::upstream(RegistryType::Nuget, &state.config.nuget.autocomplete),
+        )
+        .await
+        .map(|text| {
             let base_url = nora_base_url(&state);
-            let upstream = rewrite_host(&state);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
+            rewrite_registration_urls(&text, &rewrite_host(&state), &base_url).into_bytes()
+        })
+    } else {
+        // The package-id form: NORA's own ids first and the host's after them, as search.
+        let Some(hosted) = state.repo_index.nuget_hosted(&state.storage).await else {
+            return records_unavailable();
+        };
+        let shown = SearchFilter {
+            prerelease,
+            sem_ver_level: sem_ver_level.as_deref(),
+        };
+        let own: Vec<serde_json::Value> = own_matches(&state, &hosted, &query, shown)
+            .await
+            .into_iter()
+            .map(|entry| HostResource::Autocomplete.own_entry(entry))
+            .collect();
+        let window = PageWindow::new(skip, take, own.len());
+        let need = window.upstream_need();
+        let resource = HostResource::Autocomplete;
+        let read = match read_search_host(&state, resource, &hosted, &own, &qs, need, shown).await {
+            Err(ProxyError::NotFound) => Ok(HostRead::nothing()),
+            read => read,
+        };
+        match read.map(|read| merge_search_page(&own, read, window)) {
+            Ok(None) => return page_too_deep(),
+            Ok(Some(merged)) => Ok(merged),
+            Err(e) => Err(e),
+        }
+    };
+
+    match host {
+        Ok(merged) => {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -390,30 +473,40 @@ async fn autocomplete_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(rewritten.into_bytes())
+            with_json(merged)
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(
-            ProxyError::CircuitOpen(_)
+            e @ (ProxyError::CircuitOpen(_)
             | ProxyError::Network(_)
             | ProxyError::Upstream(_)
             | ProxyError::CredentialsRefused
-            | ProxyError::RateLimited { .. },
+            | ProxyError::RateLimited { .. }),
         ) => {
-            if !state.config.nuget.serve_stale {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            if state.config.nuget.serve_stale {
+                match local_autocomplete_results(
+                    &state,
+                    &query,
+                    id,
+                    skip,
+                    take,
+                    prerelease,
+                    sem_ver_level.as_deref(),
+                )
+                .await
+                {
+                    // NORA's own packages cannot be told apart: no answer is safe.
+                    None => return records_unavailable(),
+                    Some(data) if has_hits(&data) => {
+                        tracing::info!(
+                            "NuGet autocomplete: upstream unavailable, using local index"
+                        );
+                        return with_json_stale(data);
+                    }
+                    Some(_) => {}
+                }
             }
-            tracing::info!("NuGet autocomplete: upstream unavailable, using local index");
-            let data = local_autocomplete_results(
-                &state,
-                &query,
-                skip,
-                take,
-                prerelease,
-                sem_ver_level.as_deref(),
-            )
-            .await;
-            with_json_stale(data)
+            search_unavailable(&e)
         }
     }
 }
@@ -1662,6 +1755,26 @@ fn with_json_gzip(data: Vec<u8>) -> Response {
 }
 
 /// JSON response with `X-Nora-Stale: true` header indicating degraded/fallback data.
+/// Whether the page of a local search or autocomplete result (`data`, after `skip` and `take`)
+/// names anything: a page past what NORA holds of the query is no answer while the host is
+/// down, though `totalHits` counts the matches before it.
+fn has_hits(data: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|result| result["data"].as_array().map(|page| !page.is_empty()))
+        .unwrap_or(false)
+}
+
+/// The answer of search or autocomplete when their host cannot answer and nothing local
+/// does: unavailable (503, as restore answers), never an empty result that says no package
+/// matches.
+fn search_unavailable(e: &ProxyError) -> Response {
+    match e {
+        ProxyError::CircuitOpen(key) => circuit_open_response(key),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 fn with_json_stale(data: Vec<u8>) -> Response {
     (
         StatusCode::OK,
@@ -1685,8 +1798,19 @@ fn with_json_stale(data: Vec<u8>) -> Response {
 }
 // ── Local search helpers ───────────────────────────────────────────────
 
-/// Read cached version list from flatcontainer index.json.
-async fn get_cached_versions(storage: &crate::storage::Storage, id: &str) -> Vec<String> {
+/// The versions package `id` lists: a hosted package's records (`hosted`, from
+/// [`crate::repo_index::RepoIndex::nuget_hosted`]), else the cached flatcontainer index.json an
+/// upstream gave.
+async fn get_cached_versions(
+    storage: &crate::storage::Storage,
+    hosted: &std::collections::HashMap<String, Vec<String>>,
+    id: &str,
+) -> Vec<String> {
+    // A hosted package's versions are its records, as its flat container lists them: an import
+    // writes no upstream list, and one an upstream gave for the id before is not its own.
+    if let Some(versions) = hosted.get(&id.to_lowercase()) {
+        return versions.clone();
+    }
     let key = format!("nuget/flatcontainer/{}/index.json", id.to_lowercase());
     let data = match storage.get(&key).await {
         Ok(d) => d,
@@ -1738,6 +1862,376 @@ fn build_search_entry(
     })
 }
 
+/// Which versions a search shows.
+#[derive(Clone, Copy)]
+struct SearchFilter<'a> {
+    /// Pre-release versions too.
+    prerelease: bool,
+    /// `semVerLevel`: SemVer 2.0 versions only when `"2.0.0"`.
+    sem_ver_level: Option<&'a str>,
+}
+
+impl SearchFilter<'_> {
+    fn shows(&self, version: &str) -> bool {
+        (self.prerelease || !version.contains('-'))
+            && (self.sem_ver_level == Some("2.0.0") || !is_semver2_version(version))
+    }
+}
+
+/// The search entry of local package `pkg` with the versions `shown` lets through (a hosted
+/// package's from its records), `None` when none is left.
+async fn local_search_entry(
+    state: &AppState,
+    hosted: &std::collections::HashMap<String, Vec<String>>,
+    base_url: &str,
+    pkg: &crate::repo_index::RepoInfo,
+    shown: SearchFilter<'_>,
+) -> Option<serde_json::Value> {
+    let versions: Vec<String> = get_cached_versions(&state.storage, hosted, &pkg.name)
+        .await
+        .into_iter()
+        .filter(|v| shown.shows(v))
+        .collect();
+    (!versions.is_empty()).then(|| build_search_entry(base_url, pkg, &versions))
+}
+
+/// 503 for a search while NORA does not know which packages are its own (the records could not
+/// be listed): a result then could show the search host's versions of a package NORA hosts.
+fn records_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("retry-after", "30")],
+        "nuget: hosted packages temporarily not listed",
+    )
+        .into_response()
+}
+
+/// NORA's own packages the query matches, as search shows them, ordered by id: the hosted ones
+/// whose id contains the query (case-insensitive) and that have a version `shown` lets through.
+async fn own_matches(
+    state: &AppState,
+    hosted: &std::collections::HashMap<String, Vec<String>>,
+    query: &str,
+    shown: SearchFilter<'_>,
+) -> Vec<serde_json::Value> {
+    let packages = state.repo_index.get("nuget", &state.storage).await;
+    let base_url = nora_base_url(state);
+    let query = query.to_lowercase();
+    let mut matched: Vec<&crate::repo_index::RepoInfo> = packages
+        .iter()
+        .filter(|pkg| {
+            let id = pkg.name.to_lowercase();
+            hosted.contains_key(&id) && id.contains(&query)
+        })
+        .collect();
+    matched.sort_by_key(|pkg| pkg.name.to_lowercase());
+    let mut entries = Vec::new();
+    for pkg in matched {
+        if let Some(entry) = local_search_entry(state, hosted, &base_url, pkg, shown).await {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+/// Where a page (`skip`, `take`) of a merged search falls: NORA's own packages (`own` of them)
+/// come first, the search host's after them, so the host is asked for its part of the page
+/// only, at the offset past NORA's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PageWindow {
+    /// NORA's own packages on the page: `own[own_from..own_from + own_take]`.
+    own_from: usize,
+    own_take: usize,
+    /// Where the page starts among the host's entries NORA shows, and how many of them it has
+    /// room for.
+    upstream_skip: usize,
+    upstream_room: usize,
+    /// NORA's own packages in all.
+    own_total: usize,
+}
+
+impl PageWindow {
+    fn new(skip: usize, take: usize, own_total: usize) -> Self {
+        let own_from = skip.min(own_total);
+        let own_take = (own_total - own_from).min(take);
+        let upstream_room = take - own_take;
+        Self {
+            own_from,
+            own_take,
+            upstream_skip: skip.saturating_sub(own_total),
+            upstream_room,
+            own_total,
+        }
+    }
+
+    /// How many of the host's entries NORA shows must be read for the page: those before it
+    /// and those on it. None when NORA's own packages fill the page; the host is still asked
+    /// once, for its total.
+    fn upstream_need(&self) -> usize {
+        self.upstream_skip.saturating_add(self.upstream_room)
+    }
+}
+
+/// A host result of at most this many entries is read whole, on every page, so that
+/// `totalHits` counts exactly what the pages hold. Above it `totalHits` is NORA's own plus the
+/// host's total: never fewer than the pages hold, more by the host's entries NORA does not show.
+const SEARCH_HOST_READ_WHOLE: usize = 100;
+/// The most entries asked of the search host in one request (nuget.org's `take` limit), and the
+/// most requests one search makes.
+const SEARCH_HOST_TAKE_MAX: usize = 1000;
+const SEARCH_HOST_READS_MAX: usize = 6;
+
+/// Which host a merged search reads: search answers entries (objects with an `id`),
+/// autocomplete answers package ids.
+#[derive(Clone, Copy, PartialEq)]
+enum HostResource {
+    Search,
+    Autocomplete,
+}
+
+impl HostResource {
+    fn url(self, state: &AppState) -> &str {
+        match self {
+            HostResource::Search => &state.config.nuget.search_service,
+            HostResource::Autocomplete => &state.config.nuget.autocomplete,
+        }
+    }
+
+    fn id_of(self, entry: &serde_json::Value) -> Option<&str> {
+        match self {
+            HostResource::Search => entry["id"].as_str(),
+            HostResource::Autocomplete => entry.as_str(),
+        }
+    }
+
+    /// The entry NORA shows for its own package, from its search entry.
+    fn own_entry(self, search_entry: serde_json::Value) -> serde_json::Value {
+        match self {
+            HostResource::Search => search_entry,
+            HostResource::Autocomplete => search_entry["id"].clone(),
+        }
+    }
+}
+
+/// What a merged search read of the search host.
+enum HostRead {
+    /// The host's entries NORA shows, in the host's order from its first, as NORA shows them;
+    /// `total` is the host's part of `totalHits`; `envelope` is the host's result object.
+    Entries {
+        shown: Vec<serde_json::Value>,
+        total: u64,
+        envelope: serde_json::Value,
+    },
+    /// A host result that is not the search JSON, passed on as it is.
+    Verbatim(String),
+    /// The page lies deeper than NORA reads the host for: it cannot be told which entries are
+    /// on it, and a short or empty page would read as the end of the results.
+    TooDeep,
+}
+
+impl HostRead {
+    fn nothing() -> Self {
+        HostRead::Entries {
+            shown: Vec::new(),
+            total: 0,
+            envelope: serde_json::json!({ "totalHits": 0, "data": [] }),
+        }
+    }
+}
+
+/// Reads the search host's result from its first entry, as many entries as it takes to have
+/// `need` that NORA shows, and the whole result when it is small (see
+/// [`SEARCH_HOST_READ_WHOLE`]). An entry of the host whose id is NORA's own — hosted, or in an
+/// internal namespace — is never shown as the host has it: one NORA already shows among its own
+/// (`own`) is dropped, another is replaced by NORA's entry of it, or dropped when NORA holds
+/// none. A dropped entry takes no place: the page is cut from what NORA shows, so no page is
+/// empty or short before the end. A request after the first asks for twice what was read
+/// before it at least, so a run of dropped entries is read past; a page that
+/// [`SEARCH_HOST_READS_MAX`] requests do not reach is [`HostRead::TooDeep`]. The first
+/// request's failure is the search's; a later one fails the search too, since the page cannot
+/// be told without it.
+async fn read_search_host(
+    state: &AppState,
+    resource: HostResource,
+    hosted: &std::collections::HashMap<String, Vec<String>>,
+    own: &[serde_json::Value],
+    qs: &str,
+    need: usize,
+    shown: SearchFilter<'_>,
+) -> Result<HostRead, ProxyError> {
+    let packages = state.repo_index.get("nuget", &state.storage).await;
+    let engine = &state.curation().curation_engine;
+    let base_url = nora_base_url(state);
+    let upstream = rewrite_host(state);
+    let mut seen: std::collections::HashSet<String> = own
+        .iter()
+        .filter_map(|entry| resource.id_of(entry).map(str::to_lowercase))
+        .collect();
+    let mut kept: Vec<serde_json::Value> = Vec::new();
+    let mut envelope: Option<serde_json::Value> = None;
+    let (mut read, mut host_total, mut whole) = (0usize, 0usize, false);
+
+    for round in 0..SEARCH_HOST_READS_MAX {
+        let take = if round == 0 {
+            need
+        } else if host_total <= SEARCH_HOST_READ_WHOLE {
+            host_total - read
+        } else {
+            need.saturating_sub(kept.len()).max(read)
+        }
+        .clamp(1, SEARCH_HOST_TAKE_MAX);
+        let url = format!("{}?{}", resource.url(state), with_page(qs, read, take));
+        let text = match proxy_fetch_text(
+            &state.http_client,
+            &url,
+            Duration::from_secs(SEARCH_TIMEOUT_SECS),
+            None, // search and autocomplete endpoints are public
+            None,
+            &state.circuit_breaker,
+            // Its own breaker: the search host is not the package source, and its failures
+            // must not stop restore (nor the reverse).
+            BreakerScope::upstream(RegistryType::Nuget, resource.url(state)),
+        )
+        .await
+        {
+            Ok(text) => rewrite_registration_urls(&text, &upstream, &base_url),
+            // Past the first page, a failed read (any 4xx included, which proxy_fetch_text gives
+            // as NotFound) leaves the rest of the result unread: the host is unavailable, not
+            // at its end, which `totalHits` or a short page tells.
+            Err(ProxyError::NotFound) if round > 0 => return Err(ProxyError::Upstream(503)),
+            Err(e) => return Err(e),
+        };
+        let parsed = serde_json::from_str::<serde_json::Value>(&text).ok();
+        let Some((mut result, entries)) = parsed.and_then(|mut result| {
+            let entries = result
+                .get_mut("data")
+                .and_then(|data| data.as_array_mut())
+                .map(std::mem::take)?;
+            Some((result, entries))
+        }) else {
+            if round == 0 {
+                return Ok(HostRead::Verbatim(text));
+            }
+            return Err(ProxyError::Upstream(502));
+        };
+        if round == 0 {
+            let total = result["totalHits"].as_u64().unwrap_or(0);
+            host_total = usize::try_from(total).unwrap_or(usize::MAX);
+        }
+        let got = entries.len();
+        for entry in entries {
+            let Some(id) = resource.id_of(&entry).map(str::to_lowercase) else {
+                kept.push(entry);
+                continue;
+            };
+            if !seen.insert(id.clone()) {
+                // NORA's own, shown among NORA's, or the host's twice.
+                continue;
+            }
+            let nora_own = hosted.contains_key(&id)
+                || crate::curation::is_internal_namespace(
+                    engine,
+                    crate::curation::RegistryType::Nuget,
+                    &id,
+                );
+            if !nora_own {
+                kept.push(entry);
+            } else if let Some(pkg) = packages.iter().find(|pkg| pkg.name.to_lowercase() == id) {
+                if let Some(held) = local_search_entry(state, hosted, &base_url, pkg, shown).await {
+                    kept.push(resource.own_entry(held));
+                }
+            }
+        }
+        read += got;
+        if envelope.is_none() {
+            result["data"] = serde_json::Value::Array(Vec::new());
+            envelope = Some(result);
+        }
+        if got == 0 || read >= host_total {
+            whole = true;
+            break;
+        }
+        if kept.len() >= need && host_total > SEARCH_HOST_READ_WHOLE {
+            break;
+        }
+    }
+    if !whole && kept.len() < need {
+        return Ok(HostRead::TooDeep);
+    }
+    let total = if whole && host_total <= SEARCH_HOST_READ_WHOLE {
+        kept.len() as u64
+    } else {
+        u64::try_from(host_total).unwrap_or(u64::MAX)
+    };
+    Ok(HostRead::Entries {
+        shown: kept,
+        total,
+        envelope: envelope.unwrap_or_else(|| serde_json::json!({})),
+    })
+}
+
+/// The query string `qs` with `skip` and `take` set to these.
+fn with_page(qs: &str, skip: usize, take: usize) -> String {
+    let mut pairs: Vec<String> = qs
+        .split('&')
+        .filter(|pair| {
+            let key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+            !pair.is_empty()
+                && !key.eq_ignore_ascii_case("skip")
+                && !key.eq_ignore_ascii_case("take")
+        })
+        .map(str::to_string)
+        .collect();
+    pairs.push(format!("skip={skip}"));
+    pairs.push(format!("take={take}"));
+    pairs.join("&")
+}
+
+/// One page of a merged search: NORA's own packages of the page (`own`, from [`own_matches`])
+/// first, then the host's entries NORA shows (from [`read_search_host`]) of the window of
+/// [`PageWindow`]. The page holds `take` entries at most; `totalHits` is NORA's own plus the
+/// host's part, the same on every page. A host result that is not the search JSON is passed on
+/// as it is; a page NORA could not read the host for is `None`.
+fn merge_search_page(
+    own: &[serde_json::Value],
+    host: HostRead,
+    window: PageWindow,
+) -> Option<Vec<u8>> {
+    let (shown, total, mut result) = match host {
+        HostRead::TooDeep => return None,
+        HostRead::Verbatim(text) => return Some(text.into_bytes()),
+        HostRead::Entries {
+            shown,
+            total,
+            envelope,
+        } => (shown, total, envelope),
+    };
+    let mut page: Vec<serde_json::Value> = own
+        .iter()
+        .skip(window.own_from)
+        .take(window.own_take)
+        .cloned()
+        .collect();
+    page.extend(
+        shown
+            .into_iter()
+            .skip(window.upstream_skip)
+            .take(window.upstream_room),
+    );
+    result["totalHits"] = (window.own_total as u64).saturating_add(total).into();
+    result["data"] = page.into();
+    Some(serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec()))
+}
+
+/// A merged search page NORA could not read the search host for ([`HostRead::TooDeep`]).
+fn page_too_deep() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "nuget: this page lies deeper than NORA reads the search host for",
+    )
+        .into_response()
+}
+
 /// Build local search results from the in-memory repo index.
 ///
 /// When `prerelease` is false, versions containing a hyphen (SemVer pre-release)
@@ -1751,8 +2245,9 @@ async fn local_search_results(
     take: usize,
     prerelease: bool,
     sem_ver_level: Option<&str>,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let packages = state.repo_index.get("nuget", &state.storage).await;
+    let hosted = state.repo_index.nuget_hosted(&state.storage).await?;
     let base_url = nora_base_url(state);
 
     let query_lower = query.to_lowercase();
@@ -1763,28 +2258,13 @@ async fn local_search_results(
 
     let mut data = Vec::new();
     for pkg in &filtered {
-        let all_versions = get_cached_versions(&state.storage, &pkg.name).await;
-        let versions: Vec<String> = if prerelease {
-            all_versions
-        } else {
-            all_versions
-                .into_iter()
-                .filter(|v| !v.contains('-'))
-                .collect()
+        let shown = SearchFilter {
+            prerelease,
+            sem_ver_level,
         };
-        // Hide SemVer 2.0 versions unless semVerLevel=2.0.0
-        let versions: Vec<String> = if sem_ver_level == Some("2.0.0") {
-            versions
-        } else {
-            versions
-                .into_iter()
-                .filter(|v| !is_semver2_version(v))
-                .collect()
-        };
-        if versions.is_empty() {
-            continue;
+        if let Some(entry) = local_search_entry(state, &hosted, &base_url, pkg, shown).await {
+            data.push(entry);
         }
-        data.push(build_search_entry(&base_url, pkg, &versions));
     }
 
     let total_hits = data.len();
@@ -1794,7 +2274,7 @@ async fn local_search_results(
         "totalHits": total_hits,
         "data": page,
     });
-    serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
+    Some(serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec()))
 }
 
 /// Build local autocomplete results from the in-memory repo index.
@@ -1802,15 +2282,64 @@ async fn local_search_results(
 ///
 /// When `prerelease` is false, packages that have only pre-release versions are omitted.
 /// When `sem_ver_level` is not `"2.0.0"`, packages with only SemVer 2.0 versions are hidden.
+/// Whether a version is listed for the autocomplete filters: pre-releases only when asked for,
+/// SemVer 2.0 versions only when `semVerLevel=2.0.0` is asked for.
+fn autocomplete_version_visible(
+    version: &str,
+    prerelease: bool,
+    sem_ver_level: Option<&str>,
+) -> bool {
+    (prerelease || !version.contains('-'))
+        && (sem_ver_level == Some("2.0.0") || !is_semver2_version(version))
+}
+
+/// Local answer to the autocomplete versions form (`?id=`): the versions of `id` the filters
+/// allow, in index order. Shape per the NuGet Autocomplete resource: a root object with `data`
+/// only, no `totalHits`.
+async fn local_autocomplete_versions(
+    state: &AppState,
+    id: &str,
+    prerelease: bool,
+    sem_ver_level: Option<&str>,
+) -> Option<Vec<u8>> {
+    // An imported package's versions are its records: without them the id cannot be told apart
+    // from an upstream's (None, a 503), as the other local answers.
+    let hosted = state.repo_index.nuget_hosted(&state.storage).await?;
+    Some(autocomplete_versions_answer(
+        get_cached_versions(&state.storage, &hosted, id).await,
+        prerelease,
+        sem_ver_level,
+    ))
+}
+
+/// The versions-form answer for `versions`, filtered as the autocomplete query asks.
+fn autocomplete_versions_answer(
+    versions: Vec<String>,
+    prerelease: bool,
+    sem_ver_level: Option<&str>,
+) -> Vec<u8> {
+    let data: Vec<String> = versions
+        .into_iter()
+        .filter(|v| autocomplete_version_visible(v, prerelease, sem_ver_level))
+        .collect();
+    serde_json::to_vec(&serde_json::json!({ "data": data }))
+        .unwrap_or_else(|_| br#"{"data":[]}"#.to_vec())
+}
+
 async fn local_autocomplete_results(
     state: &AppState,
     query: &str,
+    id: Option<&str>,
     skip: usize,
     take: usize,
     prerelease: bool,
     sem_ver_level: Option<&str>,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
+    if let Some(id) = id {
+        return local_autocomplete_versions(state, id, prerelease, sem_ver_level).await;
+    }
     let packages = state.repo_index.get("nuget", &state.storage).await;
+    let hosted = state.repo_index.nuget_hosted(&state.storage).await?;
 
     let query_lower = query.to_lowercase();
     let mut matched: Vec<&str> = Vec::new();
@@ -1818,7 +2347,7 @@ async fn local_autocomplete_results(
         if !query_lower.is_empty() && !pkg.name.to_lowercase().contains(&query_lower) {
             continue;
         }
-        let versions = get_cached_versions(&state.storage, &pkg.name).await;
+        let versions = get_cached_versions(&state.storage, &hosted, &pkg.name).await;
         // Apply prerelease filter
         let versions: Vec<&String> = if prerelease {
             versions.iter().collect()
@@ -1844,7 +2373,7 @@ async fn local_autocomplete_results(
         "totalHits": total_hits,
         "data": names,
     });
-    serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
+    Some(serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec()))
 }
 
 /// Generate NuGet v3 service index from scratch, advertising only resources
@@ -1895,9 +2424,219 @@ fn generate_service_index(base_url: &str) -> String {
 /// Catch-all handler for unhandled NuGet v3 resource paths.
 /// Returns 404 with diagnostic logging so operators can see which resources
 /// clients are requesting that NORA doesn't implement yet. (#404)
-async fn nuget_catchall(Path(path): Path<String>) -> Response {
+/// Catch-all under `/v3/`. Registration leaves (`registration/{id}/{version}.json`) come here:
+/// a `{version}.json` segment cannot be a route of its own beside `index.json` and `page/…`.
+async fn nuget_catchall(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
+    if let Some((id, file)) = path
+        .strip_prefix("registration/")
+        .and_then(|rest| rest.split_once('/'))
+    {
+        if let Some(version) = file.strip_suffix(".json") {
+            return registration_leaf(&state, &headers, id, version).await;
+        }
+    }
     tracing::debug!(path = %path, "NuGet: unhandled resource requested");
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// `GET /v3/registration/{id}/{version}.json` — the registration leaf of one version: the
+/// `@id` a search result gives for it. Shape per the NuGet registration resource (RegistrationLeaf):
+/// `@id`, `listed`, `packageContent`, `registration`; `catalogEntry` is an optional URL we have no
+/// catalog document for, so it is left out. A version NORA has is answered from its own index;
+/// one it does not have is asked of the upstream, as the registration index is.
+async fn registration_leaf(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    id: &str,
+    version: &str,
+) -> Response {
+    let id_lower = id.to_lowercase();
+    if !is_valid_package_id(&id_lower) || !is_valid_version(version) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Nuget,
+        &id_lower,
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            headers,
+            crate::curation::RegistryType::Nuget,
+            &id_lower,
+            crate::curation::RequestVersion::Unspecified,
+            None,
+        ) {
+            return response;
+        }
+    }
+
+    let base_url = nora_base_url(state);
+    let nuget = format!("{}/nuget/v3", base_url.trim_end_matches('/'));
+    let leaf_for = |listed: bool| {
+        serde_json::json!({
+            "@id": format!("{nuget}/registration/{id_lower}/{version}.json"),
+            "listed": listed,
+            "packageContent": format!("{nuget}/flatcontainer/{id_lower}/{version}/{id_lower}.{version}.nupkg"),
+            "registration": format!("{nuget}/registration/{id_lower}/index.json"),
+        })
+    };
+
+    // A hosted package is its own: only its listed versions have a leaf, and no upstream is asked.
+    // Records that cannot be listed decide nothing: 503, and the upstream is not asked (it may name
+    // another package under this id), as the registration index does.
+    let Some(hosted) = hosted_versions(&state.storage, &id_lower).await else {
+        return crate::registry::storage_unavailable("nuget", &hosted_prefix(&id_lower));
+    };
+    if hosted.hosted() {
+        return if hosted.listed().iter().any(|v| v == version) {
+            with_json(serde_json::to_vec(&leaf_for(true)).unwrap_or_default())
+        } else {
+            StatusCode::NOT_FOUND.into_response()
+        };
+    }
+
+    // The version's own listing, as the registration NORA stored gives it — served without the
+    // upstream, internal package or not. The flatcontainer index names the version but not whether
+    // it is listed, so it decides nothing here.
+    match stored_listing(state, &id_lower, version).await {
+        Ok(Some(listed)) => {
+            return with_json(serde_json::to_vec(&leaf_for(listed)).unwrap_or_default());
+        }
+        Ok(None) => {}
+        // A stored registration that cannot be read decides nothing, and neither does the
+        // upstream in its place: it may list the version otherwise.
+        Err(UnreadableDocument(key)) => {
+            return crate::registry::storage_unavailable("nuget", &key);
+        }
+    }
+
+    // Not stored: asked of the upstream, as the registration index is — never for an
+    // internal-namespace package.
+    let Some(upstream) = upstream_url(state) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if internal {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let url = format!(
+        "{}/v3/registration5-gz-semver2/{}/{}.json",
+        upstream.trim_end_matches('/'),
+        id_lower,
+        version
+    );
+    // The configured credential goes with it, as the registration index and pages send theirs.
+    match proxy_fetch_text(
+        &state.http_client,
+        &url,
+        Duration::from_secs(SEARCH_TIMEOUT_SECS),
+        expose_opt(&state.config.nuget.proxy_auth).map(UpstreamAuth::Basic),
+        None,
+        &state.circuit_breaker,
+        RegistryType::Nuget,
+    )
+    .await
+    {
+        Ok(text) => {
+            let rewritten = rewrite_registration_urls(&text, &rewrite_host(state), &base_url);
+            with_json(rewritten.into_bytes())
+        }
+        Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+/// Where a stored registration document (the index, or a page) gives version `version`'s leaf.
+enum StoredLeaf {
+    /// Inline in the document, with its `listed` flag.
+    Inline(bool),
+    /// On the page the index names for the version's bounds.
+    OnPage { lower: String, upper: String },
+    /// Not in the document.
+    Absent,
+}
+
+/// The `listed` flag of `version` when the document holds its leaf inline. `catalogEntry.listed`
+/// absent means listed (NuGet's registration resource).
+fn inline_listing(doc: &[u8], version: &str) -> Option<bool> {
+    let json = serde_json::from_slice::<serde_json::Value>(doc).ok()?;
+    let items = json.get("items")?.as_array()?;
+    let find = |leaves: &[serde_json::Value]| {
+        leaves.iter().find_map(|item| {
+            let entry = item.get("catalogEntry")?;
+            let listed_version = entry.get("version")?.as_str()?;
+            let same = nuget_version_order(listed_version, version).map_or_else(
+                || listed_version.eq_ignore_ascii_case(version),
+                |o| o.is_eq(),
+            );
+            same.then(|| {
+                entry
+                    .get("listed")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(true)
+            })
+        })
+    };
+    if items.iter().any(|item| item.get("catalogEntry").is_some()) {
+        return find(items);
+    }
+    items
+        .iter()
+        .find_map(|page| find(page.get("items")?.as_array()?))
+}
+
+fn stored_leaf(doc: &[u8], version: &str) -> StoredLeaf {
+    if let Some(listed) = inline_listing(doc, version) {
+        return StoredLeaf::Inline(listed);
+    }
+    match registered(doc, version) {
+        Registered::OnPage { lower, upper } => StoredLeaf::OnPage { lower, upper },
+        _ => StoredLeaf::Absent,
+    }
+}
+
+/// A stored document that exists but cannot be read, by its storage key.
+struct UnreadableDocument(String);
+
+/// The `listed` flag the registration NORA stored gives `version`: the index's leaf, or the leaf
+/// on the page the index names for it. `Ok(None)` when nothing stored says it (no document, or
+/// none naming the version); an error when a stored document cannot be read.
+async fn stored_listing(
+    state: &AppState,
+    id_lower: &str,
+    version: &str,
+) -> Result<Option<bool>, UnreadableDocument> {
+    let read = |key: String| async move {
+        match state.storage.get(&key).await {
+            Ok(doc) => Ok(Some(doc)),
+            Err(crate::storage::StorageError::NotFound) => Ok(None),
+            Err(_) => Err(UnreadableDocument(key)),
+        }
+    };
+    let index_key = format!("nuget/registration/{id_lower}/index.json");
+    let Some(doc) = read(index_key).await? else {
+        return Ok(None);
+    };
+    Ok(match stored_leaf(&doc, version) {
+        StoredLeaf::Inline(listed) => Some(listed),
+        StoredLeaf::OnPage { lower, upper } => {
+            let page_key = format!("nuget/registration/{id_lower}/page/{lower}/{upper}.json");
+            match read(page_key).await? {
+                Some(page) => match stored_leaf(&page, version) {
+                    StoredLeaf::Inline(listed) => Some(listed),
+                    _ => None,
+                },
+                None => None,
+            }
+        }
+        StoredLeaf::Absent => None,
+    })
 }
 
 /// Rewrite upstream registration URLs in NuGet registration index/page responses: registration5-*
@@ -2044,6 +2783,38 @@ async fn hosted_versions(
             None
         }
     }
+}
+
+/// Every package NORA hosts, by lowercase id, with the versions its records list (as
+/// [`hosted_versions`] gives them for one package), from one listing of all records; `None`
+/// when the listing failed. What the repository index keeps for search.
+pub(crate) async fn hosted_index(
+    storage: &crate::storage::Storage,
+) -> Option<std::collections::HashMap<String, Vec<String>>> {
+    const ROOT: &str = "nuget/hosted/";
+    crate::validation::validate_storage_key(crate::validation::listing_key(ROOT)).ok()?;
+    let keys = match storage.list(ROOT).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::warn!(registry = "nuget", error = %e, "nuget: hosted records not listed");
+            return None;
+        }
+    };
+    let mut names: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (id, name) in keys
+        .iter()
+        .filter_map(|key| key.strip_prefix(ROOT)?.split_once('/'))
+    {
+        names.entry(id).or_default().push(name);
+    }
+    Some(
+        names
+            .into_iter()
+            .map(|(id, names)| (id, hosted::Versions::from_listing(names)))
+            .filter(|(_, versions)| versions.hosted())
+            .map(|(id, versions)| (id.to_string(), versions.listed().to_vec()))
+            .collect(),
+    )
 }
 
 /// What NORA records of a hosted version: the .nuspec's id and version (normalized, in the case
@@ -3567,8 +4338,10 @@ mod integration_tests {
         assert!(json["data"].as_array().unwrap().is_empty());
     }
 
+    /// Nothing local matches and the autocomplete host is unreachable: 503, not an empty
+    /// list that says no package matches.
     #[tokio::test]
-    async fn test_autocomplete_unreachable_upstream_returns_empty() {
+    async fn test_autocomplete_unreachable_upstream_with_nothing_local_is_503() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.nuget.enabled = true;
             cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
@@ -3583,11 +4356,7 @@ mod integration_tests {
             "",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_bytes(resp).await;
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["totalHits"].as_u64().unwrap(), 0);
-        assert!(json["data"].as_array().unwrap().is_empty());
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -3636,6 +4405,23 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A package held locally under the id `test.pkg`, for the stale fallbacks.
+    async fn seed_test_package(ctx: &crate::test_helpers::TestContext) {
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/test.pkg/1.0.0/test.pkg.1.0.0.nupkg",
+                &b"nupkg"[..],
+            ),
+            (
+                "nuget/flatcontainer/test.pkg/index.json",
+                br#"{"versions":["1.0.0"]}"#,
+            ),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+    }
+
     /// Search fallback adds X-Nora-Stale header when upstream is unreachable (#422)
     #[tokio::test]
     async fn test_search_fallback_has_stale_header() {
@@ -3645,6 +4431,8 @@ mod integration_tests {
             cfg.nuget.search_service = "http://127.0.0.1:1/query".to_string();
             cfg.nuget.serve_stale = true;
         });
+        // What NORA holds of the query is what it answers with, marked stale.
+        seed_test_package(&ctx).await;
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=test", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -3676,6 +4464,8 @@ mod integration_tests {
             cfg.nuget.autocomplete = "http://127.0.0.1:1/autocomplete".to_string();
             cfg.nuget.serve_stale = true;
         });
+        // What NORA holds of the query is what it answers with, marked stale.
+        seed_test_package(&ctx).await;
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/autocomplete?q=test", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -4089,7 +4879,7 @@ mod spec_conformance_tests {
         use wiremock::matchers::{header_exists, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Conditional request (has If-None-Match) → 304. A request WITHOUT it
         // would 404 (no other mount), so any full fetch would visibly fail.
         Mock::given(method("GET"))
@@ -4160,7 +4950,7 @@ mod nuget_version_curation {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn upstream() -> MockServer {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(any())
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"NUPKG".to_vec()))
             .mount(&upstream)
@@ -4294,7 +5084,7 @@ mod nuget_release_dates {
     /// Tests count only its registration requests: wiremock hands a dropped server on to the
     /// next one started, and a background request of an earlier context may still reach it.
     async fn elsewhere() -> MockServer {
-        let elsewhere = MockServer::start().await;
+        let elsewhere = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path_regex(r"/page/[^/]+/[^/]+\.json$"))
             .respond_with(|req: &wiremock::Request| {
@@ -4320,7 +5110,7 @@ mod nuget_release_dates {
 
     /// An upstream whose every package is its own bytes: two versions never share a digest.
     async fn upstream() -> MockServer {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path_regex(r"^/v3-flatcontainer/[^/]+/[^/]+/[^/]+\.nupkg$"))
             .respond_with(|req: &wiremock::Request| {
@@ -5162,5 +5952,976 @@ mod nuget_release_dates {
             assert_eq!(nuget_version_order(a, b), Some(want), "{a} vs {b}");
         }
         assert_eq!(nuget_version_order("not.a.version.x", "1.0.0"), None);
+    }
+}
+
+/// Search and autocomplete go to their own hosts (`nuget.search_service`, `nuget.autocomplete`,
+/// for nuget.org not `api.nuget.org`), so each reports to the breaker of that host, not to the
+/// one restore goes through: a failing search host does not stop restore from a healthy
+/// package source, and the reverse.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod search_breaker {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A NuGet proxy on `source` (package source) and `search` (search and autocomplete
+    /// host), with the breaker on and slow to close.
+    fn ctx(source: String, search: String) -> TestContext {
+        let autocomplete = format!("{search}/autocomplete");
+        ctx_with(source, format!("{search}/query"), autocomplete)
+    }
+
+    /// The same with search and autocomplete on hosts of their own.
+    fn ctx_with(source: String, search: String, autocomplete: String) -> TestContext {
+        create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(source);
+            cfg.nuget.search_service = search;
+            cfg.nuget.autocomplete = autocomplete;
+            cfg.nuget.serve_stale = true;
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.reset_timeout = 3600;
+        })
+    }
+
+    async fn answering(status: u16) -> MockServer {
+        let server = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(
+                ResponseTemplate::new(status)
+                    .set_body_json(serde_json::json!({ "versions": ["1.0.0"], "data": [] })),
+            )
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn status(ctx: &TestContext, path: &str) -> StatusCode {
+        send(&ctx.app, Method::GET, path, "").await.status()
+    }
+
+    async fn asked(server: &MockServer) -> usize {
+        server.received_requests().await.unwrap().len()
+    }
+
+    /// Searches and autocompletes that fail against a dead search host leave restore from a
+    /// healthy package source alone. Before, they counted toward the one `nuget` breaker and
+    /// restore answered 503 for `reset_timeout` while the package source was up.
+    #[tokio::test]
+    async fn failed_searches_do_not_open_the_restore_breaker() {
+        for search_path in ["/nuget/v3/query?q=anything", "/nuget/v3/autocomplete?q=any"] {
+            let source = answering(200).await;
+            let ctx = ctx(source.uri(), "http://127.0.0.1:1".to_string());
+            let restore = "/nuget/v3/flatcontainer/before.pkg/index.json";
+            assert_eq!(status(&ctx, restore).await, StatusCode::OK, "control");
+            for _ in 0..ctx.state.config.circuit_breaker.failure_threshold {
+                // Nothing local to answer with: the search is unavailable, not empty.
+                assert_eq!(
+                    status(&ctx, search_path).await,
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+            }
+            let restore = "/nuget/v3/flatcontainer/after.pkg/index.json";
+            assert_eq!(
+                status(&ctx, restore).await,
+                StatusCode::OK,
+                "restore after failed {search_path}"
+            );
+            let registration = "/nuget/v3/registration/after.pkg/index.json";
+            assert_ne!(
+                status(&ctx, registration).await,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "registration after failed {search_path}"
+            );
+        }
+    }
+
+    /// The search host still has a breaker: once it has failed `failure_threshold` times it is
+    /// not asked again until the breaker lets a probe through, and searches are served from
+    /// the local index meanwhile. One breaker for it, whatever the query.
+    #[tokio::test]
+    async fn a_failing_search_host_has_its_own_breaker() {
+        let source = answering(200).await;
+        let search = answering(500).await;
+        let ctx = ctx(source.uri(), search.uri());
+        let threshold = ctx.state.config.circuit_breaker.failure_threshold as usize;
+        for i in 0..threshold * 2 {
+            let path = format!("/nuget/v3/query?q=term{i}");
+            assert_eq!(status(&ctx, &path).await, StatusCode::SERVICE_UNAVAILABLE);
+        }
+        // A failure is two attempts (one retry after a 5xx), then the breaker holds.
+        assert_eq!(
+            asked(&search).await,
+            threshold * 2,
+            "asked past an open breaker"
+        );
+        let search_keys: Vec<String> = ctx
+            .state
+            .circuit_breaker
+            .keys()
+            .into_iter()
+            .filter(|key| key.starts_with("nuget:"))
+            .collect();
+        assert_eq!(
+            search_keys,
+            [format!("nuget:{}/query", search.uri())],
+            "one breaker for the search host, not one per query"
+        );
+        // The package source is still asked.
+        let restore = "/nuget/v3/flatcontainer/pkg/index.json";
+        assert_eq!(status(&ctx, restore).await, StatusCode::OK);
+        assert_eq!(asked(&source).await, 1);
+    }
+
+    /// Search and autocomplete on different hosts each have their own breaker: a dead
+    /// autocomplete host does not stop search, and the reverse.
+    #[tokio::test]
+    async fn search_and_autocomplete_hosts_have_breakers_of_their_own() {
+        let source = answering(200).await;
+        let alive = answering(200).await;
+        let dead = "http://127.0.0.1:1".to_string();
+        for (dead_path, alive_path, search, autocomplete) in [
+            (
+                "/nuget/v3/autocomplete?q=x",
+                "/nuget/v3/query?q=x",
+                format!("{}/query", alive.uri()),
+                format!("{dead}/autocomplete"),
+            ),
+            (
+                "/nuget/v3/query?q=x",
+                "/nuget/v3/autocomplete?q=x",
+                format!("{dead}/query"),
+                format!("{}/autocomplete", alive.uri()),
+            ),
+        ] {
+            let ctx = ctx_with(source.uri(), search, autocomplete);
+            for _ in 0..ctx.state.config.circuit_breaker.failure_threshold {
+                assert_eq!(
+                    status(&ctx, dead_path).await,
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+            }
+            let before = asked(&alive).await;
+            assert_eq!(status(&ctx, alive_path).await, StatusCode::OK);
+            assert_eq!(
+                asked(&alive).await,
+                before + 1,
+                "{alive_path} not asked after {dead_path} failed"
+            );
+        }
+    }
+
+    /// While the search host cannot answer — failing, or its breaker open — search and
+    /// autocomplete answer with what NORA holds of the query (`serve_stale`), and 503 when it
+    /// holds nothing of it or `serve_stale` is off: never an empty result that says the
+    /// packages do not exist.
+    #[tokio::test]
+    async fn an_unavailable_search_host_is_503_unless_something_local_answers() {
+        for serve_stale in [true, false] {
+            let source = answering(200).await;
+            let search = answering(500).await;
+            let ctx = create_test_context_with_config({
+                let (source, search) = (source.uri(), search.uri());
+                move |cfg| {
+                    cfg.nuget.enabled = true;
+                    cfg.nuget.proxy = Some(source);
+                    cfg.nuget.search_service = format!("{search}/query");
+                    cfg.nuget.autocomplete = format!("{search}/autocomplete");
+                    cfg.nuget.serve_stale = serve_stale;
+                    cfg.circuit_breaker.enabled = true;
+                    cfg.circuit_breaker.reset_timeout = 3600;
+                }
+            });
+            for (key, data) in [
+                (
+                    "nuget/flatcontainer/held.pkg/1.0.0/held.pkg.1.0.0.nupkg",
+                    &b"nupkg"[..],
+                ),
+                (
+                    "nuget/flatcontainer/held.pkg/index.json",
+                    br#"{"versions":["1.0.0"]}"#,
+                ),
+            ] {
+                ctx.state.storage.put(key, data).await.unwrap();
+            }
+            ctx.state.repo_index.invalidate("nuget");
+            let threshold = ctx.state.config.circuit_breaker.failure_threshold;
+            // Failing, then with the breaker open.
+            for round in 0..threshold + 2 {
+                for (path, held) in [
+                    ("/nuget/v3/query?q=held", true),
+                    ("/nuget/v3/autocomplete?q=held", true),
+                    ("/nuget/v3/query?q=missing", false),
+                    ("/nuget/v3/autocomplete?q=missing", false),
+                ] {
+                    let resp = send(&ctx.app, Method::GET, path, "").await;
+                    let got = resp.status();
+                    if held && serve_stale {
+                        assert_eq!(got, StatusCode::OK, "round {round}: {path}");
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+                        assert_eq!(body["totalHits"], 1, "round {round}: {path}: {body}");
+                    } else {
+                        assert_eq!(
+                            got,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "round {round}: {path}, serve_stale {serve_stale}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The local index answers for the page asked: a page past what it holds of the query is
+    /// not an empty end of the result while the search host is down, it is 503.
+    #[tokio::test]
+    async fn a_page_past_the_local_matches_is_503_while_the_search_host_is_down() {
+        let source = answering(200).await;
+        let ctx = ctx(source.uri(), "http://127.0.0.1:1".to_string());
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/held.pkg/1.0.0/held.pkg.1.0.0.nupkg",
+                &b"nupkg"[..],
+            ),
+            (
+                "nuget/flatcontainer/held.pkg/index.json",
+                br#"{"versions":["1.0.0"]}"#,
+            ),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+        for (path, want) in [
+            ("/nuget/v3/query?q=held&skip=0&take=20", StatusCode::OK),
+            (
+                "/nuget/v3/query?q=held&skip=1&take=20",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/nuget/v3/autocomplete?q=held&skip=0&take=20",
+                StatusCode::OK,
+            ),
+            (
+                "/nuget/v3/autocomplete?q=held&skip=1&take=20",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            assert_eq!(status(&ctx, path).await, want, "{path}");
+        }
+    }
+
+    /// The reverse: a dead package source does not stop search from a healthy search host.
+    #[tokio::test]
+    async fn a_failing_package_source_does_not_open_the_search_breaker() {
+        let search = answering(200).await;
+        let ctx = ctx("http://127.0.0.1:1".to_string(), search.uri());
+        let threshold = ctx.state.config.circuit_breaker.failure_threshold;
+        for i in 0..threshold {
+            let path = format!("/nuget/v3/flatcontainer/pkg{i}/index.json");
+            assert_ne!(status(&ctx, &path).await, StatusCode::OK);
+        }
+        let before = asked(&search).await;
+        assert_eq!(status(&ctx, "/nuget/v3/query?q=x").await, StatusCode::OK);
+        assert_eq!(
+            status(&ctx, "/nuget/v3/autocomplete?q=x").await,
+            StatusCode::OK
+        );
+        assert_eq!(asked(&search).await, before + 2, "search host not asked");
+    }
+}
+
+/// Проверка находок ревью #1233 (session-3): каждый тест описывает ожидаемое поведение и падает,
+/// если находка верна.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_1233_findings {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+
+    async fn seed(ctx: &crate::test_helpers::TestContext, id: &str, versions: &[&str]) {
+        let index = serde_json::json!({ "versions": versions });
+        ctx.state
+            .storage
+            .put(
+                &format!("nuget/flatcontainer/{id}/index.json"),
+                serde_json::to_vec(&index).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        for ver in versions {
+            ctx.state
+                .storage
+                .put(
+                    &format!("nuget/flatcontainer/{id}/{ver}/{id}.{ver}.nupkg"),
+                    b"fake-nupkg",
+                )
+                .await
+                .unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+    }
+
+    /// The stored registration of `testpkg` listing `versions` as listed leaves: the state a
+    /// registration index leaves behind, which the leaf reads its `listed` from.
+    async fn store_registration(ctx: &crate::test_helpers::TestContext, versions: &[&str]) {
+        let items: Vec<_> = versions
+            .iter()
+            .map(|v| serde_json::json!({ "catalogEntry": { "version": v, "listed": true } }))
+            .collect();
+        let doc = serde_json::json!({ "count": items.len(), "items": items });
+        ctx.state
+            .storage
+            .put(
+                "nuget/registration/testpkg/index.json",
+                serde_json::to_vec(&doc).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// F3: `?id=` on the autocomplete resource enumerates the versions of that package.
+    #[tokio::test]
+    async fn f3_autocomplete_by_id_enumerates_versions() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        seed(&ctx, "testpkg", &["1.0.0", "2.0.0"]).await;
+        seed(&ctx, "otherpkg", &["3.0.0"]).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?id=testpkg&prerelease=true",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(
+            json["data"],
+            serde_json::json!(["1.0.0", "2.0.0"]),
+            "{json}"
+        );
+    }
+
+    /// F4: the `@id` a search result gives for a version answers.
+    #[tokio::test]
+    async fn f4_search_version_id_resolves() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        seed(&ctx, "testpkg", &["1.0.0", "2.0.0"]).await;
+        store_registration(&ctx, &["1.0.0", "2.0.0"]).await;
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=testpkg", "").await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let id = json["data"][0]["versions"][0]["@id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let path = id.strip_prefix("http://nora.example").unwrap().to_string();
+        let resp = send(&ctx.app, Method::GET, &path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{id}");
+    }
+
+    /// F3 shape: the versions form is `{"data": [...]}` only, and a pre-release is listed only
+    /// when `prerelease=true` asks for it.
+    #[tokio::test]
+    async fn f3_autocomplete_versions_shape_and_prerelease_filter() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        seed(&ctx, "testpkg", &["1.0.0", "2.0.0-beta"]).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?id=testpkg",
+            "",
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json, serde_json::json!({ "data": ["1.0.0"] }));
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?id=testpkg&prerelease=true",
+            "",
+        )
+        .await;
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json, serde_json::json!({ "data": ["1.0.0", "2.0.0-beta"] }));
+    }
+
+    /// F4 negative: a leaf for a version NORA does not have is not found (no upstream here), and
+    /// a leaf for a version it has carries the RegistrationLeaf fields with URLs that resolve.
+    #[tokio::test]
+    async fn f4_registration_leaf_known_and_unknown_versions() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        seed(&ctx, "testpkg", &["1.0.0"]).await;
+        store_registration(&ctx, &["1.0.0"]).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/9.9.9.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(
+            json["@id"],
+            "http://nora.example/nuget/v3/registration/testpkg/1.0.0.json"
+        );
+        assert_eq!(json["listed"], true);
+        assert!(json.get("catalogEntry").is_none(), "{json}");
+        let content = json["packageContent"].as_str().unwrap().to_string();
+        let path = content
+            .strip_prefix("http://nora.example")
+            .unwrap()
+            .to_string();
+        let resp = send(&ctx.app, Method::GET, &path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{content}");
+    }
+}
+
+/// Second pass over #1233 (review of f5b3fbe): autocomplete versions of a hosted package, the leaf
+/// when hosted records cannot be listed, the leaf's upstream auth, and the upstream leaf branch.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_1233_second_pass {
+    use crate::secrets::ProtectedString;
+    use crate::storage::{FileMeta, Storage, StorageBackend, StorageError};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, create_test_context_with_storage_and_config,
+        send,
+    };
+    use axum::http::{Method, StatusCode};
+    use std::path::Path;
+    use std::sync::Arc;
+    use wiremock::matchers::{any, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A storage whose listing of hosted records fails; every other operation is the real one.
+    struct HostedListingFails {
+        inner: Storage,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for HostedListingFails {
+        async fn put(&self, key: &str, data: &[u8], _sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(key, data).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            Ok((self.inner.get(key).await?, None))
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+        async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            if prefix.starts_with("nuget/hosted/") {
+                return Err(StorageError::Network("hosted listing unavailable".into()));
+            }
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<FileMeta> {
+            self.inner.stat(key).await
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "hosted-listing-fails"
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+        async fn copy(
+            &self,
+            src: &str,
+            dst: &str,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+    }
+
+    fn leaf_body(upstream: &str, id: &str, version: &str) -> serde_json::Value {
+        serde_json::json!({
+            "@id": format!("{upstream}/v3/registration5-gz-semver2/{id}/{version}.json"),
+            "listed": true,
+            "packageContent": format!("{upstream}/v3-flatcontainer/{id}/{version}/{id}.{version}.nupkg"),
+            "registration": format!("{upstream}/v3/registration5-gz-semver2/{id}/index.json"),
+        })
+    }
+
+    /// Finding 1: a hosted package's autocomplete versions are its own records. The stale upstream
+    /// index names 9.0.0, which must not appear, and the upstream must not be asked.
+    #[tokio::test]
+    async fn s2_f1_autocomplete_versions_of_a_hosted_package_are_its_own() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": ["9.0.0"] })),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.autocomplete = format!("{uri}/v3/autocomplete");
+        });
+        ctx.state
+            .storage
+            .put(
+                "nuget/hosted/corp.lib/1.0.0.json",
+                br#"{"id":"corp.lib","version":"1.0.0"}"#,
+            )
+            .await
+            .unwrap();
+        let index = serde_json::json!({ "versions": ["9.0.0"] });
+        ctx.state
+            .storage
+            .put(
+                "nuget/flatcontainer/corp.lib/index.json",
+                serde_json::to_vec(&index).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        ctx.state.repo_index.invalidate("nuget");
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?id=corp.lib&prerelease=true",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(json["data"], serde_json::json!(["1.0.0"]), "{json}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            0
+        );
+    }
+
+    /// Finding 2: hosted records that cannot be listed give 503 for the leaf, and the upstream is
+    /// not asked — a foreign package must not be served as this one.
+    #[tokio::test]
+    async fn s2_f2_leaf_with_unlistable_hosted_records_is_503_without_upstream() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(leaf_body(
+                &upstream.uri(),
+                "testpkg",
+                "1.0.0",
+            )))
+            .mount(&upstream)
+            .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::from_backend(Arc::new(HostedListingFails {
+            inner: Storage::new_local(dir.path().to_str().unwrap()),
+        }));
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            0
+        );
+    }
+
+    /// Finding 3: the leaf's upstream request carries the configured proxy credential, as the
+    /// registration index and pages do.
+    #[tokio::test]
+    async fn s2_f3_leaf_upstream_request_carries_proxy_auth() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
+            .and(header("authorization", "Basic dXNlcjpwYXNz"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(leaf_body(
+                &upstream.uri(),
+                "testpkg",
+                "1.0.0",
+            )))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.nuget.proxy_auth = Some(ProtectedString::from("user:pass"));
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Branch B(a): a cold miss goes to the upstream leaf and comes back with its URLs rewritten
+    /// to NORA — no upstream host survives in the body.
+    #[tokio::test]
+    async fn s2_b_leaf_cold_miss_is_rewritten_to_nora() {
+        let upstream = MockServer::builder().start().await;
+        let up = upstream.uri();
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(leaf_body(&up, "testpkg", "1.0.0")),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = up.clone();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let text = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(!text.contains(&up), "upstream host leaked: {text}");
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert!(
+            json["packageContent"]
+                .as_str()
+                .unwrap()
+                .starts_with("http://nora.example/nuget/v3/"),
+            "{json}"
+        );
+    }
+
+    /// Branch B(a): an upstream failure is not a missing version — 500 gives 503, 404 gives 404.
+    #[tokio::test]
+    async fn s2_b_leaf_upstream_error_is_503_and_not_found_is_404() {
+        let upstream = MockServer::builder().start().await;
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/testpkg/2.0.0.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/1.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/registration/testpkg/2.0.0.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+/// Third pass over #1233 (review of f8a5d87): the leaf's `listed` comes from the registration
+/// NORA has stored or the upstream's leaf, not from the flatcontainer index; a stored registration
+/// serves its leaf without the flatcontainer index or the proxy.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod review_1233_third_pass {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// A stored registration index with one version inline in a page, as the upstream writes it.
+    fn stored_registration(version: &str, listed: bool) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "count": 1,
+            "items": [{
+                "@id": "https://api.nuget.org/v3/registration5-gz-semver2/testpkg/index.json#page",
+                "count": 1,
+                "lower": version,
+                "upper": version,
+                "items": [{
+                    "@id": format!("https://api.nuget.org/v3/registration5-gz-semver2/testpkg/{version}.json"),
+                    "catalogEntry": {
+                        "@id": "https://api.nuget.org/v3/catalog0/data/x.json",
+                        "id": "testpkg",
+                        "version": version,
+                        "listed": listed
+                    },
+                    "packageContent": format!("https://api.nuget.org/v3-flatcontainer/testpkg/{version}/testpkg.{version}.nupkg"),
+                    "registration": "https://api.nuget.org/v3/registration5-gz-semver2/testpkg/index.json"
+                }]
+            }]
+        }))
+        .unwrap()
+    }
+
+    async fn put_flatcontainer(
+        ctx: &crate::test_helpers::TestContext,
+        id: &str,
+        versions: &[&str],
+    ) {
+        let index = serde_json::json!({ "versions": versions });
+        ctx.state
+            .storage
+            .put(
+                &format!("nuget/flatcontainer/{id}/index.json"),
+                serde_json::to_vec(&index).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        for ver in versions {
+            ctx.state
+                .storage
+                .put(
+                    &format!("nuget/flatcontainer/{id}/{ver}/{id}.{ver}.nupkg"),
+                    b"fake-nupkg",
+                )
+                .await
+                .unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+    }
+
+    async fn put_stored_registration(
+        ctx: &crate::test_helpers::TestContext,
+        version: &str,
+        listed: bool,
+    ) {
+        ctx.state
+            .storage
+            .put(
+                "nuget/registration/testpkg/index.json",
+                &stored_registration(version, listed),
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn leaf(
+        ctx: &crate::test_helpers::TestContext,
+        version: &str,
+    ) -> (StatusCode, serde_json::Value) {
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/nuget/v3/registration/testpkg/{version}.json"),
+            "",
+        )
+        .await;
+        let status = resp.status();
+        let json =
+            serde_json::from_slice(&body_bytes(resp).await).unwrap_or(serde_json::Value::Null);
+        (status, json)
+    }
+
+    /// Finding 1, stored registration: the flatcontainer index is warm and the stored registration
+    /// says 1.0.0 is unlisted — the leaf says so, and the upstream is not asked.
+    #[tokio::test]
+    async fn t3_f1_stored_unlisted_version_is_not_listed() {
+        let upstream = MockServer::builder().start().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        put_flatcontainer(&ctx, "testpkg", &["1.0.0"]).await;
+        put_stored_registration(&ctx, "1.0.0", false).await;
+        let (status, json) = leaf(&ctx, "1.0.0").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["listed"], false, "{json}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            0
+        );
+    }
+
+    /// Finding 1, upstream leaf: the flatcontainer index is warm but nothing is stored; the leaf is
+    /// the upstream's, so an unlisted version stays unlisted.
+    #[tokio::test]
+    async fn t3_f1_upstream_unlisted_version_after_warm_flatcontainer() {
+        let upstream = MockServer::builder().start().await;
+        let up = upstream.uri();
+        Mock::given(method("GET"))
+            .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "@id": format!("{up}/v3/registration5-gz-semver2/testpkg/1.0.0.json"),
+                "listed": false,
+                "packageContent": format!("{up}/v3-flatcontainer/testpkg/1.0.0/testpkg.1.0.0.nupkg"),
+                "registration": format!("{up}/v3/registration5-gz-semver2/testpkg/index.json"),
+            })))
+            .mount(&upstream)
+            .await;
+        let uri = up.clone();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        put_flatcontainer(&ctx, "testpkg", &["1.0.0"]).await;
+        let (status, json) = leaf(&ctx, "1.0.0").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["listed"], false, "{json}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            1
+        );
+    }
+
+    /// Finding 2: a stored registration with no flatcontainer index and no proxy serves its leaf.
+    #[tokio::test]
+    async fn t3_f2_stored_registration_serves_leaf_without_flatcontainer_or_proxy() {
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        put_stored_registration(&ctx, "1.0.0", true).await;
+        let (status, json) = leaf(&ctx, "1.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["listed"], true);
+        assert_eq!(
+            json["@id"],
+            "http://nora.example/nuget/v3/registration/testpkg/1.0.0.json"
+        );
+    }
+
+    /// A stored registration (index, or the page the index names for the version) that cannot
+    /// be read decides nothing: the leaf is a 503, not a 404 that tells the client the version
+    /// does not exist.
+    #[tokio::test]
+    async fn a_stored_registration_that_cannot_be_read_is_not_a_missing_leaf() {
+        use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+
+        let paged = serde_json::to_vec(&serde_json::json!({
+            "count": 1,
+            "items": [{
+                "@id": "https://api.nuget.org/v3/registration5-gz-semver2/testpkg/page/1.0.0/2.0.0.json",
+                "lower": "1.0.0",
+                "upper": "2.0.0",
+                "count": 2,
+            }],
+        }))
+        .unwrap();
+        let page = stored_registration("1.0.0", true);
+        for (failing, index) in [
+            (
+                "nuget/registration/testpkg/index.json",
+                stored_registration("1.0.0", true),
+            ),
+            ("nuget/registration/testpkg/page/1.0.0/2.0.0.json", paged),
+        ] {
+            let (storage, outage) = outage_storage();
+            let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = None;
+                cfg.curation.internal_namespaces = vec!["testpkg*".to_string()];
+            });
+            for (key, doc) in [
+                ("nuget/registration/testpkg/index.json", &index),
+                ("nuget/registration/testpkg/page/1.0.0/2.0.0.json", &page),
+            ] {
+                ctx.state.storage.put(key, doc).await.unwrap();
+            }
+            let (status, json) = leaf(&ctx, "1.0.0").await;
+            assert_eq!(status, StatusCode::OK, "{failing} readable: {json}");
+            outage.fail_reads_of(failing);
+            let (status, _) = leaf(&ctx, "1.0.0").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failing}");
+        }
+    }
+
+    /// Finding 2 for an internal package: the stored registration serves the leaf, the upstream
+    /// is never asked.
+    #[tokio::test]
+    async fn t3_f2_internal_stored_registration_serves_leaf_without_upstream() {
+        let upstream = MockServer::builder().start().await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri);
+            cfg.curation.internal_namespaces = vec!["testpkg*".to_string()];
+            cfg.server.public_url = Some("http://nora.example".to_string());
+        });
+        put_stored_registration(&ctx, "1.0.0", true).await;
+        let (status, json) = leaf(&ctx, "1.0.0").await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["listed"], true);
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            0
+        );
     }
 }

@@ -1169,8 +1169,8 @@ pub fn pub_version_key(version: &str) -> Option<String> {
 /// parsed versions, so `1.0-1`, `1.0.post1` and `1.0.0.post1` are one version); NuGet's in
 /// NuGet's lowercase normal form (`13.0`, `13.0.0.0` and `13.0.0+build` are `13.0.0`); npm's as
 /// npm publishes them (`v1.3.0` is `1.3.0`); Go's as the go command reads them (`v1.2` is
-/// `v1.2.0`); pub's as pub.dev keeps them (`01.0.0` is `1.0.0`); every other registry's as
-/// written. A string the format would not parse compares as written (NuGet's in lowercase:
+/// `v1.2.0`); pub's as pub.dev keeps them (`01.0.0` is `1.0.0`); Composer's in its normal form
+/// (`v1.0` and `1.0.0.0` are one version); every other registry's as written. A string the format would not parse compares as written (NuGet's in lowercase:
 /// NuGet compares versions without case).
 pub fn curation_version(registry: RegistryType, version: &str) -> String {
     match registry {
@@ -1179,6 +1179,9 @@ pub fn curation_version(registry: RegistryType, version: &str) -> String {
         RegistryType::Npm => npm_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::Go => go_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::PubDart => pub_version_key(version).unwrap_or_else(|| version.to_string()),
+        // Composer's normal form: `v1.0` and `1.0.0.0` are one version.
+        RegistryType::Composer => crate::registry::composer::normalize_version(version)
+            .unwrap_or_else(|| version.to_string()),
         // A Hub commit is hex, served in lower case.
         RegistryType::HuggingFace => version.to_lowercase(),
         _ => version.to_string(),
@@ -1196,6 +1199,7 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
             RegistryType::Npm => npm_version_key(version),
             RegistryType::Go => go_version_key(version),
             RegistryType::PubDart => pub_version_key(version),
+            RegistryType::Composer => crate::registry::composer::normalize_version(version),
             _ => None,
         };
         // NuGet compares versions without case: the pattern and the spelling both fold.
@@ -1212,7 +1216,8 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
 
 /// A package name in the form its registry looks it up: PyPI per PEP 503, NuGet and Terraform
 /// in lowercase (NuGet ids resolve without case; Terraform lowercases provider names and
-/// registry.terraform.io answers provider and module paths in any case), Hugging Face repo ids
+/// registry.terraform.io answers provider and module paths in any case), Composer in lowercase
+/// (Composer lowercases a name before it asks a repository), Hugging Face repo ids
 /// in lowercase (the Hub answers `Org/Model` with a redirect to `org/model`), cargo as crates.io's
 /// `canon_crate_name` (lowercase, `-` as `_`: `Evil-Crate` and `evil_crate` are one crate),
 /// every other registry as written. Requests,
@@ -1222,9 +1227,11 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
 pub fn curation_name(registry: RegistryType, name: &str) -> String {
     match registry {
         RegistryType::PyPI => pep503_normalize(name),
-        RegistryType::Nuget | RegistryType::Terraform | RegistryType::HuggingFace => {
-            name.to_lowercase()
-        }
+        // Composer lowercases a package name before it looks it up.
+        RegistryType::Nuget
+        | RegistryType::Terraform
+        | RegistryType::HuggingFace
+        | RegistryType::Composer => name.to_lowercase(),
         RegistryType::Cargo => name.to_lowercase().replace('-', "_"),
         _ => name.to_string(),
     }

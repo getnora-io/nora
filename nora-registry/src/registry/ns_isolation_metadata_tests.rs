@@ -849,7 +849,7 @@ async fn pypi_internal_refusal_increments_isolation_refused_metric() {
 // request; each internal path has a public twin that must reach it, so no path passes for
 // being dead.
 
-const INTERNAL_PATHS: [&str; 35] = [
+const INTERNAL_PATHS: [&str; 39] = [
     "/npm/internalpkg",
     "/npm/internalpkg/-/internalpkg-1.0.0.tgz",
     "/simple/internalpkg/",
@@ -873,6 +873,10 @@ const INTERNAL_PATHS: [&str; 35] = [
     "/ansible/api/v3/plugin/ansible/content/published/collections/index/internalns/coll/versions/",
     "/ansible/download/internalns-coll-1.0.0.tar.gz",
     "/cpan/authors/id/I/IN/INTERNAL/internalpkg-1.0.tar.gz",
+    "/composer/p2/internalpkg/lib.json",
+    "/composer/p2/internalpkg/lib~dev.json",
+    "/composer/dists/internalpkg/lib/1.0.0/aaaa.zip",
+    "/composer/api/security-advisories/?packages[]=internalpkg/lib",
     "/terraform/v1/providers/internalns/infra/versions",
     "/terraform/v1/providers/internalns/infra/1.0.0/download/linux/amd64",
     "/terraform/v1/providers/download/internalns/infra/1.0.0/terraform-provider-infra_1.0.0_darwin_arm64.zip",
@@ -935,6 +939,8 @@ async fn an_internal_name_never_reaches_a_recording_upstream_dates_included() {
         c.ansible.proxy = Some(uri.clone());
         c.cpan.enabled = true;
         c.cpan.proxy = Some(uri.clone());
+        c.composer.enabled = true;
+        c.composer.proxy = Some(uri.clone());
         c.terraform.enabled = true;
         c.terraform.proxy = Some(uri.clone());
         c.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri.clone())];
