@@ -1069,9 +1069,56 @@ fn is_configured(state: &AppState, origin: Option<&str>) -> bool {
     })
 }
 
+/// Whether a p2 document names `name`, as Composer reads it (`isset($response['packages'][$name])`):
+/// an empty version list names it too.
+fn names_package(body: &[u8], name: &str) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|doc| doc.get("packages")?.get(name).map(|v| !v.is_null()))
+        .unwrap_or(false)
+}
+
+/// Whether the upstream `up` has `name` by its document `dev`: the fresh copy it served, else
+/// its answer now. An answer other than the document or "not found" is the error.
+async fn upstream_has(
+    state: &AppState,
+    up: &ComposerProxyEntry,
+    root: &UpstreamRoot,
+    name: &str,
+    dev: bool,
+) -> Result<bool, ProxyError> {
+    if let Some(c) = cached_document(state, &p2_key(name, dev)).await {
+        if c.fresh
+            && c.origin
+                .as_deref()
+                .is_some_and(|o| same_upstream(o, up.url()))
+        {
+            return Ok(names_package(&c.body, name));
+        }
+    }
+    let url = root.p2_url(name, dev);
+    match proxy_fetch_conditional(
+        &state.http_client,
+        &url,
+        timeout(state),
+        auth_for(up, &url),
+        &Validators::default(),
+        &state.circuit_breaker,
+        BreakerScope::upstream(RegistryType::Composer, up.url()),
+    )
+    .await
+    {
+        Ok(Revalidation::Modified { body, .. }) => Ok(names_package(&body, name)),
+        Ok(Revalidation::NotModified) => Err(ProxyError::Upstream(304)),
+        Err(ProxyError::NotFound) => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// The upstream p2 document of `name`: the fresh cached copy, else the first upstream that
-/// has it (a 304 keeps the cached copy), else the stale copy when every upstream that did
-/// not say "not found" failed, else the miss as a response.
+/// has the package (a 304 keeps the cached copy) — by either of its two documents, as Composer
+/// finds a package — else the stale copy when every upstream that did not say "not found"
+/// failed, else the miss as a response.
 async fn upstream_document(
     state: &AppState,
     name: &str,
@@ -1093,7 +1140,7 @@ async fn upstream_document(
     let path = format!("/composer/p2/{name}{}.json", if dev { "~dev" } else { "" });
     let mut miss = UpstreamMiss::default();
     let mut failed = false;
-    for up in &upstreams {
+    for (i, up) in upstreams.iter().enumerate() {
         // `known`: the address comes from the upstream's root. Without it the address is the
         // usual layout's guess, and a 4xx there says nothing about the package.
         let (root, known) = root_of(state, up).await;
@@ -1226,6 +1273,20 @@ async fn upstream_document(
                 }
                 tracing::debug!(registry = REGISTRY, url, error = ?e, "upstream metadata miss");
                 miss.record(&e);
+                // An upstream without this document that has the package's other one has the
+                // package: Composer finds a package in a repository by either document and asks
+                // no later repository for it, so no later upstream answers for this one.
+                if matches!(e, ProxyError::NotFound) && i + 1 < upstreams.len() {
+                    match upstream_has(state, up, &root, name, !dev).await {
+                        Ok(true) => break,
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::debug!(registry = REGISTRY, package = name, error = ?e, "upstream's other document unavailable");
+                            failed = true;
+                            miss.record(&e);
+                        }
+                    }
+                }
             }
         }
     }

@@ -256,6 +256,19 @@ fn a_document_serves_the_package_it_is_for_alone() {
     assert_eq!(names, ["acme/lib"]);
 }
 
+/// A document names a package as Composer reads it (`isset($response['packages'][$name])`):
+/// an empty version list names it, so the upstream that sent it has the package.
+#[test]
+fn a_document_names_a_package_as_composer_reads_it() {
+    let names = |body: &str| names_package(body.as_bytes(), "acme/lib");
+    assert!(names(r#"{"packages":{"acme/lib":[]}}"#));
+    assert!(names(r#"{"packages":{"acme/lib":[{"version":"1.0.0"}]}}"#));
+    assert!(!names(r#"{"packages":{"acme/other":[]}}"#));
+    assert!(!names(r#"{"packages":{"acme/lib":null}}"#));
+    assert!(!names(r#"{"packages":[]}"#));
+    assert!(!names("not json"));
+}
+
 #[test]
 fn a_dist_without_a_plain_reference_is_named_by_its_url() {
     let dist = json!({"type": "zip", "url": "https://x/y.zip", "reference": "v1.2.3"});
@@ -2314,4 +2327,134 @@ async fn an_archive_a_lock_file_names_is_served_after_its_branch_moves() {
         send(&ctx.app, Method::GET, locked, "").await.status(),
         StatusCode::FORBIDDEN
     );
+}
+
+// ── xhigh-2: the upstream that has a package answers for both of its documents ────────
+
+fn lib_doc(up: &str, version: &str, reference: &str) -> Value {
+    json!({"packages": {"acme/lib": [
+        {"name": "acme/lib", "version": version,
+         "dist": {"type": "zip", "url": format!("{up}/archives/{reference}.zip"), "reference": reference}}
+    ]}})
+}
+
+/// `[private, public]`, both with `acme/lib`: the private upstream with one of its two
+/// documents (the branches when `private_dev`, else the releases), the public one with both.
+async fn split_upstreams(private_dev: bool) -> (MockServer, MockServer, TestContext) {
+    let private = MockServer::start().await;
+    mount_root(&private).await;
+    let (has, lacks, version, reference) = if private_dev {
+        (
+            "/p2/acme/lib~dev.json",
+            "/p2/acme/lib.json",
+            "dev-main",
+            "privatedev",
+        )
+    } else {
+        (
+            "/p2/acme/lib.json",
+            "/p2/acme/lib~dev.json",
+            "1.0.0",
+            "privaterel",
+        )
+    };
+    Mock::given(wm_path(has))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &private.uri(),
+            version,
+            reference,
+        )))
+        .mount(&private)
+        .await;
+    Mock::given(wm_path(lacks))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&private)
+        .await;
+    let public = MockServer::start().await;
+    mount_root(&public).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &public.uri(),
+            "6.6.6",
+            "publicrel",
+        )))
+        .mount(&public)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib~dev.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &public.uri(),
+            "dev-main",
+            "publicdev",
+        )))
+        .mount(&public)
+        .await;
+    Mock::given(wm_method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ZIP_1.to_vec()))
+        .with_priority(10)
+        .mount(&public)
+        .await;
+    let (a, b) = (private.uri(), public.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    (private, public, ctx)
+}
+
+/// Composer finds a package in a repository by either of its two documents and asks no
+/// later repository for it (`PoolBuilder` drops every name found). Neither document of a
+/// package the first upstream has comes from another, nor does an archive the other lists.
+#[tokio::test]
+async fn the_upstream_that_has_a_package_answers_for_both_of_its_documents() {
+    for private_dev in [false, true] {
+        let (_private, public, ctx) = split_upstreams(private_dev).await;
+        let (own, other) = if private_dev {
+            ("~dev", "")
+        } else {
+            ("", "~dev")
+        };
+        // Composer asks for both at once: the one the private upstream lacks may come first.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/composer/p2/acme/lib{other}.json"),
+            "",
+        )
+        .await;
+        let status = resp.status();
+        let served = if status == StatusCode::OK {
+            versions_of(&json_of(resp).await, "acme/lib").len()
+        } else {
+            0
+        };
+        assert!(
+            status == StatusCode::NOT_FOUND || (status == StatusCode::OK && served == 0),
+            "private_dev={private_dev}: {status}, {served} versions of another upstream's"
+        );
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/composer/p2/acme/lib{own}.json"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        for path in [
+            "/composer/dists/acme/lib/dev-main/publicdev.zip",
+            "/composer/dists/acme/lib/6.6.6/publicrel.zip",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        let asked = upstream_paths(&public).await;
+        assert!(
+            !asked
+                .iter()
+                .any(|p| p.contains("acme/lib") || p.starts_with("/archives/")),
+            "private_dev={private_dev}: {asked:?}"
+        );
+    }
 }
