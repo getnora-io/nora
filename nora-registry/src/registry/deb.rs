@@ -754,6 +754,10 @@ async fn download(
     // which are server-generated only for hosted repos) proxies to the
     // configured upstream. Packages are immutable; metadata is TTL-bounded.
     if let Some(entry) = state.config.deb.proxies.get(&repo) {
+        // A byte the upstream URL cuts at is no byte of a package path: refused before the upstream.
+        if !crate::registry::repo_upstream_path_ok(&path) {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
         let key = package_key(&repo, &path);
         if validate_storage_key(&key).is_err() || path.starts_with(META_DIR) {
             return StatusCode::BAD_REQUEST.into_response();
@@ -2355,5 +2359,78 @@ mod proxy_tests {
         assert_eq!(resp.status(), StatusCode::CONFLICT);
         let resp = send(&ctx.app, Method::POST, "/deb/debian/-/reindex", "").await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod url_fold {
+    //! A proxied path with a byte the upstream URL drops or cuts at (a control byte, `?`, `#`) is
+    //! refused with a 400 before the upstream is asked: the URL built from the path
+    //! (`{upstream}/{path}`) would otherwise end at that byte and fetch another file.
+    use crate::config::registry::RepoProxyEntry;
+    use crate::test_helpers::{create_test_context_with_config, send, upstream_paths, TestContext};
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn upstream() -> MockServer {
+        let up = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UP".to_vec()))
+            .mount(&up)
+            .await;
+        up
+    }
+
+    fn context(up: &str) -> TestContext {
+        let up = up.to_string();
+        create_test_context_with_config(move |cfg| {
+            cfg.deb.enabled = true;
+            cfg.deb
+                .proxies
+                .insert("debian".to_string(), RepoProxyEntry::Simple(up));
+        })
+    }
+
+    #[tokio::test]
+    async fn proxied_path_with_a_cut_or_control_byte_is_refused() {
+        let cases: [&str; 4] = [
+            "/deb/debian/pool/main/a/ev%23il_1.0_amd64.deb",
+            "/deb/debian/pool/main/a/ev%3Fil_1.0_amd64.deb",
+            "/deb/debian/dists/bookworm/In%23Release",
+            "/deb/debian/pool/main/a/ev%09il_1.0_amd64.deb",
+        ];
+        assert_eq!(cases.len(), 4);
+        for uri in cases {
+            let up = upstream().await;
+            let ctx = context(&up.uri());
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
+            let asked = upstream_paths(&up).await;
+            assert!(asked.is_empty(), "{uri} reached the upstream as {asked:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legitimate_proxied_path_still_reaches_upstream() {
+        let up = upstream().await;
+        let ctx = context(&up.uri());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/deb/debian/pool/main/e/evil/evil_1.0-1+b1~rc:2_amd64.deb",
+            "",
+        )
+        .await;
+        assert_ne!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "legitimate path refused"
+        );
+        assert!(
+            !upstream_paths(&up).await.is_empty(),
+            "legitimate path never reached the upstream"
+        );
     }
 }

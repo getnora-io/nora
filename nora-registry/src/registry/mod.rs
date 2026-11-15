@@ -743,6 +743,16 @@ pub(crate) async fn proxy_fetch_text(
 
 /// One pull-through download for a per-repo proxied rpm/deb repository.
 ///
+/// Whether a path a pull-through repo fetches holds only what a Debian or RPM repository path holds:
+/// ASCII letters and digits, `.`, `-`, `_`, `+` and `~` (versions), `:` (a Debian epoch), and `/`.
+/// The upstream URL is `{upstream}/{path}`: a control byte, `?` or `#` in the path ends that URL, and
+/// the upstream fetches another file. Refused before the upstream is asked.
+pub(crate) fn repo_upstream_path_ok(path: &str) -> bool {
+    path.bytes().all(|b| {
+        b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'~' | b':' | b'/')
+    })
+}
+
 /// Shared by `rpm::download` and `deb::download` — the flow is the Maven proxy
 /// flow minus name-based curation (a proxied repo is declared in config and
 /// disjoint from hosted repos, so dependency-confusion gating does not apply;
