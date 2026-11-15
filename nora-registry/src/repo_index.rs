@@ -16,7 +16,7 @@ use crate::validation::ends_with_ci;
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
@@ -38,9 +38,15 @@ pub struct RepoInfo {
 }
 
 /// Index for a single registry type
+///
+/// Every invalidation moves `generation` on; a rebuild records the generation it starts from
+/// and, once stored, marks the index as built up to that one. An invalidation that lands while
+/// a rebuild is listing storage leaves the index dirty, so the next read rebuilds again instead
+/// of keeping a listing taken before the write.
 pub struct RegistryIndex {
     data: RwLock<Arc<Vec<RepoInfo>>>,
-    dirty: AtomicBool,
+    generation: AtomicU64,
+    built: AtomicU64,
     rebuild_lock: AsyncMutex<()>,
 }
 
@@ -48,27 +54,36 @@ impl RegistryIndex {
     pub fn new() -> Self {
         Self {
             data: RwLock::new(Arc::new(Vec::new())),
-            dirty: AtomicBool::new(true),
+            generation: AtomicU64::new(1),
+            built: AtomicU64::new(0),
             rebuild_lock: AsyncMutex::new(()),
         }
     }
 
     /// Mark index as needing rebuild
     pub fn invalidate(&self) {
-        self.dirty.store(true, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn is_dirty(&self) -> bool {
-        self.dirty.load(Ordering::Acquire)
+        self.built.load(Ordering::Acquire) != self.generation.load(Ordering::Acquire)
+    }
+
+    /// The generation a rebuild covers: read before it lists storage.
+    fn rebuild_from(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn get_cached(&self) -> Arc<Vec<RepoInfo>> {
         Arc::clone(&self.data.read())
     }
 
-    fn set(&self, data: Vec<RepoInfo>) {
+    /// Store a rebuild that listed storage after `from` was read: the index is clean only if
+    /// nothing invalidated it since.
+    fn set(&self, data: Vec<RepoInfo>, from: u64) {
         *self.data.write() = Arc::new(data);
-        self.dirty.store(false, Ordering::Release);
+        // Rebuilds are serialized by `rebuild_lock`, so `from` never goes back.
+        self.built.store(from, Ordering::Release);
     }
 
     pub fn count(&self) -> usize {
@@ -170,6 +185,7 @@ impl RepoIndex {
 
         // Double-check under lock (another thread may have rebuilt)
         if index.is_dirty() {
+            let from = index.rebuild_from();
             let data = match reg_type {
                 RegistryType::Docker => build_docker_index(storage).await,
                 RegistryType::Maven => build_maven_index(storage).await,
@@ -211,7 +227,7 @@ impl RepoIndex {
             match data {
                 Some(data) => {
                     info!(registry = registry, count = data.len(), "Index rebuilt");
-                    index.set(data);
+                    index.set(data, from);
                 }
                 None => {
                     // Storage list failed mid-rebuild. Leave the index dirty so the
@@ -797,7 +813,7 @@ mod tests {
         let idx = RepoIndex::new();
         // Clear dirty on every index (they start dirty).
         for ri in idx.indexes.values() {
-            ri.set(Vec::new());
+            ri.set(Vec::new(), ri.rebuild_from());
             assert!(!ri.is_dirty());
         }
         idx.invalidate_all();
@@ -876,13 +892,16 @@ mod tests {
         assert!(idx.is_dirty());
 
         // Set data clears dirty
-        idx.set(vec![RepoInfo {
-            name: "test".to_string(),
-            versions: 1,
-            size: 100,
-            updated: "2026-01-01".to_string(),
-            ..Default::default()
-        }]);
+        idx.set(
+            vec![RepoInfo {
+                name: "test".to_string(),
+                versions: 1,
+                size: 100,
+                updated: "2026-01-01".to_string(),
+                ..Default::default()
+            }],
+            idx.rebuild_from(),
+        );
         assert!(!idx.is_dirty());
         assert_eq!(idx.count(), 1);
 
@@ -891,25 +910,43 @@ mod tests {
         assert!(idx.is_dirty());
     }
 
+    /// An invalidation between the start of a rebuild and the index it stores is not lost: the
+    /// stored listing may predate the write, so the index stays marked for the next read.
+    #[test]
+    fn an_invalidation_during_a_rebuild_leaves_the_index_dirty() {
+        let idx = RegistryIndex::new();
+        let from = idx.rebuild_from();
+        idx.invalidate();
+        idx.set(Vec::new(), from);
+        assert!(idx.is_dirty());
+        // The next rebuild, started after the write, covers it.
+        let from = idx.rebuild_from();
+        idx.set(Vec::new(), from);
+        assert!(!idx.is_dirty());
+    }
+
     #[test]
     fn test_registry_index_get_cached() {
         let idx = RegistryIndex::new();
-        idx.set(vec![
-            RepoInfo {
-                name: "a".to_string(),
-                versions: 2,
-                size: 200,
-                updated: "today".to_string(),
-                ..Default::default()
-            },
-            RepoInfo {
-                name: "b".to_string(),
-                versions: 1,
-                size: 100,
-                updated: "yesterday".to_string(),
-                ..Default::default()
-            },
-        ]);
+        idx.set(
+            vec![
+                RepoInfo {
+                    name: "a".to_string(),
+                    versions: 2,
+                    size: 200,
+                    updated: "today".to_string(),
+                    ..Default::default()
+                },
+                RepoInfo {
+                    name: "b".to_string(),
+                    versions: 1,
+                    size: 100,
+                    updated: "yesterday".to_string(),
+                    ..Default::default()
+                },
+            ],
+            idx.rebuild_from(),
+        );
 
         let cached = idx.get_cached();
         assert_eq!(cached.len(), 2);
