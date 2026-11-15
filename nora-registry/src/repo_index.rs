@@ -205,12 +205,14 @@ impl RepoIndex {
                     let (p, s) = crate::registry::nuget::INDEX_PATTERN;
                     // An index whose records could not be listed stays dirty, as one whose
                     // files could not, and its hosted packages are not known until a rebuild
-                    // lists them: never the listing from before the write that made it dirty.
+                    // lists both: never the listing from before the write that made it dirty,
+                    // nor records beside an index of packages that was not built (search shows
+                    // NORA's own packages from that index, and could not show them as held).
                     let hosted = crate::registry::nuget::hosted_index(storage).await;
-                    let listed = hosted.is_some();
-                    *self.nuget_hosted.write() = hosted.map(Arc::new);
                     let data = build_generic_index(storage, p, s).await;
-                    data.filter(|_| listed)
+                    let built = hosted.is_some() && data.is_some();
+                    *self.nuget_hosted.write() = hosted.filter(|_| built).map(Arc::new);
+                    data.filter(|_| built)
                 }
                 RegistryType::Gems => build_gems_index(storage).await,
                 RegistryType::Terraform => {
