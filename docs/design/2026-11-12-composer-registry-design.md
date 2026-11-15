@@ -176,7 +176,9 @@ hosted or internal name, answers `{"advisories":{}}` itself when none is left,
 and forwards the rest to the first upstream whose root names an advisories API.
 When an upstream's root cannot be read (no answer, no cached copy, or a 200
 that is not a repository root: `null`, `[]`, an error object) and no other
-names an API, the answer is 502, not an empty result. A query names at most 1000
+names an API, the answer is 502, not an empty result. So is a root that offers
+advisories in its metadata only (`security-advisories` without `api-url`): NORA
+does not read them out of the p2 documents, so it cannot say there are none. A query names at most 1000
 distinct packages (413), and costs one listing per name asked about — the name's
 own hosted space, at most 16 at a time — never a walk of the whole registry.
 Treated as a read under `anonymous_read`, like `npm audit`. `composer update`'s

@@ -763,6 +763,9 @@ struct UpstreamRoot {
     /// Absolute, with `%package%`.
     metadata_url: String,
     advisories_url: Option<String>,
+    /// The root names advisories (`security-advisories`) but no API to ask for them: they are
+    /// in its metadata only.
+    advisories_inline: bool,
 }
 
 impl UpstreamRoot {
@@ -815,14 +818,14 @@ fn parse_root(base: &str, body: Option<&[u8]>) -> UpstreamRoot {
         .and_then(|u| resolve_root_url(base, u))
         .filter(|u| u.contains("%package%"))
         .unwrap_or_else(|| format!("{base}/p2/%package%.json"));
-    let advisories_url = doc
-        .as_ref()
-        .and_then(|d| d.get("security-advisories"))
+    let advisories = doc.as_ref().and_then(|d| d.get("security-advisories"));
+    let advisories_url = advisories
         .and_then(|s| s.get("api-url"))
         .and_then(Value::as_str)
         .and_then(|u| resolve_root_url(base, u));
     UpstreamRoot {
         metadata_url,
+        advisories_inline: advisories.is_some() && advisories_url.is_none(),
         advisories_url,
     }
 }
@@ -2158,6 +2161,7 @@ async fn security_advisories(
     }
     let mut target = None;
     let mut unread = false;
+    let mut inline = false;
     for up in state.config.composer.upstreams() {
         let (root, known) = root_of(&state, &up).await;
         if let Some(url) = root.advisories_url {
@@ -2165,8 +2169,17 @@ async fn security_advisories(
             break;
         }
         unread |= !known;
+        inline |= root.advisories_inline;
     }
     let Some((up, url)) = target else {
+        if inline {
+            // The upstream has advisories, in its metadata only: NORA does not read them there,
+            // so it cannot say there are none.
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "the upstream offers advisories in its metadata only; NORA cannot check them",
+            );
+        }
         if unread {
             // An upstream whose root could not be read may have an advisories API: its silence
             // is an outage, not "no advisories".

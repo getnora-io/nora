@@ -2207,3 +2207,28 @@ async fn every_reload_dates_a_newer_configuration() {
     }
     assert!(dates.windows(2).all(|w| w[1] > w[0]), "{dates:?}");
 }
+
+#[tokio::test]
+async fn advisories_offered_only_inline_are_not_a_clean_audit() {
+    // The root says the repository has advisories, in its metadata only: NORA has no API to
+    // ask, and an empty answer would read as "no vulnerabilities".
+    let up = MockServer::start().await;
+    Mock::given(wm_path("/packages.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [],
+            "metadata-url": "/p2/%package%.json",
+            "security-advisories": {"metadata": true}
+        })))
+        .mount(&up)
+        .await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::POST,
+        "/composer/api/security-advisories/",
+        vec![("content-type", "application/x-www-form-urlencoded")],
+        "packages%5B%5D=vendor%2Fpublic",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
