@@ -2203,11 +2203,11 @@ async fn upstream_metadata(
 
 /// Validate attachment filename: only safe characters, no path traversal.
 /// Whether a request path holds only what an npm package name, scope, version, tarball file name
-/// and dist-tag hold: ASCII letters and digits, `.`, `-`, `_`, `~`, `+` (semver build metadata), `@`
-/// (the scope), `/`, and `! * ' ( )`. A dist-tag may hold any character `encodeURIComponent` leaves
-/// alone (npm-package-arg `lib/npa.js`: a tag with any other character is refused), and those five
-/// are among them; the URL parser keeps them. A control byte, `?` or `#` is dropped or cut by the
-/// upstream URL.
+/// and dist-tag hold: ASCII letters and digits, `.`, `-`, `_`, `~`, `+` (semver build metadata),
+/// `@` (the scope), `/`, and `! * ' ( )`. A dist-tag may hold any character `encodeURIComponent`
+/// leaves alone (npm-package-arg `lib/npa.js`: a tag with any other character is refused), and
+/// those five are among them; the URL parser keeps them. A control byte, `?` or `#` is dropped or
+/// cut by the upstream URL.
 fn is_npm_path(path: &str) -> bool {
     path.bytes().all(|b| {
         b.is_ascii_alphanumeric()

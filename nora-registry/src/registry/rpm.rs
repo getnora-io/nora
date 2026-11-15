@@ -817,7 +817,8 @@ async fn download(
     // which are server-generated only for hosted repos) proxies to the
     // configured upstream. Packages are immutable; metadata is TTL-bounded.
     if let Some(entry) = state.config.rpm.proxies.get(&repo) {
-        // A byte the upstream URL cuts at is no byte of a package path: refused before the upstream.
+        // A byte the upstream URL cuts at is no byte of a package path: refused before the upstream
+        // is asked.
         if !crate::registry::repo_upstream_path_ok(&path) {
             return StatusCode::BAD_REQUEST.into_response();
         }

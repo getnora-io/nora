@@ -1776,11 +1776,12 @@ fn hf_name_segment(decoded: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Whether a decoded part of a file or metadata request holds no control byte. The URL parser drops
-/// them (`\t\n\r` and the rest), and no client has a reason to send one. `?` and `#` are not refused
-/// here: the upstream URL keeps the client's escape for every part past the repo id (`files` and
-/// `models_api_upstream` forward the path as encoded), so the Hub resolves them, and the URL parser
-/// never cuts at an escaped `?` or `#`.
+/// Whether a decoded part of a file or metadata request holds no control byte. The URL parser
+/// drops them (`\t\n\r` and the rest), and no client has a reason to send one. `?` and `#` are not
+/// refused here: the upstream URL keeps the client's escape for every part past the repo id
+/// (`files`
+/// and `models_api_upstream` forward the path as encoded), so the Hub resolves them, and the URL
+/// parser never cuts at an escaped `?` or `#`.
 fn control_free(decoded: &str) -> bool {
     decoded.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
@@ -5693,8 +5694,9 @@ mod url_fold {
         assert_refused("hf metadata", &uris, hf_proxy).await;
     }
 
-    /// `#` and `?` in a file name or a revision are sent as the client encoded them, so the Hub gets
-    /// the same escape and resolves the file the client asked for: the URL parser never cuts there.
+    /// `#` and `?` in a file name or a revision are sent as the client encoded them, so the Hub
+    /// gets the same escape and resolves the file the client asked for: the URL parser never cuts
+    /// there.
     #[tokio::test]
     async fn number_sign_and_question_mark_in_a_file_or_revision_go_upstream_escaped() {
         use crate::test_helpers::{

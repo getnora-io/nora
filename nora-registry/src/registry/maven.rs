@@ -43,10 +43,11 @@ pub(crate) fn storage_key(path: &str) -> String {
 
 /// Whether a request path (as decoded) holds only what a Maven coordinate and its file name
 /// hold: ASCII letters and digits, `.`, `-`, `_`, `+` and `~` (versions), and `/`. Maven's version
-/// rule bans `\ / : " < > | ? *` and nothing else (`maven-model-builder` `DefaultModelValidator`,
-/// `ILLEGAL_VERSION_CHARS`), so `~` is a version byte; the group and artifact ids hold letters,
-/// digits, `-`, `_`, `.` (`validateId`). Anything else — `\t`, `\n`, `?`, `#` — is dropped or cut by
-/// the upstream URL, so the upstream would fetch a coordinate other than the one curation checked.
+/// rule bans `\ / : " < > | ? *` and nothing else (`maven-model-builder`
+/// `DefaultModelValidator`, `ILLEGAL_VERSION_CHARS`), so `~` is a version byte; the group and
+/// artifact ids hold letters, digits, `-`, `_`, `.` (`validateId`). Anything else — `\t`, `\n`,
+/// `?`, `#` — is dropped or cut by the upstream URL, so the upstream would fetch a coordinate other
+/// than the one curation checked.
 fn is_maven_path(path: &str) -> bool {
     path.bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'~' | b'/'))
@@ -3299,8 +3300,8 @@ mod url_fold {
         assert_refused("maven", &uris, maven_proxy).await;
     }
 
-    /// Maven's version rule bans `\\ / : " < > | ? *` and no other byte (`DefaultModelValidator`), so `~`
-    /// is a legitimate version byte, and the URL parser keeps it.
+    /// Maven's version rule bans `\\ / : " < > | ? *` and no other byte
+    /// (`DefaultModelValidator`), so `~` is a legitimate version byte, and the URL parser keeps it.
     #[tokio::test]
     async fn legitimate_tilde_version_reaches_upstream_and_deploys() {
         assert_served_upstream(

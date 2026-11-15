@@ -90,10 +90,10 @@ const MAX_REFERENCE_LENGTH: usize = 128;
 /// - Leading `/` or `\` (absolute paths)
 /// - Null bytes
 /// - Empty segments
-/// - ASCII control bytes (`\t`, `\n`, `\r`, …): a key may become an upstream URL, and the URL parser
-///   drops them. `?` and `#` are not refused here: a storage key is a plain name (raw files keep them,
-///   as v1.4.4 stored them), and each format that builds an upstream URL from a name refuses them in its
-///   own name check, where the URL would cut at them
+/// - ASCII control bytes (`\t`, `\n`, `\r`, …): a key may become an upstream URL, and the URL
+///   parser drops them. `?` and `#` are not refused here: a storage key is a plain name (raw files
+///   keep them, as v1.4.4 stored them), and each format that builds an upstream URL from a name
+///   refuses them in its own name check, where the URL would cut at them
 pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
     if key.is_empty() {
         return Err(ValidationError::EmptyInput);
@@ -117,8 +117,9 @@ pub fn validate_storage_key(key: &str) -> Result<(), ValidationError> {
     }
 
     // ASCII control bytes. A key may go on into an upstream URL, and the URL parser drops `\t\n\r`:
-    // `ev%09il` would reach the upstream as `evil`, and curation (which saw `ev\til`) would not match
-    // a rule for `evil`. `?` and `#` are left to the formats that build a URL from a name, see above.
+    // `ev%09il` would reach the upstream as `evil`, and curation (which saw `ev\til`) would not
+    // match a rule for `evil`. `?` and `#` are left to the formats that build a URL from a name,
+    // see above.
     if let Some(ch) = key.chars().find(|c| c.is_ascii_control()) {
         return Err(ValidationError::ForbiddenCharacter(ch));
     }

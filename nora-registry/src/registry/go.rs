@@ -535,8 +535,9 @@ fn split_go_path(path: &str) -> Option<(String, String)> {
 /// and `-`, `.`, `_`, `~` (`go.dev/ref/mod#module-path`), plus `/` and `!` (the case escape).
 /// The part from the first `/@` on — `@v/<version>.<ext>` or `@latest` — also holds `@`, `+` for
 /// `+incompatible` and build metadata, and `=`: `module.EscapeVersion` admits it in a non-semantic
-/// revision (golang.org/x/mod `module/module.go`, `fileNameOK`). A control byte, `?` or `#` in either part would
-/// be dropped or cut by the upstream URL: the upstream would fetch another module.
+/// revision (golang.org/x/mod `module/module.go`, `fileNameOK`). A control byte, `?` or `#` in
+/// either part would be dropped or cut by the upstream URL: the upstream would fetch another
+/// module.
 fn is_safe_path(path: &str) -> bool {
     let module = path.find("/@").map_or(path, |at| &path[..at]);
     let rest = &path[module.len()..];
@@ -1556,8 +1557,8 @@ mod url_fold {
         assert_refused("go", &uris, go_proxy).await;
     }
 
-    /// A non-semantic revision (`module.EscapeVersion`) may hold `=`: `fileNameOK` allows it (golang.org/x/mod
-    /// `module/module.go`), and the URL parser keeps it.
+    /// A non-semantic revision (`module.EscapeVersion`) may hold `=`: `fileNameOK` allows it
+    /// (golang.org/x/mod `module/module.go`), and the URL parser keeps it.
     #[tokio::test]
     async fn legitimate_equals_revision_still_reaches_upstream() {
         assert_served_upstream("go", "/go/example.com/m/@v/feature=api.info", go_proxy).await;

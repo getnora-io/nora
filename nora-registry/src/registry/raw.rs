@@ -843,7 +843,8 @@ mod integration_tests {
             let del = send(&ctx.app, Method::DELETE, path, "").await;
             assert_eq!(del.status(), StatusCode::NO_CONTENT, "DELETE {path}");
         }
-        // A control byte in a name stays refused: no client writes one, and a stored one is unreadable.
+        // A control byte in a name stays refused: no client writes one, and a stored one is
+        // unreadable.
         let put = send(&ctx.app, Method::PUT, "/raw/report%092026.txt", "hello").await;
         assert_eq!(put.status(), StatusCode::BAD_REQUEST, "control byte stored");
     }
