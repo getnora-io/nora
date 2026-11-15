@@ -5213,4 +5213,22 @@ mod url_fold {
         )
         .await;
     }
+
+    /// Both normalized spellings of every version the measured NuGet corpus
+    /// (`NuGet.Versioning` 6.14.0, `testdata/nuget/versions/normal-forms.tsv`) accepts are
+    /// versions a client puts in a flatcontainer path: none may be refused.
+    #[test]
+    fn every_corpus_normal_form_is_accepted() {
+        let corpus = include_str!("../../testdata/nuget/versions/normal-forms.tsv");
+        let refused: Vec<&str> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.contains("INVALID"))
+            .flat_map(|line| line.split('\t').skip(1))
+            .filter(|version| !super::is_valid_version(version))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "legitimate versions refused: {refused:?}"
+        );
+    }
 }
