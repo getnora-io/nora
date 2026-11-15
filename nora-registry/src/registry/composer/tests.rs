@@ -398,9 +398,11 @@ async fn a_package_installs_through_the_proxy_and_its_archive_is_cached() {
     let ctx = proxy_ctx(&up.uri(), |_| {});
     let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
     assert_eq!(resp.status(), StatusCode::OK);
+    // The served document is NORA's rewrite: dated no earlier than the configuration that
+    // shapes it, whatever the upstream's 2020 date.
     assert_eq!(
         resp.headers()[header::LAST_MODIFIED],
-        "Wed, 01 Jan 2020 00:00:00 GMT"
+        http_date(ctx.state.curation().loaded_at as u64).as_str()
     );
     let doc = json_of(resp).await;
     let url = doc["packages"]["acme/lib"][0]["dist"]["url"]
@@ -1982,7 +1984,7 @@ async fn a_root_without_an_advisories_api_is_still_a_root() {
 async fn mount_source_only(up: &MockServer) {
     mount_root(up).await;
     Mock::given(wm_path("/p2/acme/lib.json"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages": {"acme/lib": [
+        .respond_with(ResponseTemplate::new(200).insert_header("last-modified", "Wed, 01 Jan 2020 00:00:00 GMT").set_body_json(json!({"packages": {"acme/lib": [
             {"name": "acme/lib", "version": "2.0.0",
              "source": {"type": "git", "url": "https://git.example.invalid/acme/lib.git", "reference": "bbbb"}},
             {"name": "acme/lib", "version": "1.0.0", "time": "2020-01-01T00:00:00+00:00",
@@ -2063,4 +2065,145 @@ async fn a_read_root_and_a_missing_package_is_a_404() {
     let ctx = proxy_ctx(&up.uri(), |_| {});
     let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/none.json", "").await;
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── after the final review (#1228): a client's copy of what NORA served, upstreams that failed ──
+
+#[tokio::test]
+async fn a_conditional_request_answers_for_what_is_served_now() {
+    let up = MockServer::start().await;
+    mount_source_only(&up).await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let p2 = "/composer/p2/acme/lib.json";
+    let first = send(&ctx.app, Method::GET, p2, "").await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let last_modified = first.headers()[header::LAST_MODIFIED]
+        .to_str()
+        .unwrap()
+        .to_string();
+    // Unchanged, the client's copy is current.
+    let again = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        p2,
+        vec![("if-modified-since", last_modified.as_str())],
+        "",
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    // Curation turned on: the served document is another one (no source-only version, no source).
+    crate::test_helpers::reload_curation(&ctx, |c| {
+        c.curation.mode = crate::config::CurationMode::Enforce;
+        c.curation.min_release_age = Some("7d".into());
+        c.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+    });
+    // As Composer asks: `If-Modified-Since` alone.
+    let conditions = vec![("if-modified-since", last_modified.as_str())];
+    let after = send_with_headers(&ctx.app, Method::GET, p2, conditions, "").await;
+    assert_eq!(
+        after.status(),
+        StatusCode::OK,
+        "a 304 kept the client on a document NORA no longer serves"
+    );
+    let doc = json_of(after).await;
+    assert!(
+        versions_of(&doc, "acme/lib")
+            .iter()
+            .all(|v| !v.contains_key("source")),
+        "{doc}"
+    );
+}
+
+#[tokio::test]
+async fn an_etag_names_the_served_document() {
+    let up = upstream().await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let p2 = "/composer/p2/acme/lib.json";
+    let first = send(&ctx.app, Method::GET, p2, "").await;
+    let etag = first.headers()[header::ETAG].to_str().unwrap().to_string();
+    let again = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        p2,
+        vec![("if-none-match", etag.as_str())],
+        "",
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    let other = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        p2,
+        vec![("if-none-match", "\"something-else\"")],
+        "",
+    )
+    .await;
+    assert_eq!(other.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_not_found_beside_a_failed_upstream_is_not_a_missing_package() {
+    let first = MockServer::start().await;
+    mount_root(&first).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&first)
+        .await;
+    let second = MockServer::start().await;
+    mount_root(&second).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&second)
+        .await;
+    let (a, b) = (first.uri(), second.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "the package may be on the upstream that failed"
+    );
+}
+
+#[tokio::test]
+async fn every_upstream_saying_not_found_is_a_404() {
+    let first = MockServer::start().await;
+    mount_root(&first).await;
+    let second = MockServer::start().await;
+    mount_root(&second).await;
+    for up in [&first, &second] {
+        Mock::given(wm_path("/p2/acme/lib.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(up)
+            .await;
+    }
+    let (a, b) = (first.uri(), second.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn every_reload_dates_a_newer_configuration() {
+    // What a served document's `Last-Modified` stands on: a reload within the same second as
+    // the last one still dates the new configuration later.
+    let ctx = hosted_ctx();
+    let mut dates = vec![ctx.state.curation().loaded_at];
+    for _ in 0..3 {
+        crate::test_helpers::reload_curation(&ctx, |_| {});
+        dates.push(ctx.state.curation().loaded_at);
+    }
+    assert!(dates.windows(2).all(|w| w[1] > w[0]), "{dates:?}");
 }

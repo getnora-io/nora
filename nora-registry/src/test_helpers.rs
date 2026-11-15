@@ -354,6 +354,7 @@ fn build_context_full(
     let reloadable = Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {
         curation_engine,
         bypass_token,
+        loaded_at: chrono::Utc::now().timestamp(),
     }));
 
     let leak_finders = crate::metrics::LeakFinders::new(config.upstream_hostnames());

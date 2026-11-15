@@ -651,23 +651,43 @@ fn http_date(unix: u64) -> String {
         .to_string()
 }
 
-/// A metadata document, or 304 when the client's `If-Modified-Since` names the very
-/// `Last-Modified` it would get (Composer revalidates its own cache that way).
+/// A metadata document, or 304 when the client's copy is the one NORA serves now. The
+/// validators describe the served document, not the upstream's: NORA rewrites it (archive
+/// URLs, and sources under curation), so a configuration that took effect after the upstream's
+/// `Last-Modified` dates it — `since`, when the current configuration was loaded. The `ETag` is
+/// the served bytes'. Composer revalidates its own cache with `If-Modified-Since`; an
+/// `If-None-Match`, when sent, decides alone.
 fn metadata_response(
     headers: &HeaderMap,
     body: Vec<u8>,
     last_modified: Option<String>,
     stale: bool,
+    since: i64,
 ) -> Response {
-    let not_modified = last_modified.as_deref().is_some_and(|lm| {
-        headers
-            .get(header::IF_MODIFIED_SINCE)
-            .and_then(|v| v.to_str().ok())
-            == Some(lm)
+    let last_modified = last_modified.map(|lm| match chrono::DateTime::parse_from_rfc2822(&lm) {
+        Ok(date) if date.timestamp() >= since => lm,
+        _ => http_date(since.max(0) as u64),
     });
+    let etag = format!("\"{}\"", &hex::encode(sha2::Sha256::digest(&body))[..32]);
+    let not_modified = match headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(tags) => tags
+            .split(',')
+            .map(str::trim)
+            .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag),
+        None => last_modified.as_deref().is_some_and(|lm| {
+            headers
+                .get(header::IF_MODIFIED_SINCE)
+                .and_then(|v| v.to_str().ok())
+                == Some(lm)
+        }),
+    };
     let mut builder = axum::http::Response::builder()
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE);
+        .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(header::ETAG, &etag);
     if let Some(lm) = last_modified.as_deref() {
         builder = builder.header(header::LAST_MODIFIED, lm);
     }
@@ -1222,6 +1242,19 @@ async fn upstream_document(
             });
         }
     }
+    // "No such package" only when every upstream said so: one that failed may hold it, and a
+    // 404 makes Composer look for the name in the project's other repositories.
+    if failed && miss.status() == StatusCode::NOT_FOUND {
+        tracing::warn!(
+            registry = REGISTRY,
+            package = name,
+            "an upstream failed and the others have no such package, returning 502"
+        );
+        return Err(json_error(
+            StatusCode::BAD_GATEWAY,
+            "an upstream could not be read; the package may be there",
+        ));
+    }
     Err(miss.response(REGISTRY, &path))
 }
 
@@ -1312,7 +1345,13 @@ async fn package_metadata(
             Sources::Drop
         };
         return match rewrite_document(&c.body, &name, &base, false, sources) {
-            Some(body) => metadata_response(&headers, body, c.last_modified, !c.fresh),
+            Some(body) => metadata_response(
+                &headers,
+                body,
+                c.last_modified,
+                !c.fresh,
+                state.curation().loaded_at,
+            ),
             None => {
                 tracing::warn!(
                     registry = REGISTRY,
@@ -1340,7 +1379,13 @@ async fn package_metadata(
         Err(response) => return response,
     };
     match rewrite_document(&doc.body, &name, &base, false, Sources::for_proxy(&state)) {
-        Some(body) => metadata_response(&headers, body, doc.last_modified, doc.stale),
+        Some(body) => metadata_response(
+            &headers,
+            body,
+            doc.last_modified,
+            doc.stale,
+            state.curation().loaded_at,
+        ),
         None => {
             tracing::warn!(
                 registry = REGISTRY,
@@ -1363,7 +1408,13 @@ async fn hosted_metadata(
         // Uploaded versions are releases: a hosted package has no branch versions, and its
         // `~dev` document is never an upstream's.
         let body = serde_json::json!({ "packages": { name: [] } }).to_string();
-        return metadata_response(headers, body.into_bytes(), None, false);
+        return metadata_response(
+            headers,
+            body.into_bytes(),
+            None,
+            false,
+            state.curation().loaded_at,
+        );
     }
     let key = hosted_document_key(name);
     let body = match state.storage.get(&key).await {
@@ -1391,7 +1442,13 @@ async fn hosted_metadata(
         .await
         .map(|m| http_date(m.modified));
     match rewrite_document(&body, name, base, true, Sources::Keep) {
-        Some(body) => metadata_response(headers, body, last_modified, false),
+        Some(body) => metadata_response(
+            headers,
+            body,
+            last_modified,
+            false,
+            state.curation().loaded_at,
+        ),
         None => {
             tracing::error!(registry = REGISTRY, key, "hosted metadata does not parse");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()

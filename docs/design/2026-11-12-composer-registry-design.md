@@ -85,7 +85,16 @@ read. Private Packagist (`/org/p2/…`), Satis and Packagist mirrors work unchan
   (`composer/2.0`) form is expanded, rewritten and minified again, so a version
   that inherits its `dist` from the one before still gets a URL naming its own
   version — curation reads the version from that URL.
-- `Last-Modified` is the upstream's; a client `If-Modified-Since` naming it is a 304.
+- The validators NORA answers with describe the document it serves, which is its
+  rewrite: `Last-Modified` is the upstream's date, or the moment the current
+  configuration took effect when that is later (a reload dates it strictly later), and
+  `ETag` is the hash of the served bytes. A client `If-None-Match` decides alone; else an
+  `If-Modified-Since` naming that `Last-Modified` is a 304. Turning curation on (or
+  changing `keep_source`) therefore never leaves a client on a document NORA no longer
+  serves.
+- With several upstreams, a 404 is answered only when every upstream said "not
+  found": one that failed may hold the package, and Composer reads a 404 as "look in the
+  project's other repositories" (502).
 - A copy whose `.origin` is no longer a configured upstream is not trusted.
 
 ### Archives
