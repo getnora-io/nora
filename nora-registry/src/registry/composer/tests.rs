@@ -2232,3 +2232,86 @@ async fn advisories_offered_only_inline_are_not_a_clean_audit() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
+
+// ── xhigh-1: an archive a lock file names stays downloadable once NORA holds it ───────
+
+async fn mount_branch(up: &MockServer, reference: &str, bytes: &[u8]) {
+    Mock::given(wm_path("/p2/acme/lib~dev.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages": {"acme/lib": [
+            {"name": "acme/lib", "version": "dev-main",
+             "dist": {"type": "zip", "url": format!("{}/archives/main-{reference}.zip", up.uri()), "reference": reference}}
+        ]}})))
+        .mount(up)
+        .await;
+    Mock::given(wm_path(format!("/archives/main-{reference}.zip")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+        .mount(up)
+        .await;
+}
+
+/// `composer install` downloads the URL its lock file recorded. A branch that moved on since
+/// leaves that URL out of the current metadata, but the archive under it is the one NORA
+/// fetched and checked then: it is served from the cache, curation still deciding, and a
+/// reference NORA never held is still not asked of anyone.
+#[tokio::test]
+async fn an_archive_a_lock_file_names_is_served_after_its_branch_moves() {
+    let up = MockServer::start().await;
+    mount_root(&up).await;
+    mount_branch(&up, "aaaa", ZIP_1).await;
+    let ctx = proxy_ctx(&up.uri(), |c| c.composer.metadata_ttl = 0);
+    let dev = "/composer/p2/acme/lib~dev.json";
+    let locked = "/composer/dists/acme/lib/dev-main/aaaa.zip";
+    assert_eq!(
+        send(&ctx.app, Method::GET, dev, "").await.status(),
+        StatusCode::OK
+    );
+    let resp = send(&ctx.app, Method::GET, locked, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(resp).await[..], ZIP_1);
+
+    // The branch moves on.
+    up.reset().await;
+    mount_root(&up).await;
+    mount_branch(&up, "bbbb", b"PK\x03\x04 archive two").await;
+    let doc = json_of(send(&ctx.app, Method::GET, dev, "").await).await;
+    let url = doc["packages"]["acme/lib"][0]["dist"]["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        url.ends_with("/composer/dists/acme/lib/dev-main/bbbb.zip"),
+        "{url}"
+    );
+
+    let resp = send(&ctx.app, Method::GET, locked, "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the archive NORA holds under the locked reference"
+    );
+    assert_eq!(&body_bytes(resp).await[..], ZIP_1);
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/dev-main/cccc.zip",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let sent = upstream_paths(&up).await;
+    assert!(
+        !sent.iter().any(|p| p.starts_with("/archives/")),
+        "{sent:?}"
+    );
+
+    // Curation decides on a held archive as on any other.
+    let (_dir, blocklist) = blocklist_file("composer", "acme/lib");
+    crate::test_helpers::reload_curation(&ctx, move |c| {
+        c.curation.mode = crate::config::CurationMode::Enforce;
+        c.curation.blocklist_path = Some(blocklist);
+    });
+    assert_eq!(
+        send(&ctx.app, Method::GET, locked, "").await.status(),
+        StatusCode::FORBIDDEN
+    );
+}

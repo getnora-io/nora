@@ -1626,6 +1626,53 @@ async fn listed_dist(
     Err(miss.unwrap_or_else(|| StatusCode::NOT_FOUND.into_response()))
 }
 
+/// An archive NORA holds under a URL the metadata no longer lists: a branch that moved on, or a
+/// tag pointed elsewhere, since a lock file recorded the URL (Composer installs from the URL
+/// and reference it locked). The URL names one reference, so what is stored under it is what
+/// NORA fetched and checked then; it is served from the cache like any other archive, curation
+/// deciding, and never fetched again. Its version is the one a trusted listing has under that
+/// path segment, else the segment itself when it is a version as written; a digested segment
+/// whose version no listing has any more names no version curation could decide on.
+async fn held_archive(
+    state: &AppState,
+    name: &str,
+    segment: &str,
+    token: &str,
+    ext: &str,
+) -> Option<(Listed, String)> {
+    state
+        .storage
+        .stat(&proxied_dist_key(name, segment, token, ext))
+        .await?;
+    let held = |version: String| Listed {
+        version,
+        url: String::new(),
+        shasum: None,
+        time: None,
+    };
+    for dev in [false, true] {
+        let metadata_key = p2_key(name, dev);
+        let Some(c) = cached_document(state, &metadata_key).await else {
+            continue;
+        };
+        if !is_configured(state, c.origin.as_deref()) {
+            continue;
+        }
+        if let Some(version) = listed_versions(&c.body, name)
+            .into_iter()
+            .find(|v| version_segment(v) == segment)
+        {
+            return Some((held(version), metadata_key));
+        }
+    }
+    (!segment.starts_with('~')).then(|| {
+        (
+            held(segment.to_string()),
+            p2_key(name, is_dev_version(segment)),
+        )
+    })
+}
+
 async fn download_dist(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1669,6 +1716,13 @@ async fn download_dist(
     };
     let (listed, origin, metadata_key) = match found {
         Ok(found) => found,
+        // Not listed any more, but held: a lock file names it (a branch moved on since).
+        Err(response) if !internal && response.status() == StatusCode::NOT_FOUND => {
+            match held_archive(&state, &name, &segment, token, ext).await {
+                Some((listed, metadata_key)) => (listed, String::new(), metadata_key),
+                None => return response,
+            }
+        }
         Err(response) => return response,
     };
     // Without trusted dates a release is as old as NORA's first sight of it in a listing: the
@@ -1794,6 +1848,10 @@ async fn download_dist(
     }
     if internal {
         return internal_refused(&state, &name);
+    }
+    // A held archive no listing names any more is never fetched: no upstream lists its URL.
+    if listed.url.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
     }
 
     let Some(up) = state
