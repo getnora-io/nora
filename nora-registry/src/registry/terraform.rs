@@ -3093,7 +3093,7 @@ mod integration_tests {
     async fn a_file_url_with_a_query_or_an_encoded_name_is_fetched_under_its_path_name() {
         use wiremock::matchers::{method, path, path_regex, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let files = format!("{}/gh/v9.3.2", server.uri());
         let stem = "terraform-provider-selectel_9.3.2";
         Mock::given(method("GET"))
@@ -3162,7 +3162,7 @@ mod integration_tests {
     async fn signed_link_upstream() -> wiremock::MockServer {
         use wiremock::matchers::{method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         let files = format!("{}/gh/v9.3.2", server.uri());
         let stem = "terraform-provider-selectel_9.3.2";
         Mock::given(method("GET"))
