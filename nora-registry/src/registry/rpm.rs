@@ -819,7 +819,7 @@ async fn download(
     if let Some(entry) = state.config.rpm.proxies.get(&repo) {
         // A byte the upstream URL cuts at is no byte of a package path: refused before the upstream
         // is asked.
-        if !crate::registry::repo_upstream_path_ok(&path) {
+        if !crate::registry::rpm_upstream_path_ok(&path) {
             return StatusCode::BAD_REQUEST.into_response();
         }
         let key = package_key(&repo, &path);
@@ -2355,6 +2355,27 @@ mod url_fold {
             assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{uri}");
             let asked = upstream_paths(&up).await;
             assert!(asked.is_empty(), "{uri} reached the upstream as {asked:?}");
+        }
+    }
+
+    /// `^` is the RPM snapshot operator, admitted by the rpm library's version and release check
+    /// (`rpm-0.25.1` `src/rpm/util.rs` `validate_version`: alphanumeric plus `._+%{}~^`). The URL
+    /// parser keeps it, so it names the same file upstream: a snapshot version or release must
+    /// reach it.
+    #[tokio::test]
+    async fn caret_snapshot_version_and_release_still_reach_upstream() {
+        for uri in [
+            "/rpm/rpmrepo/Packages/pkg-1.0%5Egit1-1.x86_64.rpm",
+            "/rpm/rpmrepo/Packages/pkg-1.0-1%5Egit1.x86_64.rpm",
+        ] {
+            let up = upstream().await;
+            let ctx = context(&up.uri());
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_ne!(resp.status(), StatusCode::BAD_REQUEST, "{uri} refused");
+            assert!(
+                !upstream_paths(&up).await.is_empty(),
+                "{uri} never reached upstream"
+            );
         }
     }
 

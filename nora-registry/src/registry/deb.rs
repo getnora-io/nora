@@ -756,7 +756,7 @@ async fn download(
     if let Some(entry) = state.config.deb.proxies.get(&repo) {
         // A byte the upstream URL cuts at is no byte of a package path: refused before the upstream
         // is asked.
-        if !crate::registry::repo_upstream_path_ok(&path) {
+        if !crate::registry::deb_upstream_path_ok(&path) {
             return StatusCode::BAD_REQUEST.into_response();
         }
         let key = package_key(&repo, &path);
@@ -2411,6 +2411,26 @@ mod url_fold {
             let asked = upstream_paths(&up).await;
             assert!(asked.is_empty(), "{uri} reached the upstream as {asked:?}");
         }
+    }
+
+    /// Debian's version grammar admits `- + : . ~` and alphanumerics (dpkg `Dpkg/Version.pm`, the
+    /// check `[-+:.0-9a-zA-Z~]`): `^` is not one of them, so a `^` version stays refused.
+    #[tokio::test]
+    async fn caret_is_no_debian_version_byte_and_stays_refused() {
+        let up = upstream().await;
+        let ctx = context(&up.uri());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/deb/debian/pool/main/p/pkg/pkg_1.0%5Egit1-1_amd64.deb",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            upstream_paths(&up).await.is_empty(),
+            "caret path reached the upstream"
+        );
     }
 
     #[tokio::test]
