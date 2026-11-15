@@ -38,6 +38,9 @@ use std::time::Duration;
 
 const UPSTREAM_DEFAULT: &str = "https://api.nuget.org";
 const SEARCH_TIMEOUT_SECS: u64 = 5;
+/// The most entries a search or autocomplete page holds, whatever `take` asks: nuget.org's limit
+/// (it answers a larger `take` with its default page, measured 15.11.2026).
+const SEARCH_TAKE_MAX: usize = 1000;
 const DEFAULT_SEARCH: &str = "https://azuresearch-usnc.nuget.org/query";
 const DEFAULT_AUTOCOMPLETE: &str = "https://azuresearch-usnc.nuget.org/autocomplete";
 
@@ -230,7 +233,7 @@ async fn search_query(
 ) -> Response {
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
-    let take = params.take.unwrap_or(20);
+    let take = params.take.unwrap_or(20).min(SEARCH_TAKE_MAX);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
 
@@ -354,7 +357,7 @@ async fn autocomplete_query(
 ) -> Response {
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
-    let take = params.take.unwrap_or(20);
+    let take = params.take.unwrap_or(20).min(SEARCH_TAKE_MAX);
     let prerelease = params.prerelease.unwrap_or(false);
     let sem_ver_level = params.sem_ver_level;
     // An empty `?id=` is the package-ID form, not the versions form.
@@ -1964,7 +1967,7 @@ impl PageWindow {
     /// How many of the host's entries NORA shows must be read for the page: those before it
     /// and those on it, one at least (for the host's total).
     fn upstream_need(&self) -> usize {
-        (self.upstream_skip + self.upstream_room).max(1)
+        self.upstream_skip.saturating_add(self.upstream_room).max(1)
     }
 }
 
@@ -2112,7 +2115,8 @@ async fn read_search_host(
             return Err(ProxyError::Upstream(502));
         };
         if round == 0 {
-            host_total = result["totalHits"].as_u64().unwrap_or(0) as usize;
+            let total = result["totalHits"].as_u64().unwrap_or(0);
+            host_total = usize::try_from(total).unwrap_or(usize::MAX);
         }
         let got = entries.len();
         for entry in entries {
@@ -2157,7 +2161,7 @@ async fn read_search_host(
     let total = if whole && host_total <= SEARCH_HOST_READ_WHOLE {
         kept.len() as u64
     } else {
-        host_total as u64
+        u64::try_from(host_total).unwrap_or(u64::MAX)
     };
     Ok(HostRead::Entries {
         shown: kept,
@@ -2214,7 +2218,7 @@ fn merge_search_page(
             .skip(window.upstream_skip)
             .take(window.upstream_room),
     );
-    result["totalHits"] = (window.own_total as u64 + total).into();
+    result["totalHits"] = (window.own_total as u64).saturating_add(total).into();
     result["data"] = page.into();
     Some(serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec()))
 }

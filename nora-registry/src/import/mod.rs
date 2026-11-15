@@ -2510,6 +2510,28 @@ mod integration_tests {
         search
     }
 
+    /// An autocomplete host that pages as it is asked over `ids`.
+    async fn paging_autocomplete_host(ids: &'static [&'static str]) -> MockServer {
+        let autocomplete = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(move |request: &wiremock::Request| {
+                let param = |name: &str| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == name)
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                };
+                let (skip, take) = (param("skip").unwrap_or(0), param("take").unwrap_or(20));
+                let data: Vec<&str> = ids.iter().skip(skip).take(take).copied().collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "totalHits": ids.len(), "data": data }))
+            })
+            .mount(&autocomplete)
+            .await;
+        autocomplete
+    }
+
     /// Walks a search page by page (`take` a page) until a page comes back short, as a client
     /// does: the ids in order, and every `totalHits` seen.
     async fn walk_search(
@@ -2724,23 +2746,7 @@ mod integration_tests {
         ids.extend((0..95).map(|n| &*Box::leak(format!("Lib{n:03}").into_boxed_str())));
         let ids: &'static [&'static str] = Box::leak(ids.into_boxed_slice());
         let search = paging_search_host(ids).await;
-        let autocomplete = MockServer::builder().start().await;
-        Mock::given(wiremock::matchers::any())
-            .respond_with(move |request: &wiremock::Request| {
-                let param = |name: &str| {
-                    request
-                        .url
-                        .query_pairs()
-                        .find(|(key, _)| key == name)
-                        .and_then(|(_, value)| value.parse::<usize>().ok())
-                };
-                let (skip, take) = (param("skip").unwrap_or(0), param("take").unwrap_or(20));
-                let data: Vec<&str> = ids.iter().skip(skip).take(take).copied().collect();
-                ResponseTemplate::new(200)
-                    .set_body_json(json!({ "totalHits": ids.len(), "data": data }))
-            })
-            .mount(&autocomplete)
-            .await;
+        let autocomplete = paging_autocomplete_host(ids).await;
         let (search_uri, autocomplete_uri) = (search.uri(), autocomplete.uri());
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.nuget.enabled = true;
@@ -2809,6 +2815,111 @@ mod integration_tests {
         let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         assert_eq!(page["data"][0]["id"], "Lib2000", "{}", page["data"][0]);
         assert_eq!(page["data"].as_array().unwrap().len(), 20);
+    }
+
+    /// `skip` and `take` as large as a query can hold, and a host `totalHits` as large as JSON
+    /// can: nothing overflows. `take` is held to 1000, as nuget.org holds it, so `skip=1` with
+    /// the largest `take` is the host's result past its first entry, and the largest `skip` is
+    /// past the end of a result NORA has read whole: an empty page, the end, as nuget.org
+    /// answers a `skip` past its results.
+    #[tokio::test]
+    async fn the_largest_skip_take_and_host_total_do_not_overflow() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let ids: Vec<&'static str> = (0..151)
+            .map(|n| &*Box::leak(format!("Lib{n:03}").into_boxed_str()))
+            .collect();
+        let ids: &'static [&'static str] = Box::leak(ids.into_boxed_slice());
+        let search = paging_search_host(ids).await;
+        let autocomplete = paging_autocomplete_host(ids).await;
+        let (search_uri, autocomplete_uri) = (search.uri(), autocomplete.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(search_uri.clone());
+            cfg.nuget.search_service = format!("{search_uri}/query");
+            cfg.nuget.autocomplete = format!("{autocomplete_uri}/autocomplete");
+        });
+        let max = u64::MAX;
+        for path in [
+            format!("/nuget/v3/query?q=lib&skip=1&take={max}"),
+            format!("/nuget/v3/autocomplete?q=lib&skip=1&take={max}"),
+        ] {
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(page["data"].as_array().unwrap().len(), 150, "{path}");
+            assert_eq!(page["totalHits"], 151, "{path}");
+        }
+        for path in [
+            format!("/nuget/v3/query?q=lib&skip={max}&take={max}"),
+            format!("/nuget/v3/autocomplete?q=lib&skip={max}&take={max}"),
+        ] {
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(page["data"], json!([]), "{path}");
+            assert_eq!(page["totalHits"], 151, "{path}");
+        }
+
+        // A page holds 1000 entries at most, whatever take asks.
+        let ids: Vec<&'static str> = (0..1200)
+            .map(|n| &*Box::leak(format!("Lib{n:04}").into_boxed_str()))
+            .collect();
+        let ids: &'static [&'static str] = Box::leak(ids.into_boxed_slice());
+        let (search, autocomplete) = (
+            paging_search_host(ids).await,
+            paging_autocomplete_host(ids).await,
+        );
+        let (search_uri, autocomplete_uri) = (search.uri(), autocomplete.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(search_uri.clone());
+            cfg.nuget.search_service = format!("{search_uri}/query");
+            cfg.nuget.autocomplete = format!("{autocomplete_uri}/autocomplete");
+        });
+        for path in [
+            "/nuget/v3/query?q=lib&take=1500",
+            "/nuget/v3/autocomplete?q=lib&take=1500",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(page["data"].as_array().unwrap().len(), 1000, "{path}");
+        }
+
+        // A host's totalHits as large as JSON holds, beside a package of NORA's own.
+        let huge = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalHits": u64::MAX,
+                "data": [{ "id": "Other.Lib", "version": "1.0.0", "versions": [{ "version": "1.0.0" }] }],
+            })))
+            .mount(&huge)
+            .await;
+        let uri = huge.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib&take=1", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(page["totalHits"], u64::MAX, "{page}");
+        let first = page["data"][0]["id"].as_str().map(str::to_lowercase);
+        assert_eq!(first.as_deref(), Some("corp.lib"), "{page}");
     }
 
     /// When the records cannot be listed, which packages are NORA's own is not known: search
