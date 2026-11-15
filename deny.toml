@@ -11,13 +11,6 @@ ignore = [
     # key at signing.key_path is refused at load (signing.rs:signs_with_ed25519),
     # so no rsa private-key operation is ever performed there either.
     "RUSTSEC-2023-0071",
-    # quick-xml <0.41 DoS (quadratic-attr + NsReader memory-exhaustion).
-    # Transitive via object_store (S3 XML parsing); no upstream fix yet
-    # (object_store 0.14 still pins quick-xml <0.41). Low exposure: XML comes
-    # from the configured S3 backend, not attacker input. Remove when
-    # object_store ships quick-xml >=0.41. Tracking: #799
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
     # crypto-bigint <0.7.6 timing variability in operations meant to be
     # constant-time. Transitive via pgp (k256/p256/p384/p521/cx448) and
     # jsonwebtoken (p256/p384); both pin elliptic-curve 0.13 -> crypto-bigint

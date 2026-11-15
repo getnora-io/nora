@@ -31,6 +31,9 @@ fn streaming_client_options() -> object_store::ClientOptions {
 
 /// object_store's reqwest 0.13 has no built-in TLS provider (`rustls-no-provider` keeps
 /// aws-lc-rs out), so install ring; an install Err means a concurrent caller installed it.
+/// Every object_store client must be built after this call: reqwest panics when it builds a
+/// client with no process default provider. Each constructor calls it, so a deployment that
+/// only uses one backend still installs it.
 fn install_ring_provider() {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         let _ = rustls::crypto::ring::default_provider().install_default();
