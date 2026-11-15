@@ -831,6 +831,23 @@ mod integration_tests {
     };
     use axum::http::{Method, StatusCode};
 
+    #[tokio::test]
+    async fn a_name_with_a_number_sign_or_question_mark_round_trips() {
+        let ctx = create_test_context();
+        for path in ["/raw/report%232026.txt", "/raw/why%3F.txt"] {
+            let put = send(&ctx.app, Method::PUT, path, "hello").await;
+            assert_eq!(put.status(), StatusCode::OK, "PUT {path}");
+            let get = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(get.status(), StatusCode::OK, "GET {path}");
+            assert_eq!(&body_bytes(get).await[..], b"hello", "GET {path}");
+            let del = send(&ctx.app, Method::DELETE, path, "").await;
+            assert_eq!(del.status(), StatusCode::NO_CONTENT, "DELETE {path}");
+        }
+        // A control byte in a name stays refused: no client writes one, and a stored one is unreadable.
+        let put = send(&ctx.app, Method::PUT, "/raw/report%092026.txt", "hello").await;
+        assert_eq!(put.status(), StatusCode::BAD_REQUEST, "control byte stored");
+    }
+
     fn scoped(mode: crate::config::ScopeEnforcement) -> crate::auth::NamespaceAuthority {
         crate::auth::NamespaceAuthority::from_oidc_scope("ci", &["myorg/**".to_string()], mode)
     }
