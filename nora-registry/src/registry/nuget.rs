@@ -1038,6 +1038,16 @@ async fn flatcontainer_download(
     if !is_safe_path(path) {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    // The id, the version and the file name are each one the NuGet protocol allows. A byte the
+    // upstream URL drops or cuts at (`%09`, `%3F`) would make it fetch another package.
+    if !is_valid_package_id(&id.to_lowercase())
+        || !is_valid_version(ver)
+        || !filename
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+'))
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
 
     // Only serve .nupkg and .nuspec files
     if !ends_with_ci(filename, ".nupkg") && !ends_with_ci(filename, ".nuspec") {
@@ -5952,6 +5962,64 @@ mod nuget_release_dates {
             assert_eq!(nuget_version_order(a, b), Some(want), "{a} vs {b}");
         }
         assert_eq!(nuget_version_order("not.a.version.x", "1.0.0"), None);
+    }
+}
+
+#[cfg(test)]
+mod url_fold {
+    //! A name or version holding a byte the upstream URL drops or cuts at (`%09`, `%0A`, `%0D`,
+    //! `%3F`, `%23`) is refused by this handler with a 400 before curation, storage or the upstream
+    //! sees it, and the upstream is never asked. Legitimate names of the format still reach it.
+    use crate::test_helpers::{assert_refused, assert_served_upstream, SMUGGLED};
+
+    fn nuget_proxy(cfg: &mut crate::config::Config, up: &str) {
+        cfg.nuget.enabled = true;
+        cfg.nuget.proxy = Some(up.to_string());
+    }
+
+    #[tokio::test]
+    async fn id_or_file_with_a_smuggled_byte_is_refused() {
+        let mut uris = Vec::new();
+        for s in SMUGGLED {
+            uris.push(format!(
+                "/nuget/v3/flatcontainer/ev{s}il/1.0.0/evil.1.0.0.nupkg"
+            ));
+            uris.push(format!(
+                "/nuget/v3/flatcontainer/evil/1.0.0{s}/evil.1.0.0.nupkg"
+            ));
+            uris.push(format!(
+                "/nuget/v3/flatcontainer/evil/1.0.0/ev{s}il.1.0.0.nupkg"
+            ));
+        }
+        assert_refused("nuget", &uris, nuget_proxy).await;
+    }
+
+    #[tokio::test]
+    async fn legitimate_id_still_reaches_upstream() {
+        assert_served_upstream(
+            "nuget",
+            "/nuget/v3/flatcontainer/newtonsoft.json/13.0.1/newtonsoft.json.13.0.1.nupkg",
+            nuget_proxy,
+        )
+        .await;
+    }
+
+    /// Both normalized spellings of every version the measured NuGet corpus
+    /// (`NuGet.Versioning` 6.14.0, `testdata/nuget/versions/normal-forms.tsv`) accepts are
+    /// versions a client puts in a flatcontainer path: none may be refused.
+    #[test]
+    fn every_corpus_normal_form_is_accepted() {
+        let corpus = include_str!("../../testdata/nuget/versions/normal-forms.tsv");
+        let refused: Vec<&str> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.contains("INVALID"))
+            .flat_map(|line| line.split('\t').skip(1))
+            .filter(|version| !super::is_valid_version(version))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "legitimate versions refused: {refused:?}"
+        );
     }
 }
 

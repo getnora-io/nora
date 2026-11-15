@@ -41,6 +41,18 @@ pub(crate) fn storage_key(path: &str) -> String {
     format!("maven/{path}")
 }
 
+/// Whether a request path (as decoded) holds only what a Maven coordinate and its file name
+/// hold: ASCII letters and digits, `.`, `-`, `_`, `+` and `~` (versions), and `/`. Maven's version
+/// rule bans `\ / : " < > | ? *` and nothing else (`maven-model-builder`
+/// `DefaultModelValidator`, `ILLEGAL_VERSION_CHARS`), so `~` is a version byte; the group and
+/// artifact ids hold letters, digits, `-`, `_`, `.` (`validateId`). Anything else — `\t`, `\n`,
+/// `?`, `#` — is dropped or cut by the upstream URL, so the upstream would fetch a coordinate other
+/// than the one curation checked.
+fn is_maven_path(path: &str) -> bool {
+    path.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'~' | b'/'))
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new().route(
         "/maven2/{*path}",
@@ -307,8 +319,9 @@ async fn download(
 ) -> Response {
     let key = storage_key(&path);
     // A path with an empty segment names another artifact's file and must not reach
-    // curation, storage or an upstream (which may normalise it to that artifact).
-    if crate::validation::validate_storage_key(&key).is_err() {
+    // curation, storage or an upstream (which may normalise it to that artifact). Nor may one
+    // with a byte the upstream URL drops or cuts at (`%09`, `%3F`): see `is_maven_path`.
+    if !is_maven_path(&path) || crate::validation::validate_storage_key(&key).is_err() {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
 
@@ -788,7 +801,12 @@ async fn upload(
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
     body: Bytes,
 ) -> Response {
-    if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
+    if !path.is_ascii()
+        || path.contains("..")
+        || path.contains('\0')
+        || path.starts_with('/')
+        || !is_maven_path(&path)
+    {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
     // An empty segment (`com//x`, `x.jar/`) would name another artifact's file: refuse it
@@ -3262,5 +3280,114 @@ mod maven_version_metadata_identity {
                 resp.status()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod url_fold {
+    //! A name or version holding a byte the upstream URL drops or cuts at (`%09`, `%0A`, `%0D`,
+    //! `%3F`, `%23`) is refused by this handler with a 400 before curation, storage or the upstream
+    //! sees it, and the upstream is never asked. Legitimate names of the format still reach it.
+    use crate::test_helpers::{assert_refused, assert_served_upstream, SMUGGLED};
+
+    fn maven_proxy(cfg: &mut crate::config::Config, up: &str) {
+        cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(up.to_string())];
+    }
+
+    #[tokio::test]
+    async fn coordinate_with_a_smuggled_byte_is_refused() {
+        let mut uris = Vec::new();
+        for s in SMUGGLED {
+            uris.push(format!("/maven2/com/ev{s}il/x/1.0/x-1.0.jar"));
+            uris.push(format!("/maven2/com/evil/x{s}/1.0/x-1.0.jar"));
+        }
+        uris.push("/maven2/com/evil/x/1.0%091/x-1.0%091.jar".to_string());
+        assert_refused("maven", &uris, maven_proxy).await;
+    }
+
+    /// Maven's version rule bans `\\ / : " < > | ? *` and no other byte
+    /// (`DefaultModelValidator`), so `~` is a legitimate version byte, and the URL parser keeps it.
+    #[tokio::test]
+    async fn legitimate_tilde_version_reaches_upstream_and_deploys() {
+        assert_served_upstream(
+            "maven",
+            "/maven2/org/example/my-lib/1.0~rc1/my-lib-1.0~rc1.jar",
+            maven_proxy,
+        )
+        .await;
+        let ctx = crate::test_helpers::create_test_context();
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            axum::http::Method::PUT,
+            "/maven2/org/example/my-lib/1.0~rc1/my-lib-1.0~rc1.jar",
+            vec![("content-type", "application/octet-stream")],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "tilde deploy refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn legitimate_coordinate_still_reaches_upstream() {
+        assert_served_upstream(
+            "maven",
+            "/maven2/org/example/my-lib_2/1.0.0-SNAPSHOT/my-lib_2-1.0.0-SNAPSHOT.pom",
+            maven_proxy,
+        )
+        .await;
+    }
+
+    /// Every artifact path in the measured Maven layout corpus (`maven-resolver` 1.9.27,
+    /// `testdata/maven/layout.tsv`) is a path a client requests: none may be refused.
+    #[test]
+    fn every_corpus_layout_path_is_accepted() {
+        let corpus = include_str!("../../testdata/maven/layout.tsv");
+        let refused: Vec<&str> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .filter_map(|line| line.split('\t').nth(7))
+            .filter(|path| !super::is_maven_path(path))
+            .collect();
+        assert!(refused.is_empty(), "legitimate paths refused: {refused:?}");
+    }
+
+    /// A deploy (PUT) to a coordinate with a byte the upstream URL drops or cuts at is refused with a
+    /// 400 before anything is stored; the same deploy of a legitimate coordinate is stored (201).
+    #[tokio::test]
+    async fn deploy_with_a_smuggled_byte_is_refused_and_a_legitimate_one_stored() {
+        for s in SMUGGLED {
+            let ctx = crate::test_helpers::create_test_context();
+            let resp = crate::test_helpers::send_with_headers(
+                &ctx.app,
+                axum::http::Method::PUT,
+                &format!("/maven2/com/ev{s}il/x/1.0/x-1.0.jar"),
+                vec![("content-type", "application/octet-stream")],
+                b"x".to_vec(),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "deploy ev{s}il"
+            );
+        }
+        let ctx = crate::test_helpers::create_test_context();
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            axum::http::Method::PUT,
+            "/maven2/com/evil/x/1.0/x-1.0.jar",
+            vec![("content-type", "application/octet-stream")],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "legitimate deploy refused"
+        );
     }
 }

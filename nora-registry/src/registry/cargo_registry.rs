@@ -458,7 +458,7 @@ async fn download(
     headers: axum::http::HeaderMap,
     Path((crate_name, version)): Path<(String, String)>,
 ) -> Response {
-    if !is_valid_crate_name(&crate_name) || !crate::validation::is_one_segment(&version) {
+    if !is_valid_crate_name(&crate_name) || !is_valid_crate_version(&version) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     // The upstream path keeps the name as cargo sent it (the published name, from the index):
@@ -1684,6 +1684,17 @@ fn crate_index_prefix(name: &str) -> String {
 }
 
 /// Validate crate name per Cargo spec.
+/// Whether a crate version in a request path is one: a SemVer version (`1.0.0`, `1.0.0-rc.1`,
+/// `1.0.0+build.5`) — ASCII letters and digits, `.`, `-`, `+`, and no `/`. A control byte, `?` or
+/// `#` in it would be dropped or cut by the upstream URL: the upstream would fetch another version
+/// than the one curation checked.
+fn is_valid_crate_version(version: &str) -> bool {
+    crate::validation::is_one_segment(version)
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+}
+
 fn is_valid_crate_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 {
         return false;
@@ -5388,5 +5399,38 @@ mod quarantine_first_seen {
     async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
         let (_up, ctx) = context(true).await;
         assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod url_fold {
+    //! A name or version holding a byte the upstream URL drops or cuts at (`%09`, `%0A`, `%0D`,
+    //! `%3F`, `%23`) is refused by this handler with a 400 before curation, storage or the upstream
+    //! sees it, and the upstream is never asked. Legitimate names of the format still reach it.
+    use crate::test_helpers::{assert_refused, assert_served_upstream, SMUGGLED};
+
+    fn cargo_proxy(cfg: &mut crate::config::Config, up: &str) {
+        cfg.cargo.proxy = Some(up.to_string());
+    }
+
+    #[tokio::test]
+    async fn version_with_a_smuggled_byte_is_refused() {
+        let mut uris = Vec::new();
+        for s in SMUGGLED {
+            uris.push(format!("/cargo/api/v1/crates/evil/1.0{s}1/download"));
+            uris.push(format!("/cargo/api/v1/crates/evil/1.0.0{s}/download"));
+        }
+        uris.push("/cargo/api/v1/crates/ev%09il/1.0.0/download".to_string());
+        assert_refused("cargo", &uris, cargo_proxy).await;
+    }
+
+    #[tokio::test]
+    async fn legitimate_semver_still_reaches_upstream() {
+        assert_served_upstream(
+            "cargo",
+            "/cargo/api/v1/crates/evil/1.0.0-rc.1+build.5/download",
+            cargo_proxy,
+        )
+        .await;
     }
 }

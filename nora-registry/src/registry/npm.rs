@@ -403,6 +403,12 @@ async fn handle_request(
     axum::extract::RawQuery(query): axum::extract::RawQuery,
     Extension(user): Extension<AuthenticatedUser>,
 ) -> Response {
+    // A name or version with a byte the upstream URL drops or cuts at (`%09`, `%3F`) is no name
+    // of the registry: refused before curation, the cache or the upstream see it.
+    if !is_npm_path(&path) {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+
     // Handle npm whoami endpoint
     if path == "-/whoami" {
         return handle_whoami(&user).await;
@@ -2196,6 +2202,22 @@ async fn upstream_metadata(
 // ============================================================================
 
 /// Validate attachment filename: only safe characters, no path traversal.
+/// Whether a request path holds only what an npm package name, scope, version, tarball file name
+/// and dist-tag hold: ASCII letters and digits, `.`, `-`, `_`, `~`, `+` (semver build metadata),
+/// `@` (the scope), `/`, and `! * ' ( )`. A dist-tag may hold any character `encodeURIComponent`
+/// leaves alone (npm-package-arg `lib/npa.js`: a tag with any other character is refused), and
+/// those five are among them; the URL parser keeps them. A control byte, `?` or `#` is dropped or
+/// cut by the upstream URL.
+fn is_npm_path(path: &str) -> bool {
+    path.bytes().all(|b| {
+        b.is_ascii_alphanumeric()
+            || matches!(
+                b,
+                b'.' | b'-' | b'_' | b'~' | b'+' | b'@' | b'/' | b'!' | b'*' | b'\'' | b'(' | b')'
+            )
+    })
+}
+
 fn is_valid_attachment_name(name: &str) -> bool {
     !name.is_empty()
         && !name.contains("..")
@@ -12771,5 +12793,66 @@ mod install_v1_version_manifest {
         assert_eq!(found["total"], 1, "{found}");
         assert_eq!(found["objects"][0]["package"]["name"], "pnpm", "{found}");
         assert_eq!(content_type, "application/json");
+    }
+}
+
+#[cfg(test)]
+mod url_fold {
+    //! A name or version holding a byte the upstream URL drops or cuts at (`%09`, `%0A`, `%0D`,
+    //! `%3F`, `%23`) is refused by this handler with a 400 before curation, storage or the upstream
+    //! sees it, and the upstream is never asked. Legitimate names of the format still reach it.
+    use crate::test_helpers::{assert_refused, assert_served_upstream, SMUGGLED};
+
+    fn npm_proxy(cfg: &mut crate::config::Config, up: &str) {
+        cfg.npm.proxy = Some(up.to_string());
+    }
+
+    #[tokio::test]
+    async fn name_with_a_smuggled_byte_is_refused() {
+        let mut uris = Vec::new();
+        for s in SMUGGLED {
+            uris.push(format!("/npm/ev{s}il"));
+            uris.push(format!("/npm/@sc{s}ope/pkg"));
+            uris.push(format!("/npm/ev{s}il/-/evil-1.0.0.tgz"));
+            uris.push(format!("/npm/evil/-/evil-1.0.0{s}.tgz"));
+        }
+        assert_refused("npm", &uris, npm_proxy).await;
+    }
+
+    /// A dist-tag may hold any character `encodeURIComponent` leaves alone (npm-package-arg
+    /// `lib/npa.js`: `encodeURIComponent(spec) !== spec` is the refusal): `! * ' ( )` among them.
+    #[tokio::test]
+    async fn legitimate_dist_tag_characters_reach_upstream() {
+        for uri in [
+            "/npm/pkg/canary!test",
+            "/npm/pkg/canary*test",
+            "/npm/pkg/canary'test",
+            "/npm/pkg/canary(test)",
+        ] {
+            assert_served_upstream("npm", uri, npm_proxy).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn legitimate_name_still_reaches_upstream() {
+        assert_served_upstream("npm", "/npm/@scope/my.pkg-name_2", npm_proxy).await;
+    }
+
+    /// Every version the measured npm corpus (`semver.clean`, `testdata/npm/versions/clean.tsv`)
+    /// yields for a valid input is a version a client puts in a tarball name: none may be refused.
+    #[test]
+    fn every_corpus_cleaned_version_is_accepted() {
+        let corpus = include_str!("../../testdata/npm/versions/clean.tsv");
+        let refused: Vec<String> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.contains("INVALID"))
+            .filter_map(|line| line.split('\t').nth(1))
+            .map(|version| format!("pkg/-/pkg-{version}.tgz"))
+            .filter(|path| !super::is_npm_path(path))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "legitimate versions refused: {refused:?}"
+        );
     }
 }

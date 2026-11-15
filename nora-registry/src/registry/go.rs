@@ -530,8 +530,28 @@ fn split_go_path(path: &str) -> Option<(String, String)> {
 /// Path validation: a Go proxy path is a valid storage key — no traversal, no null byte, and
 /// no empty segment anywhere: `a//b` and a trailing `/` (no Go proxy path ends in one) would
 /// name another module's file, and `x.zip/` is no longer a `.zip` to curation.
+///
+/// Its characters are those of each part. A module path's elements hold ASCII letters, digits
+/// and `-`, `.`, `_`, `~` (`go.dev/ref/mod#module-path`), plus `/` and `!` (the case escape).
+/// The part from the first `/@` on — `@v/<version>.<ext>` or `@latest` — also holds `@`, `+` for
+/// `+incompatible` and build metadata, and `=`: `module.EscapeVersion` admits it in a non-semantic
+/// revision (golang.org/x/mod `module/module.go`, `fileNameOK`). A control byte, `?` or `#` in
+/// either part would be dropped or cut by the upstream URL: the upstream would fetch another
+/// module.
 fn is_safe_path(path: &str) -> bool {
+    let module = path.find("/@").map_or(path, |at| &path[..at]);
+    let rest = &path[module.len()..];
     crate::validation::validate_storage_key(path).is_ok()
+        && module.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/' | b'!')
+        })
+        && rest.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'.' | b'_' | b'~' | b'/' | b'!' | b'@' | b'+' | b'='
+                )
+        })
 }
 
 /// Content-Type for Go proxy responses
@@ -788,6 +808,12 @@ mod tests {
     #[test]
     fn test_safe_path_normal() {
         assert!(is_safe_path("github.com/user/repo/@v/list"));
+        // `+` is a version's (`+incompatible`), never a module path's character.
+        assert!(is_safe_path(
+            "github.com/user/repo/@v/v2.0.0+incompatible.info"
+        ));
+        assert!(!is_safe_path("github.com/user+x/repo/@v/list"));
+        assert!(!is_safe_path("github.com/user@x/repo/@v/list"));
     }
 
     #[test]
@@ -1507,5 +1533,63 @@ mod quarantine_first_seen {
     async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
         let (_up, ctx) = context(true).await;
         assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod url_fold {
+    //! A name or version holding a byte the upstream URL drops or cuts at (`%09`, `%0A`, `%0D`,
+    //! `%3F`, `%23`) is refused by this handler with a 400 before curation, storage or the upstream
+    //! sees it, and the upstream is never asked. Legitimate names of the format still reach it.
+    use crate::test_helpers::{assert_refused, assert_served_upstream, SMUGGLED};
+
+    fn go_proxy(cfg: &mut crate::config::Config, up: &str) {
+        cfg.go.proxy = Some(up.to_string());
+    }
+
+    #[tokio::test]
+    async fn module_path_with_a_smuggled_byte_is_refused() {
+        let mut uris = Vec::new();
+        for s in SMUGGLED {
+            uris.push(format!("/go/example.com/ev{s}il/@v/v1.0.0.zip"));
+        }
+        uris.push("/go/example.com/evil/@v/v1.0.0%091.zip".to_string());
+        assert_refused("go", &uris, go_proxy).await;
+    }
+
+    /// A non-semantic revision (`module.EscapeVersion`) may hold `=`: `fileNameOK` allows it
+    /// (golang.org/x/mod `module/module.go`), and the URL parser keeps it.
+    #[tokio::test]
+    async fn legitimate_equals_revision_still_reaches_upstream() {
+        assert_served_upstream("go", "/go/example.com/m/@v/feature=api.info", go_proxy).await;
+    }
+
+    #[tokio::test]
+    async fn legitimate_module_path_still_reaches_upstream() {
+        assert_served_upstream(
+            "go",
+            "/go/github.com/!azure/sdk/@v/v2.0.0+incompatible.info",
+            go_proxy,
+        )
+        .await;
+    }
+
+    /// Every canonical version the measured Go corpus (`golang.org/x/mod`,
+    /// `testdata/go/versions/canonical.tsv`) yields for a valid input is a version a client asks
+    /// for in `@v/<version>.zip`: none may be refused.
+    #[test]
+    fn every_corpus_canonical_version_is_accepted() {
+        let corpus = include_str!("../../testdata/go/versions/canonical.tsv");
+        let refused: Vec<String> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.contains("INVALID"))
+            .filter_map(|line| line.split('\t').nth(1))
+            .map(|version| format!("example.com/m/@v/{version}.zip"))
+            .filter(|path| !super::is_safe_path(path))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "legitimate versions refused: {refused:?}"
+        );
     }
 }

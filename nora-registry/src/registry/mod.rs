@@ -743,6 +743,30 @@ pub(crate) async fn proxy_fetch_text(
     .await
 }
 
+/// The upstream URL is `{upstream}/{path}`: a control byte, `?` or `#` in the path ends that
+/// URL, and the upstream fetches another file. So a proxied path holds only the bytes of its
+/// format, checked before the upstream is asked. Both formats admit ASCII letters, digits, `.` and
+/// `/`, and the bytes their check lists beside them.
+fn path_bytes_within(path: &str, extra: &[u8]) -> bool {
+    path.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'/' || extra.contains(&b))
+}
+
+/// A proxied Debian path. dpkg's version grammar (`Dpkg/Version.pm`: `[-+:.0-9a-zA-Z~]`) admits
+/// `- + : . ~` and alphanumerics; package names add `+`, and `_` separates the fields of a pool
+/// file name. `^` is not a Debian version byte and stays refused.
+pub(crate) fn deb_upstream_path_ok(path: &str) -> bool {
+    path_bytes_within(path, b"-_+~:")
+}
+
+/// A proxied RPM path. The rpm library's version and release check (`rpm-0.25.1` `src/rpm/util.rs`,
+/// `validate_version`) admits alphanumerics and `._+%{}~^`. `^` is the RPM snapshot operator, which
+/// the URL parser keeps, so it is admitted here. `%` and `{}` are not: a `%` past the edge check is
+/// refused anyway, and `{}` are spec-macro bytes that no lead or measurement asked for.
+pub(crate) fn rpm_upstream_path_ok(path: &str) -> bool {
+    path_bytes_within(path, b"-_+~:^")
+}
+
 /// One pull-through download for a per-repo proxied rpm/deb repository.
 ///
 /// Shared by `rpm::download` and `deb::download` — the flow is the Maven proxy

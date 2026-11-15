@@ -1760,3 +1760,64 @@ pub fn functions_containing(
     }
     found
 }
+
+// ---------------------------------------------------------------------------
+// Smuggled-byte matrix (shared by the per-format `url_fold` test modules)
+// ---------------------------------------------------------------------------
+
+/// The bytes a name must not carry into an upstream URL, as they stand in a path: control bytes
+/// the URL parser drops (`%09`, `%0A`, `%0D`) and the delimiters it cuts at (`%3F` = `?`, `%23` = `#`).
+pub const SMUGGLED: [&str; 5] = ["%09", "%0A", "%0D", "%3F", "%23"];
+
+/// An upstream that answers every request with 200 and keeps what it was asked.
+pub async fn answering_upstream() -> wiremock::MockServer {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let up = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UP".to_vec()))
+        .mount(&up)
+        .await;
+    up
+}
+
+/// Every `uri` is refused with `status` (the handler's own refusal), and the upstream is never asked.
+pub async fn assert_refused_as(
+    label: &str,
+    status: axum::http::StatusCode,
+    uris: &[String],
+    configure: impl Fn(&mut Config, &str),
+) {
+    for uri in uris {
+        let up = answering_upstream().await;
+        let ctx = create_test_context_with_config(|cfg| configure(cfg, &up.uri()));
+        let resp = send(&ctx.app, axum::http::Method::GET, uri, "").await;
+        assert_eq!(resp.status(), status, "{label}: {uri}");
+        let asked = upstream_paths(&up).await;
+        assert!(
+            asked.is_empty(),
+            "{label}: {uri} reached upstream as {asked:?}"
+        );
+    }
+}
+
+/// Refused with 400, the status of a name or version the handler rejects.
+pub async fn assert_refused(label: &str, uris: &[String], configure: impl Fn(&mut Config, &str)) {
+    assert_refused_as(label, axum::http::StatusCode::BAD_REQUEST, uris, configure).await;
+}
+
+/// `uri` is a legitimate name: it is not refused, and the upstream is asked for it.
+pub async fn assert_served_upstream(label: &str, uri: &str, configure: impl Fn(&mut Config, &str)) {
+    let up = answering_upstream().await;
+    let ctx = create_test_context_with_config(|cfg| configure(cfg, &up.uri()));
+    let resp = send(&ctx.app, axum::http::Method::GET, uri, "").await;
+    assert_ne!(
+        resp.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "{label}: {uri} refused"
+    );
+    assert!(
+        !upstream_paths(&up).await.is_empty(),
+        "{label}: {uri} never reached upstream"
+    );
+}
