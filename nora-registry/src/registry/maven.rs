@@ -3306,4 +3306,54 @@ mod url_fold {
         )
         .await;
     }
+
+    /// Every artifact path in the measured Maven layout corpus (`maven-resolver` 1.9.27,
+    /// `testdata/maven/layout.tsv`) is a path a client requests: none may be refused.
+    #[test]
+    fn every_corpus_layout_path_is_accepted() {
+        let corpus = include_str!("../../testdata/maven/layout.tsv");
+        let refused: Vec<&str> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .filter_map(|line| line.split('\t').nth(7))
+            .filter(|path| !super::is_maven_path(path))
+            .collect();
+        assert!(refused.is_empty(), "legitimate paths refused: {refused:?}");
+    }
+
+    /// A deploy (PUT) to a coordinate with a byte the upstream URL drops or cuts at is refused with a
+    /// 400 before anything is stored; the same deploy of a legitimate coordinate is stored (201).
+    #[tokio::test]
+    async fn deploy_with_a_smuggled_byte_is_refused_and_a_legitimate_one_stored() {
+        for s in SMUGGLED {
+            let ctx = crate::test_helpers::create_test_context();
+            let resp = crate::test_helpers::send_with_headers(
+                &ctx.app,
+                axum::http::Method::PUT,
+                &format!("/maven2/com/ev{s}il/x/1.0/x-1.0.jar"),
+                vec![("content-type", "application/octet-stream")],
+                b"x".to_vec(),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "deploy ev{s}il"
+            );
+        }
+        let ctx = crate::test_helpers::create_test_context();
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            axum::http::Method::PUT,
+            "/maven2/com/evil/x/1.0/x-1.0.jar",
+            vec![("content-type", "application/octet-stream")],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "legitimate deploy refused"
+        );
+    }
 }
