@@ -28,8 +28,9 @@ use crate::cache_ttl::is_within_ttl;
 use crate::circuit_breaker::BreakerScope;
 use crate::config::{ComposerProxyEntry, UpstreamAuth};
 use crate::registry::{
-    method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional, proxy_fetch_hop,
-    proxy_forward_post, validators_key, Hopped, ProxyError, Revalidation, UpstreamMiss, Validators,
+    method_not_allowed, nora_base_url, proxy_fetch, proxy_fetch_conditional_refusals,
+    proxy_fetch_hop, proxy_forward_post, validators_key, Hopped, ProxyError, Revalidation,
+    UpstreamMiss, Validators,
 };
 use crate::registry_type::RegistryType;
 use crate::AppState;
@@ -1140,7 +1141,7 @@ async fn upstream_has(
         }
     }
     let url = root.p2_url(name, dev);
-    match proxy_fetch_conditional(
+    match proxy_fetch_conditional_refusals(
         &state.http_client,
         &url,
         timeout(state),
@@ -1202,7 +1203,7 @@ async fn upstream_document(
             _ => Validators::default(),
         };
         let had_validators = validators.is_some();
-        match proxy_fetch_conditional(
+        match proxy_fetch_conditional_refusals(
             &state.http_client,
             &url,
             timeout(state),
@@ -1318,6 +1319,13 @@ async fn upstream_document(
                 }
                 tracing::debug!(registry = REGISTRY, url, error = ?e, "upstream metadata miss");
                 miss.record(&e);
+                // The upstream the cached copy came from has the package. Failing now — down,
+                // refusing NORA's credential, rate-limiting it — it is not replaced by a later
+                // upstream's package of the same name: the copy is served stale, or the failure
+                // answered.
+                if from_here.is_some() && !matches!(e, ProxyError::NotFound) {
+                    break;
+                }
                 // An upstream without this document that has the package's other one has the
                 // package: Composer finds a package in a repository by either document and asks
                 // no later repository for it, so no later upstream answers for this one.

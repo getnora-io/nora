@@ -2601,3 +2601,112 @@ async fn a_hosted_name_the_store_cannot_be_asked_about_is_never_an_upstream_s() 
         "{asked:?}"
     );
 }
+
+use wiremock::matchers::path_regex as wm_path_regex;
+
+// ── xhigh-5: an upstream that refused NORA or rate-limited it did not say "not found" ─
+
+/// A 401 or 403 (an expired credential) and a 429 from an upstream whose root was read are
+/// not "no such package": a cached copy is served stale, and without one the miss is a 502
+/// or the 429 — never the 404 that sends Composer to the project's other repositories.
+#[tokio::test]
+async fn a_refusal_or_rate_limit_is_not_a_missing_package() {
+    for refusal in [401u16, 403, 429] {
+        let up = MockServer::start().await;
+        mount_root(&up).await;
+        Mock::given(wm_path("/p2/acme/lib.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+                &up.uri(),
+                "1.0.0",
+                "aaaa",
+            )))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&up)
+            .await;
+        Mock::given(wm_path_regex("^/p2/"))
+            .respond_with(ResponseTemplate::new(refusal).insert_header("retry-after", "30"))
+            .with_priority(2)
+            .mount(&up)
+            .await;
+        let ctx = proxy_ctx(&up.uri(), |c| c.composer.metadata_ttl = 0);
+        let p2 = "/composer/p2/acme/lib.json";
+        assert_eq!(
+            send(&ctx.app, Method::GET, p2, "").await.status(),
+            StatusCode::OK
+        );
+        let resp = send(&ctx.app, Method::GET, p2, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{refusal}: the cached copy");
+        assert_eq!(resp.headers()["x-nora-stale"], "true", "{refusal}");
+        let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/other.json", "").await;
+        let expected = if refusal == 429 {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        assert_eq!(resp.status(), expected, "{refusal}: no copy");
+    }
+}
+
+/// The upstream a cached copy came from holds the package. When it fails — refused NORA,
+/// rate-limited it, or is down — a later upstream's package of the same name does not take
+/// its place: the copy is served stale.
+#[tokio::test]
+async fn a_package_whose_upstream_fails_is_not_taken_from_the_next() {
+    for failure in [401u16, 429, 503] {
+        let private = MockServer::start().await;
+        mount_root(&private).await;
+        Mock::given(wm_path("/p2/acme/lib.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+                &private.uri(),
+                "1.0.0",
+                "privaterel",
+            )))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&private)
+            .await;
+        Mock::given(wm_path("/p2/acme/lib.json"))
+            .respond_with(ResponseTemplate::new(failure))
+            .with_priority(2)
+            .mount(&private)
+            .await;
+        let public = MockServer::start().await;
+        mount_root(&public).await;
+        Mock::given(wm_path("/p2/acme/lib.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+                &public.uri(),
+                "6.6.6",
+                "publicrel",
+            )))
+            .mount(&public)
+            .await;
+        let (a, b) = (private.uri(), public.uri());
+        let ctx = create_test_context_with_config(move |c| {
+            c.composer.enabled = true;
+            c.composer.metadata_ttl = 0;
+            c.composer.proxies = vec![
+                crate::config::ComposerProxyEntry::Simple(a),
+                crate::config::ComposerProxyEntry::Simple(b),
+            ];
+        });
+        let p2 = "/composer/p2/acme/lib.json";
+        assert_eq!(
+            send(&ctx.app, Method::GET, p2, "").await.status(),
+            StatusCode::OK
+        );
+        let resp = send(&ctx.app, Method::GET, p2, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{failure}");
+        assert_eq!(resp.headers()["x-nora-stale"], "true", "{failure}");
+        let doc = json_of(resp).await;
+        assert_eq!(
+            doc["packages"]["acme/lib"][0]["version"], "1.0.0",
+            "{failure}"
+        );
+        let asked = upstream_paths(&public).await;
+        assert!(
+            !asked.iter().any(|p| p.contains("acme/lib")),
+            "{failure}: {asked:?}"
+        );
+    }
+}
