@@ -282,7 +282,18 @@ async fn search_query(
     // Try upstream with short timeout (UX-critical path)
     let qs = raw_query.0.unwrap_or_default();
 
-    match read_search_host(&state, &hosted, &own, &qs, window.upstream_need(), shown).await {
+    let need = window.upstream_need();
+    match read_search_host(
+        &state,
+        HostResource::Search,
+        &hosted,
+        &own,
+        &qs,
+        need,
+        shown,
+    )
+    .await
+    {
         Ok(host) => {
             let merged = merge_search_page(&own, host, window);
             state.metrics.record_download("nuget");
@@ -401,23 +412,49 @@ async fn autocomplete_query(
     }
 
     let qs = raw_query.0.unwrap_or_default();
-    let url = format!("{}?{}", state.config.nuget.autocomplete, qs);
-
-    match proxy_fetch_text(
-        &state.http_client,
-        &url,
-        Duration::from_secs(SEARCH_TIMEOUT_SECS),
-        None, // autocomplete endpoint is public
-        None,
-        &state.circuit_breaker,
-        BreakerScope::upstream(RegistryType::Nuget, &state.config.nuget.autocomplete),
-    )
-    .await
-    {
-        Ok(text) => {
+    let host = if id.is_some() {
+        // The versions form of an id NORA does not host: the host's answer as it is.
+        let url = format!("{}?{}", state.config.nuget.autocomplete, qs);
+        proxy_fetch_text(
+            &state.http_client,
+            &url,
+            Duration::from_secs(SEARCH_TIMEOUT_SECS),
+            None, // autocomplete endpoint is public
+            None,
+            &state.circuit_breaker,
+            BreakerScope::upstream(RegistryType::Nuget, &state.config.nuget.autocomplete),
+        )
+        .await
+        .map(|text| {
             let base_url = nora_base_url(&state);
-            let upstream = rewrite_host(&state);
-            let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
+            rewrite_registration_urls(&text, &rewrite_host(&state), &base_url).into_bytes()
+        })
+    } else {
+        // The package-id form: NORA's own ids first and the host's after them, as search.
+        let Some(hosted) = state.repo_index.nuget_hosted(&state.storage).await else {
+            return records_unavailable();
+        };
+        let shown = SearchFilter {
+            prerelease,
+            sem_ver_level: sem_ver_level.as_deref(),
+        };
+        let own: Vec<serde_json::Value> = own_matches(&state, &hosted, &query, shown)
+            .await
+            .into_iter()
+            .map(|entry| HostResource::Autocomplete.own_entry(entry))
+            .collect();
+        let window = PageWindow::new(skip, take, own.len());
+        let need = window.upstream_need();
+        let resource = HostResource::Autocomplete;
+        match read_search_host(&state, resource, &hosted, &own, &qs, need, shown).await {
+            Ok(read) => Ok(merge_search_page(&own, read, window)),
+            Err(ProxyError::NotFound) => Ok(merge_search_page(&own, HostRead::nothing(), window)),
+            Err(e) => Err(e),
+        }
+    };
+
+    match host {
+        Ok(merged) => {
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -426,7 +463,7 @@ async fn autocomplete_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(rewritten.into_bytes())
+            with_json(merged)
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(
@@ -1933,6 +1970,38 @@ const SEARCH_HOST_READ_WHOLE: usize = 100;
 const SEARCH_HOST_TAKE_MAX: usize = 1000;
 const SEARCH_HOST_READS_MAX: usize = 6;
 
+/// Which host a merged search reads: search answers entries (objects with an `id`),
+/// autocomplete answers package ids.
+#[derive(Clone, Copy, PartialEq)]
+enum HostResource {
+    Search,
+    Autocomplete,
+}
+
+impl HostResource {
+    fn url(self, state: &AppState) -> &str {
+        match self {
+            HostResource::Search => &state.config.nuget.search_service,
+            HostResource::Autocomplete => &state.config.nuget.autocomplete,
+        }
+    }
+
+    fn id_of(self, entry: &serde_json::Value) -> Option<&str> {
+        match self {
+            HostResource::Search => entry["id"].as_str(),
+            HostResource::Autocomplete => entry.as_str(),
+        }
+    }
+
+    /// The entry NORA shows for its own package, from its search entry.
+    fn own_entry(self, search_entry: serde_json::Value) -> serde_json::Value {
+        match self {
+            HostResource::Search => search_entry,
+            HostResource::Autocomplete => search_entry["id"].clone(),
+        }
+    }
+}
+
 /// What a merged search read of the search host.
 enum HostRead {
     /// The host's entries NORA shows, in the host's order from its first, as NORA shows them;
@@ -1966,6 +2035,7 @@ impl HostRead {
 /// fails the search too, since the page cannot be told without it.
 async fn read_search_host(
     state: &AppState,
+    resource: HostResource,
     hosted: &std::collections::HashMap<String, Vec<String>>,
     own: &[serde_json::Value],
     qs: &str,
@@ -1978,7 +2048,7 @@ async fn read_search_host(
     let upstream = rewrite_host(state);
     let mut seen: std::collections::HashSet<String> = own
         .iter()
-        .filter_map(|entry| entry["id"].as_str().map(str::to_lowercase))
+        .filter_map(|entry| resource.id_of(entry).map(str::to_lowercase))
         .collect();
     let mut kept: Vec<serde_json::Value> = Vec::new();
     let mut envelope: Option<serde_json::Value> = None;
@@ -1993,21 +2063,17 @@ async fn read_search_host(
             need.saturating_sub(kept.len())
         }
         .clamp(1, SEARCH_HOST_TAKE_MAX);
-        let url = format!(
-            "{}?{}",
-            state.config.nuget.search_service,
-            with_page(qs, read, take)
-        );
+        let url = format!("{}?{}", resource.url(state), with_page(qs, read, take));
         let text = match proxy_fetch_text(
             &state.http_client,
             &url,
             Duration::from_secs(SEARCH_TIMEOUT_SECS),
-            None, // search endpoint is public
+            None, // search and autocomplete endpoints are public
             None,
             &state.circuit_breaker,
             // Its own breaker: the search host is not the package source, and its failures
             // must not stop restore (nor the reverse).
-            BreakerScope::upstream(RegistryType::Nuget, &state.config.nuget.search_service),
+            BreakerScope::upstream(RegistryType::Nuget, resource.url(state)),
         )
         .await
         {
@@ -2037,7 +2103,7 @@ async fn read_search_host(
         }
         let got = entries.len();
         for entry in entries {
-            let Some(id) = entry["id"].as_str().map(str::to_lowercase) else {
+            let Some(id) = resource.id_of(&entry).map(str::to_lowercase) else {
                 kept.push(entry);
                 continue;
             };
@@ -2055,7 +2121,7 @@ async fn read_search_host(
                 kept.push(entry);
             } else if let Some(pkg) = packages.iter().find(|pkg| pkg.name.to_lowercase() == id) {
                 if let Some(held) = local_search_entry(state, hosted, &base_url, pkg, shown).await {
-                    kept.push(held);
+                    kept.push(resource.own_entry(held));
                 }
             }
         }

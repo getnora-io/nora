@@ -2630,6 +2630,83 @@ mod integration_tests {
         assert!(totals[0] >= ids.len() as u64, "{totals:?} < {}", ids.len());
     }
 
+    /// Autocomplete through a live autocomplete host has NORA's own packages in it, as search
+    /// does: an imported id the query matches comes first, an id in an internal namespace or an
+    /// id NORA hosts but holds no version of is not shown from the host, and a client walking
+    /// the pages sees every other id once, with `totalHits` counting what the pages hold.
+    #[tokio::test]
+    async fn autocomplete_through_a_live_upstream_shows_imported_ids() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let host_ids = ["Corp.Lib", "Internal.X", "Other.Lib", "Z.Lib"];
+        let autocomplete = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(move |request: &wiremock::Request| {
+                let param = |name: &str| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == name)
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                };
+                let (skip, take) = (param("skip").unwrap_or(0), param("take").unwrap_or(20));
+                let data: Vec<&str> = host_ids.iter().skip(skip).take(take).copied().collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "totalHits": host_ids.len(), "data": data }))
+            })
+            .mount(&autocomplete)
+            .await;
+        let uri = autocomplete.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.autocomplete = format!("{uri}/autocomplete");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![
+                ("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0")),
+                ("Corp.NewLib.2.0.nupkg".into(), nupkg("Corp.NewLib", "2.0")),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (2, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+
+        for take in [1, 2, 20] {
+            let (mut ids, mut totals) = (Vec::new(), std::collections::BTreeSet::new());
+            for skip in (0..).step_by(take).take(20) {
+                let path = format!("/nuget/v3/autocomplete?q=lib&skip={skip}&take={take}");
+                let resp = send(&ctx.app, Method::GET, &path, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{path}");
+                let page: serde_json::Value =
+                    serde_json::from_slice(&body_bytes(resp).await).unwrap();
+                totals.insert(page["totalHits"].as_u64().unwrap());
+                let data = page["data"].as_array().unwrap();
+                ids.extend(data.iter().map(|id| id.as_str().unwrap().to_lowercase()));
+                if data.len() < take {
+                    break;
+                }
+            }
+            assert_eq!(
+                ids,
+                ["corp.lib", "corp.newlib", "other.lib", "z.lib"],
+                "take={take}"
+            );
+            assert_eq!(totals.into_iter().collect::<Vec<_>>(), [4], "take={take}");
+        }
+        assert!(
+            !autocomplete.received_requests().await.unwrap().is_empty(),
+            "the autocomplete host was not asked"
+        );
+    }
+
     /// When the records cannot be listed, which packages are NORA's own is not known: search
     /// answers 503 rather than show the list an upstream gave for the id, as the flat container
     /// does.
