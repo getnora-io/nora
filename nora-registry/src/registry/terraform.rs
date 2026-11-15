@@ -1570,24 +1570,38 @@ async fn resolve_upstream_download_url(
 /// archive, SHA256SUMS or its signature, each named by the last segment of the path of the URL the
 /// upstream gives for it, decoded as a request path is. A query (a signed download link) or a
 /// fragment is no part of the name; the URL is returned whole, so its query goes to the upstream.
-/// `None` for a name the metadata does not give.
+/// The name in the link NORA answered for the file counts too: metadata stored by an earlier
+/// release named a file whose URL query or fragment holds `/` by what followed that `/`, and a
+/// client may hold such a link. `None` for a name the metadata does not give.
 fn upstream_url_of_file(meta: &serde_json::Value, filename: &str) -> Option<String> {
     [
-        "_nora_upstream_url",
-        "_nora_upstream_shasums_url",
-        "_nora_upstream_shasums_sig_url",
+        ("_nora_upstream_url", "download_url"),
+        ("_nora_upstream_shasums_url", "shasums_url"),
+        ("_nora_upstream_shasums_sig_url", "shasums_signature_url"),
     ]
     .into_iter()
-    .filter_map(|field| meta.get(field)?.as_str())
-    .find(|url| url_file_name(url).as_deref() == Some(filename))
-    .map(String::from)
+    .find(|(upstream, answered)| {
+        [upstream, answered].into_iter().any(|field| {
+            meta.get(field)
+                .and_then(|v| v.as_str())
+                .and_then(url_file_name)
+                .as_deref()
+                == Some(filename)
+        })
+    })
+    .and_then(|(upstream, _)| meta.get(upstream)?.as_str().map(String::from))
 }
 
-/// The last segment of a URL's path, without its query or fragment, percent-decoded.
+/// The last segment of a URL's path, without its query or fragment, as the URL writes it.
+fn url_path_segment(url: &str) -> &str {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// The name a request path carries for the last segment of a URL's path: the segment
+/// percent-decoded, as the request path is.
 fn url_file_name(url: &str) -> Option<String> {
-    let path = url.split('#').next()?.split('?').next()?;
-    let segment = path.rsplit('/').next()?;
-    percent_encoding::percent_decode_str(segment)
+    percent_encoding::percent_decode_str(url_path_segment(url))
         .decode_utf8()
         .ok()
         .map(|name| name.into_owned())
@@ -1807,7 +1821,10 @@ async fn range_binary(
 ///
 /// Also stores the original upstream URLs in `_nora_upstream_*` fields so the
 /// binary download handler can fetch from the real host (e.g.
-/// releases.hashicorp.com) instead of the registry API endpoint.
+/// releases.hashicorp.com) instead of the registry API endpoint. NORA's link names
+/// each file by the last segment of the path of the upstream's URL: a query or a
+/// fragment (a signed download link) stays in the upstream URL, where the binary
+/// download handler sends it, and is not part of NORA's link.
 fn rewrite_download_url(
     json_text: &str,
     base_url: &str,
@@ -1832,7 +1849,7 @@ fn rewrite_download_url(
                     "_nora_upstream_url".to_string(),
                     serde_json::Value::String(url_str.clone()),
                 );
-                let filename = url_str.rsplit('/').next().unwrap_or("provider.zip");
+                let filename = url_path_segment(&url_str);
                 obj.insert(
                     "download_url".to_string(),
                     serde_json::Value::String(format!("{}/{}", download_base, filename)),
@@ -1849,7 +1866,7 @@ fn rewrite_download_url(
                     "_nora_upstream_shasums_url".to_string(),
                     serde_json::Value::String(url_str.clone()),
                 );
-                let filename = url_str.rsplit('/').next().unwrap_or("SHA256SUMS");
+                let filename = url_path_segment(&url_str);
                 obj.insert(
                     "shasums_url".to_string(),
                     serde_json::Value::String(format!("{}/{}", download_base, filename)),
@@ -1866,7 +1883,7 @@ fn rewrite_download_url(
                     "_nora_upstream_shasums_sig_url".to_string(),
                     serde_json::Value::String(url_str.clone()),
                 );
-                let filename = url_str.rsplit('/').next().unwrap_or("SHA256SUMS.sig");
+                let filename = url_path_segment(&url_str);
                 obj.insert(
                     "shasums_signature_url".to_string(),
                     serde_json::Value::String(format!("{}/{}", download_base, filename)),
@@ -3130,6 +3147,166 @@ mod integration_tests {
         )
         .await;
         assert_ne!(resp.status(), StatusCode::OK);
+    }
+
+    /// An upstream for `selectel/selectel 9.3.2` whose file URLs carry a query or a fragment with
+    /// `/` in it (signed download links): the file is served only when that query reaches it.
+    async fn signed_link_upstream() -> wiremock::MockServer {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        let files = format!("{}/gh/v9.3.2", server.uri());
+        let stem = "terraform-provider-selectel_9.3.2";
+        Mock::given(method("GET"))
+            .and(path("/v1/providers/selectel/selectel/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "versions": [{"version": "9.3.2", "protocols": ["5.0"],
+                    "platforms": [{"os": "linux", "arch": "amd64"}]}]
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v1/providers/selectel/selectel/9.3.2/download/linux/amd64",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "os": "linux", "arch": "amd64", "filename": format!("{stem}_linux_amd64.zip"),
+                "download_url": format!("{files}/{stem}_linux_amd64.zip?token=a/b"),
+                "shasums_url": format!("{files}/{stem}_SHA256SUMS?sig=x/y"),
+                "shasums_signature_url": format!("{files}/{stem}_SHA256SUMS.sig#part/two"),
+                "shasum": "abc"
+            })))
+            .mount(&server)
+            .await;
+        for (file, query, body) in [
+            (
+                format!("{stem}_linux_amd64.zip"),
+                Some(("token", "a/b")),
+                &b"zip"[..],
+            ),
+            (
+                format!("{stem}_SHA256SUMS"),
+                Some(("sig", "x/y")),
+                &b"sums"[..],
+            ),
+            (format!("{stem}_SHA256SUMS.sig"), None, &b"sig"[..]),
+        ] {
+            let mock = Mock::given(method("GET")).and(path(format!("/gh/v9.3.2/{file}")));
+            let mock = match query {
+                Some((k, v)) => mock.and(query_param(k, v)),
+                None => mock,
+            };
+            mock.respond_with(ResponseTemplate::new(200).set_body_bytes(body.to_vec()))
+                .mount(&server)
+                .await;
+        }
+        server
+    }
+
+    /// The part of a URL NORA answered that a client sends back to NORA: from `/terraform/` on.
+    fn nora_request_target(url: &str) -> String {
+        let at = url
+            .find("/terraform/")
+            .unwrap_or_else(|| panic!("not a NORA URL: {url}"));
+        url[at..].to_string()
+    }
+
+    /// A client that follows the file URLs NORA answers gets each file, also when the upstream's
+    /// URL carries a query or a fragment with `/` in it: NORA's link names the file by the path of
+    /// the upstream's URL, and the upstream is asked with the query it gave. Both answers that
+    /// hand out file URLs are followed: the download metadata and the network mirror's version.
+    #[tokio::test]
+    async fn a_client_following_the_answered_urls_gets_files_whose_query_holds_a_slash() {
+        let stem = "terraform-provider-selectel_9.3.2";
+        let server = signed_link_upstream().await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/selectel/selectel/9.3.2/download/linux/amd64",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let meta: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        for (field, name, body) in [
+            (
+                "download_url",
+                format!("{stem}_linux_amd64.zip"),
+                &b"zip"[..],
+            ),
+            ("shasums_url", format!("{stem}_SHA256SUMS"), &b"sums"[..]),
+            (
+                "shasums_signature_url",
+                format!("{stem}_SHA256SUMS.sig"),
+                &b"sig"[..],
+            ),
+        ] {
+            let url = meta[field].as_str().unwrap();
+            let target = nora_request_target(url);
+            let resp = send(&ctx.app, Method::GET, &target, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{field}: {url}");
+            assert_eq!(body_bytes(resp).await.as_ref(), body, "{field}: {url}");
+            // The link names the file as the upstream's URL path does.
+            let path = target.split(['?', '#']).next().unwrap();
+            assert!(path.ends_with(&format!("/{name}")), "{field}: {url}");
+        }
+
+        // The network mirror lists the same archive link, on a cold cache.
+        let server = signed_link_upstream().await;
+        let ctx = tf_ctx(server.uri());
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/registry.terraform.io/selectel/selectel/9.3.2.json",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let version: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let url = version["archives"]["linux_amd64"]["url"].as_str().unwrap();
+        let resp = send(&ctx.app, Method::GET, &nora_request_target(url), "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "mirror archive: {url}");
+        assert_eq!(body_bytes(resp).await.as_ref(), b"zip");
+    }
+
+    /// Download metadata a NORA release before this one stored for such a URL named the archive by
+    /// whatever followed the last `/` of the whole URL; a client holding that link still gets the
+    /// archive, from the upstream's URL with its query.
+    #[tokio::test]
+    async fn a_link_from_metadata_stored_by_an_earlier_release_still_gets_its_file() {
+        let stem = "terraform-provider-selectel_9.3.2";
+        let server = signed_link_upstream().await;
+        let ctx = tf_ctx(server.uri());
+        let files = format!("{}/gh/v9.3.2", server.uri());
+        let base = "http://localhost:4000/terraform/v1/providers/download/selectel/selectel/9.3.2";
+        let stored = serde_json::json!({
+            "os": "linux", "arch": "amd64", "filename": format!("{stem}_linux_amd64.zip"),
+            "download_url": format!("{base}/b"),
+            "_nora_upstream_url": format!("{files}/{stem}_linux_amd64.zip?token=a/b"),
+            "shasums_url": format!("{base}/y"),
+            "_nora_upstream_shasums_url": format!("{files}/{stem}_SHA256SUMS?sig=x/y"),
+            "shasum": "abc"
+        });
+        ctx.state
+            .storage
+            .put(
+                "terraform/providers/selectel/selectel/9.3.2/linux_amd64.json",
+                serde_json::to_vec(&stored).unwrap().as_slice(),
+            )
+            .await
+            .unwrap();
+        for (name, body) in [("b", &b"zip"[..]), ("y", &b"sums"[..])] {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                &format!("/terraform/v1/providers/download/selectel/selectel/9.3.2/{name}"),
+                "",
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK, "{name}");
+            assert_eq!(body_bytes(resp).await.as_ref(), body, "{name}");
+        }
     }
 
     /// A blocklist rule holds for a provider asked for under a name the URL parser folds into the
