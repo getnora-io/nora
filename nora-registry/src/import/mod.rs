@@ -2242,19 +2242,7 @@ mod integration_tests {
         use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
         use axum::http::{Method, StatusCode};
 
-        let search = MockServer::start().await;
-        let entry = |id: &str, version: &str| json!({ "id": id, "version": version, "versions": [{ "version": version }] });
-        Mock::given(wiremock::matchers::any())
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "totalHits": 40,
-                "data": [
-                    entry("Corp.Lib", "9.9.9"),
-                    entry("Internal.Lib", "6.6.6"),
-                    entry("Other.Lib", "1.0.0"),
-                ],
-            })))
-            .mount(&search)
-            .await;
+        let search = paging_search_host(&["Corp.Lib", "Internal.Lib", "Other.Lib"]).await;
         let uri = search.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.nuget.enabled = true;
@@ -2312,14 +2300,15 @@ mod integration_tests {
                 want("corp.extralib", &["3.0.0"]),
                 want("corp.lib", &["1.0.0"]),
                 want("corp.newlib", &["2.0.0"]),
-                want("other.lib", &["1.0.0"]),
+                want("other.lib", &["9.9.9"]),
             ],
             "{found}"
         );
-        // NORA's own 3 and the host's 40.
-        assert_eq!(found["totalHits"], 43, "{found}");
+        // NORA's own 3 and the host's one NORA shows: its Corp.Lib is NORA's, Internal.Lib is
+        // in an internal namespace.
+        assert_eq!(found["totalHits"], 4, "{found}");
         // A later page: the host's entries without NORA's own, the same total.
-        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib&skip=20", "").await;
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib&skip=3", "").await;
         let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         let ids: Vec<&str> = page["data"]
             .as_array()
@@ -2328,7 +2317,7 @@ mod integration_tests {
             .map(|entry| entry["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, ["Other.Lib"], "{page}");
-        assert_eq!(page["totalHits"], 43, "{page}");
+        assert_eq!(page["totalHits"], 4, "{page}");
     }
 
     /// A package imported after the index was built, while the records cannot be listed: search
@@ -2471,9 +2460,9 @@ mod integration_tests {
             }
         }
         assert_eq!(
-            totals.len(),
-            1,
-            "totalHits changes with the page: {totals:?}"
+            totals.into_iter().collect::<Vec<_>>(),
+            [7],
+            "totalHits: the same on every page, and what the pages hold"
         );
         let mut ids: Vec<&str> = seen.iter().map(|(id, _)| id.as_str()).collect();
         ids.sort_unstable();
@@ -2491,6 +2480,154 @@ mod integration_tests {
         );
         let corp = seen.iter().find(|(id, _)| id == "corp.lib").unwrap();
         assert_eq!(corp.1, "1.0.0", "an import shown as the host has it");
+    }
+
+    /// A search host that pages as it is asked (`skip`, `take`) over `host_ids`, and counts the
+    /// requests it answers.
+    async fn paging_search_host(host_ids: &'static [&'static str]) -> MockServer {
+        let search = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(move |request: &wiremock::Request| {
+                let param = |name: &str| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == name)
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                };
+                let (skip, take) = (param("skip").unwrap_or(0), param("take").unwrap_or(20));
+                let data: Vec<serde_json::Value> = host_ids
+                    .iter()
+                    .skip(skip)
+                    .take(take)
+                    .map(|id| json!({ "id": id, "version": "9.9.9", "versions": [{ "version": "9.9.9" }] }))
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "totalHits": host_ids.len(), "data": data }))
+            })
+            .mount(&search)
+            .await;
+        search
+    }
+
+    /// Walks a search page by page (`take` a page) until a page comes back short, as a client
+    /// does: the ids in order, and every `totalHits` seen.
+    async fn walk_search(
+        app: &axum::Router,
+        query: &str,
+        take: usize,
+    ) -> (Vec<String>, std::collections::BTreeSet<u64>) {
+        use crate::test_helpers::{body_bytes, send};
+        use axum::http::{Method, StatusCode};
+        let (mut ids, mut totals) = (Vec::new(), std::collections::BTreeSet::new());
+        for skip in (0..).step_by(take).take(50) {
+            let path = format!("/nuget/v3/query?q={query}&skip={skip}&take={take}");
+            let resp = send(app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            totals.insert(page["totalHits"].as_u64().unwrap());
+            let data = page["data"].as_array().unwrap();
+            ids.extend(
+                data.iter()
+                    .map(|e| e["id"].as_str().unwrap().to_lowercase()),
+            );
+            if data.len() < take {
+                break;
+            }
+        }
+        (ids, totals)
+    }
+
+    /// The search host also lists an id NORA hosts, and one in an internal namespace: neither
+    /// takes a place in the merged sequence. A client walking the pages until a short one sees
+    /// every other entry of the host, and `totalHits` counts what the pages hold.
+    #[tokio::test]
+    async fn a_host_entry_nora_does_not_show_takes_no_place_on_the_pages() {
+        use crate::test_helpers::create_test_context_with_config;
+
+        let search = paging_search_host(&["Corp.Lib", "Internal.X", "Other.Lib", "Z.Lib"]).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        for take in [1, 2, 3, 20] {
+            let (ids, totals) = walk_search(&ctx.app, "lib", take).await;
+            assert_eq!(ids, ["corp.lib", "other.lib", "z.lib"], "take={take}");
+            assert_eq!(
+                totals.into_iter().collect::<Vec<_>>(),
+                [3],
+                "take={take}: totalHits"
+            );
+        }
+    }
+
+    /// A host result too large to read whole: the pages still hold every entry once and have no
+    /// gap, `totalHits` is the same on every page and not fewer than the pages hold, and a page
+    /// near the start asks the host little.
+    #[tokio::test]
+    async fn a_large_host_result_pages_without_a_gap_and_a_total_not_below_it() {
+        use crate::test_helpers::create_test_context_with_config;
+
+        let mut host_ids: Vec<&'static str> = vec!["Corp.Lib"];
+        host_ids.extend((0..150).map(|n| &*Box::leak(format!("Lib{n:03}").into_boxed_str())));
+        let search = paging_search_host(Box::leak(host_ids.into_boxed_slice())).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+
+        use crate::test_helpers::{body_bytes, send};
+        use axum::http::Method;
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib&take=20", "").await;
+        let first: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(first["data"].as_array().unwrap().len(), 20, "{first}");
+        let asked: Vec<String> = search
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.query().unwrap_or_default().to_string())
+            .collect();
+        assert!(asked.len() <= 2, "the first page asked the host {asked:?}");
+
+        let (ids, totals) = walk_search(&ctx.app, "lib", 20).await;
+        let mut want = vec!["corp.lib".to_string()];
+        want.extend((0..150).map(|n| format!("lib{n:03}")));
+        assert_eq!(ids, want);
+        let totals: Vec<u64> = totals.into_iter().collect();
+        assert_eq!(
+            totals.len(),
+            1,
+            "totalHits changes with the page: {totals:?}"
+        );
+        assert!(totals[0] >= ids.len() as u64, "{totals:?} < {}", ids.len());
     }
 
     /// When the records cannot be listed, which packages are NORA's own is not known: search
