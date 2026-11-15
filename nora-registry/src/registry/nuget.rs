@@ -4648,7 +4648,7 @@ mod spec_conformance_tests {
         use wiremock::matchers::{header_exists, method};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         // Conditional request (has If-None-Match) → 304. A request WITHOUT it
         // would 404 (no other mount), so any full fetch would visibly fail.
         Mock::given(method("GET"))
@@ -4719,7 +4719,7 @@ mod nuget_version_curation {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn upstream() -> MockServer {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(any())
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"NUPKG".to_vec()))
             .mount(&upstream)
@@ -4853,7 +4853,7 @@ mod nuget_release_dates {
     /// Tests count only its registration requests: wiremock hands a dropped server on to the
     /// next one started, and a background request of an earlier context may still reach it.
     async fn elsewhere() -> MockServer {
-        let elsewhere = MockServer::start().await;
+        let elsewhere = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path_regex(r"/page/[^/]+/[^/]+\.json$"))
             .respond_with(|req: &wiremock::Request| {
@@ -4879,7 +4879,7 @@ mod nuget_release_dates {
 
     /// An upstream whose every package is its own bytes: two versions never share a digest.
     async fn upstream() -> MockServer {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path_regex(r"^/v3-flatcontainer/[^/]+/[^/]+/[^/]+\.nupkg$"))
             .respond_with(|req: &wiremock::Request| {
@@ -5756,7 +5756,7 @@ mod search_breaker {
     }
 
     async fn answering(status: u16) -> MockServer {
-        let server = MockServer::start().await;
+        let server = MockServer::builder().start().await;
         Mock::given(wiremock::matchers::any())
             .respond_with(
                 ResponseTemplate::new(status)
@@ -6268,7 +6268,7 @@ mod review_1233_second_pass {
     /// index names 9.0.0, which must not appear, and the upstream must not be asked.
     #[tokio::test]
     async fn s2_f1_autocomplete_versions_of_a_hosted_package_are_its_own() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(any())
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": ["9.0.0"] })),
@@ -6320,7 +6320,7 @@ mod review_1233_second_pass {
     /// not asked — a foreign package must not be served as this one.
     #[tokio::test]
     async fn s2_f2_leaf_with_unlistable_hosted_records_is_503_without_upstream() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(any())
             .respond_with(ResponseTemplate::new(200).set_body_json(leaf_body(
                 &upstream.uri(),
@@ -6356,7 +6356,7 @@ mod review_1233_second_pass {
     /// registration index and pages do.
     #[tokio::test]
     async fn s2_f3_leaf_upstream_request_carries_proxy_auth() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
             .and(header("authorization", "Basic dXNlcjpwYXNz"))
@@ -6387,7 +6387,7 @@ mod review_1233_second_pass {
     /// to NORA — no upstream host survives in the body.
     #[tokio::test]
     async fn s2_b_leaf_cold_miss_is_rewritten_to_nora() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let up = upstream.uri();
         Mock::given(method("GET"))
             .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
@@ -6425,7 +6425,7 @@ mod review_1233_second_pass {
     /// Branch B(a): an upstream failure is not a missing version — 500 gives 503, 404 gives 404.
     #[tokio::test]
     async fn s2_b_leaf_upstream_error_is_503_and_not_found_is_404() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         Mock::given(method("GET"))
             .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
             .respond_with(ResponseTemplate::new(500))
@@ -6559,7 +6559,7 @@ mod review_1233_third_pass {
     /// says 1.0.0 is unlisted — the leaf says so, and the upstream is not asked.
     #[tokio::test]
     async fn t3_f1_stored_unlisted_version_is_not_listed() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let uri = upstream.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.nuget.enabled = true;
@@ -6581,7 +6581,7 @@ mod review_1233_third_pass {
     /// the upstream's, so an unlisted version stays unlisted.
     #[tokio::test]
     async fn t3_f1_upstream_unlisted_version_after_warm_flatcontainer() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let up = upstream.uri();
         Mock::given(method("GET"))
             .and(path("/v3/registration5-gz-semver2/testpkg/1.0.0.json"))
@@ -6631,7 +6631,7 @@ mod review_1233_third_pass {
     /// is never asked.
     #[tokio::test]
     async fn t3_f2_internal_stored_registration_serves_leaf_without_upstream() {
-        let upstream = MockServer::start().await;
+        let upstream = MockServer::builder().start().await;
         let uri = upstream.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.nuget.enabled = true;
