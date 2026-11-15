@@ -2922,6 +2922,96 @@ mod integration_tests {
         assert_eq!(first.as_deref(), Some("corp.lib"), "{page}");
     }
 
+    /// The review's example as it stands: NORA hosts Corp.Lib, the host answers [Corp.Lib,
+    /// A.Lib]; with take=1 the pages are [Corp.Lib] and [A.Lib], and totalHits is 2 on both.
+    #[tokio::test]
+    async fn the_review_example_pages_as_two_entries() {
+        use crate::test_helpers::create_test_context_with_config;
+
+        let search = paging_search_host(&["Corp.Lib", "A.Lib"]).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        let (ids, totals) = walk_search(&ctx.app, "lib", 1).await;
+        assert_eq!(ids, ["corp.lib", "a.lib"]);
+        assert_eq!(totals.into_iter().collect::<Vec<_>>(), [2]);
+    }
+
+    /// The records list but the flat container cannot: the index NORA's own packages are shown
+    /// from is not built, so search and autocomplete cannot show them as held, nor tell a host
+    /// entry of one from another. They answer 503, not a result without NORA's own packages.
+    #[tokio::test]
+    async fn search_answers_503_when_the_index_of_own_packages_cannot_be_built() {
+        use crate::test_helpers::{
+            body_bytes, create_test_context_with_storage_and_config, outage_storage, send,
+        };
+        use axum::http::{Method, StatusCode};
+
+        let search = paging_search_host(&["Corp.Lib", "Other.Lib"]).await;
+        let autocomplete = paging_autocomplete_host(&["Corp.Lib", "Other.Lib"]).await;
+        let (storage, outage) = outage_storage();
+        let (search_uri, autocomplete_uri) = (search.uri(), autocomplete.uri());
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(search_uri.clone());
+            cfg.nuget.search_service = format!("{search_uri}/query");
+            cfg.nuget.autocomplete = format!("{autocomplete_uri}/autocomplete");
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        outage.fail_listings_of(crate::registry::nuget::INDEX_PATTERN.0);
+        for path in ["/nuget/v3/query?q=lib", "/nuget/v3/autocomplete?q=lib"] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            let status = resp.status();
+            let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
+        }
+        // Listed again: the next search rebuilds the index (nothing has to invalidate it) and
+        // shows NORA's own package as held.
+        outage.end();
+        let held = |body: &str| body.contains("\"1.0.0\"") && body.contains("Other.Lib");
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(held(&body), "{body}");
+        // The same with the records failing and the flat container listing: 503, then held
+        // again once they list, with no write in between.
+        ctx.state.repo_index.invalidate("nuget");
+        outage.fail_listings_of("nuget/hosted/");
+        let status = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib", "")
+            .await
+            .status();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        outage.end();
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(held(&body), "{body}");
+    }
+
     /// When the records cannot be listed, which packages are NORA's own is not known: search
     /// answers 503 rather than show the list an upstream gave for the id, as the flat container
     /// does.
