@@ -1561,4 +1561,23 @@ mod url_fold {
         )
         .await;
     }
+
+    /// Every canonical version the measured Go corpus (`golang.org/x/mod`,
+    /// `testdata/go/versions/canonical.tsv`) yields for a valid input is a version a client asks
+    /// for in `@v/<version>.zip`: none may be refused.
+    #[test]
+    fn every_corpus_canonical_version_is_accepted() {
+        let corpus = include_str!("../../testdata/go/versions/canonical.tsv");
+        let refused: Vec<String> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.contains("INVALID"))
+            .filter_map(|line| line.split('\t').nth(1))
+            .map(|version| format!("example.com/m/@v/{version}.zip"))
+            .filter(|path| !super::is_safe_path(path))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "legitimate versions refused: {refused:?}"
+        );
+    }
 }
