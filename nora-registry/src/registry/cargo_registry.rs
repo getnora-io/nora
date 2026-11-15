@@ -458,7 +458,7 @@ async fn download(
     headers: axum::http::HeaderMap,
     Path((crate_name, version)): Path<(String, String)>,
 ) -> Response {
-    if !is_valid_crate_name(&crate_name) || !crate::validation::is_one_segment(&version) {
+    if !is_valid_crate_name(&crate_name) || !is_valid_crate_version(&version) {
         return StatusCode::BAD_REQUEST.into_response();
     }
     // The upstream path keeps the name as cargo sent it (the published name, from the index):
@@ -551,7 +551,9 @@ async fn download(
     // raw or merely tamper-evident bytes on this path is a compile error. An
     // open-world read (unpinned key / S3 backend) is served knowingly, never
     // silently. (Typestate rollout — see `crate::verified`, raw.rs is the PoC.)
-    if let Ok(outcome) = state.storage.get_verified(&key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         // A stored copy of a version that is not published, under a name with a canon record: of a
         // published crate it is an upstream's bytes or a removed version and is never served; under a
@@ -607,7 +609,10 @@ async fn download(
             &q_mode,
             q_secs,
             "cache",
-            publish_date,
+            crate::digest_quarantine::first_seen_seed(
+                state.config.server.trust_upstream_dates,
+                publish_date,
+            ),
         ) {
             return resp;
         }
@@ -651,6 +656,9 @@ async fn download(
 
     // #733: an internal-namespace crate with no local copy is never proxied upstream.
     if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("cargo", &key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Cargo,
@@ -718,7 +726,10 @@ async fn download(
                 &q_mode,
                 q_secs,
                 &url,
-                publish_date,
+                crate::digest_quarantine::first_seen_seed(
+                    state.config.server.trust_upstream_dates,
+                    publish_date,
+                ),
             ) {
                 return resp;
             }
@@ -1673,6 +1684,17 @@ fn crate_index_prefix(name: &str) -> String {
 }
 
 /// Validate crate name per Cargo spec.
+/// Whether a crate version in a request path is one: a SemVer version (`1.0.0`, `1.0.0-rc.1`,
+/// `1.0.0+build.5`) — ASCII letters and digits, `.`, `-`, `+`, and no `/`. A control byte, `?` or
+/// `#` in it would be dropped or cut by the upstream URL: the upstream would fetch another version
+/// than the one curation checked.
+fn is_valid_crate_version(version: &str) -> bool {
+    crate::validation::is_one_segment(version)
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+}
+
 fn is_valid_crate_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 {
         return false;
@@ -5302,5 +5324,113 @@ mod crate_name_one_canon {
             );
         }
         assert_eq!(asked(&server).await, 0);
+    }
+}
+
+/// Without trusted upstream dates the quarantine counts from NORA's own first fetch of an
+/// artifact's bytes: metadata cached a month ago says when NORA last wrote it, not when it first
+/// fetched this file, and its age would let a file first fetched now pass as mature. With trusted
+/// dates the release date seeds it (#750), so an old release is not held as new to this mirror.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod quarantine_first_seen {
+    use crate::test_helpers::{
+        create_test_context_with_config, put_written_days_ago, quarantine_7d, send, TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn serve(up: &MockServer, at: &str, body: Vec<u8>) {
+        Mock::given(method("GET"))
+            .and(path(at))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(up)
+            .await;
+    }
+
+    async fn status(ctx: &TestContext, uri: &str) -> StatusCode {
+        send(&ctx.app, Method::GET, uri, "").await.status()
+    }
+
+    const DOWNLOAD: &str = "/cargo/api/v1/crates/oldcrate/1.0.0/download";
+    const METADATA: &[u8] = br#"{"crate":{"name":"oldcrate"},"versions":[{"num":"1.0.0","created_at":"2019-01-01T00:00:00Z"}]}"#;
+
+    async fn context(trust: bool) -> (MockServer, TestContext) {
+        let up = MockServer::start().await;
+        serve(
+            &up,
+            "/api/v1/crates/oldcrate/1.0.0/download",
+            b"CRATE".to_vec(),
+        )
+        .await;
+        let uri = up.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.cargo.proxy = Some(uri);
+            cfg.server.trust_upstream_dates = trust;
+            quarantine_7d(cfg);
+        });
+        put_written_days_ago(&ctx, "cargo/oldcrate/metadata.json", METADATA, 30).await;
+        (up, ctx)
+    }
+
+    #[tokio::test]
+    async fn without_trusted_dates_cached_metadata_does_not_date_the_quarantine() {
+        let (_up, ctx) = context(false).await;
+        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::FORBIDDEN);
+    }
+
+    /// A crate cached before the quarantine recorded it is counted from now on the cache path.
+    #[tokio::test]
+    async fn a_file_cached_before_the_quarantine_saw_it_counts_from_now() {
+        let (up, ctx) = context(false).await;
+        put_written_days_ago(
+            &ctx,
+            "cargo/oldcrate/1.0.0/oldcrate-1.0.0.crate",
+            b"CRATE",
+            30,
+        )
+        .await;
+        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::FORBIDDEN);
+        assert!(crate::test_helpers::upstream_paths(&up).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
+        let (_up, ctx) = context(true).await;
+        assert_eq!(status(&ctx, DOWNLOAD).await, StatusCode::OK);
+    }
+}
+
+#[cfg(test)]
+mod url_fold {
+    //! A name or version holding a byte the upstream URL drops or cuts at (`%09`, `%0A`, `%0D`,
+    //! `%3F`, `%23`) is refused by this handler with a 400 before curation, storage or the upstream
+    //! sees it, and the upstream is never asked. Legitimate names of the format still reach it.
+    use crate::test_helpers::{assert_refused, assert_served_upstream, SMUGGLED};
+
+    fn cargo_proxy(cfg: &mut crate::config::Config, up: &str) {
+        cfg.cargo.proxy = Some(up.to_string());
+    }
+
+    #[tokio::test]
+    async fn version_with_a_smuggled_byte_is_refused() {
+        let mut uris = Vec::new();
+        for s in SMUGGLED {
+            uris.push(format!("/cargo/api/v1/crates/evil/1.0{s}1/download"));
+            uris.push(format!("/cargo/api/v1/crates/evil/1.0.0{s}/download"));
+        }
+        uris.push("/cargo/api/v1/crates/ev%09il/1.0.0/download".to_string());
+        assert_refused("cargo", &uris, cargo_proxy).await;
+    }
+
+    #[tokio::test]
+    async fn legitimate_semver_still_reaches_upstream() {
+        assert_served_upstream(
+            "cargo",
+            "/cargo/api/v1/crates/evil/1.0.0-rc.1+build.5/download",
+            cargo_proxy,
+        )
+        .await;
     }
 }

@@ -140,6 +140,8 @@ pub struct CurationConfig {
     pub deb: RegistryCurationOverride,
     #[serde(default)]
     pub cpan: RegistryCurationOverride,
+    #[serde(default)]
+    pub composer: RegistryCurationOverride,
 }
 
 /// Per-registry curation override (used within `[curation.{registry}]`).
@@ -185,6 +187,7 @@ impl Default for CurationConfig {
             rpm: RegistryCurationOverride::default(),
             deb: RegistryCurationOverride::default(),
             cpan: RegistryCurationOverride::default(),
+            composer: RegistryCurationOverride::default(),
         }
     }
 }
@@ -215,6 +218,110 @@ impl CurationConfig {
             RegistryType::Rpm => Some(&self.rpm),
             RegistryType::Deb => Some(&self.deb),
             RegistryType::Cpan => Some(&self.cpan),
+            RegistryType::Composer => Some(&self.composer),
+            RegistryType::HuggingFace => None,
+        }
+    }
+
+    /// The settings a SIGHUP reload does not apply, keyed as config.toml spells them, with
+    /// their values: the digest quarantine, global and each registry's own.
+    ///
+    /// A reload swaps the curation engine, rebuilt from the file, and the bypass token. The
+    /// digest quarantine is not in either: each format reads it from the configuration NORA
+    /// started with, and the start decides whether the store of first-seen digests is loaded
+    /// at all. A key is listed whether it is set or not, so a key removed from the file differs
+    /// from the one NORA started with as a key set or changed does.
+    ///
+    /// The destructuring names every field, so a new key does not compile until it is
+    /// placed on one side.
+    pub fn unreloaded_settings(&self) -> Vec<(String, String)> {
+        let Self {
+            // In the engine a reload builds, or the bypass token it swaps.
+            mode: _,
+            allowlist_path: _,
+            blocklist_path: _,
+            bypass_token: _,
+            require_integrity: _,
+            internal_namespaces: _,
+            min_release_age: _,
+            // Whether `mode` was written down: read once, for the notice at start.
+            mode_explicit: _,
+            // Validation refuses any value but `closed`, and with it the reload.
+            on_failure: _,
+            quarantine,
+            quarantine_ttl,
+            // A registry's own section, walked below through `registry_override`.
+            npm: _,
+            pypi: _,
+            cargo: _,
+            go: _,
+            docker: _,
+            maven: _,
+            gems: _,
+            terraform: _,
+            ansible: _,
+            nuget: _,
+            pub_dart: _,
+            conan: _,
+            rpm: _,
+            deb: _,
+            cpan: _,
+            composer: _,
+        } = self;
+        let mut settings = vec![
+            ("curation.quarantine".to_string(), format!("{quarantine:?}")),
+            (
+                "curation.quarantine_ttl".to_string(),
+                format!("{quarantine_ttl:?}"),
+            ),
+        ];
+        for &rt in RegistryType::all() {
+            let Some(own) = self.registry_override(rt) else {
+                continue;
+            };
+            let RegistryCurationOverride {
+                // In the engine a reload builds.
+                min_release_age: _,
+                quarantine,
+                quarantine_ttl,
+            } = own;
+            settings.push((
+                format!("curation.{rt}.quarantine"),
+                format!("{quarantine:?}"),
+            ));
+            settings.push((
+                format!("curation.{rt}.quarantine_ttl"),
+                format!("{quarantine_ttl:?}"),
+            ));
+        }
+        settings
+    }
+
+    /// Test-only: [`Self::registry_override`] to change, for tests that set a section of every
+    /// registry in turn.
+    #[cfg(test)]
+    pub(crate) fn registry_override_mut(
+        &mut self,
+        rt: RegistryType,
+    ) -> Option<&mut RegistryCurationOverride> {
+        match rt {
+            RegistryType::Docker => Some(&mut self.docker),
+            RegistryType::Maven => Some(&mut self.maven),
+            RegistryType::Npm => Some(&mut self.npm),
+            RegistryType::Cargo => Some(&mut self.cargo),
+            RegistryType::PyPI => Some(&mut self.pypi),
+            RegistryType::Go => Some(&mut self.go),
+            RegistryType::Raw => None,
+            RegistryType::Gems => Some(&mut self.gems),
+            RegistryType::Terraform => Some(&mut self.terraform),
+            RegistryType::Ansible => Some(&mut self.ansible),
+            RegistryType::Nuget => Some(&mut self.nuget),
+            RegistryType::PubDart => Some(&mut self.pub_dart),
+            RegistryType::Conan => Some(&mut self.conan),
+            RegistryType::Rpm => Some(&mut self.rpm),
+            RegistryType::Deb => Some(&mut self.deb),
+            RegistryType::Cpan => Some(&mut self.cpan),
+            RegistryType::Composer => Some(&mut self.composer),
             RegistryType::HuggingFace => None,
         }
     }
@@ -290,6 +397,7 @@ impl CurationConfig {
             ("RPM", &mut self.rpm),
             ("DEB", &mut self.deb),
             ("CPAN", &mut self.cpan),
+            ("COMPOSER", &mut self.composer),
         ] {
             if let Ok(val) = env::var(format!("NORA_CURATION_{}_MIN_RELEASE_AGE", env_suffix)) {
                 field.min_release_age = if val.is_empty() { None } else { Some(val) };

@@ -1,0 +1,15 @@
+---
+source: nora-registry/src/registry/npm.rs
+assertion_line: 9067
+expression: "serde_json::json!({ \"content_type\": content_type, \"body\": manifest })"
+---
+{
+  "body": {
+    "dist": {
+      "tarball": "http://127.0.0.1:0/npm/corp-lib/-/corp-lib-1.0.0.tgz"
+    },
+    "name": "corp-lib",
+    "version": "1.0.0"
+  },
+  "content_type": "application/json"
+}

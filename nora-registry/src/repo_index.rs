@@ -16,7 +16,7 @@ use crate::validation::ends_with_ci;
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::info;
@@ -31,12 +31,22 @@ pub struct RepoInfo {
     /// True for root-level files in raw storage (not directories)
     #[serde(default)]
     pub is_file: bool,
+    /// Newest modification time (epoch seconds) behind `updated`, so a page that folds
+    /// entries together can take the newest of them (#1216).
+    #[serde(skip)]
+    pub modified: u64,
 }
 
 /// Index for a single registry type
+///
+/// Every invalidation moves `generation` on; a rebuild records the generation it starts from
+/// and, once stored, marks the index as built up to that one. An invalidation that lands while
+/// a rebuild is listing storage leaves the index dirty, so the next read rebuilds again instead
+/// of keeping a listing taken before the write.
 pub struct RegistryIndex {
     data: RwLock<Arc<Vec<RepoInfo>>>,
-    dirty: AtomicBool,
+    generation: AtomicU64,
+    built: AtomicU64,
     rebuild_lock: AsyncMutex<()>,
 }
 
@@ -44,27 +54,36 @@ impl RegistryIndex {
     pub fn new() -> Self {
         Self {
             data: RwLock::new(Arc::new(Vec::new())),
-            dirty: AtomicBool::new(true),
+            generation: AtomicU64::new(1),
+            built: AtomicU64::new(0),
             rebuild_lock: AsyncMutex::new(()),
         }
     }
 
     /// Mark index as needing rebuild
     pub fn invalidate(&self) {
-        self.dirty.store(true, Ordering::Release);
+        self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
     fn is_dirty(&self) -> bool {
-        self.dirty.load(Ordering::Acquire)
+        self.built.load(Ordering::Acquire) != self.generation.load(Ordering::Acquire)
+    }
+
+    /// The generation a rebuild covers: read before it lists storage.
+    fn rebuild_from(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     fn get_cached(&self) -> Arc<Vec<RepoInfo>> {
         Arc::clone(&self.data.read())
     }
 
-    fn set(&self, data: Vec<RepoInfo>) {
+    /// Store a rebuild that listed storage after `from` was read: the index is clean only if
+    /// nothing invalidated it since.
+    fn set(&self, data: Vec<RepoInfo>, from: u64) {
         *self.data.write() = Arc::new(data);
-        self.dirty.store(false, Ordering::Release);
+        // Rebuilds are serialized by `rebuild_lock`, so `from` never goes back.
+        self.built.store(from, Ordering::Release);
     }
 
     pub fn count(&self) -> usize {
@@ -93,6 +112,12 @@ impl Default for RegistryIndex {
 /// Main repository index for all registries
 pub struct RepoIndex {
     indexes: HashMap<RegistryType, RegistryIndex>,
+    /// The NuGet packages NORA hosts (imported), by lowercase id, with the versions their
+    /// records list: rebuilt with the NuGet index, from one listing of the records, so search
+    /// does not list every package's records on each request. `None` until a rebuild has
+    /// listed them, and again when the last rebuild could not: which ids are NORA's own is
+    /// then not known, and search does not guess it from an older listing.
+    nuget_hosted: RwLock<Option<Arc<HashMap<String, Vec<String>>>>>,
     /// Epoch-seconds of the last accepted admin reindex (0 = never). Used to
     /// debounce operator-triggered reindex so a tight `reindex + read` loop
     /// cannot amplify into repeated full-storage scans (see `try_accept_reindex`).
@@ -107,6 +132,7 @@ impl RepoIndex {
         }
         Self {
             indexes,
+            nuget_hosted: RwLock::new(None),
             last_reindex: AtomicU64::new(0),
         }
     }
@@ -166,6 +192,7 @@ impl RepoIndex {
 
         // Double-check under lock (another thread may have rebuilt)
         if index.is_dirty() {
+            let from = index.rebuild_from();
             let data = match reg_type {
                 RegistryType::Docker => build_docker_index(storage).await,
                 RegistryType::Maven => build_maven_index(storage).await,
@@ -176,7 +203,16 @@ impl RepoIndex {
                 RegistryType::Raw => build_raw_index(storage).await,
                 RegistryType::Nuget => {
                     let (p, s) = crate::registry::nuget::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
+                    // An index whose records could not be listed stays dirty, as one whose
+                    // files could not, and its hosted packages are not known until a rebuild
+                    // lists both: never the listing from before the write that made it dirty,
+                    // nor records beside an index of packages that was not built (search shows
+                    // NORA's own packages from that index, and could not show them as held).
+                    let hosted = crate::registry::nuget::hosted_index(storage).await;
+                    let data = build_generic_index(storage, p, s).await;
+                    let built = hosted.is_some() && data.is_some();
+                    *self.nuget_hosted.write() = hosted.filter(|_| built).map(Arc::new);
+                    data.filter(|_| built)
                 }
                 RegistryType::Gems => build_gems_index(storage).await,
                 RegistryType::Terraform => {
@@ -201,12 +237,13 @@ impl RepoIndex {
                     build_generic_index(storage, p, s).await
                 }
                 RegistryType::Cpan => build_cpan_index(storage).await,
+                RegistryType::Composer => build_composer_index(storage).await,
                 RegistryType::HuggingFace => build_hf_index(storage).await,
             };
             match data {
                 Some(data) => {
                     info!(registry = registry, count = data.len(), "Index rebuilt");
-                    index.set(data);
+                    index.set(data, from);
                 }
                 None => {
                     // Storage list failed mid-rebuild. Leave the index dirty so the
@@ -222,6 +259,17 @@ impl RepoIndex {
         }
 
         index.get_cached()
+    }
+
+    /// The NuGet packages NORA hosts, by lowercase id, with the versions their records list, as
+    /// of the NuGet index (rebuilt first when it is stale); `None` when the last rebuild could
+    /// not list the records.
+    pub async fn nuget_hosted(
+        &self,
+        storage: &Storage,
+    ) -> Option<Arc<HashMap<String, Vec<String>>>> {
+        self.get("nuget", storage).await;
+        self.nuget_hosted.read().clone()
     }
 
     /// Get counts for stats (no rebuild, just current state)
@@ -287,7 +335,14 @@ async fn build_docker_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                 continue;
             }
             let raw_name = parts[..boundary].join("/");
-            let name = crate::registry::docker::strip_docker_namespace(&raw_name).to_string();
+            // A push under a registry host or prefix is listed under the name it was pushed as.
+            let name = match raw_name
+                .strip_prefix(crate::config::QUALIFIED_PUSH_ROOT)
+                .and_then(|rest| rest.strip_prefix('/'))
+            {
+                Some(qualified) => qualified.to_string(),
+                None => crate::registry::docker::strip_docker_namespace(&raw_name).to_string(),
+            };
             let entry = repos.entry(name).or_insert((0, 0, 0));
 
             // Size = ACTUAL on-disk bytes of every file in the repo (blobs +
@@ -499,6 +554,7 @@ async fn build_raw_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
                 "N/A".to_string()
             },
             is_file,
+            modified,
         })
         .collect();
 
@@ -604,6 +660,26 @@ fn cpan_package_of(rel: &str) -> Option<String> {
     Some(format!("{author_path}/{distribution}"))
 }
 
+/// Composer index: one entry per `vendor/package` holding an archive, uploaded
+/// (`composer/hosted/{name}/dists/{version}.zip`) or cached
+/// (`composer/dists/{name}/{version}/{ref}.{type}`), counting its archives.
+async fn build_composer_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
+    let keys = list_keys(storage, "composer/").await?;
+    let mut packages: HashMap<String, (usize, u64, u64)> = HashMap::new();
+    for (key, meta) in &keys {
+        let Some(name) = crate::registry::composer::package_of_archive(key) else {
+            continue;
+        };
+        let entry = packages.entry(name).or_insert((0, 0, 0));
+        entry.0 += 1;
+        entry.1 += meta.size;
+        if meta.modified > entry.2 {
+            entry.2 = meta.modified;
+        }
+    }
+    Some(to_sorted_vec(packages))
+}
+
 /// Hugging Face index: cached files under `hf/models/{repo}/blobs/{digest}`, one entry per
 /// repository id (one or two segments), counting its cached files.
 async fn build_hf_index(storage: &Storage) -> Option<Vec<RepoInfo>> {
@@ -668,6 +744,7 @@ fn to_sorted_vec(map: HashMap<String, (usize, u64, u64)>) -> Vec<RepoInfo> {
                 "N/A".to_string()
             },
             is_file: false,
+            modified,
         })
         .collect();
 
@@ -763,7 +840,7 @@ mod tests {
         let idx = RepoIndex::new();
         // Clear dirty on every index (they start dirty).
         for ri in idx.indexes.values() {
-            ri.set(Vec::new());
+            ri.set(Vec::new(), ri.rebuild_from());
             assert!(!ri.is_dirty());
         }
         idx.invalidate_all();
@@ -842,13 +919,16 @@ mod tests {
         assert!(idx.is_dirty());
 
         // Set data clears dirty
-        idx.set(vec![RepoInfo {
-            name: "test".to_string(),
-            versions: 1,
-            size: 100,
-            updated: "2026-01-01".to_string(),
-            ..Default::default()
-        }]);
+        idx.set(
+            vec![RepoInfo {
+                name: "test".to_string(),
+                versions: 1,
+                size: 100,
+                updated: "2026-01-01".to_string(),
+                ..Default::default()
+            }],
+            idx.rebuild_from(),
+        );
         assert!(!idx.is_dirty());
         assert_eq!(idx.count(), 1);
 
@@ -857,25 +937,43 @@ mod tests {
         assert!(idx.is_dirty());
     }
 
+    /// An invalidation between the start of a rebuild and the index it stores is not lost: the
+    /// stored listing may predate the write, so the index stays marked for the next read.
+    #[test]
+    fn an_invalidation_during_a_rebuild_leaves_the_index_dirty() {
+        let idx = RegistryIndex::new();
+        let from = idx.rebuild_from();
+        idx.invalidate();
+        idx.set(Vec::new(), from);
+        assert!(idx.is_dirty());
+        // The next rebuild, started after the write, covers it.
+        let from = idx.rebuild_from();
+        idx.set(Vec::new(), from);
+        assert!(!idx.is_dirty());
+    }
+
     #[test]
     fn test_registry_index_get_cached() {
         let idx = RegistryIndex::new();
-        idx.set(vec![
-            RepoInfo {
-                name: "a".to_string(),
-                versions: 2,
-                size: 200,
-                updated: "today".to_string(),
-                ..Default::default()
-            },
-            RepoInfo {
-                name: "b".to_string(),
-                versions: 1,
-                size: 100,
-                updated: "yesterday".to_string(),
-                ..Default::default()
-            },
-        ]);
+        idx.set(
+            vec![
+                RepoInfo {
+                    name: "a".to_string(),
+                    versions: 2,
+                    size: 200,
+                    updated: "today".to_string(),
+                    ..Default::default()
+                },
+                RepoInfo {
+                    name: "b".to_string(),
+                    versions: 1,
+                    size: 100,
+                    updated: "yesterday".to_string(),
+                    ..Default::default()
+                },
+            ],
+            idx.rebuild_from(),
+        );
 
         let cached = idx.get_cached();
         assert_eq!(cached.len(), 2);
@@ -1275,6 +1373,27 @@ mod tests {
             .unwrap();
         let repos = build_docker_index(&s).await.expect("index built");
         assert_eq!(repos[0].versions, 1);
+    }
+
+    /// A push under a registry host or prefix is listed under the name it was pushed as, apart
+    /// from the upstream's copy of the name without the host.
+    #[tokio::test]
+    async fn docker_index_lists_a_push_under_a_host_by_its_full_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Storage::new_local(dir.path().to_str().unwrap());
+        s.put("docker/_/quay.io/org/img/manifests/v1.json", b"{}")
+            .await
+            .unwrap();
+        s.put("docker/_/hub/acme/tool/manifests/v1.json", b"{}")
+            .await
+            .unwrap();
+        s.put("docker/quay.io/org/img/manifests/up.json", b"{}")
+            .await
+            .unwrap();
+        let repos = build_docker_index(&s).await.expect("index built");
+        let mut names: Vec<&str> = repos.iter().map(|r| r.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["hub/acme/tool", "org/img", "quay.io/org/img"]);
     }
 
     /// only tags count as versions: a sha512 digest copy of a manifest is not one.

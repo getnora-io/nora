@@ -38,6 +38,7 @@ pub struct RegistryStats {
     pub rpm: usize,
     pub deb: usize,
     pub cpan: usize,
+    pub composer: usize,
     pub hf: usize,
 }
 
@@ -101,6 +102,21 @@ pub struct PackageDetail {
     /// Total stable versions available (may be > versions.len() if truncated)
     pub total_stable: usize,
     pub metadata: PackageMetadata,
+}
+
+/// One version of a Composer package NORA holds an archive of.
+#[derive(Serialize)]
+pub struct ComposerVersion {
+    pub version: String,
+    pub size: u64,
+    pub published: String,
+    /// Uploaded to NORA, not cached from an upstream.
+    pub hosted: bool,
+}
+
+#[derive(Serialize)]
+pub struct ComposerDetail {
+    pub versions: Vec<ComposerVersion>,
 }
 
 #[derive(Serialize)]
@@ -181,6 +197,7 @@ pub async fn api_stats(State(state): State<AppState>) -> Json<RegistryStats> {
         rpm: get(RegistryType::Rpm),
         deb: get(RegistryType::Deb),
         cpan: get(RegistryType::Cpan),
+        composer: get(RegistryType::Composer),
         hf: get(RegistryType::HuggingFace),
     })
 }
@@ -268,6 +285,13 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                 RegistryType::Rpm => vec![],
                 RegistryType::Deb => vec![],
                 RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
+                RegistryType::Composer => state
+                    .config
+                    .composer
+                    .upstreams()
+                    .iter()
+                    .map(|u| u.url().to_string())
+                    .collect(),
                 RegistryType::HuggingFace => state.config.hf.proxy.clone().into_iter().collect(),
             }
         } else {
@@ -396,11 +420,31 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     // bounded number of listings — one per upstream — instead of scanning every
     // key under docker/, whose cost grew with the whole registry, not the
     // repository being viewed (#986).
-    let mut keys = state
-        .storage
-        .list(&format!("docker/{}/manifests/", name))
-        .await
-        .unwrap_or_default();
+    // A name behind a registry host is never stored bare: `docker/quay.io/…` is the copy an
+    // upstream namespaced `quay.io` serves of another name. Its pushes are under `_/`.
+    let host_first = name
+        .split_once('/')
+        .is_some_and(|(first, _)| first.contains('.'));
+    let mut keys = if host_first {
+        Vec::new()
+    } else {
+        state
+            .storage
+            .list(&format!("docker/{}/manifests/", name))
+            .await
+            .unwrap_or_default()
+    };
+    keys.extend(
+        state
+            .storage
+            .list(&format!(
+                "docker/{}/{}/manifests/",
+                crate::config::QUALIFIED_PUSH_ROOT,
+                name
+            ))
+            .await
+            .unwrap_or_default(),
+    );
 
     for upstream in &state.config.docker.upstreams {
         let ns = upstream.resolved_namespace();
@@ -522,55 +566,46 @@ pub async fn get_docker_detail(state: &AppState, name: &str) -> DockerDetail {
     DockerDetail { tags }
 }
 
-/// List immediate children of a Maven namespace path for hierarchical browsing.
-/// Returns (entries, is_leaf_artifact). A leaf artifact has maven-metadata.xml.
-pub async fn get_maven_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
+/// The immediate children of a Maven directory, folded from the repository index (#1216):
+/// no storage is walked on a page visit. Returns (entries, is_leaf); a leaf holds files but
+/// no directories, as a version directory does. An index entry is a directory holding files,
+/// carrying their count (sidecars and maven-metadata.xml not counted, as the dashboard counts
+/// them), their bytes (sidecars included) and the newest of their times; a child adds up every
+/// entry at or below it. Nothing at or below `path` is (vec![], false).
+pub fn maven_dir_listing(index: &[RepoInfo], path: &str) -> (Vec<RepoInfo>, bool) {
     let prefix = if path.is_empty() {
-        "maven/".to_string()
+        String::new()
     } else {
-        format!("maven/{}/", path)
+        format!("{path}/")
     };
-    let keys = storage.list(&prefix).await.unwrap_or_default();
-
-    if keys.is_empty() {
-        return (vec![], false);
-    }
-
-    // Leaf = no subdirectories (only direct files like JARs, POMs, checksums)
-    let has_subdirs = keys.iter().any(|k| {
-        k.strip_prefix(&prefix)
-            .is_some_and(|r| !r.is_empty() && r.contains('/'))
-    });
-    if !has_subdirs {
-        return (vec![], true);
-    }
-
-    // Group by immediate child segment (skip direct files like maven-metadata.xml)
-    let mut groups: HashMap<String, (usize, u64, u64)> = HashMap::new();
-    for key in &keys {
-        if let Some(rest) = key.strip_prefix(&prefix) {
-            if rest.is_empty() || !rest.contains('/') {
-                continue;
-            }
-            let child_name = rest.split('/').next().unwrap_or(rest).to_string();
-            let entry = groups.entry(child_name).or_insert((0, 0, 0));
-            entry.0 += 1;
-            if let Some(meta) = storage.stat(key).await {
-                entry.1 += meta.size;
-                if meta.modified > entry.2 {
-                    entry.2 = meta.modified;
-                }
-            }
+    let mut holds_files = false;
+    let mut groups: HashMap<&str, (usize, u64, u64)> = HashMap::new();
+    for entry in index {
+        if entry.name == path {
+            holds_files = true;
+            continue;
         }
+        let Some(rest) = entry.name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let child = rest.split('/').next().unwrap_or(rest);
+        let group = groups.entry(child).or_insert((0, 0, 0));
+        group.0 += entry.versions;
+        group.1 += entry.size;
+        group.2 = group.2.max(entry.modified);
+    }
+    if groups.is_empty() {
+        return (vec![], holds_files);
     }
 
     let mut result: Vec<RepoInfo> = groups
         .into_iter()
         .map(|(name, (count, size, modified))| RepoInfo {
-            name,
+            name: name.to_string(),
             versions: count,
             size,
             updated: format_timestamp(modified),
+            modified,
             ..Default::default()
         })
         .collect();
@@ -579,23 +614,21 @@ pub async fn get_maven_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoIn
     (result, false)
 }
 
+/// The files of one Maven directory with their sizes, from one listing that carries them.
 pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
     let prefix = format!("maven/{}/", path);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    let entries = storage.list_with_meta(&prefix).await.unwrap_or_default();
 
-    let mut artifacts = Vec::new();
-    for key in &keys {
-        if let Some(filename) = key.strip_prefix(&prefix) {
-            if filename.contains('/') {
-                continue;
-            }
-            let size = storage.stat(key).await.map(|m| m.size).unwrap_or(0);
-            artifacts.push(MavenArtifact {
+    let artifacts = entries
+        .into_iter()
+        .filter_map(|(key, meta)| {
+            let filename = key.strip_prefix(&prefix)?;
+            (!filename.contains('/')).then(|| MavenArtifact {
                 filename: filename.to_string(),
-                size,
-            });
-        }
-    }
+                size: meta.size,
+            })
+        })
+        .collect();
 
     MavenDetail { artifacts }
 }
@@ -1823,6 +1856,22 @@ pub async fn get_cpan_detail(
     }
 }
 
+/// Composer detail: the versions of `vendor/package` NORA holds an archive of, uploaded
+/// and cached, newest first. `name` must be a valid package name; any other yields none.
+pub async fn get_composer_detail(storage: &Storage, name: &str) -> ComposerDetail {
+    let versions = crate::registry::composer::stored_versions(storage, name)
+        .await
+        .into_iter()
+        .map(|v| ComposerVersion {
+            version: v.version,
+            size: v.size,
+            published: format_timestamp(v.modified),
+            hosted: v.hosted,
+        })
+        .collect();
+    ComposerDetail { versions }
+}
+
 /// Fallback: scan storage for files matching {registry}/{name}/*
 async fn get_storage_scan_detail(
     storage: &Storage,
@@ -2120,6 +2169,7 @@ pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo
             size,
             updated: format_timestamp(modified),
             is_file,
+            modified,
         })
         .collect();
 

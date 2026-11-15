@@ -474,7 +474,9 @@ async fn download_gem(
 
     // Immutable: if cached, serve directly. get_verified discharges the integrity
     // witness at the serve site (compile-time guarantee — see crate::verified).
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -519,8 +521,12 @@ async fn download_gem(
         return response;
     }
 
-    // #733: an internal-namespace gem with no local copy is never proxied upstream.
+    // #733: an internal-namespace gem with no local copy is never proxied upstream; one whose
+    // copy the store could not read is unavailable, not absent.
     if let Some(name) = &internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("gems", &storage_key, e);
+        }
         return crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
             crate::curation::RegistryType::Gems,
@@ -621,7 +627,9 @@ async fn download_gemspec(
     };
 
     // Immutable cache. get_verified discharges the integrity witness at serve.
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -664,7 +672,11 @@ async fn download_gemspec(
     }
 
     // #68 namespace isolation: a cached internal gem's spec was served above; an
-    // internal name with no local copy must not be fetched upstream.
+    // internal name with no local copy must not be fetched upstream, and one whose copy the
+    // store could not read is unavailable, not absent.
+    if let Some(e) = read_failure.as_ref().filter(|_| internal.is_some()) {
+        return crate::registry::local_copy_unreadable("gems", &storage_key, e);
+    }
     if let Some(response) = internal.as_deref().and_then(|name| {
         crate::curation::check_namespace_isolation(
             &state.curation().curation_engine,
@@ -1115,6 +1127,11 @@ fn gem_platform_to_s((cpu, os, version): &GemPlatformParts, rubygems4: bool) -> 
 /// CPU-less `darwin19` as `darwin-19`), so the platforms tried are the suffix itself and the
 /// suffix with one `-` taken out or made `_` (`mswin32_60`).
 fn rubygems_writes_platform(suffix: &str) -> bool {
+    // `to_s` joins at most a CPU, an OS and a version, none of which holds a `-`: a suffix with
+    // more than two is no platform's `to_s`, and is not parsed once per `-` it holds.
+    if suffix.bytes().filter(|&b| b == b'-').count() > 2 {
+        return false;
+    }
     let mut candidates = vec![suffix.to_string()];
     for (at, _) in suffix.match_indices('-') {
         candidates.push(format!("{}{}", &suffix[..at], &suffix[at + 1..]));
@@ -1211,13 +1228,18 @@ fn is_gem_platform(suffix: &str) -> bool {
 pub fn gem_file_readings(stem: &str) -> Vec<GemFile> {
     let fields: Vec<&str> = stem.split('-').collect();
     (1..fields.len())
+        // A field that is no version decides the split alone, before any part is built.
+        .filter(|&at| is_gem_version_field(fields[at]))
         .filter_map(|at| {
             let name = fields[..at].join("-");
+            if !is_gem_name(&name) {
+                return None;
+            }
             let platform = (at + 1 < fields.len()).then(|| fields[at + 1..].join("-"));
             let suffix_ok = platform
                 .as_deref()
                 .is_none_or(|p| is_gem_platform(p) || is_gem_content_address(p));
-            (is_gem_name(&name) && is_gem_version_field(fields[at]) && suffix_ok).then(|| GemFile {
+            suffix_ok.then(|| GemFile {
                 name,
                 version: fields[at].to_string(),
                 platform,
@@ -1309,6 +1331,11 @@ async fn gem_file_gate(
     stem: &str,
     storage_key: &str,
 ) -> Result<GemFileGate, Box<Response>> {
+    // Reading a name costs more the longer it is, and it arrives from any client: a name no
+    // reading of which NORA serves is refused unread.
+    if stem.len() > GEM_FILE_STEM_MAX {
+        return Err(Box::new(StatusCode::BAD_REQUEST.into_response()));
+    }
     let readings = gem_file_readings(stem);
     if readings.is_empty() || !readings.iter().all(is_valid_gem_file) {
         return Err(Box::new(StatusCode::BAD_REQUEST.into_response()));
@@ -1399,11 +1426,22 @@ async fn upstream_gem_release_dates(
     dated
 }
 
+/// The longest gem name, and platform, NORA serves.
+const GEM_NAME_MAX: usize = 256;
+
+/// The longest gem version NORA serves.
+const GEM_VERSION_MAX: usize = 128;
+
+/// The longest gem file name (without its extension) that can have a reading NORA serves: a name,
+/// a version and a platform each at its longest, and the two `-` between them. Every reading of a
+/// longer name has a part over its limit, so such a name is refused before it is read.
+const GEM_FILE_STEM_MAX: usize = GEM_NAME_MAX + 1 + GEM_VERSION_MAX + 1 + GEM_NAME_MAX;
+
 /// Validate gem name: alphanumeric, hyphens, underscores, dots.
 /// No path traversal, no slashes, no null bytes.
 fn is_valid_gem_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 256
+        && name.len() <= GEM_NAME_MAX
         && !name.contains('/')
         && !name.contains('\0')
         && !name.contains("..")
@@ -1415,7 +1453,7 @@ fn is_valid_gem_name(name: &str) -> bool {
 /// Validate version string: digits, dots, hyphens, alphanumeric, ".pre", ".beta", etc.
 fn is_valid_version(version: &str) -> bool {
     !version.is_empty()
-        && version.len() <= 128
+        && version.len() <= GEM_VERSION_MAX
         && !version.contains('/')
         && !version.contains('\0')
         && !version.contains("..")
@@ -3002,5 +3040,241 @@ mod gem_file_decided_once {
         assert!(violations(&late)
             .iter()
             .any(|v| v.contains("download_gem: get_verified")));
+    }
+}
+
+/// What a gem file name costs before it is answered. The name arrives from any client, so
+/// the work done on it before it is refused must not grow with what the client sends: the
+/// handlers run that work inline, on a runtime worker.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod gem_file_name_work {
+    use super::{
+        gem_file_readings, gem_platform_to_s, gem_platform_v36, gem_platform_v40,
+        is_valid_gem_file, rubygems_writes_platform,
+    };
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use proptest::prelude::*;
+    use std::time::Duration;
+
+    /// The longest name a served gem file can carry: a name, a version and a platform each at the
+    /// longest the key rules allow (256, 128, 256), and the two `-` between them.
+    const LONGEST_SERVABLE: usize = 256 + 1 + 128 + 1 + 256;
+
+    /// Run `work` on its own thread and fail unless it is done within `limit`. The work under test
+    /// is synchronous: an async timeout could not interrupt it.
+    fn done_within<T: Send + 'static>(
+        limit: Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (done, wait) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(work());
+        });
+        wait.recv_timeout(limit)
+            .unwrap_or_else(|_| panic!("not done within {limit:?}"))
+    }
+
+    /// `1-1-…-1`: every field reads as a version, so every split is a candidate reading and every
+    /// suffix is weighed as a platform.
+    fn all_versions(len: usize) -> String {
+        let mut stem = "1-".repeat(len / 2);
+        stem.truncate(len.saturating_sub(1));
+        stem.push('1');
+        stem
+    }
+
+    #[test]
+    fn a_name_of_the_longest_servable_length_is_read_at_once() {
+        let stem = all_versions(LONGEST_SERVABLE);
+        assert_eq!(stem.len(), LONGEST_SERVABLE);
+        let readings = done_within(Duration::from_secs(2), move || gem_file_readings(&stem));
+        // Its readings take nearly the whole name as the gem name, longer than a gem name may
+        // be: the gate refuses it.
+        assert!(!readings.is_empty());
+        assert!(!readings.iter().all(is_valid_gem_file), "{readings:?}");
+    }
+
+    #[test]
+    fn an_overlong_gem_file_name_is_refused_at_once_on_both_paths() {
+        let stem = all_versions(60_000);
+        let statuses = done_within(Duration::from_secs(10), move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async move {
+                    let ctx = create_test_context_with_config(|cfg| {
+                        cfg.gems.enabled = true;
+                        cfg.gems.proxy = None;
+                    });
+                    let gem =
+                        send(&ctx.app, Method::GET, &format!("/gems/gems/{stem}.gem"), "").await;
+                    let spec = send(
+                        &ctx.app,
+                        Method::GET,
+                        &format!("/gems/quick/Marshal.4.8/{stem}.gemspec.rz"),
+                        "",
+                    )
+                    .await;
+                    (gem.status(), spec.status())
+                })
+        });
+        assert_eq!(statuses, (StatusCode::BAD_REQUEST, StatusCode::BAD_REQUEST));
+    }
+
+    #[tokio::test]
+    async fn the_longest_servable_name_is_not_refused() {
+        // A name, a version and a platform each at its longest (`<cpu>-linux` reads back as
+        // written): its one reading is served, so the name is looked up, not refused.
+        let stem = format!(
+            "{}-1.{}-{}-linux",
+            "a".repeat(256),
+            "0".repeat(126),
+            "c".repeat(250)
+        );
+        assert_eq!(stem.len(), LONGEST_SERVABLE);
+        let readings = gem_file_readings(&stem);
+        assert_eq!(readings.len(), 1, "{readings:?}");
+        assert!(readings.iter().all(is_valid_gem_file));
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.gems.enabled = true;
+            cfg.gems.proxy = None;
+        });
+        let gem = send(&ctx.app, Method::GET, &format!("/gems/gems/{stem}.gem"), "").await;
+        assert_eq!(gem.status(), StatusCode::NOT_FOUND);
+        let spec = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/gems/quick/Marshal.4.8/{stem}.gemspec.rz"),
+            "",
+        )
+        .await;
+        assert_eq!(spec.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// `rubygems_writes_platform` as it reads without any shortcut: every candidate is parsed.
+    fn writes_platform_trying_every_candidate(suffix: &str) -> bool {
+        let mut candidates = vec![suffix.to_string()];
+        for (at, _) in suffix.match_indices('-') {
+            candidates.push(format!("{}{}", &suffix[..at], &suffix[at + 1..]));
+            candidates.push(format!("{}_{}", &suffix[..at], &suffix[at + 1..]));
+        }
+        candidates.iter().any(|candidate| {
+            gem_platform_to_s(&gem_platform_v36(candidate), false) == suffix
+                || gem_platform_to_s(&gem_platform_v40(candidate), true) == suffix
+        })
+    }
+
+    fn platform_word() -> impl Strategy<Value = &'static str> {
+        prop::sample::select(vec![
+            "x86_64",
+            "x86",
+            "i686",
+            "i386",
+            "arm64",
+            "aarch64",
+            "universal",
+            "x64",
+            "java",
+            "jruby",
+            "linux",
+            "gnu",
+            "musl",
+            "darwin",
+            "darwin19",
+            "19",
+            "8",
+            "mingw32",
+            "mingw",
+            "ucrt",
+            "mswin32",
+            "mswin64",
+            "60",
+            "dalvik5",
+            "dotnet",
+            "dotnet4.0",
+            "freebsd12",
+            "openbsd7.1",
+            "solaris2.8",
+            "wasi",
+            "cygwin",
+            "aix5",
+            "a_platform",
+            "test_platform",
+            "macruby",
+            "netbsdelf",
+            "1",
+            "1.2",
+            "",
+            "x",
+        ])
+    }
+
+    fn platform_suffix() -> impl Strategy<Value = String> {
+        (
+            prop::collection::vec(platform_word(), 1..7),
+            prop::collection::vec(prop::sample::select(vec!["-", "-", "_", ""]), 6),
+        )
+            .prop_map(|(words, seps)| {
+                let mut suffix = String::new();
+                for (i, word) in words.iter().enumerate() {
+                    if i > 0 {
+                        suffix.push_str(seps[i - 1]);
+                    }
+                    suffix.push_str(word);
+                }
+                suffix
+            })
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        // However the platform check is cut short, it says what trying every candidate says.
+        #[test]
+        fn the_platform_check_says_what_every_candidate_says(suffix in platform_suffix()) {
+            prop_assert_eq!(
+                rubygems_writes_platform(&suffix),
+                writes_platform_trying_every_candidate(&suffix),
+                "{}", suffix
+            );
+        }
+
+        // No name longer than the longest servable one has a reading NORA serves: refusing such a
+        // name before it is read refuses nothing the gate would let through.
+        #[test]
+        fn no_overlong_name_has_only_servable_readings(
+            name in "[a-z][a-z0-9_]{0,12}(-[a-z0-9]{1,6}){0,2}",
+            name_pad in 0usize..300,
+            version in "[0-9]{1,3}(\\.[0-9a-z]{1,4}){0,3}",
+            version_pad in 0usize..140,
+            platform in prop::option::of("[a-z0-9_]{1,8}-(linux|darwin|mingw32)(-[0-9]{1,2})?"),
+            platform_pad in 0usize..300,
+            grow in 0usize..3,
+        ) {
+            let mut name = format!("{name}{}", "n".repeat(name_pad));
+            let mut version = format!("{version}{}", "0".repeat(version_pad));
+            let mut platform = platform.map(|p| format!("{}{p}", "c".repeat(platform_pad)));
+            let len = name.len() + 1 + version.len() + platform.as_ref().map_or(0, |p| p.len() + 1);
+            // Made just longer than the bound, in the field `grow` names.
+            let short = (LONGEST_SERVABLE + 1).saturating_sub(len);
+            match (grow, platform.as_mut()) {
+                (0, _) => name.push_str(&"n".repeat(short)),
+                (1, _) | (_, None) => version.push_str(&"0".repeat(short)),
+                (_, Some(p)) => p.insert_str(0, &"c".repeat(short)),
+            }
+            let stem = match &platform {
+                Some(p) => format!("{name}-{version}-{p}"),
+                None => format!("{name}-{version}"),
+            };
+            prop_assert!(stem.len() > LONGEST_SERVABLE);
+            let readings = gem_file_readings(&stem);
+            prop_assert!(
+                readings.is_empty() || !readings.iter().all(is_valid_gem_file),
+                "{} reads as {:?}", stem, readings
+            );
+        }
     }
 }

@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use axum::body::Bytes;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -145,6 +146,18 @@ fn readable_listing_root(root: &Path) -> std::result::Result<(), StorageError> {
     match std::fs::read_dir(root) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(StorageError::Io(e)),
+    }
+}
+
+/// Whether a listing's directory is there to walk. Missing, or under a stored file, is nothing
+/// to list; a directory whose presence cannot be told — an ancestor that cannot be passed
+/// through (`EACCES`), an I/O error — is an error, where `Path::exists` would call it missing
+/// and the listing would answer "nothing here" for keys that may be stored.
+fn listing_root_present(root: &Path) -> std::result::Result<bool, StorageError> {
+    match std::fs::metadata(root) {
+        Ok(_) => readable_listing_root(root).map(|()| true),
+        Err(e) if is_missing(&e) => Ok(false),
         Err(e) => Err(StorageError::Io(e)),
     }
 }
@@ -400,6 +413,147 @@ pub struct LocalStorage {
     commit_locks: crate::PublishLocks,
     /// This instance's staging directory, see [`Staging`].
     staging: StagingCell,
+    /// Outcome of the last write probe, served by `health_check()`. Starts `false`, so
+    /// readiness gates until the maintenance loop's first tick has probed the disk; a
+    /// probe per health request would put disk I/O, and a disk that hangs, on the probe.
+    cached_reachable: AtomicBool,
+    /// Unix seconds of the last probe (`0` = never). A verdict older than
+    /// `HEALTH_MAX_STALE_SECS` is treated as unreachable, so a maintenance loop that stops
+    /// un-readies the instance instead of pinning a stale `true`.
+    last_refresh_unix: AtomicU64,
+    /// Set while a write probe runs, see `refresh_reachability`.
+    probing: Arc<AtomicBool>,
+    /// Bytes stored, as last counted by `refresh_total_size`.
+    cached_total_size: AtomicU64,
+}
+
+/// Clears the probe-running flag when the probe ends, however it ends.
+struct ProbeDone(Arc<AtomicBool>);
+
+impl Drop for ProbeDone {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Name prefix of the write probe's file, in the storage root.
+const HEALTH_PROBE_PREFIX: &str = ".nora-health-probe.";
+
+/// A step of the local write probe, in the order [`probe`] takes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeStep {
+    /// Create the storage directory if it is not there.
+    Directory,
+    /// Create a new probe file: one that exists already passes on a read-only directory.
+    Create,
+    Write,
+    /// fsync the file: a disk that takes a write into the page cache and fails to flush it
+    /// takes no artifact either.
+    Sync,
+    Remove,
+}
+
+/// What the write probe does on a disk, one call per step.
+trait ProbeDisk {
+    fn run(&mut self, step: ProbeStep) -> std::io::Result<()>;
+}
+
+/// Take the probe's steps on `disk`: the directory, a new file, a write, an fsync, the file
+/// removed. The disk takes writes only if every step succeeds; once the file is created it
+/// is removed whatever fails after.
+fn probe(disk: &mut impl ProbeDisk) -> bool {
+    if disk.run(ProbeStep::Directory).is_err() || disk.run(ProbeStep::Create).is_err() {
+        return false;
+    }
+    let written = disk.run(ProbeStep::Write).is_ok() && disk.run(ProbeStep::Sync).is_ok();
+    let removed = disk.run(ProbeStep::Remove).is_ok();
+    written && removed
+}
+
+/// The probe's steps on the local disk, on the file `path` under `base`.
+struct OnDisk<'a> {
+    base: &'a Path,
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl OnDisk<'_> {
+    fn file(&mut self) -> std::io::Result<&mut std::fs::File> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("no probe file"))
+    }
+}
+
+impl ProbeDisk for OnDisk<'_> {
+    fn run(&mut self, step: ProbeStep) -> std::io::Result<()> {
+        use std::io::Write as _;
+        match step {
+            ProbeStep::Directory => std::fs::create_dir_all(self.base),
+            ProbeStep::Create => {
+                self.file = Some(std::fs::File::create_new(&self.path)?);
+                Ok(())
+            }
+            ProbeStep::Write => self.file()?.write_all(b"ok"),
+            ProbeStep::Sync => self.file()?.sync_all(),
+            ProbeStep::Remove => {
+                self.file = None;
+                std::fs::remove_file(&self.path)
+            }
+        }
+    }
+}
+
+/// The write probe under `base` ([`probe`]): only a store that takes a durable write passes.
+/// `base.exists()` is not a health signal — a read-only mount or a full disk where the
+/// directory already exists would still pass.
+fn write_probe(base: &Path) -> bool {
+    #[cfg(test)]
+    crate::test_helpers::wait_while_disk_hangs(base);
+    let seq = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = base.join(format!(
+        "{HEALTH_PROBE_PREFIX}{}.{}",
+        std::process::id(),
+        seq
+    ));
+    probe(&mut OnDisk {
+        base,
+        path,
+        file: None,
+    })
+}
+
+/// Bytes of the stored artifacts under `path`, walking the whole tree. At the root it
+/// leaves out the pin sidecar, a write probe in flight (the count runs beside it), `tmp/` (in-flight streamed uploads — transient staging,
+/// not stored artifacts; counting it makes the storage gauge sawtooth during pushes) and
+/// the staging directory (writes in progress, see `Staging`).
+fn dir_size(path: &Path, is_root: bool) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if is_root
+                    && path.file_name().is_some_and(|n| {
+                        n == PIN_FILE || n.to_string_lossy().starts_with(HEALTH_PROBE_PREFIX)
+                    })
+                {
+                    continue;
+                }
+                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            } else if path.is_dir() {
+                if is_root
+                    && path
+                        .file_name()
+                        .is_some_and(|n| n == "tmp" || n == crate::validation::STAGING_DIR)
+                {
+                    continue;
+                }
+                total += dir_size(&path, false);
+            }
+        }
+    }
+    total
 }
 
 impl LocalStorage {
@@ -411,6 +565,10 @@ impl LocalStorage {
             pins,
             commit_locks: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             staging: Arc::new(std::sync::OnceLock::new()),
+            cached_reachable: AtomicBool::new(false),
+            last_refresh_unix: AtomicU64::new(0),
+            probing: Arc::new(AtomicBool::new(false)),
+            cached_total_size: AtomicU64::new(0),
         }
     }
 
@@ -437,6 +595,31 @@ impl LocalStorage {
         crate::acquire_publish_lock(&self.commit_locks, key)
     }
 
+    /// Open `key` with its pin, both of one version (#1153). A write publishes body and pin
+    /// under the key's commit lock, renaming the body first; a read in between would pair the
+    /// new body with the old pin. A key written by this process has a lock, and the read waits
+    /// for it. A key without one is read without waiting, then asked again: a write that began
+    /// meanwhile created its lock before its rename, and the read is done again under it.
+    /// Reads never add locks, so they cost the lock map nothing.
+    async fn open_version(
+        &self,
+        key: &str,
+    ) -> Result<(fs::File, std::fs::Metadata, Option<String>)> {
+        let path = self.key_to_path(key);
+        let held = || self.commit_locks.lock().get(key).cloned();
+        if held().is_none() {
+            let (file, meta) = open_object(&path).await?;
+            let pin = self.pins.get(key);
+            if held().is_none() {
+                return Ok((file, meta, pin));
+            }
+        }
+        let lock = self.commit_lock(key);
+        let _commit = lock.lock().await;
+        let (file, meta) = open_object(&path).await?;
+        Ok((file, meta, self.pins.get(key)))
+    }
+
     /// Record `sha256` for `key`, on the blocking pool (the append is
     /// filesystem I/O). Fails closed: an artifact whose pin did not reach the
     /// disk would silently downgrade to open-world after the next restart — the
@@ -456,6 +639,25 @@ impl LocalStorage {
                 tracing::error!(error = %e, key = %key, "hash-pin record failed");
                 StorageError::Io(std::io::Error::other(format!(
                     "hash-pin record failed: {e}"
+                )))
+            })
+    }
+
+    /// Drop the pin of `key`, for a write that stored bytes without a digest: the pin of the
+    /// bytes it replaced must not outlive them (#1154). The object store gets this from the
+    /// write itself, which replaces the object's attributes. A key without a pin writes nothing.
+    /// Fails closed, as [`record_pin`](Self::record_pin) does: a stale pin left behind would
+    /// fail every later read of the new bytes.
+    async fn forget_pin(&self, key: &str) -> Result<()> {
+        let pins = Arc::clone(&self.pins);
+        let key_owned = key.to_string();
+        tokio::task::spawn_blocking(move || pins.remove(&key_owned))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())))
+            .map_err(|e| {
+                tracing::error!(error = %e, key = %key, "hash-pin tombstone failed");
+                StorageError::Io(std::io::Error::other(format!(
+                    "hash-pin tombstone failed: {e}"
                 )))
             })
     }
@@ -718,8 +920,10 @@ impl StorageBackend for LocalStorage {
         // Use blocking task for filesystem traversal
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
-                readable_listing_root(&root)?;
+            if let Some(root) = list_root(&base, &prefix) {
+                if !listing_root_present(&root)? {
+                    return Ok(results);
+                }
                 Self::list_files_sync(&root, &base, &prefix, &mut results);
             }
             results.sort();
@@ -735,8 +939,10 @@ impl StorageBackend for LocalStorage {
 
         tokio::task::spawn_blocking(move || {
             let mut results = Vec::new();
-            if let Some(root) = list_root(&base, &prefix).filter(|r| r.exists()) {
-                readable_listing_root(&root)?;
+            if let Some(root) = list_root(&base, &prefix) {
+                if !listing_root_present(&root)? {
+                    return Ok(results);
+                }
                 Self::list_files_with_meta_sync(&root, &base, &prefix, &mut results);
             }
             results.sort_by(|a, b| a.0.cmp(&b.0));
@@ -762,67 +968,56 @@ impl StorageBackend for LocalStorage {
     }
 
     async fn health_check(&self) -> bool {
-        // A real write-probe — `base_path.exists()` is not a health signal: a
-        // read-only mount or a full disk where the directory already exists would
-        // still report healthy. Create + write + fsync + remove a unique temp
-        // file; only a genuinely writable backing store passes.
-        if fs::create_dir_all(&self.base_path).await.is_err() {
-            return false;
-        }
-        let seq = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let probe =
-            self.base_path
-                .join(format!(".nora-health-probe.{}.{}", std::process::id(), seq));
-        let writable = match fs::File::create(&probe).await {
-            Ok(mut file) => file.write_all(b"ok").await.is_ok() && file.sync_all().await.is_ok(),
-            Err(_) => false,
-        };
-        let _ = fs::remove_file(&probe).await; // best-effort cleanup
-        writable
+        // The verdict of the last write probe, which the maintenance loop takes once a tick
+        // (`refresh_reachability`): a health request does no disk I/O, so a disk that hangs
+        // cannot hang the probe. It expires like the object store's: a loop that stopped
+        // probing lets the window lapse and un-readies the instance.
+        self.cached_reachable.load(Ordering::Relaxed)
+            && crate::cache_ttl::is_within_ttl(
+                self.last_refresh_unix.load(Ordering::Relaxed),
+                super::HEALTH_MAX_STALE_SECS,
+            )
     }
 
     async fn total_size(&self) -> u64 {
-        let base = self.base_path.clone();
-        tokio::task::spawn_blocking(move || {
-            fn dir_size(path: &std::path::Path, is_root: bool) -> u64 {
-                let mut total = 0u64;
-                if let Ok(entries) = std::fs::read_dir(path) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_file() {
-                            if is_root && path.file_name().is_some_and(|n| n == PIN_FILE) {
-                                continue;
-                            }
-                            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
-                        } else if path.is_dir() {
-                            // `<root>/tmp/` holds in-flight streamed uploads —
-                            // transient staging, not stored artifacts; counting
-                            // it makes the storage gauge sawtooth during pushes.
-                            if is_root && path.file_name().is_some_and(|n| n == "tmp") {
-                                continue;
-                            }
-                            // Writes in progress, see `Staging`.
-                            if is_root
-                                && path
-                                    .file_name()
-                                    .is_some_and(|n| n == crate::validation::STAGING_DIR)
-                            {
-                                continue;
-                            }
-                            total += dir_size(&path, false);
-                        }
-                    }
-                }
-                total
-            }
-            dir_size(&base, true)
-        })
-        .await
-        .unwrap_or(0)
+        self.cached_total_size.load(Ordering::Relaxed)
     }
 
     fn backend_name(&self) -> &'static str {
         "local"
+    }
+
+    async fn refresh_reachability(&self) {
+        // At most one probe at a time. A probe that has not come back is a disk that does
+        // not answer: record that, rather than queue a second probe (and a second blocked
+        // thread) behind it each tick.
+        let writable = if self.probing.swap(true, Ordering::AcqRel) {
+            false
+        } else {
+            let done = ProbeDone(Arc::clone(&self.probing));
+            let base = self.base_path.clone();
+            // On its own blocking thread, the probe runs to its end even when the tick that
+            // started it is cut at its deadline; only then is the flag cleared.
+            tokio::task::spawn_blocking(move || {
+                let _done = done;
+                write_probe(&base)
+            })
+            .await
+            .unwrap_or(false)
+        };
+        self.cached_reachable.store(writable, Ordering::Relaxed);
+        // Stamp every run, writable or not: `health_check` expires the verdict when the
+        // loop stops.
+        self.last_refresh_unix
+            .store(crate::cache_ttl::now_unix(), Ordering::Relaxed);
+    }
+
+    async fn refresh_total_size(&self) {
+        // The whole tree, as long as it takes; health requests read the count.
+        let base = self.base_path.clone();
+        if let Ok(total) = tokio::task::spawn_blocking(move || dir_size(&base, true)).await {
+            self.cached_total_size.store(total, Ordering::Relaxed);
+        }
     }
 
     async fn prepare(&self) {
@@ -882,7 +1077,7 @@ impl StorageBackend for LocalStorage {
         }
         match sha256 {
             Some(hash) => self.record_pin(key, hash).await,
-            None => Ok(()),
+            None => self.forget_pin(key).await,
         }
     }
 
@@ -950,7 +1145,7 @@ impl StorageBackend for LocalStorage {
             .or_else(|| self.pins.get(src))
         {
             Some(hash) => self.record_pin(dst, &hash).await,
-            None => Ok(()),
+            None => self.forget_pin(dst).await,
         }
     }
 
@@ -958,9 +1153,8 @@ impl StorageBackend for LocalStorage {
         &self,
         key: &str,
     ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
-        let path = self.key_to_path(key);
-        let (file, meta) = open_object(&path).await?;
-        Ok((meta.len(), self.pins.get(key), Box::pin(file)))
+        let (file, meta, pin) = self.open_version(key).await?;
+        Ok((meta.len(), pin, Box::pin(file)))
     }
 
     async fn get_range(
@@ -968,16 +1162,15 @@ impl StorageBackend for LocalStorage {
         key: &str,
         start: u64,
         end: u64,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let path = self.key_to_path(key);
-        let (mut file, meta) = open_object(&path).await?;
+        let (mut file, meta, pin) = self.open_version(key).await?;
         let size = meta.len();
         if start > 0 {
             file.seek(std::io::SeekFrom::Start(start)).await?;
         }
         let len = end.saturating_sub(start) + 1;
-        Ok((size, Box::pin(file.take(len))))
+        Ok((size, pin, Box::pin(file.take(len))))
     }
 }
 
@@ -1294,6 +1487,50 @@ mod tests {
         }
         assert!(storage
             .list("npm/absent/versions/")
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A listing under a directory that cannot be passed through is an error too: whether the
+    /// listed directory is there cannot be told, and "nothing here" would be a guess a caller
+    /// acts on (a hosted name taken for an upstream's). What is not there is still nothing,
+    /// a path through a stored file included.
+    #[tokio::test]
+    async fn a_listing_under_an_ancestor_that_cannot_be_entered_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        put(
+            &storage,
+            "composer/hosted/acme/lib/versions/1.0.0.0.json",
+            b"{}",
+        )
+        .await
+        .unwrap();
+        put(&storage, "raw/file.txt", b"x").await.unwrap();
+        let vendor = dir.path().join("composer/hosted/acme");
+        std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let blocked = std::fs::metadata(vendor.join("lib")).is_err();
+        let own = storage.list("composer/hosted/acme/lib/versions/").await;
+        let meta = storage
+            .list_with_meta("composer/hosted/acme/lib/versions/")
+            .await;
+        std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if blocked {
+            assert!(own.is_err(), "{own:?}");
+            assert!(meta.is_err(), "{meta:?}");
+        } else {
+            eprintln!("skipped: this user passes through a directory without permissions");
+        }
+        assert!(storage
+            .list("composer/hosted/none/versions/")
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(storage.list("raw/file.txt/x/").await.unwrap().is_empty());
+        assert!(storage
+            .list_with_meta("raw/file.txt/x/")
             .await
             .unwrap()
             .is_empty());
@@ -1707,6 +1944,7 @@ mod tests {
         file.flush().await.unwrap();
         assert!(in_flight.path().exists());
 
+        storage.refresh_total_size().await;
         assert_eq!(storage.total_size().await, 3);
         assert_eq!(storage.list("").await.unwrap(), vec!["raw/a".to_string()]);
         let listed: Vec<String> = storage
@@ -1932,7 +2170,37 @@ mod tests {
     async fn test_health_check() {
         let temp_dir = TempDir::new().unwrap();
         let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        assert!(
+            !storage.health_check().await,
+            "no verdict before the first probe"
+        );
+        storage.refresh_reachability().await;
         assert!(storage.health_check().await);
+    }
+
+    /// The verdict of the last probe expires: a maintenance loop that stopped probing
+    /// leaves a verdict older than `HEALTH_MAX_STALE_SECS`, which reads as unreachable;
+    /// the next probe makes it fresh again.
+    #[tokio::test]
+    async fn the_verdict_expires_when_the_loop_stops() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        storage.refresh_reachability().await;
+        assert!(storage.health_check().await);
+
+        let now = crate::cache_ttl::now_unix();
+        let window = super::super::HEALTH_MAX_STALE_SECS as u64;
+        storage
+            .last_refresh_unix
+            .store(now - window + 5, Ordering::Relaxed);
+        assert!(storage.health_check().await, "inside the window");
+        storage
+            .last_refresh_unix
+            .store(now - window - 1, Ordering::Relaxed);
+        assert!(!storage.health_check().await, "past the window");
+
+        storage.refresh_reachability().await;
+        assert!(storage.health_check().await, "fresh again");
     }
 
     #[tokio::test]
@@ -1942,6 +2210,7 @@ mod tests {
         let storage = LocalStorage::new(new_path.to_str().unwrap());
 
         assert!(!new_path.exists());
+        storage.refresh_reachability().await;
         assert!(storage.health_check().await);
         assert!(new_path.exists());
     }
@@ -1956,9 +2225,214 @@ mod tests {
         let file = temp_dir.path().join("not-a-dir");
         std::fs::write(&file, b"x").unwrap();
         let storage = LocalStorage::new(file.join("store").to_str().unwrap());
+        storage.refresh_reachability().await;
         assert!(
             !storage.health_check().await,
             "an unwritable backing store must report unhealthy"
+        );
+    }
+
+    /// A probe stuck on the disk is not started a second time: the next refresh does not
+    /// wait, it records the store as unwritable. Once the disk answers, the probe ends and
+    /// the store is writable again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_probe_stuck_on_the_disk_is_not_started_again() {
+        use std::time::Duration;
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        storage.refresh_reachability().await;
+        assert!(storage.health_check().await);
+
+        let hung = crate::test_helpers::hang_health_probe(temp_dir.path());
+        // CANCEL-SAFETY: the cut refresh leaves its probe blocked on its own thread, which is
+        // what the next refresh has to cope with.
+        let first =
+            tokio::time::timeout(Duration::from_millis(300), storage.refresh_reachability());
+        assert!(first.await.is_err(), "the probe waits on the disk");
+        // CANCEL-SAFETY: only the elapsed outcome is asserted on.
+        let second =
+            tokio::time::timeout(Duration::from_millis(300), storage.refresh_reachability());
+        assert!(second.await.is_ok(), "the next refresh does not wait on it");
+        assert!(!storage.health_check().await, "a disk that does not answer");
+
+        // The disk answers: the stuck probe goes on and ends.
+        hung.answer();
+        let mut writable = false;
+        for _ in 0..50 {
+            storage.refresh_reachability().await;
+            writable = storage.health_check().await;
+            if writable {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(writable, "writable again once the probe ended");
+    }
+
+    /// The probe must create its file: in a directory that takes no new entries, probe files
+    /// already there (left by a probe cut while the directory turned read-only) and writable
+    /// do not make it pass.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_files_left_behind_do_not_pass_a_read_only_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        let pid = std::process::id();
+        let next = TMP_COUNTER.load(Ordering::Relaxed);
+        let mut names = vec![format!(".nora-health-probe.{pid}")];
+        names.extend((next..next + 1024).map(|seq| format!(".nora-health-probe.{pid}.{seq}")));
+        for name in &names {
+            std::fs::write(temp_dir.path().join(name), b"").unwrap();
+        }
+        let dir = temp_dir.path();
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        storage.refresh_reachability().await;
+        let writable = storage.health_check().await;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!writable, "a read-only directory");
+    }
+
+    /// A disk that records the probe's steps and fails the one it is told to.
+    struct Recording {
+        fails: Option<super::ProbeStep>,
+        taken: Vec<super::ProbeStep>,
+    }
+
+    impl super::ProbeDisk for Recording {
+        fn run(&mut self, step: super::ProbeStep) -> std::io::Result<()> {
+            self.taken.push(step);
+            if self.fails == Some(step) {
+                return Err(std::io::Error::other("the disk refused"));
+            }
+            Ok(())
+        }
+    }
+
+    /// The probe passes only when every step succeeds, the fsync included; the steps run in
+    /// order up to the one that fails, and a created file is removed whatever fails after.
+    #[test]
+    fn the_probe_passes_only_when_every_step_succeeds() {
+        use super::ProbeStep::{Create, Directory, Remove, Sync, Write};
+        for (fails, passes, taken) in [
+            (None, true, vec![Directory, Create, Write, Sync, Remove]),
+            (Some(Directory), false, vec![Directory]),
+            (Some(Create), false, vec![Directory, Create]),
+            (Some(Write), false, vec![Directory, Create, Write, Remove]),
+            (
+                Some(Sync),
+                false,
+                vec![Directory, Create, Write, Sync, Remove],
+            ),
+            (
+                Some(Remove),
+                false,
+                vec![Directory, Create, Write, Sync, Remove],
+            ),
+        ] {
+            let mut disk = Recording {
+                fails,
+                taken: Vec::new(),
+            };
+            assert_eq!(super::probe(&mut disk), passes, "{fails:?} fails");
+            assert_eq!(disk.taken, taken, "{fails:?} fails");
+        }
+    }
+
+    /// On the local disk each step is the call it names: a write or an fsync with no file
+    /// created fails, a probe that passes leaves no file behind.
+    #[test]
+    fn the_probe_steps_on_the_disk_act_on_the_probe_file() {
+        use super::{ProbeDisk, ProbeStep};
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("probe");
+        let mut disk = super::OnDisk {
+            base: temp_dir.path(),
+            path: path.clone(),
+            file: None,
+        };
+        assert!(disk.run(ProbeStep::Write).is_err(), "a write with no file");
+        assert!(disk.run(ProbeStep::Sync).is_err(), "an fsync with no file");
+        assert!(disk.run(ProbeStep::Remove).is_err(), "no file to remove");
+        assert!(disk.run(ProbeStep::Create).is_ok());
+        assert!(disk.run(ProbeStep::Create).is_err(), "the file is new");
+        assert!(disk.run(ProbeStep::Write).is_ok());
+        assert!(disk.run(ProbeStep::Sync).is_ok());
+        assert_eq!(std::fs::read(&path).unwrap(), b"ok");
+        assert!(disk.run(ProbeStep::Remove).is_ok());
+        assert!(!path.exists());
+        assert!(super::write_probe(temp_dir.path()));
+        assert_eq!(std::fs::read_dir(temp_dir.path()).unwrap().count(), 0);
+    }
+
+    /// A file the disk cannot take a write into fails the write step, one it cannot flush
+    /// fails the fsync step: Linux refuses fsync on `/dev/null` (EINVAL), and a write into
+    /// `/dev/full` (ENOSPC).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_probe_steps_fail_on_a_file_that_takes_no_write_or_no_fsync() {
+        use super::{ProbeDisk, ProbeStep};
+        let temp_dir = TempDir::new().unwrap();
+        let on = |device: &str| super::OnDisk {
+            base: temp_dir.path(),
+            path: temp_dir.path().join("probe"),
+            file: Some(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(device)
+                    .unwrap(),
+            ),
+        };
+        let mut no_fsync = on("/dev/null");
+        assert!(no_fsync.run(ProbeStep::Write).is_ok());
+        assert!(
+            no_fsync.run(ProbeStep::Sync).is_err(),
+            "an fsync the file refuses"
+        );
+        let mut no_write = on("/dev/full");
+        assert!(
+            no_write.run(ProbeStep::Write).is_err(),
+            "a write the disk refuses"
+        );
+    }
+
+    /// The verdict is a probe of the store itself: one that cannot take a file (its root under
+    /// a plain file, ENOTDIR) is unreachable, a writable one reachable, through `write_probe`
+    /// and through `refresh_reachability`.
+    #[tokio::test]
+    async fn the_verdict_is_a_probe_of_the_store_itself() {
+        let temp_dir = TempDir::new().unwrap();
+        let file = temp_dir.path().join("not-a-dir");
+        std::fs::write(&file, b"x").unwrap();
+        let under_a_file = file.join("store");
+        assert!(!super::write_probe(&under_a_file), "a root under a file");
+        assert!(super::write_probe(temp_dir.path()), "a writable root");
+        let dead = LocalStorage::new(under_a_file.to_str().unwrap());
+        dead.refresh_reachability().await;
+        assert!(!dead.health_check().await, "a root under a file");
+        let live = LocalStorage::new(temp_dir.path().join("live").to_str().unwrap());
+        live.refresh_reachability().await;
+        assert!(live.health_check().await, "a writable root");
+    }
+
+    /// `health_check` answers the verdict of the last probe and touches no disk: a store moved
+    /// away after the probe still reads as reachable until the next one.
+    #[tokio::test]
+    async fn health_check_answers_the_last_probe_without_touching_the_disk() {
+        let temp_dir = TempDir::new().unwrap();
+        let base = temp_dir.path().join("store");
+        let storage = LocalStorage::new(base.to_str().unwrap());
+        storage.refresh_reachability().await;
+        assert!(storage.health_check().await);
+        std::fs::rename(&base, temp_dir.path().join("moved")).unwrap();
+        assert!(
+            storage.health_check().await,
+            "health_check looked at the disk"
+        );
+        storage.refresh_reachability().await;
+        assert!(
+            storage.health_check().await,
+            "the next probe recreates the root"
         );
     }
 
@@ -2115,10 +2589,23 @@ mod tests {
         );
     }
 
+    /// A write probe in flight is not stored data: the size count, which runs beside it,
+    /// leaves its file out.
+    #[tokio::test]
+    async fn the_size_leaves_out_a_probe_in_flight() {
+        let temp_dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        put(&storage, "raw/a", b"abc").await.unwrap();
+        std::fs::write(temp_dir.path().join(".nora-health-probe.1.2"), b"ok").unwrap();
+        storage.refresh_total_size().await;
+        assert_eq!(storage.total_size().await, 3);
+    }
+
     #[tokio::test]
     async fn test_total_size_empty() {
         let temp_dir = TempDir::new().unwrap();
         let storage = LocalStorage::new(temp_dir.path().to_str().unwrap());
+        storage.refresh_total_size().await;
         assert_eq!(storage.total_size().await, 0);
     }
 
@@ -2130,6 +2617,7 @@ mod tests {
         put(&storage, "a/file1", b"hello").await.unwrap(); // 5 bytes
         put(&storage, "b/file2", b"world!").await.unwrap(); // 6 bytes
 
+        storage.refresh_total_size().await;
         let size = storage.total_size().await;
         assert_eq!(size, 11);
     }
@@ -2141,9 +2629,11 @@ mod tests {
 
         put(&storage, "file1", b"12345").await.unwrap();
         put(&storage, "file2", b"67890").await.unwrap();
+        storage.refresh_total_size().await;
         assert_eq!(storage.total_size().await, 10);
 
         storage.delete("file1").await.unwrap();
+        storage.refresh_total_size().await;
         assert_eq!(storage.total_size().await, 5);
     }
 
@@ -2294,6 +2784,84 @@ mod tests {
         }
     }
 
+    /// #1154: a write without a digest whose tombstone cannot reach the disk reports it, as a
+    /// pin that cannot is reported: the stale pin left behind would fail every read of the new
+    /// bytes.
+    #[tokio::test]
+    async fn a_write_whose_tombstone_cannot_be_written_fails() {
+        use sha2::Digest;
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("store");
+        let storage = LocalStorage::new(store.to_str().unwrap());
+        let file = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let sha = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
+        for key in ["raw/k", "raw/t"] {
+            storage
+                .put_from_path(key, &file("v1", b"v1"), Some(&sha(b"v1")))
+                .await
+                .unwrap();
+        }
+        storage
+            .put_from_path("raw/u", &file("u", b"u"), None)
+            .await
+            .unwrap();
+        // The pin file can no longer be appended to.
+        let pins = store.join(PIN_FILE);
+        std::fs::remove_file(&pins).unwrap();
+        std::fs::create_dir(&pins).unwrap();
+        assert!(storage
+            .put_from_path("raw/k", &file("v2", b"v2"), None)
+            .await
+            .is_err());
+        assert!(storage.copy("raw/u", "raw/t", None).await.is_err());
+    }
+
+    /// #1153: a read of a key whose write is under way waits for it, so bytes and pin come
+    /// from one version; the write renames the body before it records the pin.
+    #[tokio::test]
+    async fn a_read_during_a_write_returns_one_version() {
+        use sha2::Digest;
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let storage = std::sync::Arc::new(LocalStorage::new(dir.path().to_str().unwrap()));
+        let sha = |b: &[u8]| hex::encode(sha2::Sha256::digest(b));
+        storage.put("raw/k", b"one", &sha(b"one")).await.unwrap();
+        for range in [false, true] {
+            // A write of the key holds its commit lock from the rename to the pin.
+            let lock = storage.commit_lock("raw/k");
+            let commit = lock.lock().await;
+            let reader = {
+                let storage = storage.clone();
+                tokio::spawn(async move {
+                    let (_, pin, mut r) = if range {
+                        storage.get_range("raw/k", 0, 2).await.unwrap()
+                    } else {
+                        storage.get_reader("raw/k").await.unwrap()
+                    };
+                    let mut bytes = Vec::new();
+                    r.read_to_end(&mut bytes).await.unwrap();
+                    (bytes, pin)
+                })
+            };
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            assert!(
+                !reader.is_finished(),
+                "range={range}: the read waits for the write"
+            );
+            let next: &[u8] = if range { b"two" } else { b"new" };
+            std::fs::write(dir.path().join("raw/k"), next).unwrap();
+            storage.record_pin("raw/k", &sha(next)).await.unwrap();
+            drop(commit);
+            let (bytes, pin) = reader.await.unwrap();
+            assert_eq!(bytes, next, "range={range}");
+            assert_eq!(pin, Some(sha(next)), "range={range}");
+        }
+    }
+
     /// Only the staging directory itself, at the root and spelled exactly, is left out; a key
     /// whose path merely contains or starts with that name is listed as the full walk lists it.
     #[tokio::test]
@@ -2305,14 +2873,20 @@ mod tests {
             crate::validation::validate_storage_key(key).unwrap();
             put_key(&storage, key).await;
         }
-        // Not writable through the API, but on disk the full walk lists it (case-sensitive fs).
-        std::fs::create_dir_all(dir.path().join(".NORA-STAGING/x")).unwrap();
-        std::fs::write(dir.path().join(".NORA-STAGING/x/f"), b"x").unwrap();
-        for (prefix, key) in [
+        let mut rows = vec![
             ("raw/g/.nora-staging/", "raw/g/.nora-staging/f"),
             (".nora-stagingx/a/", ".nora-stagingx/a/f"),
-            (".NORA-STAGING/x/", ".NORA-STAGING/x/f"),
-        ] {
+        ];
+        // Not writable through the API, but on disk the full walk lists it. On a file system
+        // that ignores case (APFS, NTFS) `.NORA-STAGING` is the staging directory itself, so
+        // the spelling the row tells apart exists only where the file system keeps it (#1156).
+        std::fs::write(dir.path().join("case-probe"), b"").unwrap();
+        if !dir.path().join("CASE-PROBE").exists() {
+            std::fs::create_dir_all(dir.path().join(".NORA-STAGING/x")).unwrap();
+            std::fs::write(dir.path().join(".NORA-STAGING/x/f"), b"x").unwrap();
+            rows.push((".NORA-STAGING/x/", ".NORA-STAGING/x/f"));
+        }
+        for (prefix, key) in rows {
             let mut full = Vec::new();
             LocalStorage::list_files_sync(
                 &dir.path().to_path_buf(),

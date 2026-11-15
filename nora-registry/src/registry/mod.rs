@@ -5,6 +5,7 @@
 
 pub(crate) mod ansible;
 mod cargo_registry;
+pub(crate) mod composer;
 mod conan;
 pub(crate) mod cpan;
 pub(crate) mod deb;
@@ -31,6 +32,7 @@ pub use ansible::routes as ansible_routes;
 pub(crate) use cargo_registry::canonical_crate_name;
 pub use cargo_registry::rebuild_crate_name_records as rebuild_cargo_name_records;
 pub use cargo_registry::routes as cargo_routes;
+pub use composer::routes as composer_routes;
 pub use conan::routes as conan_routes;
 pub use cpan::routes as cpan_routes;
 pub use deb::routes as deb_routes;
@@ -48,8 +50,17 @@ pub use npm::routes as npm_routes;
 pub(crate) use maven::storage_key as maven_storage_key;
 pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
+pub(crate) use nuget::{
+    imported_package as nuget_imported_package, package_key as nuget_package_key,
+    ImportedPackageError as NugetImportedPackageError,
+};
 pub use pub_dart::routes as pub_dart_routes;
 pub use pypi::routes as pypi_routes;
+pub(crate) use pypi::{
+    claim_imported_project as pypi_claim_imported_project, own_file_key as pypi_own_file_key,
+    record_own_file as pypi_record_own_file, record_stored_file as pypi_record_stored_file,
+    storage_key as pypi_storage_key, OWN_PREFIX as PYPI_OWN_PREFIX,
+};
 // Retention retires a PyPI file's hash markers together with the file.
 pub(crate) use pypi::HASH_MARKER_PREFIX as PYPI_HASH_MARKER_PREFIX;
 pub use raw::routes as raw_routes;
@@ -134,32 +145,35 @@ pub(crate) async fn read_json_sidecars<T: serde::de::DeserializeOwned>(
         .await
 }
 
-/// Read every key under `prefix` concurrently, returning the pairs that came back.
+/// Read every key under `prefix` concurrently, returning each key and its bytes.
 ///
-/// [`read_json_sidecars`] drops the key and fails the whole batch on the first bad
-/// entry, which suits an index rebuild that parses records. A packument rebuild needs
-/// neither: the key *is* the version, and one unreadable version must not turn a
-/// partial packument into no packument — the sequential loop this replaces skipped
-/// such a key and carried on. Same concurrency, same reason: on an object store each
-/// read is a network round-trip, and a package with a few thousand versions paid them
-/// one at a time.
+/// [`read_json_sidecars`] drops the key and parses each record; a packument rebuild keeps the
+/// key, which *is* the version or the tag. A key that cannot be read fails the whole read with
+/// that key and its error — leaving it out would assemble a document without it, and a tag left
+/// out of a packument moves `latest` — while a key gone since the listing is passed over. Same
+/// concurrency, same reason: on an object store each read is a network round-trip, and a package
+/// with a few thousand versions paid them one at a time.
 pub(crate) async fn read_keyed_blobs(
     storage: &crate::storage::Storage,
     prefix: &str,
-) -> Vec<(String, axum::body::Bytes)> {
-    use futures::StreamExt;
-    let Ok(keys) = storage.list(prefix).await else {
-        return Vec::new();
-    };
-    futures::stream::iter(keys)
+) -> Result<Vec<(String, axum::body::Bytes)>, (String, crate::storage::StorageError)> {
+    use futures::TryStreamExt;
+    let keys = storage
+        .list(prefix)
+        .await
+        .map_err(|e| (prefix.to_string(), e))?;
+    let read: Vec<Option<(String, axum::body::Bytes)>> = futures::stream::iter(keys)
         .map(|key| async move {
-            let data = storage.get(&key).await.ok()?;
-            Some((key, data))
+            match storage.get(&key).await {
+                Ok(data) => Ok(Some((key, data))),
+                Err(crate::storage::StorageError::NotFound) => Ok(None),
+                Err(e) => Err((key, e)),
+            }
         })
         .buffer_unordered(SIDECAR_READ_CONCURRENCY)
-        .filter_map(|pair| async move { pair })
-        .collect()
-        .await
+        .try_collect()
+        .await?;
+    Ok(read.into_iter().flatten().collect())
 }
 
 /// 409 for a write against a pull-through repo (rpm/deb `proxies` entry) —
@@ -173,26 +187,7 @@ pub(crate) fn proxied_repo_conflict() -> Response {
         .into_response()
 }
 
-/// Replace `from`→`to` in raw JSON text, matching BOTH the plain form and the
-/// JSON slash-escaped form (`\/`) of `from`.
-///
-/// Raw-text registry rewrites (ansible, nuget) `.replace()` on the unparsed
-/// upstream response. A valid JSON escaping that many origins emit —
-/// `"https:\/\/host\/path"` — dodges a plain `https://host/path` needle, so the
-/// upstream URL survives the rewrite and leaks the host once the client's JSON
-/// parser unescapes `\/`→`/` (#385, class of #377/#379/#380/#381). Handling the
-/// `\/` form here closes that. NB: `\uXXXX`-escaped separators are a documented
-/// residual — see `rewrite-drops-upstream-host` — caught by the runtime
-/// `UPSTREAM_URL_LEAK_TOTAL` detector, not by this string pass.
-pub(crate) fn replace_url_escape_aware(text: &str, from: &str, to: &str) -> String {
-    let plain = text.replace(from, to);
-    let esc_from = from.replace('/', "\\/");
-    if !plain.contains(&esc_from) {
-        return plain;
-    }
-    let esc_to = to.replace('/', "\\/");
-    plain.replace(&esc_from, &esc_to)
-}
+pub(crate) use nora_registry::upstream_url::ends as upstream_url_ends;
 
 /// Build NORA base URL from config (for URL rewriting).
 ///
@@ -209,6 +204,15 @@ pub(crate) enum ProxyError {
     Upstream(u16),
     Network(String),
     CircuitOpen(String),
+    /// The upstream answered and would not let NORA in: it refused the credential configured
+    /// for it, or asked for one and none is configured (#1196). Alive, not down.
+    CredentialsRefused,
+    /// The upstream answered 429, or is still inside the window of an earlier 429: alive, said
+    /// nothing about the artifact, and may be asked again in `retry_after` seconds (#1191).
+    RateLimited {
+        key: String,
+        retry_after: u64,
+    },
 }
 
 /// The `Authorization` value for an upstream request, built before the breaker is
@@ -230,11 +234,22 @@ fn upstream_auth_header(
 /// the retry, unreachable, breaker open) it is a gateway failure: a client that records a
 /// 404 as "this artifact does not exist" (Maven) must not learn that from an outage.
 /// One upstream answering "not found" decides 404 while another failed, as a group
-/// repository skips a member that is down; with no upstream configured it is 404.
+/// repository skips a member that is down; with no upstream configured it is 404. An upstream
+/// that refused NORA's credentials did not say "not found" either: it fails the miss like an
+/// outage, and the answer says which it was (#1196). An upstream skipped for its open breaker
+/// was not asked: with no answer from another upstream the miss is the 503 an open breaker is,
+/// with `Retry-After` (#1198). An upstream that rate-limited NORA may have the artifact and can
+/// be asked again soon: that decides the miss over every other answer, as a 429 with the
+/// shortest `Retry-After` among them, since clients retry a 429 and not a 5xx (#1191).
 #[derive(Debug, Default)]
 pub(crate) struct UpstreamMiss {
     not_found: bool,
     failed: bool,
+    refused: bool,
+    /// The breaker key of the first upstream skipped for its open breaker.
+    open: Option<String>,
+    /// The rate-limited upstream that may be asked again soonest: its key and seconds to wait.
+    limited: Option<(String, u64)>,
 }
 
 impl UpstreamMiss {
@@ -246,15 +261,25 @@ impl UpstreamMiss {
     }
 
     /// Record one upstream's answer. Any 4xx is an answer, even where a fetch reports it as
-    /// `Upstream(4xx)` rather than `NotFound` (Docker manifests); 5xx, network errors and an
-    /// open breaker are failures.
+    /// `Upstream(4xx)` rather than `NotFound` (Docker manifests); 5xx and network errors are
+    /// failures; a refused credential and an open breaker are kinds of their own.
     pub(crate) fn record(&mut self, e: &ProxyError) {
         match e {
             ProxyError::NotFound => self.not_found = true,
             ProxyError::Upstream(code) if (400..500).contains(code) => self.not_found = true,
-            ProxyError::Upstream(_) | ProxyError::Network(_) | ProxyError::CircuitOpen(_) => {
-                self.failed = true
+            ProxyError::Upstream(_) | ProxyError::Network(_) => self.failed = true,
+            ProxyError::CredentialsRefused => self.refused = true,
+            ProxyError::CircuitOpen(key) => {
+                self.open.get_or_insert_with(|| key.clone());
             }
+            ProxyError::RateLimited { key, retry_after } => self.limit(key, *retry_after),
+        }
+    }
+
+    /// Keep the rate-limited upstream that may be asked again soonest.
+    fn limit(&mut self, key: &str, retry_after: u64) {
+        if self.limited.as_ref().is_none_or(|(_, s)| retry_after < *s) {
+            self.limited = Some((key.to_string(), retry_after));
         }
     }
 
@@ -267,30 +292,187 @@ impl UpstreamMiss {
     /// asks it for `alpine` and `library/alpine`): it said "not found" only if it failed
     /// under none of them, since a 4xx for one name says nothing about the other.
     pub(crate) fn record_upstream(&mut self, asked: &UpstreamMiss) {
-        if asked.failed {
-            self.failed = true;
-        } else if asked.not_found {
+        // A rate limit under one name is no "not found" for the other either (#1191).
+        if let Some((key, retry_after)) = &asked.limited {
+            self.limit(key, *retry_after);
+        }
+        if asked.failed || asked.refused || asked.open.is_some() {
+            self.failed |= asked.failed;
+            self.refused |= asked.refused;
+            if self.open.is_none() {
+                self.open.clone_from(&asked.open);
+            }
+        } else if asked.not_found && asked.limited.is_none() {
             self.not_found = true;
         }
     }
 
-    /// The status for the miss: 502 when upstreams were asked and every one failed.
+    /// The status for the miss: 429 when an upstream rate-limited NORA; otherwise 404 when an
+    /// upstream said "not found" or none was asked; otherwise 503 when one was skipped for its
+    /// open breaker, 502 when every one failed or refused NORA's credentials.
     pub(crate) fn status(&self) -> StatusCode {
-        if self.failed && !self.not_found {
+        if self.limited.is_some() {
+            StatusCode::TOO_MANY_REQUESTS
+        } else if self.not_found {
+            StatusCode::NOT_FOUND
+        } else if self.open.is_some() {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else if self.failed || self.refused {
             StatusCode::BAD_GATEWAY
         } else {
             StatusCode::NOT_FOUND
         }
     }
 
+    /// The breaker key of the first upstream skipped for its open breaker, when that made the
+    /// miss a 503.
+    pub(crate) fn open_key(&self) -> Option<&str> {
+        self.open
+            .as_deref()
+            .filter(|_| self.status() == StatusCode::SERVICE_UNAVAILABLE)
+    }
+
+    /// Whether the miss is a 502 at least one of whose upstreams refused NORA's credentials.
+    pub(crate) fn credentials_refused(&self) -> bool {
+        self.refused && self.status() == StatusCode::BAD_GATEWAY
+    }
+
+    /// The rate-limited upstream that made the miss a 429, and the seconds to wait for it.
+    pub(crate) fn rate_limited(&self) -> Option<(&str, u64)> {
+        self.limited
+            .as_ref()
+            .filter(|_| self.status() == StatusCode::TOO_MANY_REQUESTS)
+            .map(|(key, secs)| (key.as_str(), *secs))
+    }
+
     /// The response for the miss, logging a gateway failure for the operator.
     pub(crate) fn response(&self, registry: &str, path: &str) -> Response {
+        if let Some((key, secs)) = self.rate_limited() {
+            tracing::warn!(
+                registry,
+                path,
+                upstream = key,
+                retry_after = secs,
+                "an upstream rate-limited NORA and none served the request, returning 429"
+            );
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                [(header::RETRY_AFTER, secs.to_string())],
+                format!("upstream {key} is rate-limiting NORA, retry after {secs} seconds"),
+            )
+                .into_response();
+        }
         let status = self.status();
-        if status == StatusCode::BAD_GATEWAY {
+        if let (StatusCode::SERVICE_UNAVAILABLE, Some(key)) = (status, &self.open) {
+            tracing::warn!(
+                registry,
+                path,
+                "no upstream answered and one was skipped for its open circuit breaker, returning 503"
+            );
+            return circuit_open_response(key);
+        }
+        if self.credentials_refused() {
+            tracing::warn!(
+                registry,
+                path,
+                "an upstream refused NORA's credentials and none answered, returning 502"
+            );
+        } else if status == StatusCode::BAD_GATEWAY {
             tracing::warn!(registry, path, "every upstream failed, returning 502");
         }
         status.into_response()
     }
+}
+
+/// A read of a stored copy split into what it found and why it failed: `(Some, None)` the copy,
+/// `(None, None)` nothing stored there, `(None, Some)` the store failed and says nothing either
+/// way. A cache read may treat the last two alike; a package served only from local copies may
+/// not (see [`local_copy_unreadable`]).
+pub(crate) fn cached_read<T>(
+    read: Result<T, crate::storage::StorageError>,
+) -> (Option<T>, Option<crate::storage::StorageError>) {
+    match read {
+        Ok(found) => (Some(found), None),
+        Err(crate::storage::StorageError::NotFound) => (None, None),
+        Err(e) => (None, Some(e)),
+    }
+}
+
+/// What the `.sha256` sidecar written beside a cached copy says of the copy's bytes.
+pub(crate) enum Sidecar {
+    /// It names these bytes, or none was written (a copy cached before sidecars were, or whose
+    /// sidecar write failed): nothing contradicts the copy.
+    Holds,
+    /// It names other bytes: the copy is not the one cached.
+    Differs { expected: String, computed: String },
+    /// The store could not read it: the copy cannot be checked, and is not served unchecked. A
+    /// copy NORA owns is unavailable; a proxied one is fetched again, as on a cache miss.
+    Unreadable(crate::storage::StorageError),
+}
+
+/// Check the cached copy `data` of `key` against the `.sha256` sidecar written beside it.
+pub(crate) async fn check_sidecar(storage: &crate::Storage, key: &str, data: &[u8]) -> Sidecar {
+    use sha2::Digest;
+    match storage.get(&format!("{key}.sha256")).await {
+        Ok(stored) => {
+            let computed = hex::encode(sha2::Sha256::digest(data));
+            let expected = String::from_utf8_lossy(&stored).into_owned();
+            if computed == expected {
+                Sidecar::Holds
+            } else {
+                Sidecar::Differs { expected, computed }
+            }
+        }
+        Err(crate::storage::StorageError::NotFound) => Sidecar::Holds,
+        Err(e) => Sidecar::Unreadable(e),
+    }
+}
+
+/// Whether anything reads the release date of a proxied download of `rt`: the running curation's
+/// release-age rule (global or `rt`'s own), or the quarantine of `rt` when upstream dates are
+/// trusted — only a trusted date seeds its first-seen. A format asks an upstream for a date only
+/// when this holds.
+pub(crate) fn release_date_read(state: &AppState, rt: crate::registry_type::RegistryType) -> bool {
+    state.curation().curation_engine.reads_release_date(rt)
+        || (state.config.server.trust_upstream_dates
+            && state.config.quarantine_mode_for(rt)
+                != crate::digest_quarantine::QuarantineMode::Off)
+}
+
+/// 503 for a package served only from local copies (one in an internal namespace) whose copy the
+/// store could not be asked about. The package is unavailable, not absent: a 403 or a 404 here
+/// sends a client with several feeds to look for the name in the next one.
+pub(crate) fn storage_unavailable(registry: &str, key: &str) -> Response {
+    tracing::warn!(
+        registry,
+        key,
+        "storage cannot be read for a package served only from local copies, returning 503"
+    );
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("retry-after", "30")],
+        "storage temporarily unavailable",
+    )
+        .into_response()
+}
+
+/// The answer for a package served only from local copies when the store failed to read its copy
+/// at `key`: 500 for a copy that failed its integrity check, else [`storage_unavailable`].
+pub(crate) fn local_copy_unreadable(
+    registry: &str,
+    key: &str,
+    error: &crate::storage::StorageError,
+) -> Response {
+    if matches!(error, crate::storage::StorageError::IntegrityViolation) {
+        tracing::error!(registry, key, "stored copy failed its integrity check");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "stored copy failed its integrity check",
+        )
+            .into_response();
+    }
+    tracing::warn!(registry, key, error = %error, "storage read failed");
+    storage_unavailable(registry, key)
 }
 
 /// 503 response for circuit breaker open state with Retry-After header.
@@ -319,7 +501,51 @@ fn policy_block_reason(headers: &reqwest::header::HeaderMap) -> Option<&'static 
     Some(if is_geo { "geo" } else { "waf" })
 }
 
-/// Core fetch logic with retry. Callers provide a response extractor.
+/// Where a redirect the client handed back unfollowed points, resolved against the URL that
+/// answered: `None` for one pointing nowhere readable.
+fn unfollowed_redirect(response: &reqwest::Response) -> Option<reqwest::Url> {
+    response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| response.url().join(v).ok())
+}
+
+/// What one request of a redirect chain NORA walks itself gave, with a client that follows no
+/// redirect (`build_no_redirect_client`).
+#[derive(Debug)]
+pub(crate) enum Hopped {
+    /// The body.
+    Body(Vec<u8>),
+    /// A redirect, to this URL, not followed: the caller decides on the next hop.
+    Redirect(reqwest::Url),
+}
+
+/// [`proxy_fetch`] of one URL of a redirect chain: a redirect the client hands back is the
+/// answer, [`Hopped::Redirect`].
+pub(crate) async fn proxy_fetch_hop(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<Hopped, ProxyError> {
+    proxy_fetch_core_with(
+        client,
+        url,
+        timeout,
+        auth,
+        None,
+        (
+            |r: reqwest::Response| async { r.bytes().await.map(|b| Hopped::Body(b.to_vec())) },
+            |r: &reqwest::Response| unfollowed_redirect(r).map(Hopped::Redirect),
+        ),
+        (cb, scope.into()),
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn proxy_fetch_core<T, F, Fut>(
     client: &reqwest::Client,
@@ -335,8 +561,36 @@ where
     F: Fn(reqwest::Response) -> Fut + Copy,
     Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
 {
+    proxy_fetch_core_with(
+        client,
+        url,
+        timeout,
+        auth,
+        extra_headers,
+        (extract, |_: &reqwest::Response| None),
+        (cb, scope.into()),
+    )
+    .await
+}
+
+/// [`proxy_fetch_core`] reading a response with `(extract, redirected)`: a redirect handed back
+/// unfollowed is answered by `redirected` when it makes something of it, else an `Upstream`
+/// error of its status.
+async fn proxy_fetch_core_with<T, F, Fut, R>(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    extra_headers: Option<(&str, &str)>,
+    (extract, redirected): (F, R),
+    (cb, scope): (&CircuitBreakerRegistry, BreakerScope<'_>),
+) -> Result<T, ProxyError>
+where
+    F: Fn(reqwest::Response) -> Fut + Copy,
+    Fut: std::future::Future<Output = Result<T, reqwest::Error>>,
+    R: Fn(&reqwest::Response) -> Option<T>,
+{
     let auth_header = upstream_auth_header(auth)?;
-    let scope = scope.into();
     let registry_str = scope.registry().as_str();
     let cb_key = scope.key();
     let probe = cb.check(&cb_key)?;
@@ -371,6 +625,15 @@ where
                     return result;
                 }
                 let status = response.status().as_u16();
+                if response.status().is_redirection() {
+                    UPSTREAM_REQUEST_DURATION
+                        .with_label_values(&[registry_str, "3xx"])
+                        .observe(elapsed);
+                    // The upstream answered, and pointed elsewhere: not asked again, and alive
+                    // to the breaker. What follows is the caller's.
+                    cb.record_alive(&cb_key, probe);
+                    return redirected(&response).ok_or(ProxyError::Upstream(status));
+                }
                 if (400..500).contains(&status) {
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "4xx"])
@@ -478,6 +741,30 @@ pub(crate) async fn proxy_fetch_text(
         scope,
     )
     .await
+}
+
+/// The upstream URL is `{upstream}/{path}`: a control byte, `?` or `#` in the path ends that
+/// URL, and the upstream fetches another file. So a proxied path holds only the bytes of its
+/// format, checked before the upstream is asked. Both formats admit ASCII letters, digits, `.` and
+/// `/`, and the bytes their check lists beside them.
+fn path_bytes_within(path: &str, extra: &[u8]) -> bool {
+    path.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'/' || extra.contains(&b))
+}
+
+/// A proxied Debian path. dpkg's version grammar (`Dpkg/Version.pm`: `[-+:.0-9a-zA-Z~]`) admits
+/// `- + : . ~` and alphanumerics; package names add `+`, and `_` separates the fields of a pool
+/// file name. `^` is not a Debian version byte and stays refused.
+pub(crate) fn deb_upstream_path_ok(path: &str) -> bool {
+    path_bytes_within(path, b"-_+~:")
+}
+
+/// A proxied RPM path. The rpm library's version and release check (`rpm-0.25.1` `src/rpm/util.rs`,
+/// `validate_version`) admits alphanumerics and `._+%{}~^`. `^` is the RPM snapshot operator, which
+/// the URL parser keeps, so it is admitted here. `%` and `{}` are not: a `%` past the edge check is
+/// refused anyway, and `{}` are spec-macro bytes that no lead or measurement asked for.
+pub(crate) fn rpm_upstream_path_ok(path: &str) -> bool {
+    path_bytes_within(path, b"-_+~:^")
 }
 
 /// One pull-through download for a per-repo proxied rpm/deb repository.
@@ -955,8 +1242,52 @@ pub(crate) async fn proxy_fetch_conditional(
     cb: &CircuitBreakerRegistry,
     scope: impl Into<BreakerScope<'_>>,
 ) -> Result<Revalidation, ProxyError> {
+    conditional_fetch(
+        client,
+        url,
+        (timeout, auth, validators),
+        (cb, scope.into()),
+        false,
+    )
+    .await
+}
+
+/// [`proxy_fetch_conditional`] keeping what a 4xx other than "not found" says: a 401 or 403 is
+/// the upstream refusing NORA's credential, or asking for one (`CredentialsRefused`, #1196); a
+/// 429 is a rate limit (`RateLimited`, #1191), recorded so the upstream is not asked again
+/// before its `Retry-After`, and an upstream still inside such a window is not asked at all.
+/// For a format whose callers tell those apart from a missing document.
+pub(crate) async fn proxy_fetch_conditional_refusals(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    validators: &Validators,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+) -> Result<Revalidation, ProxyError> {
+    conditional_fetch(
+        client,
+        url,
+        (timeout, auth, validators),
+        (cb, scope.into()),
+        true,
+    )
+    .await
+}
+
+async fn conditional_fetch(
+    client: &reqwest::Client,
+    url: &str,
+    (timeout, auth, validators): (Duration, Option<UpstreamAuth<'_>>, &Validators),
+    (cb, scope): (&CircuitBreakerRegistry, BreakerScope<'_>),
+    refusals: bool,
+) -> Result<Revalidation, ProxyError> {
     let auth_header = upstream_auth_header(auth)?;
-    let cb_key = scope.into().key();
+    let cb_key = scope.key();
+    if refusals {
+        cb.rate_limits().check(&cb_key)?;
+    }
     let probe = cb.check(&cb_key)?;
 
     let mut request = client.get(url).timeout(timeout);
@@ -1005,7 +1336,25 @@ pub(crate) async fn proxy_fetch_conditional(
                 // 4xx — upstream alive; recover the breaker without clearing a
                 // real failure tally, consistent with proxy_fetch_core (#606).
                 cb.record_alive(&cb_key, probe);
+                if refusals {
+                    match code {
+                        401 | 403 => return Err(ProxyError::CredentialsRefused),
+                        429 => {
+                            let retry_after = response.headers().get(header::RETRY_AFTER);
+                            return Err(cb
+                                .rate_limits()
+                                .limited(&cb_key, retry_after.map(|v| v.as_bytes())));
+                        }
+                        _ => {}
+                    }
+                }
                 return Err(ProxyError::NotFound);
+            }
+            if status.is_redirection() {
+                // A redirect the client did not follow (off the upstream's origin): the
+                // upstream answered, as in proxy_fetch_core.
+                cb.record_alive(&cb_key, probe);
+                return Err(ProxyError::Upstream(code));
             }
             cb.record_failure(&cb_key, probe);
             Err(ProxyError::Upstream(code))
@@ -1045,7 +1394,7 @@ mod tests {
         assert_eq!(miss(&[ProxyError::Upstream(399)]), StatusCode::BAD_GATEWAY);
         assert_eq!(miss(&[down()]), StatusCode::BAD_GATEWAY);
         assert_eq!(miss(&[unreachable()]), StatusCode::BAD_GATEWAY);
-        assert_eq!(miss(&[open()]), StatusCode::BAD_GATEWAY);
+        assert_eq!(miss(&[open()]), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(miss(&[down(), unreachable()]), StatusCode::BAD_GATEWAY);
         assert_eq!(miss(&[down(), ProxyError::NotFound]), StatusCode::NOT_FOUND);
         assert_eq!(miss(&[ProxyError::NotFound, down()]), StatusCode::NOT_FOUND);
@@ -1079,6 +1428,203 @@ mod tests {
             folded(&[hub, asked(&[ProxyError::NotFound])]),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// An upstream that answered 429 with `retry_after` seconds.
+    fn limited_for(retry_after: u64) -> ProxyError {
+        ProxyError::RateLimited {
+            key: format!("docker:http://limited-{retry_after}"),
+            retry_after,
+        }
+    }
+
+    /// #1191: an upstream that rate-limited NORA said nothing about the artifact: alone it is a
+    /// 429, never 404, and an upstream asked under two names that answered 404 to one and 429
+    /// to the other did not say "not found" either. A real 404 stays 404.
+    #[test]
+    fn an_upstream_rate_limit_is_not_a_missing_artifact() {
+        use axum::http::StatusCode;
+        assert_eq!(
+            UpstreamMiss::of(&limited_for(7)).status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            UpstreamMiss::of(&ProxyError::Upstream(404)).status(),
+            StatusCode::NOT_FOUND
+        );
+
+        let mut hub = UpstreamMiss::default();
+        hub.record(&ProxyError::Upstream(404));
+        hub.record(&limited_for(7));
+        let mut folded = UpstreamMiss::default();
+        folded.record_upstream(&hub);
+        assert_eq!(folded.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    /// #1191: a rate limit decides the miss over every other answer — "not found" (the
+    /// artifact may be on the limited upstream), a refused credential, an open breaker, a
+    /// failure — as a 429 with the shortest wait among the limited upstreams, folded or not.
+    /// Clients retry a 429 and not a 5xx (measured), and the limited upstream is the only one
+    /// whose answer can change soon.
+    #[test]
+    fn a_rate_limit_decides_the_miss() {
+        use axum::http::StatusCode;
+        let asked = |answers: &[ProxyError]| {
+            let mut m = UpstreamMiss::default();
+            for a in answers {
+                m.record(a);
+            }
+            m
+        };
+        let limited = || limited_for(7);
+        let down = || ProxyError::Upstream(503);
+        let open = || ProxyError::CircuitOpen("docker:http://open".into());
+        let refused = || ProxyError::CredentialsRefused;
+        let missing = || ProxyError::NotFound;
+        let too_many = StatusCode::TOO_MANY_REQUESTS;
+        #[rustfmt::skip]
+        let rows: &[(&[&[ProxyError]], StatusCode, Option<u64>)] = &[
+            // per upstream, the answers under each name; status; Retry-After
+            (&[&[limited()]],                        too_many, Some(7)),
+            (&[&[missing()], &[limited()]],          too_many, Some(7)),
+            (&[&[limited()], &[missing()]],          too_many, Some(7)),
+            (&[&[missing(), limited()]],             too_many, Some(7)),
+            (&[&[refused()], &[limited()]],          too_many, Some(7)),
+            (&[&[open()], &[limited()]],             too_many, Some(7)),
+            (&[&[down()], &[limited()]],             too_many, Some(7)),
+            (&[&[limited_for(30)], &[limited_for(5)]], too_many, Some(5)),
+            (&[&[limited_for(5)], &[limited_for(30)]], too_many, Some(5)),
+            // without a rate limit, nothing changes
+            (&[&[missing()], &[down()]],             StatusCode::NOT_FOUND, None),
+            (&[&[refused()]],                        StatusCode::BAD_GATEWAY, None),
+            (&[&[open()]],                           StatusCode::SERVICE_UNAVAILABLE, None),
+        ];
+        for (upstreams, status, wait) in rows {
+            let mut miss = UpstreamMiss::default();
+            for names in upstreams.iter() {
+                miss.record_upstream(&asked(names));
+            }
+            assert_eq!(miss.status(), *status, "{upstreams:?}");
+            assert_eq!(miss.rate_limited().map(|(_, s)| s), *wait, "{upstreams:?}");
+            let response = miss.response("docker", "myorg/app:1");
+            assert_eq!(response.status(), *status, "{upstreams:?}");
+            if let Some(wait) = wait {
+                let header = response.headers().get(header::RETRY_AFTER);
+                assert_eq!(
+                    header.and_then(|v| v.to_str().ok()),
+                    Some(wait.to_string().as_str()),
+                    "{upstreams:?}"
+                );
+            }
+        }
+    }
+
+    /// #1196: an upstream that refused NORA's credentials did not say "not found": alone it is
+    /// a 502 that says so; another upstream's "not found" still decides 404, as for an outage.
+    #[test]
+    fn a_refused_credential_fails_the_miss_and_is_named() {
+        use axum::http::StatusCode;
+        let asked = |answers: &[ProxyError]| {
+            let mut m = UpstreamMiss::default();
+            for a in answers {
+                m.record(a);
+            }
+            m
+        };
+        let folded = |upstreams: &[UpstreamMiss]| {
+            let mut m = UpstreamMiss::default();
+            for u in upstreams {
+                m.record_upstream(u);
+            }
+            m
+        };
+        let refused = || ProxyError::CredentialsRefused;
+        let down = || ProxyError::Upstream(503);
+        #[rustfmt::skip]
+        let rows: &[(&[&[ProxyError]], StatusCode, bool)] = &[
+            // per upstream, the answers under each name it was asked; status; named refused
+            (&[&[refused()]],                                StatusCode::BAD_GATEWAY, true),
+            (&[&[refused(), refused()]],                     StatusCode::BAD_GATEWAY, true),
+            // one upstream, two names (library/): refused under one is not "not found"
+            (&[&[ProxyError::NotFound, refused()]],          StatusCode::BAD_GATEWAY, true),
+            (&[&[refused(), ProxyError::NotFound]],          StatusCode::BAD_GATEWAY, true),
+            // the chain: another upstream's "not found" decides
+            (&[&[refused()], &[ProxyError::NotFound]],       StatusCode::NOT_FOUND,   false),
+            (&[&[ProxyError::Upstream(404)], &[refused()]],  StatusCode::NOT_FOUND,   false),
+            // refused and down: a 502 that names the refusal
+            (&[&[refused()], &[down()]],                     StatusCode::BAD_GATEWAY, true),
+            (&[&[down()], &[refused()]],                     StatusCode::BAD_GATEWAY, true),
+            // no refusal: as before
+            (&[&[down()]],                                   StatusCode::BAD_GATEWAY, false),
+            (&[],                                            StatusCode::NOT_FOUND,   false),
+        ];
+        for (upstreams, status, named) in rows {
+            let each: Vec<UpstreamMiss> = upstreams.iter().map(|a| asked(a)).collect();
+            let miss = folded(&each);
+            assert_eq!(miss.status(), *status, "{upstreams:?}");
+            assert_eq!(miss.credentials_refused(), *named, "{upstreams:?}");
+        }
+    }
+
+    /// #1198: an upstream skipped for its open breaker was not asked. An answer from another
+    /// upstream still decides 404; otherwise the miss is the 503 an open breaker always was,
+    /// naming the first skipped upstream, even beside upstreams that failed.
+    #[tokio::test]
+    async fn an_open_breaker_is_503_unless_an_upstream_answered() {
+        use axum::http::StatusCode;
+        let asked = |answers: &[ProxyError]| {
+            let mut m = UpstreamMiss::default();
+            for a in answers {
+                m.record(a);
+            }
+            m
+        };
+        let open = |key: &str| ProxyError::CircuitOpen(key.into());
+        let down = || ProxyError::Upstream(503);
+        let refused = || ProxyError::CredentialsRefused;
+        let a = "docker:https://a.example";
+        let b = "docker:https://b.example";
+        #[rustfmt::skip]
+        let rows: &[(&[&[ProxyError]], StatusCode, Option<&str>)] = &[
+            // per upstream, the answers under each name it was asked; status; key in the body
+            (&[&[open(a)]],                                StatusCode::SERVICE_UNAVAILABLE, Some(a)),
+            (&[&[open(a), open(a)]],                       StatusCode::SERVICE_UNAVAILABLE, Some(a)),
+            (&[&[open(a)], &[open(b)]],                    StatusCode::SERVICE_UNAVAILABLE, Some(a)),
+            (&[&[open(a)], &[down()]],                     StatusCode::SERVICE_UNAVAILABLE, Some(a)),
+            (&[&[down()], &[open(b)]],                     StatusCode::SERVICE_UNAVAILABLE, Some(b)),
+            (&[&[open(a)], &[refused()]],                  StatusCode::SERVICE_UNAVAILABLE, Some(a)),
+            (&[&[open(a)], &[ProxyError::NotFound]],       StatusCode::NOT_FOUND,           None),
+            (&[&[ProxyError::Upstream(400)], &[open(b)]],  StatusCode::NOT_FOUND,           None),
+            // one upstream, two names (library/): open under one is not "not found"
+            (&[&[ProxyError::NotFound, open(a)]],          StatusCode::SERVICE_UNAVAILABLE, Some(a)),
+            // no open breaker: as before
+            (&[&[down()], &[down()]],                      StatusCode::BAD_GATEWAY,         None),
+        ];
+        for (upstreams, status, key) in rows {
+            let mut miss = UpstreamMiss::default();
+            for u in upstreams.iter().map(|a| asked(a)) {
+                miss.record_upstream(&u);
+            }
+            assert_eq!(miss.status(), *status, "{upstreams:?}");
+            assert!(!miss.credentials_refused(), "{upstreams:?}");
+            let response = miss.response("docker", "x");
+            assert_eq!(response.status(), *status, "{upstreams:?}");
+            if let Some(key) = key {
+                assert_eq!(
+                    response.headers().get("retry-after").map(|v| v.as_bytes()),
+                    Some(b"30".as_slice()),
+                    "{upstreams:?}"
+                );
+                let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    body.as_ref(),
+                    format!("upstream {key} temporarily unavailable").as_bytes(),
+                    "{upstreams:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -1693,6 +2239,12 @@ mod first_download_integrity {
     #[tokio::test]
     async fn npm() {
         let s = upstream().await;
+        crate::registry::npm::mount_listing(
+            &s,
+            "corp-lib",
+            &[("1.0.0", "corp-lib/-/corp-lib-1.0.0.tgz")],
+        )
+        .await;
         let uri = "/npm/corp-lib/-/corp-lib-1.0.0.tgz";
         refused(&s, "npm", "corp-lib", "1.0.0", uri, |c, u| {
             c.npm.proxy = Some(u);
@@ -1810,6 +2362,7 @@ mod first_download_integrity {
                     auth: None,
                     namespace: None,
                     prefix: None,
+                    namespaces: Vec::new(),
                 }];
             },
         )
@@ -1904,6 +2457,7 @@ mod first_download_integrity {
                     auth: None,
                     namespace: None,
                     prefix: None,
+                    namespaces: Vec::new(),
                 }];
             },
         )
@@ -2354,12 +2908,22 @@ mod proxy_off_means_off {
         Seeded,
     }
 
+    /// Every option that has a format ask an upstream for more than the request itself: trusted
+    /// dates, and a release-age rule and the quarantine that read them — both only observing, so
+    /// the answer stays the stored copy or 404.
+    fn read_dates(c: &mut Config) {
+        c.server.trust_upstream_dates = true;
+        c.curation.mode = crate::config::CurationMode::Audit;
+        c.curation.min_release_age = Some("1h".to_string());
+        c.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+    }
+
     /// Every route of a format with its upstream switched off, over an empty store and over one
     /// holding stale copies and the upstream addresses an earlier configuration stored: no request
     /// leaves NORA, whatever host a handler meant to ask (the client goes through a recording proxy
-    /// without idle connections, so each request is seen), and the answer is the stored copy (200)
-    /// or 404. The control, per address: with the public default upstream on and nothing stored,
-    /// every address not marked local reaches the upstream.
+    /// without idle connections, so each request is seen) — a date for a release included — and
+    /// the answer is the stored copy (200) or 404. The control, per address: with the public
+    /// default upstream on and nothing stored, every address not marked local reaches the upstream.
     async fn no_egress(
         format: &str,
         uris: &[(&str, Reach)],
@@ -2370,8 +2934,10 @@ mod proxy_off_means_off {
         for mode in [Mode::Off, Mode::Blank, Mode::On] {
             let upstream_on = mode == Mode::On;
             let recorder = EgressRecorder::start().await;
-            let ctx =
-                create_test_context_with_egress_proxy(&recorder.url, move |c| configure(c, mode));
+            let ctx = create_test_context_with_egress_proxy(&recorder.url, move |c| {
+                configure(c, mode);
+                read_dates(c);
+            });
             for seeded in [false, true] {
                 if seeded {
                     for (key, body) in seeds {
@@ -2860,6 +3426,7 @@ mod pypi_credential_host {
 mod upstream_failure_matrix {
     #![allow(clippy::unwrap_used)]
 
+    use crate::circuit_breaker::upstream_key;
     use crate::config::{Config, DockerUpstream, MavenProxyEntry};
     use crate::test_helpers::{create_test_context_with_config, send};
     use axum::body::Body;
@@ -2876,18 +3443,42 @@ mod upstream_failure_matrix {
         Refused,
         /// Answers after the 1 s proxy timeout every case configures.
         Timeout,
+        /// Its breaker is open, so it is skipped; it would serve the artifact if it were asked.
+        Open,
     }
 
-    /// The status a cold miss must get from upstreams answering in `shapes`.
-    fn expected(shapes: &[Shape]) -> StatusCode {
+    /// The status a cold miss must get from upstreams answering in `shapes`: an answer decides
+    /// 404, else a skipped upstream 503 (#1198), else 502.
+    fn expected(shapes: &[Shape], format: &Format) -> StatusCode {
+        let open = shapes.iter().any(|s| matches!(s, Shape::Open));
         if shapes
             .iter()
             .any(|s| matches!(s, Shape::Status(code) if (400..500).contains(code)))
         {
-            StatusCode::NOT_FOUND
+            if open {
+                format.open_beside_an_answer
+            } else {
+                StatusCode::NOT_FOUND
+            }
+        } else if open {
+            StatusCode::SERVICE_UNAVAILABLE
         } else {
             StatusCode::BAD_GATEWAY
         }
+    }
+
+    /// A format as the matrix drives it.
+    struct Format {
+        /// Points the format at the upstream URLs, in order, with a 1 s proxy timeout.
+        configure: fn(&mut Config, Vec<String>),
+        /// The breaker the upstream at a URL reports to; `None` for a path that asks its upstream
+        /// without one (the open cases do not run).
+        key: Option<fn(&str) -> String>,
+        /// Whether it takes several upstreams (the mixed cases run).
+        several: bool,
+        /// A miss with an open breaker beside an upstream that answered 4xx. PyPI keeps the
+        /// 503 it gave before the group rule (pypi.rs, #663).
+        open_beside_an_answer: StatusCode,
     }
 
     /// An upstream answering in `shape`; the server is returned so it lives as long as the case.
@@ -2896,10 +3487,17 @@ mod upstream_failure_matrix {
             Shape::Refused => return ("http://127.0.0.1:9".to_string(), None),
             Shape::Status(code) => ResponseTemplate::new(code),
             Shape::Timeout => ResponseTemplate::new(200).set_delay(Duration::from_secs(5)),
+            Shape::Open => ResponseTemplate::new(200),
         };
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(template)
+            // A skipped upstream is never asked; the server checks it when the case drops it.
+            .expect(if matches!(shape, Shape::Open) {
+                0..1
+            } else {
+                0..u64::MAX
+            })
             .mount(&server)
             .await;
         (server.uri(), Some(server))
@@ -2911,6 +3509,7 @@ mod upstream_failure_matrix {
         &[Shape::Timeout],
         &[Shape::Status(400)],
         &[Shape::Status(404)],
+        &[Shape::Open],
     ];
 
     const MIXED: &[&[Shape]] = &[
@@ -2920,15 +3519,23 @@ mod upstream_failure_matrix {
         &[Shape::Status(400), Shape::Refused],
         &[Shape::Status(503), Shape::Refused],
         &[Shape::Refused, Shape::Timeout],
+        &[Shape::Open, Shape::Status(404)],
+        &[Shape::Status(404), Shape::Open],
+        &[Shape::Open, Shape::Status(400)],
+        &[Shape::Open, Shape::Status(503)],
+        &[Shape::Refused, Shape::Open],
+        &[Shape::Timeout, Shape::Open],
+        &[Shape::Open, Shape::Open],
     ];
 
-    /// Runs every case for one path; `configure` points the format at the upstream URLs (in
-    /// order) with a 1 s proxy timeout. One test per path, so the timed-out cases run side by side.
-    async fn run(path: &str, configure: fn(&mut Config, Vec<String>), several: bool) {
+    /// Runs every case for one path. One test per path, so the timed-out cases run side by side.
+    async fn run(path: &str, format: &Format) {
         let mut cases: Vec<&[Shape]> = ALONE.to_vec();
-        if several {
+        if format.several {
             cases.extend_from_slice(MIXED);
         }
+        let key = format.key;
+        cases.retain(|shapes| key.is_some() || !shapes.iter().any(|s| matches!(s, Shape::Open)));
         for shapes in cases {
             let mut urls = Vec::new();
             let mut servers = Vec::new();
@@ -2937,9 +3544,25 @@ mod upstream_failure_matrix {
                 urls.push(url);
                 servers.push(server);
             }
-            let ctx = create_test_context_with_config(move |cfg| configure(cfg, urls));
+            let open: Vec<String> = shapes
+                .iter()
+                .zip(&urls)
+                .filter(|(s, _)| matches!(s, Shape::Open))
+                .filter_map(|(_, url)| key.map(|key| key(url)))
+                .collect();
+            let (configure, on) = (format.configure, !open.is_empty());
+            let ctx = create_test_context_with_config(move |cfg| {
+                configure(cfg, urls);
+                // On only where a breaker is open, with a threshold no failure here can reach.
+                cfg.circuit_breaker.enabled = on;
+                cfg.circuit_breaker.failure_threshold = 1000;
+                cfg.circuit_breaker.reset_timeout = 3600;
+            });
+            for key in &open {
+                ctx.state.circuit_breaker.open_for_test(key);
+            }
             let resp = send(&ctx.app, Method::GET, path, Body::empty()).await;
-            assert_eq!(resp.status(), expected(shapes), "{path} {shapes:?}");
+            assert_eq!(resp.status(), expected(shapes, format), "{path} {shapes:?}");
             drop(servers);
         }
     }
@@ -2957,6 +3580,7 @@ mod upstream_failure_matrix {
                 auth: None,
                 namespace: None,
                 prefix: None,
+                namespaces: Vec::new(),
             })
             .collect();
         cfg.docker.proxy_timeout = 1;
@@ -2979,68 +3603,109 @@ mod upstream_failure_matrix {
         cfg.terraform.proxy_timeout = 1;
     }
 
+    fn maven_key(url: &str) -> String {
+        upstream_key("maven", url)
+    }
+
+    fn docker_key(url: &str) -> String {
+        upstream_key("docker", url)
+    }
+
+    fn pypi_key(url: &str) -> String {
+        upstream_key("pypi", url)
+    }
+
+    const MAVEN: Format = Format {
+        configure: maven,
+        key: Some(maven_key),
+        several: true,
+        open_beside_an_answer: StatusCode::NOT_FOUND,
+    };
+
+    const DOCKER: Format = Format {
+        configure: docker,
+        key: Some(docker_key),
+        several: true,
+        open_beside_an_answer: StatusCode::NOT_FOUND,
+    };
+
+    const CARGO: Format = Format {
+        configure: cargo,
+        key: Some(|_| "cargo".to_string()),
+        several: false,
+        open_beside_an_answer: StatusCode::NOT_FOUND,
+    };
+
+    const PYPI: Format = Format {
+        configure: pypi,
+        key: Some(pypi_key),
+        several: true,
+        open_beside_an_answer: StatusCode::SERVICE_UNAVAILABLE,
+    };
+
+    const TERRAFORM: Format = Format {
+        configure: terraform,
+        key: Some(|_| "terraform".to_string()),
+        several: false,
+        open_beside_an_answer: StatusCode::NOT_FOUND,
+    };
+
     #[tokio::test]
     async fn maven_artifact() {
-        run("/maven2/com/example/lib/1.0.0/lib-1.0.0.jar", maven, true).await;
+        run("/maven2/com/example/lib/1.0.0/lib-1.0.0.jar", &MAVEN).await;
     }
 
     #[tokio::test]
     async fn maven_metadata() {
-        run("/maven2/com/example/lib/maven-metadata.xml", maven, true).await;
+        run("/maven2/com/example/lib/maven-metadata.xml", &MAVEN).await;
     }
 
     #[tokio::test]
     async fn maven_metadata_checksum() {
-        run(
-            "/maven2/com/example/lib/maven-metadata.xml.sha1",
-            maven,
-            true,
-        )
-        .await;
+        run("/maven2/com/example/lib/maven-metadata.xml.sha1", &MAVEN).await;
     }
 
     #[tokio::test]
     async fn docker_manifest() {
-        run("/v2/myorg/app/manifests/1.0", docker, true).await;
+        run("/v2/myorg/app/manifests/1.0", &DOCKER).await;
     }
 
     #[tokio::test]
     async fn docker_blob() {
         let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
-        run(&format!("/v2/myorg/app/blobs/{blob}"), docker, true).await;
+        run(&format!("/v2/myorg/app/blobs/{blob}"), &DOCKER).await;
     }
 
     #[tokio::test]
     async fn cargo_sparse_index() {
-        run("/cargo/index/se/rd/serde", cargo, false).await;
+        run("/cargo/index/se/rd/serde", &CARGO).await;
     }
 
     #[tokio::test]
     async fn cargo_crate_metadata() {
-        run("/cargo/api/v1/crates/serde", cargo, false).await;
+        run("/cargo/api/v1/crates/serde", &CARGO).await;
     }
 
     #[tokio::test]
     async fn cargo_crate_download() {
-        run("/cargo/api/v1/crates/serde/1.0.0/download", cargo, false).await;
+        run("/cargo/api/v1/crates/serde/1.0.0/download", &CARGO).await;
     }
 
     #[tokio::test]
     async fn pypi_simple_index() {
-        run("/simple/flask/", pypi, true).await;
+        run("/simple/flask/", &PYPI).await;
     }
 
     #[tokio::test]
     async fn pypi_file() {
-        run("/simple/flask/flask-2.0.tar.gz", pypi, true).await;
+        run("/simple/flask/flask-2.0.tar.gz", &PYPI).await;
     }
 
     #[tokio::test]
     async fn terraform_module_download() {
         run(
             "/terraform/v1/modules/hashicorp/consul/aws/0.1.0/download",
-            terraform,
-            false,
+            &TERRAFORM,
         )
         .await;
     }
@@ -3050,6 +3715,206 @@ mod upstream_failure_matrix {
 /// and rules are looked up by that label, so a handler passing another registry's would
 /// apply another registry's settings (#1098). In the code of `registry/<format>.rs`
 /// (before its test module) the only `RegistryType::` variant is its own.
+#[cfg(test)]
+mod release_date_read {
+    use crate::config::{Config, CurationMode};
+    use crate::digest_quarantine::QuarantineMode;
+    use crate::registry_type::RegistryType;
+    use crate::test_helpers::{create_test_context_with_config, reload_curation, reload_file};
+
+    /// Apply `set` to every registry.
+    fn each_section(c: &mut Config, set: fn(&mut Config, RegistryType)) {
+        for &rt in RegistryType::all() {
+            set(c, rt);
+        }
+    }
+
+    /// A release-age rule of `rt`'s own, when it has a section.
+    fn rule(c: &mut Config, rt: RegistryType) {
+        if let Some(own) = c.curation.registry_override_mut(rt) {
+            own.min_release_age = Some("1h".to_string());
+        }
+    }
+
+    /// A quarantine of `rt`'s own, when it has a section.
+    fn quarantine(c: &mut Config, rt: RegistryType) {
+        if let Some(own) = c.curation.registry_override_mut(rt) {
+            own.quarantine = Some(QuarantineMode::Enforce);
+        }
+    }
+
+    /// The quarantine a reloaded release-age rule needs on a proxy, else the reload is refused.
+    /// A reload does not install it, and without trusted dates it reads no date.
+    fn observe(c: &mut Config) {
+        c.curation.quarantine = Some(QuarantineMode::Observe);
+    }
+
+    /// Whether a download's release date is read, for every registry: by a release-age rule
+    /// while curation is on, or, with trusted dates only, by the quarantine the registry is held
+    /// to.
+    #[tokio::test]
+    async fn a_date_is_read_by_a_running_release_age_rule_or_a_trusting_quarantine() {
+        type Setup = fn(&mut Config);
+        // (row, trusted dates, the configuration NORA starts with) -> read for a registry with a
+        // section of its own / for one without (Raw, Hugging Face)
+        let rows: [(&str, bool, Setup, bool, bool); 9] = [
+            ("nothing", true, |_| {}, false, false),
+            (
+                "global rule",
+                false,
+                |c| c.curation.min_release_age = Some("1h".into()),
+                true,
+                true,
+            ),
+            ("own rule", false, |c| each_section(c, rule), true, false),
+            (
+                "own rule, curation off",
+                false,
+                |c| {
+                    c.curation.mode = CurationMode::Off;
+                    each_section(c, rule);
+                },
+                false,
+                false,
+            ),
+            (
+                "trusted, global quarantine",
+                true,
+                |c| c.curation.quarantine = Some(QuarantineMode::Observe),
+                true,
+                false,
+            ),
+            (
+                "trusted, own quarantine",
+                true,
+                |c| each_section(c, quarantine),
+                true,
+                false,
+            ),
+            (
+                "trusted, own quarantine off",
+                true,
+                |c| {
+                    c.curation.quarantine = Some(QuarantineMode::Enforce);
+                    each_section(c, |c, rt| {
+                        if let Some(own) = c.curation.registry_override_mut(rt) {
+                            own.quarantine = Some(QuarantineMode::Off);
+                        }
+                    });
+                },
+                false,
+                false,
+            ),
+            (
+                "untrusted, global quarantine",
+                false,
+                |c| c.curation.quarantine = Some(QuarantineMode::Enforce),
+                false,
+                false,
+            ),
+            (
+                "untrusted, own quarantine",
+                false,
+                |c| each_section(c, quarantine),
+                false,
+                false,
+            ),
+        ];
+        for (row, trust, start) in rows.iter().map(|r| (r.0, r.1, r.2)) {
+            let ctx = create_test_context_with_config(move |c| {
+                c.server.trust_upstream_dates = trust;
+                c.curation.mode = CurationMode::Enforce;
+                start(c);
+            });
+            let (_, _, _, with_section, without_section) =
+                *rows.iter().find(|r| r.0 == row).unwrap();
+            for &rt in RegistryType::all() {
+                let want = match ctx.state.config.curation.registry_override(rt) {
+                    Some(_) => with_section,
+                    None => without_section,
+                };
+                assert_eq!(
+                    super::release_date_read(&ctx.state, rt),
+                    want,
+                    "{rt}: {row}"
+                );
+            }
+        }
+    }
+
+    /// A release-age rule a reload brings in is read from then on: a global one by every
+    /// registry, a registry's own by that registry alone. The server refuses a reload whose
+    /// own rule cannot apply — rpm and deb downloads are not checked by name or date, cpan's
+    /// carry none — and the running engine stays.
+    #[tokio::test]
+    async fn a_release_age_rule_a_reload_brings_in_is_read() {
+        let start = || {
+            create_test_context_with_config(|c| {
+                // Untrusted: the quarantine reads no date, the rules alone do.
+                c.server.trust_upstream_dates = false;
+                c.curation.mode = CurationMode::Enforce;
+                observe(c);
+            })
+        };
+        let ctx = start();
+        reload_curation(&ctx, |c| c.curation.min_release_age = Some("1h".into()));
+        for &rt in RegistryType::all() {
+            assert!(
+                super::release_date_read(&ctx.state, rt),
+                "{rt}: global rule"
+            );
+        }
+        let refused = [RegistryType::Rpm, RegistryType::Deb, RegistryType::Cpan];
+        for &target in RegistryType::all() {
+            let ctx = start();
+            if ctx
+                .state
+                .config
+                .curation
+                .registry_override(target)
+                .is_none()
+            {
+                continue;
+            }
+            let (_dir, file) = reload_file(&ctx, move |c| rule(c, target));
+            let reloaded = {
+                let _lock = crate::test_env::env_lock();
+                let held = crate::HeldQuarantine::of(&ctx.state.config.curation);
+                crate::reload_curation(&ctx.state.reloadable, &held, Some(file))
+            };
+            assert_eq!(
+                reloaded.is_err(),
+                refused.contains(&target),
+                "{target}: {reloaded:?}"
+            );
+            for &rt in RegistryType::all() {
+                assert_eq!(
+                    super::release_date_read(&ctx.state, rt),
+                    rt == target && reloaded.is_ok(),
+                    "{rt}: {target}'s own rule"
+                );
+            }
+        }
+    }
+
+    /// Another registry's rule or quarantine reads no date of the registries that ask for one.
+    #[tokio::test]
+    async fn another_registry_s_policy_reads_no_date() {
+        for target in [RegistryType::Nuget, RegistryType::PyPI] {
+            let ctx = create_test_context_with_config(move |c| {
+                c.server.trust_upstream_dates = true;
+                c.curation.mode = CurationMode::Enforce;
+                each_section(c, rule);
+                each_section(c, quarantine);
+                let own = c.curation.registry_override_mut(target).unwrap();
+                own.min_release_age = None;
+                own.quarantine = None;
+            });
+            assert!(!super::release_date_read(&ctx.state, target), "{target}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod curation_label_whitelist {
     use crate::registry_type::RegistryType;
@@ -3065,6 +3930,11 @@ mod curation_label_whitelist {
             "cargo_registry.rs",
             RegistryType::Cargo,
             include_str!("cargo_registry.rs"),
+        ),
+        (
+            "composer.rs",
+            RegistryType::Composer,
+            include_str!("composer.rs"),
         ),
         ("conan.rs", RegistryType::Conan, include_str!("conan.rs")),
         ("cpan.rs", RegistryType::Cpan, include_str!("cpan.rs")),

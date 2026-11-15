@@ -139,6 +139,7 @@ mod repo_proxy_tests {
 
 mod ansible;
 mod cargo;
+mod composer;
 mod conan;
 mod cpan;
 mod deb;
@@ -157,12 +158,18 @@ mod terraform;
 
 pub use self::ansible::AnsibleConfig;
 pub use self::cargo::CargoConfig;
+#[allow(unused_imports)]
+pub use self::composer::{ComposerConfig, ComposerProxy, ComposerProxyEntry};
 pub use self::conan::ConanConfig;
 pub use self::cpan::CpanConfig;
 pub use self::deb::DebConfig;
 // Re-export all Docker types including extract_docker_namespace (public API surface)
+pub(in crate::config) use self::docker::RESERVED_DOCKER_SEGMENTS;
 #[allow(unused_imports)]
-pub use self::docker::{extract_docker_namespace, DefaultAction, DockerConfig, DockerUpstream};
+pub use self::docker::{
+    extract_docker_namespace, is_docker_hub_host, DefaultAction, DockerConfig, DockerUpstream,
+    QUALIFIED_PUSH_ROOT,
+};
 pub use self::gems::GemsConfig;
 pub use self::go::GoConfig;
 pub use self::hf::HfConfig;

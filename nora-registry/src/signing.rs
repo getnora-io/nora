@@ -15,6 +15,12 @@
 //! the configured path, so a restart keeps the same identity. Key material
 //! never passes through config or env; only a filesystem path does.
 //!
+//! A key loaded from that path must be Ed25519 too (either OpenPGP
+//! encoding). Any other algorithm is refused at load: RSA, ECDSA and Ed448
+//! secret arithmetic runs through crates that are not constant-time
+//! (`rsa`, `crypto-bigint` 0.5), and the timing of every index signature
+//! would be observable to whoever requests it.
+//!
 //! The key is SINGLE-WRITER: it lives on the local filesystem even when
 //! artifacts live in an object store. Running multiple replicas requires
 //! the same key bytes at `signing.key_path` on every replica — provision
@@ -28,7 +34,7 @@ use pgp::composed::{
     SecretKeyParamsBuilder, SignedSecretKey,
 };
 use pgp::crypto::hash::HashAlgorithm;
-use pgp::types::{KeyDetails, Password};
+use pgp::types::{EddsaLegacyPublicParams, KeyDetails, Password, PublicParams};
 use std::io::Cursor;
 use std::path::Path;
 use zeroize::Zeroizing;
@@ -50,17 +56,15 @@ impl RepoSigner {
     /// first boot. Fail-closed: any error other than "file absent" is
     /// returned, never papered over with a fresh key — silently rotating
     /// the key would invalidate every client's pinned public key.
-    pub fn load_or_generate(path: &Path) -> Result<Self, String> {
+    pub fn load_or_generate(path: &Path) -> Result<Self, KeyLoadError> {
         let mut generated = false;
         let key = match std::fs::read_to_string(path).map(Zeroizing::new) {
             Ok(armored) => {
-                let (key, _) = SignedSecretKey::from_armor_single(Cursor::new(armored.as_str()))
-                    .map_err(|e| format!("parse signing key {}: {e}", path.display()))?;
-                key
+                parse_key(&armored).map_err(|e| KeyLoadError::Refused(e.describe(path)))?
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let key = generate_key()?;
-                match persist_key(&key, path)? {
+                let key = generate_key().map_err(KeyLoadError::Io)?;
+                match persist_key(&key, path).map_err(KeyLoadError::Io)? {
                     Persisted::Written => {
                         tracing::info!(path = %path.display(), "generated new repository signing key");
                         generated = true;
@@ -72,24 +76,27 @@ impl RepoSigner {
                     Persisted::LostRace => {
                         let armored =
                             Zeroizing::new(std::fs::read_to_string(path).map_err(|e| {
-                                format!("re-read signing key {}: {e}", path.display())
+                                KeyLoadError::Io(format!(
+                                    "re-read signing key {}: {e}",
+                                    path.display()
+                                ))
                             })?);
-                        let (key, _) =
-                            SignedSecretKey::from_armor_single(Cursor::new(armored.as_str()))
-                                .map_err(|e| {
-                                    format!("parse signing key {}: {e}", path.display())
-                                })?;
-                        key
+                        parse_key(&armored).map_err(|e| KeyLoadError::Refused(e.describe(path)))?
                     }
                 }
             }
-            Err(e) => return Err(format!("read signing key {}: {e}", path.display())),
+            Err(e) => {
+                return Err(KeyLoadError::Io(format!(
+                    "read signing key {}: {e}",
+                    path.display()
+                )))
+            }
         };
 
         let public = key
             .to_public_key()
             .to_armored_string(ArmorOptions::default())
-            .map_err(|e| format!("armor public key: {e}"))?;
+            .map_err(|e| KeyLoadError::Io(format!("armor public key: {e}")))?;
         let fingerprint = key.fingerprint().to_string();
         Ok(Self {
             key,
@@ -133,6 +140,70 @@ impl RepoSigner {
     pub fn fingerprint(&self) -> &str {
         &self.fingerprint
     }
+}
+
+/// Why [`RepoSigner::load_or_generate`] gave no signer.
+#[derive(Debug)]
+pub enum KeyLoadError {
+    /// The key file holds no key NORA signs with — it does not parse, or its
+    /// primary key is not Ed25519. A configuration NORA cannot start with:
+    /// the same file is refused on every restart.
+    Refused(String),
+    /// The key could not be read, generated or written; a restart may find
+    /// the path in place (a volume mounted late).
+    Io(String),
+}
+
+impl std::fmt::Display for KeyLoadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(e) | Self::Io(e) => f.write_str(e),
+        }
+    }
+}
+
+/// Parse an armored signing key and refuse it unless it signs with Ed25519.
+/// Both load paths (an existing file, a lost first-boot race) go through
+/// here, so no key reaches [`RepoSigner`] without this check.
+fn parse_key(armored: &str) -> Result<SignedSecretKey, KeyRefusal> {
+    let (key, _) =
+        SignedSecretKey::from_armor_single(Cursor::new(armored)).map_err(KeyRefusal::Unparsable)?;
+    // Signatures are made with the primary key (`&*self.key`), so the
+    // primary key is the one that has to be Ed25519.
+    if !signs_with_ed25519(key.public_params()) {
+        return Err(KeyRefusal::NotEd25519(key.algorithm()));
+    }
+    Ok(key)
+}
+
+/// Why a signing key file is not used.
+enum KeyRefusal {
+    Unparsable(pgp::errors::Error),
+    NotEd25519(pgp::crypto::public_key::PublicKeyAlgorithm),
+}
+
+impl KeyRefusal {
+    fn describe(&self, path: &Path) -> String {
+        match self {
+            Self::Unparsable(e) => format!("parse signing key {}: {e}", path.display()),
+            Self::NotEd25519(algorithm) => format!(
+                "signing key {}: {algorithm:?} keys are not accepted, NORA signs with Ed25519 \
+                 only (remove the file to let NORA generate one, or provision an Ed25519 key)",
+                path.display()
+            ),
+        }
+    }
+}
+
+/// The one rule for which keys NORA signs with: Ed25519, in its v4 legacy
+/// encoding (what NORA generates) or the RFC 9580 one. Both run on
+/// `ed25519-dalek`.
+fn signs_with_ed25519(params: &PublicParams) -> bool {
+    matches!(
+        params,
+        PublicParams::EdDSALegacy(EddsaLegacyPublicParams::Ed25519 { .. })
+            | PublicParams::Ed25519(_)
+    )
 }
 
 fn generate_key() -> Result<SignedSecretKey, String> {
@@ -266,9 +337,75 @@ mod tests {
         let path = dir.path().join("nora.key");
         std::fs::write(&path, "not a pgp key").unwrap();
         let err = RepoSigner::load_or_generate(&path).err().unwrap();
-        assert!(err.contains("parse signing key"), "{err}");
+        assert!(matches!(err, KeyLoadError::Refused(_)), "{err}");
+        assert!(err.to_string().contains("parse signing key"), "{err}");
         // The corrupt file must not be overwritten with a fresh key.
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "not a pgp key");
+    }
+
+    fn key_of(key_type: KeyType) -> SignedSecretKey {
+        SecretKeyParamsBuilder::default()
+            .key_type(key_type)
+            .can_sign(true)
+            .primary_user_id(USER_ID.into())
+            .build()
+            .unwrap()
+            .generate(rand::thread_rng())
+            .unwrap()
+    }
+
+    #[test]
+    fn a_loaded_key_is_used_only_when_it_signs_with_ed25519() {
+        use pgp::crypto::ecc_curve::ECCCurve;
+        let table = [
+            (KeyType::Ed25519Legacy, true),
+            (KeyType::Ed25519, true),
+            (KeyType::Rsa(2048), false),
+            (KeyType::ECDSA(ECCCurve::P256), false),
+            (KeyType::ECDSA(ECCCurve::P384), false),
+            (KeyType::ECDSA(ECCCurve::P521), false),
+            (KeyType::ECDSA(ECCCurve::Secp256k1), false),
+            (KeyType::Ed448, false),
+        ];
+        for (key_type, accepted) in table {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("nora.key");
+            let armored = key_of(key_type.clone())
+                .to_armored_string(ArmorOptions::default())
+                .unwrap();
+            std::fs::write(&path, &armored).unwrap();
+
+            match RepoSigner::load_or_generate(&path) {
+                Ok(signer) => {
+                    assert!(accepted, "{key_type:?} key was loaded");
+                    assert!(!signer.was_generated(), "{key_type:?}");
+                    signer.clearsign("Origin: NORA\n").unwrap();
+                    signer.sign_detached(b"repomd").unwrap();
+                }
+                Err(e) => {
+                    assert!(!accepted, "{key_type:?} key was refused: {e}");
+                    assert!(matches!(e, KeyLoadError::Refused(_)), "{key_type:?}: {e}");
+                    assert!(e.to_string().contains("Ed25519 only"), "{key_type:?}: {e}");
+                }
+            }
+            // Refused or not, the operator's file is never replaced.
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                armored,
+                "{key_type:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_legacy_eddsa_key_on_another_curve_is_not_ed25519() {
+        // pgp parses such a key but cannot generate one, so the load table
+        // above cannot carry it: the rule has to refuse it by the curve.
+        let params = PublicParams::EdDSALegacy(EddsaLegacyPublicParams::Unsupported {
+            curve: pgp::crypto::ecc_curve::ECCCurve::P256,
+            opaque: Default::default(),
+        });
+        assert!(!signs_with_ed25519(&params));
     }
 
     #[test]

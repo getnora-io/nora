@@ -4,6 +4,35 @@ This document describes which parts of each registry protocol are implemented in
 
 **Legend:** Full = complete implementation, Partial = basic support with limitations, Stub = placeholder, — = not implemented
 
+## Support matrix
+
+Which formats NORA proxies and hosts, the upstream each proxies by default, and what to know about each. The sections below describe the protocol coverage per format.
+
+| Format | Pull (proxy/cache) | Push/Publish | Default Upstream | Notes |
+|--------|:---:|:---:|---|---|
+| Docker Registry v2 | ✅ | ✅ | `registry-1.docker.io` | hosted + proxy; cache on when `docker.upstreams` non-empty (Docker Hub by default) |
+| Maven | ✅ | ✅ | `repo1.maven.org/maven2` | hosted + proxy |
+| npm | ✅ | ✅ | `registry.npmjs.org` | hosted + proxy |
+| Cargo | ✅ | ✅ | `crates.io` (sparse index) | hosted + proxy (sparse index) |
+| PyPI | ✅ | ✅ | `pypi.org/simple/` | hosted + proxy |
+| Go Modules | ✅ | — | `proxy.golang.org` | proxy only (modules immutable, push not in protocol) |
+| Raw files | ❌ | ✅ | — (no upstream) | hosted only; conditional `PUT`/`GET` (ETag, `If-Match`, `If-None-Match`) on every backend; upload verification via `Repr-Digest` (RFC 9530) |
+| RubyGems | ✅ | ❌ | `rubygems.org` | proxy only — `gem push` not implemented |
+| Terraform | ✅ | — | `registry.terraform.io` | proxy only; client configuration notes in COMPAT.md |
+| Ansible Galaxy | ✅ | ❌ | `galaxy.ansible.com` | proxy only — `ansible-galaxy collection publish` not implemented |
+| NuGet | ✅ | ❌ | `api.nuget.org` | proxy only — `dotnet nuget push` not implemented |
+| Pub (Dart/Flutter) | ✅ | ❌ | `pub.dev` | proxy only — `dart pub publish` not implemented |
+| CPAN | ✅ | — | `www.cpan.org` | proxy only |
+| Composer (PHP) | ✅ | ✅ | `repo.packagist.org` | hosted + proxy; Composer 2 only; off by default (`NORA_COMPOSER_ENABLED=true`, included in `all`); `composer audit` forwarded to the upstream |
+| Conan (C/C++) | ✅ | ❌ | `center2.conan.io` | proxy only (Conan 2 clients) |
+| RPM (yum/dnf) | ⚠️ | ✅ | — (none by default) | hosted; pull-through via `[rpm.proxies]` / `NORA_RPM_PROXIES` (off by default); auto-generates `repodata/` |
+| Debian/APT | ⚠️ | ✅ | — (none by default) | hosted; pull-through via `[deb.proxies]` / `NORA_DEB_PROXIES` (off by default); flat & structured layouts; auto-generates `Packages`/`Release`/`InRelease` |
+| Hugging Face Hub | ✅ | — | `huggingface.co` | opt-in (`NORA_HF_ENABLED=true`, not in `all`); public models; files cached by digest, checked on the way in; never Xet; datasets not served — see COMPAT.md |
+
+> **Helm charts** work via the Docker/OCI endpoint — `helm push`/`pull` with `--plain-http` or behind TLS reverse proxy.
+
+> **Pull/Push legend:** ✅ supported · ⚠️ pull-through available but off by default (no default upstream) · ❌ not implemented · — not applicable (protocol has no push). Per-format details and cache strategy in [COMPAT.md](COMPAT.md).
+
 ## Docker (OCI Distribution Spec 1.1)
 
 | Endpoint | Method | Status | Notes |
@@ -24,6 +53,7 @@ This document describes which parts of each registry protocol are implemented in
 | Namespaced `{ns}/{name}` | * | Full | Two-level paths |
 | Deep paths `a/b/c/name` | * | — | Max 2-level (`org/image`) |
 | Token auth (Bearer) | — | Full | WWW-Authenticate challenge |
+| Token service `/api/docker/token` | GET, POST | Full | Under `docker_anon_pull`: the anonymous ping and every 401 on `/v2/` name it (Bearer). No credentials → a pull token; credentials as Basic or an OAuth2 `password` grant (containerd) → a token for that user and role; a wrong password → 401, so `docker login` checks it. Checked with docker 29, dockerd 27 as `registry-mirrors`, skopeo 1.4, podman 6.1 and containerd 1.7: login, push with credentials, anonymous pull, mirror pull. (#1226) |
 | Cross-repo blob mount | POST | — | Not implemented |
 | Referrers API | GET | — | OCI 1.1 referrers |
 
@@ -56,6 +86,8 @@ This document describes which parts of each registry protocol are implemented in
 | Package metadata (GET) | Full | JSON with all versions |
 | Scoped packages `@scope/name` | Full | URL-encoded path |
 | Tarball download | Full | SHA256 verified |
+| Tarball on another host (redirect) | Full | A tarball is fetched only for a version the upstream's packument lists (else 404, no tarball request). Redirects are followed to any http(s) host, at most 10 for the whole chain and within one `npm.proxy_timeout`; the upstream's credentials go only to its own origin, never past a hop that left it. An 11th redirect answers 502. Works with registries that serve tarballs from a storage host (GitHub Packages). |
+| Scoped upstream (`npm.proxies` with a scope) | Full | Metadata is read from the upstream's own origin only: a packument redirect to another origin answers 502. |
 | Tarball URL rewriting | Full | Points to NORA, not upstream |
 | Publish (`npm publish`) | Full | Immutable versions |
 | Unpublish | — | Immutable; use quarantine/blocklist to disable a version |
@@ -168,9 +200,9 @@ NORA serves both Terraform protocols against the same upstream: the **Registry P
 | Service discovery (`.well-known/terraform.json`) | Full | Registry protocol; points to NORA |
 | Provider versions list | Full | TTL-cached |
 | Provider download metadata | Full | `download_url` rewritten to NORA |
-| Provider binary download | Full | Immutable cache |
+| Provider binary download | Full | Immutable cache. Fetched from where the upstream's download metadata says, also when that metadata is not stored yet (cold cache, another replica): checked with terraform 1.16.5 for providers on GitHub releases (#1150) |
 | Module versions list | Full | TTL-cached |
-| Module download | Full | `X-Terraform-Get` header pass-through |
+| Module download | Full | `X-Terraform-Get` header pass-through; an archive source asked for before its address is stored is resolved from the upstream again (#1150) |
 | **Network mirror — `index.json`** | Full | Mirror protocol; list versions (#801) |
 | **Network mirror — `{version}.json`** | Full | Mirror protocol; archives via NORA + `zh:` hash (#801) |
 | Provider publish | — | Proxy-only (read) |
@@ -218,7 +250,8 @@ Caching proxy for api.nuget.org. Service index URLs are rewritten to point throu
 | `.nupkg` download | Full | Immutable cache |
 | `.nuspec` download | Full | Immutable cache |
 | Package push | — | Proxy-only (read) |
-| Search | — | Not implemented |
+| Search (`/v3/query`) | Full | Proxied to the upstream, local results from the cache when it is unreachable. Listed as `SearchQueryService`, `/3.0.0-beta` and `/3.0.0-rc`; checked with `dotnet package search` (SDK 10.0.404) (#1215). No `packageType` filter (`/3.5.0` not listed) |
+| Autocomplete (`/v3/autocomplete`) | Full | Listed as `SearchAutocompleteService`, `/3.0.0-beta` and `/3.0.0-rc` |
 
 Client: `dotnet nuget add source http://nora:4000/nuget/v3/index.json -n nora`
 
@@ -283,7 +316,7 @@ upstream's signatures) is served verbatim within `rpm.metadata_ttl` seconds
 | Package publish (`PUT {repo}/{name}.rpm`) | Full | Header parsed and validated; invalid RPMs rejected |
 | Package delete (`DELETE {repo}/{name}.rpm`) | Full | Repodata regenerated |
 | Package download | Full | Byte-identical, sha256 pkgid in repodata |
-| GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1`. Object-store backends (S3/GCS) require `signing.key_path` — without it signing is disabled with a startup warning |
+| GPG-signed repodata (`repomd.xml.asc`) | Full | Signed on every regeneration; verify with `repo_gpgcheck=1`. Object-store backends (S3/GCS) require `signing.key_path` — without it signing is disabled with a startup warning. A provisioned key must be Ed25519 (since 1.4.2); any other algorithm is a fatal startup error |
 | Public key (`repodata/repomd.xml.key`) | Full | Armored, for `gpgkey=`; key auto-generated at first boot |
 | Package signatures (`gpgcheck=1`) | — | Packages are stored as uploaded; NORA signs metadata, not packages |
 | Reconcile (`POST {repo}/-/reindex`) | Full | Heals out-of-band storage changes: drops orphan metadata, adopts added packages, rebuilds + re-signs repodata |
@@ -392,6 +425,116 @@ Client:
 ```bash
 cpanm --from http://nora:4000/cpan Module::Name
 ```
+
+## Composer (PHP)
+
+Hosted packages and a pull-through cache of Composer repositories (Packagist by default), for
+Composer 2. Off by default: `[composer] enabled = true` (`NORA_COMPOSER_ENABLED=true`, or
+`composer` in `NORA_REGISTRIES_ENABLE`); `NORA_REGISTRIES_ENABLE=all` includes it. The design is
+in [the Composer registry design](docs/design/2026-11-12-composer-registry-design.md).
+Measured with Composer 2.2.6 and 2.11.2 (`composer audit` with 2.11.2; 2.2.6 has no `audit`), on
+local storage and S3: install through the proxy with archives on another host, a second install
+from an empty client cache, a hosted upload and install, `audit` reporting a known advisory, and,
+under a minimum release age, a young release (one with only a git source included) not installed.
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Repository root (`/composer/packages.json`) | Full | Generated by NORA: `metadata-url` and the `security-advisories` `api-url` name NORA. With no upstream configured it also lists the hosted packages (`available-packages`) |
+| Package metadata (`p2/{vendor}/{package}.json`, `…~dev.json`) | Full | Tagged versions and branch versions in separate files, as Composer asks for them; `Last-Modified` and `ETag` describe the document NORA serves (dated no earlier than the configuration that shapes it, so a restart or a curation reload makes clients fetch it once more); a matching `If-Modified-Since` or `If-None-Match` answers 304; with several upstreams, a 404 only when every one said so (502 when one failed) |
+| Archive download (`dists/{vendor}/{package}/{version}/{reference}.{type}`) | Full | Hosted or cached; `Range` supported (206) |
+| Security advisories (`GET`/`POST /composer/api/security-advisories/`) | Full | `composer audit`: forwarded to the upstream's advisories API (Packagist: `packagist.org/api/security-advisories/`); a hosted or internal name is never forwarded; at most 1000 distinct names per query (413 above; Composer sends 500 at a time); an upstream whose `packages.json` cannot be read, or is not a repository root, answers 502, never an empty result, as does one that offers advisories in its metadata only (no `api-url`); a query looks up only the names it asks about, whatever the registry holds; anonymous-read eligible, as `npm audit` is |
+| Publish (`PUT /composer/packages/upload/{vendor}/{package}/{version}`) | Full | The zip is the request body; versions are immutable (409); a 201 means the version is listed — when the listing cannot be stored the upload fails (500) and can be retried; when the store cannot confirm whether it was stored, 503 and the version is kept (a retry may get 409) |
+| Branch (dev) versions on publish | — | Refused (400): upload a tagged release |
+| Delete or unpublish a version | — | Not implemented |
+| Composer 1 (`providers` API) | — | Composer 2 (`metadata-url`, `p2/`) only |
+| Search and package list endpoints | — | Not implemented |
+
+Client configuration (`composer.json`):
+
+```json
+{
+  "repositories": [
+    { "type": "composer", "url": "http://nora:4000/composer" },
+    { "packagist.org": false }
+  ]
+}
+```
+
+With authentication on: `composer config --global http-basic.nora.example <user> <token>` (the key
+is the repository's host). `"config": { "secure-http": false }` is for a plain-http test setup only.
+Publish:
+
+```bash
+curl -u user:token -X PUT --data-binary @pkg.zip \
+  https://nora.example/composer/packages/upload/acme/greeter/1.0.0
+```
+
+`composer.json` is read from the zip root or its single top-level directory, as Composer reads an
+archive; its `name` must be the path's `vendor/package`, and its `version`, when it has one, the
+path's version. `v1.0` and `1.0.0` are the same version. NORA computes the `dist.shasum` (sha1).
+A write is refused (403) outside the token's OIDC `namespace_scope`, checked on `vendor/package`.
+Zip64 archives are not accepted.
+
+Configuration, `[composer]` / `NORA_COMPOSER_*`:
+
+| Setting | Variable | Default | Notes |
+|---------|----------|---------|-------|
+| `enabled` | `NORA_COMPOSER_ENABLED` | `false` | Opt-in; `all` includes it |
+| `proxy` | `NORA_COMPOSER_PROXY` | `https://repo.packagist.org` | Upstream Composer repository; empty serves hosted packages only |
+| `proxy_auth` | `NORA_COMPOSER_PROXY_AUTH` | — | `user:pass`, HTTP Basic, sent only to that upstream's origin |
+| `proxies` | `NORA_COMPOSER_PROXIES` | — | Ordered upstreams, each a URL or `{ url, auth }` (variable: `url\|user:pass,url2`); the first that has a package serves it; replaces `proxy` |
+| `proxy_timeout` | `NORA_COMPOSER_PROXY_TIMEOUT` | `30` | Seconds |
+| `metadata_ttl` | `NORA_COMPOSER_METADATA_TTL` | `300` | Seconds a cached upstream document is served before it is revalidated |
+| `serve_stale` | `NORA_COMPOSER_SERVE_STALE` | `true` | Serve the cached document when the upstream fails |
+| `revalidate` | `NORA_COMPOSER_REVALIDATE` | `true` | Conditional requests (`ETag`, `Last-Modified`) for a stale document |
+| `github_token` | `NORA_COMPOSER_GITHUB_TOKEN` | — | See below |
+| `keep_source` | `NORA_COMPOSER_KEEP_SOURCE` | `true` | See below |
+
+### Proxy cache and freshness
+
+- NORA reads each upstream's `metadata-url` and advisories `api-url` from its `packages.json` (kept for
+  `metadata_ttl`); without a `metadata-url` it asks `{upstream}/p2/%package%.json`.
+- A package's `p2` document is cached as the upstream sent it and served with every `dist.url`
+  rewritten to NORA and `dist.mirrors` dropped; the minified (`composer/2.0`) form is kept.
+- An archive is fetched only from the URL the cached upstream metadata lists for that exact version
+  and reference, so NORA is not an open proxy. It is cached permanently with a `.sha256` sidecar.
+  The upstream's `dist.shasum` (sha1), when it gives one, is verified. Redirects are followed (at
+  most 10); credentials never cross origins. Digest quarantine applies.
+- Packagist points to archives on `api.github.com` (`…/zipball/…`), which allows an anonymous client
+  60 requests an hour. `github_token` is sent as a Bearer token to `https://api.github.com` only,
+  and never past a redirect off it.
+- Composer falls back to cloning a version's `source` when a `dist` download fails, a download
+  refused by curation included. With curation on, a proxied document lists only versions NORA serves
+  an archive of, and none with a `source`, whatever `keep_source` says: NORA is the only way to
+  install them. Without curation, `keep_source = false` lists a version NORA serves an archive of
+  without its `source`.
+- Storage: `composer/p2/{vendor}/{package}[~dev].json` (with `.meta` validators and `.origin`),
+  `composer/dists/{vendor}/{package}/{version}/{reference}.{type}` (with `.sha256`),
+  `composer/roots/{hash}.json`; uploaded packages under `composer/hosted/{vendor}/{package}/`
+  (`versions/{normalized}.json`, `dists/{normalized}.zip` with `.sha256`, `p2.json`).
+
+### Hosted packages and curation
+
+- A package with any uploaded version is served only from its uploaded versions, never merged with an
+  upstream's: a published name cannot be taken over by a package of the same name upstream.
+- Namespace isolation: a name under `curation.internal_namespaces` (such as `acme/*`) is never asked
+  of an upstream. What NORA cached of it before it became internal is still served from the cache;
+  without a cached copy it is refused (403).
+- Curation (`[curation.composer]`: `min_release_age`, `quarantine`, `quarantine_ttl`;
+  `NORA_CURATION_COMPOSER_*`) judges a package by `vendor/package`, compared in lower case:
+  blocklist and allowlist, minimum release age — from the version's `time` with
+  `server.trust_upstream_dates = true`, otherwise from when NORA first saw the version listed
+  (revalidating the metadata does not restart it) — and integrity pins.
+- The web UI lists the packages NORA holds an archive of and, per package, its versions with the
+  source of each (hosted or cached).
+
+**Limitations (this release):**
+- **Composer 1** (`providers`), **search** and package list endpoints are not served.
+- **No `nora mirror`, `nora import` or retention** for Composer.
+- **VCS sources**: only `dist` archives are served; a proxied version's `source` is listed as the
+  upstream gives it, unless `keep_source = false`; with curation on, never, and a version with no
+  archive NORA serves is not listed.
+- **Dev versions** cannot be uploaded; **versions cannot be deleted**.
 
 ## Hugging Face Hub
 

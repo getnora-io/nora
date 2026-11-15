@@ -7,8 +7,9 @@ db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = [
     # rsa crate Marvin Attack (timing sidechannel). No upstream fix.
     # jsonwebtoken uses rsa for JWK decoding; NORA only verifies signatures.
-    # Also transitive via pgp (rpgp): index signing is Ed25519-only, so no
-    # rsa private-key operation is ever performed there either.
+    # Also transitive via pgp (rpgp): index signing is Ed25519-only — an RSA
+    # key at signing.key_path is refused at load (signing.rs:signs_with_ed25519),
+    # so no rsa private-key operation is ever performed there either.
     "RUSTSEC-2023-0071",
     # quick-xml <0.41 DoS (quadratic-attr + NsReader memory-exhaustion).
     # Transitive via object_store (S3 XML parsing); no upstream fix yet
@@ -17,6 +18,15 @@ ignore = [
     # object_store ships quick-xml >=0.41. Tracking: #799
     "RUSTSEC-2026-0194",
     "RUSTSEC-2026-0195",
+    # crypto-bigint <0.7.6 timing variability in operations meant to be
+    # constant-time. Transitive via pgp (k256/p256/p384/p521/cx448) and
+    # jsonwebtoken (p256/p384); both pin elliptic-curve 0.13 -> crypto-bigint
+    # 0.5, no compatible fix. Not applicable: index signing is Ed25519-only
+    # (ed25519-dalek) — ECDSA/Ed448 keys at signing.key_path are refused at
+    # load (signing.rs:signs_with_ed25519) — and JWTs are only verified, so
+    # crypto-bigint never runs on a secret. Remove when pgp and jsonwebtoken
+    # move to crypto-bigint >=0.7.6.
+    "RUSTSEC-2026-0387",
 ]
 
 [licenses]

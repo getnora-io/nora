@@ -29,3 +29,16 @@ groups:
             the `integrity violation` error log, verify the on-disk bytes, then
             recover with `nora re-pin <key> --expected <sha256> --yes` (or
             restore from backup if the disk is genuinely corrupt).
+
+      - alert: NoraTaskPanic
+        # A long-lived background task panicked (supervise.rs); it was restarted, or, for
+        # task="audit", the process exited. `/health` names a task that keeps failing.
+        expr: increase(nora_task_panics_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A NORA background task panicked"
+          description: >-
+            Find `background task panicked` with the task name in the error log.
+            Any increase is a bug worth reporting.

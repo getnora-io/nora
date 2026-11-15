@@ -114,6 +114,12 @@ pub trait ProxyFilter: Send + Sync {
 
     /// Evaluate a request and return a decision.
     fn evaluate(&self, request: &FilterRequest) -> Decision;
+
+    /// Whether this filter's decision for `registry` turns on a download's release date
+    /// ([`FilterRequest::publish_date`]).
+    fn reads_release_date(&self, _registry: RegistryType) -> bool {
+        false
+    }
 }
 
 // ============================================================================
@@ -174,6 +180,18 @@ impl CurationEngine {
     /// Whether curation is active (not off).
     pub fn is_active(&self) -> bool {
         self.config.mode != CurationMode::Off
+    }
+
+    /// Whether a download's release date decides anything for `registry`: curation is on and a
+    /// filter of the chain reads the date — a release-age rule, global or the registry's own. A
+    /// reload installs a new engine with its own rules, so a format asks this, not the
+    /// configuration NORA started with.
+    pub fn reads_release_date(&self, registry: RegistryType) -> bool {
+        self.is_active()
+            && self
+                .filters
+                .iter()
+                .any(|filter| filter.reads_release_date(registry))
     }
 
     /// Whether curation reads a download's name: it is on (audit logs what it would refuse),
@@ -690,42 +708,8 @@ pub fn verify_integrity_by_hash(
 // Version parsers for filename-based registries (issue #187)
 // ============================================================================
 
-/// Parse version from an npm tarball filename.
-///
-/// For scoped packages `@scope/name`, the tarball is `name-VERSION.tgz` on npmjs and
-/// `@scope/name-VERSION.tgz` on GitLab's npm registry; both are accepted.
-/// For regular packages `name`, the tarball is `name-VERSION.tgz`.
-/// Font Awesome's registry puts the file under a version directory,
-/// `VERSION/name-VERSION.tgz`; it is accepted when the directory names the version
-/// the file does.
-///
-/// `None` makes the allowlist treat the request as metadata and let it through, so a
-/// form this parser misses is a curation bypass, not a cosmetic miss.
-pub fn parse_npm_tarball_version(package_name: &str, filename: &str) -> Option<String> {
-    if let Some(version) = parse_npm_tarball_file(package_name, filename) {
-        return Some(version);
-    }
-    let (dir, file) = filename.split_once('/')?;
-    parse_npm_tarball_file(package_name, file).filter(|version| version == dir)
-}
-
-fn parse_npm_tarball_file(package_name: &str, filename: &str) -> Option<String> {
-    let filename = filename.strip_suffix(".tgz")?;
-    // For scoped packages like @scope/name, the npmjs tarball uses just the "name" part
-    let name_part = if package_name.contains('/') {
-        package_name.rsplit('/').next()?
-    } else {
-        package_name
-    };
-    let version = filename
-        .strip_prefix(package_name)
-        .or_else(|| filename.strip_prefix(name_part))?
-        .strip_prefix('-')?;
-    if version.is_empty() {
-        return None;
-    }
-    Some(version.to_string())
-}
+/// The version an npm tarball file name gives ([`nora_registry::npm_links`]).
+pub use nora_registry::npm_links::parse_npm_tarball_version;
 
 /// A PEP 440 version as `packaging.version.Version` reads one (the spec's `VERSION_PATTERN`:
 /// case-insensitive, an optional leading `v`, surrounding whitespace allowed). Numbers are kept
@@ -1185,8 +1169,8 @@ pub fn pub_version_key(version: &str) -> Option<String> {
 /// parsed versions, so `1.0-1`, `1.0.post1` and `1.0.0.post1` are one version); NuGet's in
 /// NuGet's lowercase normal form (`13.0`, `13.0.0.0` and `13.0.0+build` are `13.0.0`); npm's as
 /// npm publishes them (`v1.3.0` is `1.3.0`); Go's as the go command reads them (`v1.2` is
-/// `v1.2.0`); pub's as pub.dev keeps them (`01.0.0` is `1.0.0`); every other registry's as
-/// written. A string the format would not parse compares as written (NuGet's in lowercase:
+/// `v1.2.0`); pub's as pub.dev keeps them (`01.0.0` is `1.0.0`); Composer's in its normal form
+/// (`v1.0` and `1.0.0.0` are one version); every other registry's as written. A string the format would not parse compares as written (NuGet's in lowercase:
 /// NuGet compares versions without case).
 pub fn curation_version(registry: RegistryType, version: &str) -> String {
     match registry {
@@ -1195,6 +1179,9 @@ pub fn curation_version(registry: RegistryType, version: &str) -> String {
         RegistryType::Npm => npm_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::Go => go_version_key(version).unwrap_or_else(|| version.to_string()),
         RegistryType::PubDart => pub_version_key(version).unwrap_or_else(|| version.to_string()),
+        // Composer's normal form: `v1.0` and `1.0.0.0` are one version.
+        RegistryType::Composer => crate::registry::composer::normalize_version(version)
+            .unwrap_or_else(|| version.to_string()),
         // A Hub commit is hex, served in lower case.
         RegistryType::HuggingFace => version.to_lowercase(),
         _ => version.to_string(),
@@ -1212,6 +1199,7 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
             RegistryType::Npm => npm_version_key(version),
             RegistryType::Go => go_version_key(version),
             RegistryType::PubDart => pub_version_key(version),
+            RegistryType::Composer => crate::registry::composer::normalize_version(version),
             _ => None,
         };
         // NuGet compares versions without case: the pattern and the spelling both fold.
@@ -1228,7 +1216,8 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
 
 /// A package name in the form its registry looks it up: PyPI per PEP 503, NuGet and Terraform
 /// in lowercase (NuGet ids resolve without case; Terraform lowercases provider names and
-/// registry.terraform.io answers provider and module paths in any case), Hugging Face repo ids
+/// registry.terraform.io answers provider and module paths in any case), Composer in lowercase
+/// (Composer lowercases a name before it asks a repository), Hugging Face repo ids
 /// in lowercase (the Hub answers `Org/Model` with a redirect to `org/model`), cargo as crates.io's
 /// `canon_crate_name` (lowercase, `-` as `_`: `Evil-Crate` and `evil_crate` are one crate),
 /// every other registry as written. Requests,
@@ -1238,9 +1227,11 @@ fn rule_version_matches(registry: RegistryType, rule: &str, version: &str) -> bo
 pub fn curation_name(registry: RegistryType, name: &str) -> String {
     match registry {
         RegistryType::PyPI => pep503_normalize(name),
-        RegistryType::Nuget | RegistryType::Terraform | RegistryType::HuggingFace => {
-            name.to_lowercase()
-        }
+        // Composer lowercases a package name before it looks it up.
+        RegistryType::Nuget
+        | RegistryType::Terraform
+        | RegistryType::HuggingFace
+        | RegistryType::Composer => name.to_lowercase(),
         RegistryType::Cargo => name.to_lowercase().replace('-', "_"),
         _ => name.to_string(),
     }
@@ -1965,6 +1956,11 @@ impl MinReleaseAgeFilter {
         }
     }
 
+    /// The threshold `(seconds, value)` `registry` is held to: its own, else the global one.
+    fn threshold(&self, registry: RegistryType) -> Option<&(i64, String)> {
+        self.overrides.get(&registry).or(self.default.as_ref())
+    }
+
     /// The thresholds for a log line: `"7d (npm: 3d)"`, or `"npm: 3d"` without a
     /// global value.
     pub fn summary(&self) -> String {
@@ -2008,11 +2004,7 @@ impl ProxyFilter for MinReleaseAgeFilter {
     fn evaluate(&self, request: &FilterRequest) -> Decision {
         // Resolve the threshold for this registry first: a per-registry override
         // takes precedence over the global default.
-        let Some((threshold, label)) = self
-            .overrides
-            .get(&request.registry)
-            .or(self.default.as_ref())
-        else {
+        let Some((threshold, label)) = self.threshold(request.registry) else {
             // Neither a value of its own nor a global one: not filtered by age.
             return Decision::Skip;
         };
@@ -2050,6 +2042,11 @@ impl ProxyFilter for MinReleaseAgeFilter {
         } else {
             Decision::Skip
         }
+    }
+
+    /// A registry held to a threshold has its downloads judged by their release date.
+    fn reads_release_date(&self, registry: RegistryType) -> bool {
+        self.threshold(registry).is_some()
     }
 }
 
@@ -4598,6 +4595,58 @@ mod min_release_age_tests {
     }
 
     // ── MinReleaseAgeFilter tests ───────────────────────────────────────
+
+    /// The chain reads a download's release date for a registry held to a release-age rule —
+    /// the global one or its own — while curation is on; no other filter reads it.
+    #[test]
+    fn the_chain_reads_a_release_date_where_a_release_age_rule_applies() {
+        /// A filter that refuses everything without looking at a date.
+        struct Refuse;
+        impl ProxyFilter for Refuse {
+            fn name(&self) -> &'static str {
+                "refuse"
+            }
+            fn evaluate(&self, _request: &FilterRequest) -> Decision {
+                Decision::Block {
+                    rule: "refuse".to_string(),
+                    reason: "test".to_string(),
+                }
+            }
+        }
+        let hour = || (3600, "1h".to_string());
+        for &rt in RegistryType::all() {
+            let other = *RegistryType::all().iter().find(|&&o| o != rt).unwrap();
+            // (mode, global rule, registries with a rule of their own) -> the date is read for rt
+            let rows = [
+                (CurationMode::Enforce, true, vec![], true),
+                (CurationMode::Audit, true, vec![], true),
+                (CurationMode::Enforce, false, vec![rt], true),
+                (CurationMode::Audit, false, vec![rt], true),
+                (CurationMode::Enforce, true, vec![other], true),
+                (CurationMode::Enforce, false, vec![other], false),
+                (CurationMode::Enforce, false, vec![], false),
+                (CurationMode::Off, true, vec![rt], false),
+            ];
+            for (mode, global, own, want) in rows {
+                let mut engine = CurationEngine::new(CurationConfig {
+                    mode: mode.clone(),
+                    ..CurationConfig::default()
+                });
+                engine.add_filter(Box::new(Refuse));
+                if global || !own.is_empty() {
+                    engine.add_filter(Box::new(MinReleaseAgeFilter {
+                        default: global.then(hour),
+                        overrides: own.iter().map(|&r| (r, hour())).collect(),
+                    }));
+                }
+                assert_eq!(
+                    engine.reads_release_date(rt),
+                    want,
+                    "{rt}: {mode:?}, global rule {global}, own rules {own:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn test_min_release_age_young_package_blocked() {

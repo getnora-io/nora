@@ -86,6 +86,9 @@ pub struct NpmProxy {
 pub struct NpmUpstream<'a> {
     pub url: &'a str,
     pub auth: Option<UpstreamAuth<'a>>,
+    /// Whether the upstream is bound to a scope (a `proxies` entry with `scopes`): it answers
+    /// that scope's metadata from its own origin only.
+    pub scoped: bool,
 }
 
 impl NpmProxyEntry {
@@ -114,6 +117,7 @@ impl NpmProxyEntry {
         NpmUpstream {
             url: self.url(),
             auth,
+            scoped: !self.scopes().is_empty(),
         }
     }
 }
@@ -185,6 +189,7 @@ impl NpmConfig {
             return self.proxy.as_deref().map(|url| NpmUpstream {
                 url,
                 auth: expose_opt(&self.proxy_auth).map(UpstreamAuth::Basic),
+                scoped: false,
             });
         }
         let owner = npm_scope_of(path).and_then(|scope| {

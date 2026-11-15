@@ -43,6 +43,13 @@ entryPoints:
           scheme: https
   websecure:
     address: ":443"
+    # With its default readTimeout, Traefik v3 (measured on 3.7) ends a request
+    # whose body takes longer than 60 s to arrive: a docker push of a large layer
+    # over a slow link fails with 499 at that mark. 0 removes the limit; a value
+    # longer than the slowest push you expect works too.
+    transport:
+      respondingTimeouts:
+        readTimeout: 0
 
 providers:
   file:

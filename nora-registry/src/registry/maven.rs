@@ -11,10 +11,9 @@
 use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
+use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
-use crate::registry::{
-    circuit_open_response, method_not_allowed, proxy_fetch, ProxyError, UpstreamMiss,
-};
+use crate::registry::{method_not_allowed, proxy_fetch, UpstreamMiss};
 use crate::registry_type::RegistryType;
 use crate::storage::StorageError;
 use crate::validation::ends_with_ci;
@@ -40,6 +39,18 @@ use std::time::Duration;
 /// that GC/retention/UI browse walk as strings.
 pub(crate) fn storage_key(path: &str) -> String {
     format!("maven/{path}")
+}
+
+/// Whether a request path (as decoded) holds only what a Maven coordinate and its file name
+/// hold: ASCII letters and digits, `.`, `-`, `_`, `+` and `~` (versions), and `/`. Maven's version
+/// rule bans `\ / : " < > | ? *` and nothing else (`maven-model-builder`
+/// `DefaultModelValidator`, `ILLEGAL_VERSION_CHARS`), so `~` is a version byte; the group and
+/// artifact ids hold letters, digits, `-`, `_`, `.` (`validateId`). Anything else — `\t`, `\n`,
+/// `?`, `#` — is dropped or cut by the upstream URL, so the upstream would fetch a coordinate other
+/// than the one curation checked.
+fn is_maven_path(path: &str) -> bool {
+    path.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'~' | b'/'))
 }
 
 pub fn routes() -> Router<AppState> {
@@ -308,8 +319,9 @@ async fn download(
 ) -> Response {
     let key = storage_key(&path);
     // A path with an empty segment names another artifact's file and must not reach
-    // curation, storage or an upstream (which may normalise it to that artifact).
-    if crate::validation::validate_storage_key(&key).is_err() {
+    // curation, storage or an upstream (which may normalise it to that artifact). Nor may one
+    // with a byte the upstream URL drops or cuts at (`%09`, `%3F`): see `is_maven_path`.
+    if !is_maven_path(&path) || crate::validation::validate_storage_key(&key).is_err() {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
 
@@ -468,7 +480,7 @@ async fn download(
     }
 
     // Read the cached artifact eagerly — kept for the freshness check and the stale-on-error fallback.
-    let cached = state.storage.get(&key).await.ok();
+    let (cached, read_failure) = crate::registry::cached_read(state.storage.get(&key).await);
 
     // maven-metadata.xml and SNAPSHOT artifacts are MUTABLE (rewritten as versions deploy); a
     // proxied mutable path must be revalidated against upstream unless within a positive
@@ -566,6 +578,9 @@ async fn download(
                 state.metrics.record_cache_hit("maven");
                 return with_content_type(&path, data.clone()).into_response();
             }
+            if let Some(e) = &read_failure {
+                return crate::registry::local_copy_unreadable("maven", &key, e);
+            }
             return crate::curation::check_namespace_isolation(
                 &state.curation().curation_engine,
                 crate::curation::RegistryType::Maven,
@@ -582,6 +597,9 @@ async fn download(
             state.metrics.record_download("maven");
             state.metrics.record_cache_hit("maven");
             return with_content_type(&path, data.clone()).into_response();
+        }
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("maven", &key, e);
         }
         if let Some((ref maven_name, _)) = curation_coords {
             return crate::curation::check_namespace_isolation(
@@ -622,7 +640,7 @@ async fn download(
             Duration::from_secs(state.config.maven.proxy_timeout),
             proxy.auth().map(UpstreamAuth::Basic),
             &state.circuit_breaker,
-            RegistryType::Maven,
+            BreakerScope::upstream(RegistryType::Maven, proxy.url()),
         )
         .await
         {
@@ -706,7 +724,7 @@ async fn download(
                 }
                 return with_content_type(&path, response_data).into_response();
             }
-            Err(ProxyError::CircuitOpen(reg)) => return circuit_open_response(&reg),
+            // An open breaker skips this upstream for the next, as a failure does (#1198).
             Err(e) => {
                 tracing::debug!(error = ?e, upstream = %proxy.url(), path = %path, "Maven proxy fetch failed, trying next");
                 miss.record(&e);
@@ -783,7 +801,12 @@ async fn upload(
     user: Option<Extension<crate::auth::AuthenticatedUser>>,
     body: Bytes,
 ) -> Response {
-    if !path.is_ascii() || path.contains("..") || path.contains('\0') || path.starts_with('/') {
+    if !path.is_ascii()
+        || path.contains("..")
+        || path.contains('\0')
+        || path.starts_with('/')
+        || !is_maven_path(&path)
+    {
         return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
     }
     // An empty segment (`com//x`, `x.jar/`) would name another artifact's file: refuse it
@@ -838,7 +861,10 @@ async fn upload(
                 }
             }
             match state.storage.put(&key, &body).await {
-                Ok(()) => StatusCode::CREATED.into_response(),
+                Ok(()) => {
+                    state.repo_index.invalidate("maven");
+                    StatusCode::CREATED.into_response()
+                }
                 Err(e) => {
                     tracing::error!(error = %e, key = %key, "Failed to store Maven checksum");
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -932,6 +958,7 @@ async fn upload(
             match state.storage.put(&key, &body).await {
                 Ok(()) => {
                     state.metrics.record_upload("maven");
+                    state.repo_index.invalidate("maven");
                     StatusCode::CREATED.into_response()
                 }
                 Err(e) => {
@@ -1205,6 +1232,7 @@ async fn merge_and_cache_proxy_metadata(
             tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata");
         } else {
             compute_and_store_checksums(&state.storage, &key, &data).await;
+            state.repo_index.invalidate("maven");
         }
     }
 
@@ -2785,8 +2813,11 @@ mod index_cost_tests {
 
 #[cfg(test)]
 mod upstream_failure_cases {
+    #![allow(clippy::unwrap_used)]
+
+    use crate::circuit_breaker::upstream_key;
     use crate::config::MavenProxyEntry;
-    use crate::test_helpers::{create_test_context_with_config, send};
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
     use axum::http::{Method, StatusCode};
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -2825,6 +2856,110 @@ mod upstream_failure_cases {
         send(&ctx.app, Method::GET, path, "").await; // trips the breaker
         let resp = send(&ctx.app, Method::GET, path, "").await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// #1198: an upstream whose breaker is open is skipped, not asked, and the next one serves.
+    #[tokio::test]
+    async fn an_open_upstream_is_skipped_for_the_next() {
+        let (skipped, serving) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("from-skipped"))
+            .expect(0)
+            .mount(&skipped)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("from-next"))
+            .mount(&serving)
+            .await;
+        let urls = vec![skipped.uri(), serving.uri()];
+        let ctx = create_test_context_with_config(move |c| {
+            c.circuit_breaker.enabled = true;
+            c.circuit_breaker.reset_timeout = 3600;
+            c.maven.proxies = urls.into_iter().map(MavenProxyEntry::Simple).collect();
+        });
+        ctx.state
+            .circuit_breaker
+            .open_for_test(&upstream_key("maven", &skipped.uri()));
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/example/lib/1.0.0/lib-1.0.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), b"from-next");
+    }
+
+    /// #1198: each Maven upstream reports to a breaker of its own. A dead first upstream opens
+    /// only its own; the next one keeps serving, on the request that opened it and after.
+    #[tokio::test]
+    async fn a_dead_upstream_opens_only_its_own_breaker() {
+        let serving = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("from-next"))
+            .mount(&serving)
+            .await;
+        let dead = "http://127.0.0.1:9".to_string();
+        let urls = vec![dead.clone(), serving.uri()];
+        let ctx = create_test_context_with_config(move |c| {
+            c.circuit_breaker.enabled = true;
+            c.circuit_breaker.failure_threshold = 1;
+            c.circuit_breaker.reset_timeout = 3600;
+            c.maven.proxies = urls.into_iter().map(MavenProxyEntry::Simple).collect();
+        });
+        for version in ["1.0.0", "1.0.1", "1.0.2"] {
+            let path = format!("/maven2/com/example/lib/{version}/lib-{version}.jar");
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
+        let mut keys = vec![
+            upstream_key("maven", &dead),
+            upstream_key("maven", &serving.uri()),
+        ];
+        keys.sort();
+        assert_eq!(ctx.state.circuit_breaker.keys(), keys);
+        let cb = &ctx.state.circuit_breaker;
+        assert!(cb.check(&upstream_key("maven", &dead)).is_err());
+        assert!(cb.check(&upstream_key("maven", &serving.uri())).is_ok());
+    }
+
+    /// #1198: a copy whose revalidation found every upstream skipped is served stale, as when
+    /// every upstream failed.
+    #[tokio::test]
+    async fn an_open_upstream_leaves_the_stale_copy_served() {
+        let skipped = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("from-skipped"))
+            .expect(0)
+            .mount(&skipped)
+            .await;
+        let url = skipped.uri();
+        let ctx = create_test_context_with_config(move |c| {
+            c.circuit_breaker.enabled = true;
+            c.circuit_breaker.reset_timeout = 3600;
+            c.maven.metadata_ttl = 0;
+            c.maven.proxies = vec![MavenProxyEntry::Simple(url)];
+        });
+        let path = "/maven2/com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar";
+        ctx.state
+            .storage
+            .put(
+                &super::storage_key("com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar"),
+                b"cached-copy",
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .circuit_breaker
+            .open_for_test(&upstream_key("maven", &skipped.uri()));
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
+            Some(b"true".as_slice())
+        );
+        assert_eq!(body_bytes(resp).await.as_ref(), b"cached-copy");
     }
 }
 
@@ -3145,5 +3280,114 @@ mod maven_version_metadata_identity {
                 resp.status()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod url_fold {
+    //! A name or version holding a byte the upstream URL drops or cuts at (`%09`, `%0A`, `%0D`,
+    //! `%3F`, `%23`) is refused by this handler with a 400 before curation, storage or the upstream
+    //! sees it, and the upstream is never asked. Legitimate names of the format still reach it.
+    use crate::test_helpers::{assert_refused, assert_served_upstream, SMUGGLED};
+
+    fn maven_proxy(cfg: &mut crate::config::Config, up: &str) {
+        cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(up.to_string())];
+    }
+
+    #[tokio::test]
+    async fn coordinate_with_a_smuggled_byte_is_refused() {
+        let mut uris = Vec::new();
+        for s in SMUGGLED {
+            uris.push(format!("/maven2/com/ev{s}il/x/1.0/x-1.0.jar"));
+            uris.push(format!("/maven2/com/evil/x{s}/1.0/x-1.0.jar"));
+        }
+        uris.push("/maven2/com/evil/x/1.0%091/x-1.0%091.jar".to_string());
+        assert_refused("maven", &uris, maven_proxy).await;
+    }
+
+    /// Maven's version rule bans `\\ / : " < > | ? *` and no other byte
+    /// (`DefaultModelValidator`), so `~` is a legitimate version byte, and the URL parser keeps it.
+    #[tokio::test]
+    async fn legitimate_tilde_version_reaches_upstream_and_deploys() {
+        assert_served_upstream(
+            "maven",
+            "/maven2/org/example/my-lib/1.0~rc1/my-lib-1.0~rc1.jar",
+            maven_proxy,
+        )
+        .await;
+        let ctx = crate::test_helpers::create_test_context();
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            axum::http::Method::PUT,
+            "/maven2/org/example/my-lib/1.0~rc1/my-lib-1.0~rc1.jar",
+            vec![("content-type", "application/octet-stream")],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "tilde deploy refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn legitimate_coordinate_still_reaches_upstream() {
+        assert_served_upstream(
+            "maven",
+            "/maven2/org/example/my-lib_2/1.0.0-SNAPSHOT/my-lib_2-1.0.0-SNAPSHOT.pom",
+            maven_proxy,
+        )
+        .await;
+    }
+
+    /// Every artifact path in the measured Maven layout corpus (`maven-resolver` 1.9.27,
+    /// `testdata/maven/layout.tsv`) is a path a client requests: none may be refused.
+    #[test]
+    fn every_corpus_layout_path_is_accepted() {
+        let corpus = include_str!("../../testdata/maven/layout.tsv");
+        let refused: Vec<&str> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .filter_map(|line| line.split('\t').nth(7))
+            .filter(|path| !super::is_maven_path(path))
+            .collect();
+        assert!(refused.is_empty(), "legitimate paths refused: {refused:?}");
+    }
+
+    /// A deploy (PUT) to a coordinate with a byte the upstream URL drops or cuts at is refused with a
+    /// 400 before anything is stored; the same deploy of a legitimate coordinate is stored (201).
+    #[tokio::test]
+    async fn deploy_with_a_smuggled_byte_is_refused_and_a_legitimate_one_stored() {
+        for s in SMUGGLED {
+            let ctx = crate::test_helpers::create_test_context();
+            let resp = crate::test_helpers::send_with_headers(
+                &ctx.app,
+                axum::http::Method::PUT,
+                &format!("/maven2/com/ev{s}il/x/1.0/x-1.0.jar"),
+                vec![("content-type", "application/octet-stream")],
+                b"x".to_vec(),
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                axum::http::StatusCode::BAD_REQUEST,
+                "deploy ev{s}il"
+            );
+        }
+        let ctx = crate::test_helpers::create_test_context();
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            axum::http::Method::PUT,
+            "/maven2/com/evil/x/1.0/x-1.0.jar",
+            vec![("content-type", "application/octet-stream")],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "legitimate deploy refused"
+        );
     }
 }

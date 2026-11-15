@@ -192,16 +192,28 @@ async fn distribution_proxy(
         }
         None => crate::curation::RequestVersion::Unspecified,
     };
-    if let Some(response) = crate::curation::check_download(
-        &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
-        crate::curation::RegistryType::Cpan,
-        dist_name,
-        request_version,
-        None,
-    ) {
-        return response;
+    // #733 serve-local: a distribution in an internal namespace (by its name, or by its author
+    // path) is operator-owned — curation is skipped and any local copy is served below; with none
+    // it is refused, never fetched.
+    let internal = [dist_name, dist_path].into_iter().any(|name| {
+        crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Cpan,
+            name,
+        )
+    });
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Cpan,
+            dist_name,
+            request_version,
+            None,
+        ) {
+            return response;
+        }
     }
 
     let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -220,7 +232,9 @@ async fn distribution_proxy(
     );
 
     // Verified-cache fast path — serve with integrity guarantee
-    if let Ok(outcome) = state.storage.get_verified(&storage_key).await {
+    let (cached, read_failure) =
+        crate::registry::cached_read(state.storage.get_verified(&storage_key).await);
+    if let Some(outcome) = cached {
         use nora_registry::verified::{verified_body, GateOutcome};
         let data = match outcome {
             GateOutcome::Verified(blob) => verified_body(blob),
@@ -259,13 +273,22 @@ async fn distribution_proxy(
         return with_binary(data.to_vec(), "application/octet-stream");
     }
 
-    // Internal namespace check
-    if let Some(response) = crate::curation::check_namespace_isolation(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Cpan,
-        dist_path,
-    ) {
-        return response;
+    // An internal distribution with no local copy is never fetched upstream; one whose copy the
+    // store could not read is unavailable, not absent.
+    if internal {
+        if let Some(e) = &read_failure {
+            return crate::registry::local_copy_unreadable("cpan", &storage_key, e);
+        }
+        return [dist_name, dist_path]
+            .into_iter()
+            .find_map(|name| {
+                crate::curation::check_namespace_isolation(
+                    &state.curation().curation_engine,
+                    crate::curation::RegistryType::Cpan,
+                    name,
+                )
+            })
+            .unwrap_or_else(|| StatusCode::NOT_FOUND.into_response());
     }
 
     // Fetch from upstream — none when the operator switched it off.
@@ -581,12 +604,18 @@ fn parse_dist_filename(filename: &str) -> (String, Option<String>) {
 }
 
 /// Validate distribution path: no path traversal, no null bytes.
+/// Whether a distribution path is one: `/`-separated PAUSE author path and archive name, every
+/// part of ASCII letters, digits and `.`, `-`, `_`, `+`, and `@`: a distribution's version may
+/// carry one (`cshar-3.0@15.tar.gz`, in the measured corpus `testdata/cpan/distnames.tsv`). A
+/// control byte, `?` or `#` is dropped or cut by the upstream URL, and the upstream would fetch
+/// another distribution than the one curation checked (`Ev%09il-1.0.tar.gz` → `Evil-1.0.tar.gz`).
 fn is_valid_dist_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= 1024
-        && !path.contains('\0')
         && !path.contains("..")
-        && path.chars().all(|c| c.is_ascii() && c != '\0')
+        && path.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'@' | b'/')
+        })
 }
 
 // ── Tests ──────────────────────────────────────────────────────────────
@@ -1586,5 +1615,63 @@ mod cpan_fallback_holds_the_pin {
         let (status, _, body) = fallback(STORED, true).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, STORED);
+    }
+}
+
+#[cfg(test)]
+mod url_fold {
+    //! A name or version holding a byte the upstream URL drops or cuts at (`%09`, `%0A`, `%0D`,
+    //! `%3F`, `%23`) is refused by this handler with a 400 before curation, storage or the upstream
+    //! sees it, and the upstream is never asked. Legitimate names of the format still reach it.
+    use crate::test_helpers::{assert_refused, assert_served_upstream, SMUGGLED};
+
+    fn cpan_proxy(cfg: &mut crate::config::Config, up: &str) {
+        cfg.cpan.enabled = true;
+        cfg.cpan.proxy = Some(up.to_string());
+    }
+
+    #[tokio::test]
+    async fn dist_with_a_smuggled_byte_is_refused() {
+        let mut uris = Vec::new();
+        for s in SMUGGLED {
+            uris.push(format!("/cpan/authors/id/E/EV/EVIL/Ev{s}il-1.0.tar.gz"));
+            uris.push(format!("/cpan/authors/id/E/EV/EV{s}IL/Evil-1.0.tar.gz"));
+        }
+        assert_refused("cpan", &uris, cpan_proxy).await;
+    }
+
+    /// Every distribution file name in the measured corpus (`CPAN::DistnameInfo` 0.12 on real
+    /// names, `testdata/cpan/distnames.tsv`) is a legitimate path: a version may carry `@`
+    /// (`cshar-3.0@15.tar.gz`), and none may be refused.
+    #[test]
+    fn every_corpus_distribution_name_is_accepted() {
+        let corpus = include_str!("../../testdata/cpan/distnames.tsv");
+        let refused: Vec<&str> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .filter_map(|line| line.split('\t').next())
+            .filter(|file| !super::is_valid_dist_path(&format!("A/AB/ABC/{file}")))
+            .collect();
+        assert!(refused.is_empty(), "legitimate names refused: {refused:?}");
+    }
+
+    #[tokio::test]
+    async fn distribution_with_an_at_sign_still_reaches_upstream() {
+        assert_served_upstream(
+            "cpan",
+            "/cpan/authors/id/A/AB/ABC/cshar-3.0%4015.tar.gz",
+            cpan_proxy,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn legitimate_dist_still_reaches_upstream() {
+        assert_served_upstream(
+            "cpan",
+            "/cpan/authors/id/F/FO/FOO/Foo-Bar-1.00_01.tar.gz",
+            cpan_proxy,
+        )
+        .await;
     }
 }

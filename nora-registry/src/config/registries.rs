@@ -29,7 +29,7 @@ pub struct RegistriesSection {
 /// What registries to enable — a single string or list of strings.
 ///
 /// Supports:
-/// - `"all"` — all 13 registries
+/// - `"all"` — every registry except the opt-in ones (Hugging Face: `["all", "hf"]`)
 /// - `"docker"` — single registry
 /// - `["docker", "npm", "pypi"]` — explicit list
 /// - `["all", "-maven"]` — all except maven

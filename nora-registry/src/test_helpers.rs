@@ -166,6 +166,10 @@ fn build_context_full(
             // tests exercise the upstream-date path (prod default is false/secure;
             // the trust=false path has its own dedicated tests).
             shutdown_timeout: 15,
+            header_read_timeout: 30,
+            keep_alive_timeout: 120,
+            max_connections: 4096,
+            maintenance_stall_secs: 300,
             trust_upstream_dates: true,
         },
         storage: StorageConfig {
@@ -252,6 +256,12 @@ fn build_context_full(
             ..crate::config::DebConfig::default()
         },
         cpan: crate::config::CpanConfig::default(),
+        // Off, and no upstream: a test turns it on and names its own.
+        composer: crate::config::ComposerConfig {
+            proxy: None,
+            proxy_timeout: 5,
+            ..crate::config::ComposerConfig::default()
+        },
         hf: crate::config::HfConfig::default(),
         auth: AuthConfig {
             enabled: auth_enabled,
@@ -309,6 +319,14 @@ fn build_context_full(
     } else {
         None
     };
+    let docker_tokens = (auth_enabled && config.auth.docker_anon_pull).then(|| {
+        let dir = tempdir.path().join("tokens");
+        std::fs::create_dir_all(&dir).expect("token dir");
+        Arc::new(
+            crate::auth::docker_token::DockerTokens::load_or_create(&dir)
+                .expect("docker token key"),
+        )
+    });
 
     let docker_auth =
         registry::DockerAuth::new(reqwest::Client::new(), config.docker.proxy_timeout);
@@ -336,6 +354,7 @@ fn build_context_full(
     let reloadable = Arc::new(arc_swap::ArcSwap::from_pointee(crate::ReloadableConfig {
         curation_engine,
         bypass_token,
+        loaded_at: chrono::Utc::now().timestamp(),
     }));
 
     let leak_finders = crate::metrics::LeakFinders::new(config.upstream_hostnames());
@@ -350,7 +369,7 @@ fn build_context_full(
     } else {
         None
     };
-    let (http_client, http_client_no_redirect) = match egress_proxy {
+    let (http_client, http_client_no_redirect, http_client_same_origin) = match egress_proxy {
         Some(url) => {
             let proxy = || reqwest::Proxy::all(url).expect("egress proxy url");
             (
@@ -366,13 +385,21 @@ fn build_context_full(
                     .redirect(reqwest::redirect::Policy::none())
                     .build()
                     .expect("egress client"),
+                reqwest::Client::builder()
+                    .proxy(proxy())
+                    .pool_max_idle_per_host(0)
+                    .redirect(crate::same_origin_redirects())
+                    .build()
+                    .expect("egress client"),
             )
         }
         None => (
             reqwest::Client::new(),
             crate::build_no_redirect_client(&config.tls),
+            crate::build_same_origin_client(&config.tls),
         ),
     };
+    let (tasks, maintenance) = crate::supervision(&config.server);
     let state = AppState {
         storage,
         config: Arc::new(config),
@@ -385,9 +412,11 @@ fn build_context_full(
         activity: Arc::new(ActivityLog::new(50)),
         audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
         docker_auth: Arc::new(docker_auth),
+        docker_tokens,
         repo_index: Arc::new(RepoIndex::new()),
         http_client,
         http_client_no_redirect,
+        http_client_same_origin,
         hf_canonical_ids: Arc::default(),
         upload_sessions: Arc::new(RwLock::new(HashMap::new())),
         publish_locks: Arc::new(parking_lot::Mutex::new(HashMap::new())),
@@ -404,6 +433,8 @@ fn build_context_full(
         leak_finders,
         cancel_token: tokio_util::sync::CancellationToken::new(),
         pull_stats: std::sync::Arc::new(crate::registry::docker::PullStatsAccumulator::default()),
+        tasks,
+        maintenance,
     };
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
@@ -519,6 +550,9 @@ const COUNTED_METHODS: [&str; 11] = [
 #[derive(Default)]
 pub struct OpCounts {
     counts: [AtomicUsize; COUNTED_METHODS.len()],
+    /// Keys the listings returned: a listing is one round-trip, but its cost grows with what
+    /// it enumerates (an object store pages it, a local store walks it).
+    listed: AtomicUsize,
 }
 
 impl OpCounts {
@@ -536,6 +570,16 @@ impl OpCounts {
         for count in &self.counts {
             count.store(0, Ordering::Relaxed);
         }
+        self.listed.store(0, Ordering::Relaxed);
+    }
+
+    /// Keys every listing since the last [`reset`](Self::reset) returned, together.
+    pub fn listed_keys(&self) -> usize {
+        self.listed.load(Ordering::Relaxed)
+    }
+
+    fn enumerated(&self, keys: usize) {
+        self.listed.fetch_add(keys, Ordering::Relaxed);
     }
 
     /// Round-trips counted since the last [`reset`](Self::reset).
@@ -607,7 +651,9 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
     async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
         self.counts.hit("list");
-        self.inner.list(prefix).await
+        let keys = self.inner.list(prefix).await?;
+        self.counts.enumerated(keys.len());
+        Ok(keys)
     }
 
     async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
@@ -620,7 +666,9 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         prefix: &str,
     ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
         self.counts.hit("list_with_meta");
-        self.inner.list_with_meta(prefix).await
+        let keys = self.inner.list_with_meta(prefix).await?;
+        self.counts.enumerated(keys.len());
+        Ok(keys)
     }
 
     async fn health_check(&self) -> bool {
@@ -633,6 +681,10 @@ impl crate::storage::StorageBackend for OpCountingBackend {
 
     fn backend_name(&self) -> &'static str {
         self.inner.backend_name()
+    }
+
+    async fn refresh_reachability(&self) {
+        self.inner.refresh_reachability().await
     }
 
     async fn refresh_total_size(&self) {
@@ -673,11 +725,668 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         end: u64,
     ) -> crate::storage::Result<(
         u64,
+        Option<String>,
         std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
     )> {
         self.counts.hit("get_range");
         self.inner.get_range(key, start, end).await
     }
+}
+
+// ── Storage outage ──────────────────────────────────────────────────────────
+
+/// The switch of an [`outage_storage`]: up, down, silent, failing object reads only, or failing
+/// the reads of some keys, each with its own [`ReadFault`], and the listings of some prefixes.
+#[derive(Clone)]
+pub struct StorageOutage(
+    Arc<std::sync::atomic::AtomicU8>,
+    Arc<std::sync::Mutex<Faults>>,
+);
+
+/// The keys and prefixes an [`outage_storage`] fails.
+#[derive(Default)]
+struct Faults {
+    /// Key suffixes whose reads fail, and how.
+    reads: Vec<(String, ReadFault)>,
+    /// Prefixes whose listings fail.
+    listings: Vec<String>,
+    /// Key suffixes whose writes fail.
+    writes: Vec<String>,
+    /// Key suffixes `stat` cannot answer for.
+    stats: Vec<String>,
+    /// Key suffixes whose writes land but report a failure.
+    landed_writes: Vec<String>,
+    /// Writes held at the store until released, each once.
+    held: Vec<WriteHold>,
+}
+
+/// A write [`StorageOutage::hold_write_of`] stops at the store, before anything is stored,
+/// until it is released: for a test that orders the writes of concurrent requests by the
+/// writes themselves, not by timing them.
+#[derive(Clone)]
+pub struct WriteHold {
+    suffix: String,
+    containing: Vec<u8>,
+    reached: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl WriteHold {
+    /// Wait until the held write has reached the store.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    /// Let the held write go on.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
+
+    fn holds(&self, key: &str, data: &[u8]) -> bool {
+        key.ends_with(self.suffix.as_str())
+            && data
+                .windows(self.containing.len().max(1))
+                .any(|w| w == self.containing.as_slice())
+    }
+}
+
+/// How the read of a key fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReadFault {
+    /// The store cannot be asked: a network error.
+    Network,
+    /// The store answers with bytes that are not the ones written (changed on disk), under the
+    /// pin of the bytes written, so the read fails its integrity check as a tampered copy does.
+    /// Applies to the buffered read the integrity gate checks; streamed reads are left alone.
+    Tampered,
+}
+
+const STORE_UP: u8 = 0;
+const STORE_DOWN: u8 = 1;
+const STORE_READS_FAIL: u8 = 2;
+const STORE_READS_OF_FAIL: u8 = 3;
+const STORE_SILENT: u8 = 4;
+const STORE_SIZE_PANICS: u8 = 5;
+
+impl StorageOutage {
+    /// Take the store down: every read, listing and write fails from now on.
+    pub fn begin(&self) {
+        self.0.store(STORE_DOWN, Ordering::SeqCst);
+    }
+
+    /// Fail object reads only: listings and `stat` still answer, as a store that throttles its
+    /// GETs does.
+    pub fn fail_reads(&self) {
+        self.0.store(STORE_READS_FAIL, Ordering::SeqCst);
+    }
+
+    /// Fail the reads of the keys ending with `suffix` with a network error; other keys read.
+    pub fn fail_reads_of(&self, suffix: &str) {
+        self.fault_reads_of(suffix, ReadFault::Network);
+    }
+
+    /// Fail the reads of the keys ending with `suffix` with `fault`; other keys read. Faults
+    /// add up: each key fails with the first fault whose suffix it ends with.
+    pub fn fault_reads_of(&self, suffix: &str, fault: ReadFault) {
+        self.faults().reads.push((suffix.to_string(), fault));
+        self.0.store(STORE_READS_OF_FAIL, Ordering::SeqCst);
+    }
+
+    /// Make the store silent: every operation waits, as on a store that accepted the
+    /// connection and never answers, until [`Self::end`].
+    pub fn silence(&self) {
+        self.0.store(STORE_SILENT, Ordering::SeqCst);
+    }
+
+    /// Make every count of the store's size panic after a while (a bug that shows late);
+    /// everything else answers.
+    pub fn panic_counting_size(&self) {
+        self.0.store(STORE_SIZE_PANICS, Ordering::SeqCst);
+    }
+
+    /// Fail the listings of `prefix` exactly with a network error; other listings and every
+    /// read answer.
+    pub fn fail_listings_of(&self, prefix: &str) {
+        self.faults().listings.push(prefix.to_string());
+    }
+
+    /// Fail the writes of the keys ending with `suffix` with a network error; other writes and
+    /// every read answer.
+    pub fn fail_writes_of(&self, suffix: &str) {
+        self.faults().writes.push(suffix.to_string());
+    }
+
+    /// Store the writes of the keys ending with `suffix`, then report a network error — as
+    /// `LocalStorage::put` does when the rename published the body and the directory sync or
+    /// the pin after it fails: the caller cannot tell the write landed.
+    pub fn fail_writes_after_landing_of(&self, suffix: &str) {
+        self.faults().landed_writes.push(suffix.to_string());
+    }
+
+    /// Make `stat` of the keys ending with `suffix` find nothing, as a backend that cannot ask
+    /// the store answers; other keys and every read answer.
+    pub fn fail_stats_of(&self, suffix: &str) {
+        self.faults().stats.push(suffix.to_string());
+    }
+
+    /// Hold the next write of a key ending with `suffix` whose bytes contain `containing`: it
+    /// waits at the store until [`WriteHold::release`], and [`WriteHold::reached`] tells the
+    /// test it is there. Other writes go on.
+    pub fn hold_write_of(&self, suffix: &str, containing: &[u8]) -> WriteHold {
+        let hold = WriteHold {
+            suffix: suffix.to_string(),
+            containing: containing.to_vec(),
+            reached: Arc::default(),
+            release: Arc::default(),
+        };
+        self.faults().held.push(hold.clone());
+        hold
+    }
+
+    /// The hold the write of `key` with `data` meets, taken so it holds once.
+    fn take_hold(&self, key: &str, data: &[u8]) -> Option<WriteHold> {
+        let mut faults = self.faults();
+        let at = faults.held.iter().position(|h| h.holds(key, data))?;
+        Some(faults.held.remove(at))
+    }
+
+    /// Bring the store back and clear every fault: operations waiting on a silent store go on,
+    /// and every later one is answered.
+    pub fn end(&self) {
+        *self.faults() = Faults::default();
+        self.0.store(STORE_UP, Ordering::SeqCst);
+    }
+
+    /// The faults set; held for one statement, never across an await.
+    fn faults(&self) -> std::sync::MutexGuard<'_, Faults> {
+        self.1.lock().unwrap()
+    }
+
+    fn mode(&self) -> u8 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Wait while the store is silent.
+    async fn wait_answer(&self) {
+        while self.mode() == STORE_SILENT {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Whether a write of `key` fails now.
+    fn write_fails(&self, key: &str) -> bool {
+        self.faults()
+            .writes
+            .iter()
+            .any(|suffix| key.ends_with(suffix.as_str()))
+    }
+
+    /// Whether a write of `key` lands and then reports a failure.
+    fn write_lands_then_fails(&self, key: &str) -> bool {
+        self.faults()
+            .landed_writes
+            .iter()
+            .any(|suffix| key.ends_with(suffix.as_str()))
+    }
+
+    /// Whether `stat` of `key` fails now.
+    fn stat_fails(&self, key: &str) -> bool {
+        self.faults()
+            .stats
+            .iter()
+            .any(|suffix| key.ends_with(suffix.as_str()))
+    }
+
+    /// Whether a listing of `prefix` fails now.
+    fn listing_fails(&self, prefix: &str) -> bool {
+        self.mode() == STORE_DOWN || self.faults().listings.iter().any(|p| p == prefix)
+    }
+
+    /// The fault an object read of `key` meets now, if any.
+    fn read_fault(&self, key: &str) -> Option<ReadFault> {
+        match self.mode() {
+            STORE_UP => None,
+            STORE_READS_OF_FAIL => self
+                .faults()
+                .reads
+                .iter()
+                .find(|(suffix, _)| key.ends_with(suffix.as_str()))
+                .map(|(_, fault)| *fault),
+            _ => Some(ReadFault::Network),
+        }
+    }
+}
+
+/// An in-memory object store that can be taken down. While down, every read, listing and write
+/// fails with a network error and `stat` finds nothing, as an object store behind a dropped
+/// connection answers: the store holds what was written, but cannot say so.
+pub struct OutageBackend {
+    inner: Arc<dyn crate::storage::StorageBackend>,
+    outage: StorageOutage,
+}
+
+/// An in-memory [`Storage`] to seed while it is up, and its outage switch.
+pub fn outage_storage() -> (Storage, StorageOutage) {
+    let outage = StorageOutage(Arc::default(), Arc::default());
+    let backend = OutageBackend {
+        inner: Arc::new(crate::storage::ObjectStorage::in_memory()),
+        outage: outage.clone(),
+    };
+    (Storage::from_backend(Arc::new(backend)), outage)
+}
+
+/// A local [`Storage`] at `path` with the same outage switch: for a test that needs what only
+/// a filesystem has, such as a file's modification time ([`put_written_days_ago`] — the
+/// context's `storage.path` must be `path`).
+pub fn local_outage_storage(path: &str) -> (Storage, StorageOutage) {
+    let outage = StorageOutage(Arc::default(), Arc::default());
+    let backend = OutageBackend {
+        inner: Arc::new(crate::storage::LocalStorage::new(path)),
+        outage: outage.clone(),
+    };
+    (Storage::from_backend(Arc::new(backend)), outage)
+}
+
+fn network_error() -> crate::storage::StorageError {
+    crate::storage::StorageError::Network("connection refused".into())
+}
+
+impl OutageBackend {
+    /// For a listing, `stat`, `pin` or a write: fails while the store is down.
+    fn check(&self) -> crate::storage::Result<()> {
+        match self.outage.mode() {
+            STORE_DOWN => Err(network_error()),
+            _ => Ok(()),
+        }
+    }
+
+    /// For a streamed read of `key`: fails with a network error while the store is down,
+    /// failing reads, or failing the reads of keys like this one with one.
+    fn check_read(&self, key: &str) -> crate::storage::Result<()> {
+        match self.outage.read_fault(key) {
+            Some(ReadFault::Network) => Err(network_error()),
+            Some(ReadFault::Tampered) | None => Ok(()),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for OutageBackend {
+    async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+        self.outage.wait_answer().await;
+        self.check()?;
+        if let Some(hold) = self.outage.take_hold(key, data) {
+            hold.reached.notify_one();
+            hold.release.notified().await;
+        }
+        if self.outage.write_fails(key) {
+            return Err(network_error());
+        }
+        self.inner.put(key, data, sha256).await?;
+        if self.outage.write_lands_then_fails(key) {
+            return Err(network_error());
+        }
+        Ok(())
+    }
+
+    async fn get(&self, key: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        self.outage.wait_answer().await;
+        self.check_read(key)?;
+        let (data, pin) = self.inner.get(key).await?;
+        if self.outage.read_fault(key) != Some(ReadFault::Tampered) {
+            return Ok((data, pin));
+        }
+        // The pin of the bytes written, whether or not the inner store keeps one.
+        use sha2::Digest;
+        let pin = pin.unwrap_or_else(|| hex::encode(sha2::Sha256::digest(&data)));
+        let mut changed = data.to_vec();
+        changed.extend_from_slice(b" changed on disk");
+        Ok((changed.into(), Some(pin)))
+    }
+
+    async fn pin(&self, key: &str) -> Option<String> {
+        self.outage.wait_answer().await;
+        self.check().ok()?;
+        self.inner.pin(key).await
+    }
+
+    async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+        self.outage.wait_answer().await;
+        self.check()?;
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+        self.outage.wait_answer().await;
+        if self.outage.listing_fails(prefix) {
+            return Err(network_error());
+        }
+        self.inner.list(prefix).await
+    }
+
+    async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
+        self.outage.wait_answer().await;
+        self.check().ok()?;
+        if self.outage.stat_fails(key) {
+            return None;
+        }
+        self.inner.stat(key).await
+    }
+
+    async fn list_with_meta(
+        &self,
+        prefix: &str,
+    ) -> crate::storage::Result<Vec<(String, crate::storage::FileMeta)>> {
+        self.outage.wait_answer().await;
+        if self.outage.listing_fails(prefix) {
+            return Err(network_error());
+        }
+        self.inner.list_with_meta(prefix).await
+    }
+
+    async fn health_check(&self) -> bool {
+        self.check().is_ok() && self.inner.health_check().await
+    }
+
+    async fn total_size(&self) -> u64 {
+        self.inner.total_size().await
+    }
+
+    /// A store that is down refreshes nothing: its cached reachability goes stale.
+    async fn refresh_reachability(&self) {
+        self.outage.wait_answer().await;
+        if self.check().is_ok() {
+            self.inner.refresh_reachability().await;
+        }
+    }
+
+    async fn refresh_total_size(&self) {
+        self.outage.wait_answer().await;
+        if self.outage.mode() == STORE_SIZE_PANICS {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            panic!("a bug in counting the store's size");
+        }
+        if self.check().is_ok() {
+            self.inner.refresh_total_size().await;
+        }
+    }
+
+    fn backend_name(&self) -> &'static str {
+        "outage-test-store"
+    }
+
+    async fn put_from_path(
+        &self,
+        key: &str,
+        src: &std::path::Path,
+        sha256: Option<&str>,
+    ) -> crate::storage::Result<()> {
+        self.outage.wait_answer().await;
+        self.check()?;
+        self.inner.put_from_path(key, src, sha256).await
+    }
+
+    async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> crate::storage::Result<()> {
+        self.outage.wait_answer().await;
+        self.check()?;
+        self.inner.copy(src, dst, sha256).await
+    }
+
+    async fn get_reader(
+        &self,
+        key: &str,
+    ) -> crate::storage::Result<(
+        u64,
+        Option<String>,
+        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    )> {
+        self.outage.wait_answer().await;
+        self.check_read(key)?;
+        self.inner.get_reader(key).await
+    }
+
+    async fn get_range(
+        &self,
+        key: &str,
+        start: u64,
+        end: u64,
+    ) -> crate::storage::Result<(
+        u64,
+        Option<String>,
+        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    )> {
+        self.outage.wait_answer().await;
+        self.check_read(key)?;
+        self.inner.get_range(key, start, end).await
+    }
+}
+
+// ── A size count that never ends ────────────────────────────────────────────
+
+/// How often a [`long_count_storage`] was asked what.
+#[derive(Default)]
+pub struct LongCount {
+    /// Readiness requests made.
+    pub probes: std::sync::atomic::AtomicU64,
+    /// Size counts started.
+    pub counting: std::sync::atomic::AtomicU64,
+    /// The most size counts running at once.
+    pub most_counting: std::sync::atomic::AtomicU64,
+}
+
+/// A store whose size count never ends (a bucket too large to list in the test's time)
+/// and whose first readiness request panics (a bug that shows once); nothing is stored.
+struct LongCountBackend(Arc<LongCount>);
+
+/// A [`Storage`] whose size count never ends and whose first readiness request panics,
+/// and what it was asked.
+pub fn long_count_storage() -> (Storage, Arc<LongCount>) {
+    let counts = Arc::new(LongCount::default());
+    let backend = LongCountBackend(Arc::clone(&counts));
+    (Storage::from_backend(Arc::new(backend)), counts)
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for LongCountBackend {
+    async fn put(&self, _k: &str, _d: &[u8], _sha256: &str) -> crate::storage::Result<()> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+    async fn get(&self, _k: &str) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+    async fn pin(&self, _k: &str) -> Option<String> {
+        None
+    }
+    async fn delete(&self, _k: &str) -> crate::storage::Result<()> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+    async fn list(&self, _prefix: &str) -> crate::storage::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    async fn stat(&self, _k: &str) -> Option<crate::storage::FileMeta> {
+        None
+    }
+    async fn health_check(&self) -> bool {
+        true
+    }
+    async fn total_size(&self) -> u64 {
+        0
+    }
+    fn backend_name(&self) -> &'static str {
+        "long-count-test"
+    }
+    async fn refresh_reachability(&self) {
+        if self.0.probes.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("a bug in the first readiness request");
+        }
+    }
+    async fn refresh_total_size(&self) {
+        let now = self.0.counting.fetch_add(1, Ordering::SeqCst) + 1;
+        self.0.most_counting.fetch_max(now, Ordering::SeqCst);
+        std::future::pending::<()>().await;
+    }
+    async fn put_from_path(
+        &self,
+        _k: &str,
+        _src: &std::path::Path,
+        _sha256: Option<&str>,
+    ) -> crate::storage::Result<()> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+    async fn copy(
+        &self,
+        _src: &str,
+        _dst: &str,
+        _sha256: Option<&str>,
+    ) -> crate::storage::Result<()> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+    async fn get_reader(
+        &self,
+        _k: &str,
+    ) -> crate::storage::Result<(
+        u64,
+        Option<String>,
+        std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+    )> {
+        Err(crate::storage::StorageError::NotFound)
+    }
+}
+
+// ── A large bucket ──────────────────────────────────────────────────────────
+
+/// An in-memory object store whose listing answers its first object at once and each later
+/// one after `delay`, as a large bucket listed page by page over a slow link: one page is
+/// quick, the whole listing is not. Everything else is the in-memory store as is.
+#[derive(Debug)]
+pub struct SlowListing {
+    inner: object_store::memory::InMemory,
+    delay: std::time::Duration,
+}
+
+impl std::fmt::Display for SlowListing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "SlowListing")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for SlowListing {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        use futures::StreamExt;
+        let delay = self.delay;
+        self.inner
+            .list(prefix)
+            .enumerate()
+            .then(move |(n, item)| async move {
+                if n > 0 {
+                    tokio::time::sleep(delay).await;
+                }
+                item
+            })
+            .boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// While this file is in a storage directory, its disk "does not answer": the local
+/// backend's write probe under it waits. See [`hang_health_probe`].
+const DISK_HANGS: &str = ".nora-test-disk-hangs";
+
+/// Called by the local backend's write probe: wait while `base` holds the
+/// [`hang_health_probe`] marker, as a write does on a disk that stopped answering.
+pub fn wait_while_disk_hangs(base: &std::path::Path) {
+    while base.join(DISK_HANGS).exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A local disk that stopped answering, for the health probe: see [`hang_health_probe`].
+pub struct HungProbe(std::path::PathBuf);
+
+impl HungProbe {
+    /// The disk answers again: every probe waiting on it goes on and ends.
+    pub fn answer(self) {}
+}
+
+impl Drop for HungProbe {
+    fn drop(&mut self) {
+        // Also on a failed assertion: a probe still waiting would keep the runtime from
+        // shutting down and hang the test instead of failing it.
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Make the local backend's write probe under `base` wait, as on a disk that stopped
+/// answering, until the returned guard answers or is dropped.
+pub fn hang_health_probe(base: &std::path::Path) -> HungProbe {
+    let marker = base.join(DISK_HANGS);
+    std::fs::write(&marker, b"").unwrap();
+    HungProbe(marker)
+}
+
+/// A [`Storage`] over a [`SlowListing`] store with `delay` between listed objects.
+pub fn slow_listing_storage(delay: std::time::Duration) -> Storage {
+    let store = SlowListing {
+        inner: object_store::memory::InMemory::new(),
+        delay,
+    };
+    Storage::from_backend(Arc::new(crate::storage::ObjectStorage::over(Box::new(
+        store,
+    ))))
 }
 
 // ── Per-registry artifact counts, each read from its real source ────────────
@@ -725,6 +1434,75 @@ pub async fn artifact_counts(ctx: &TestContext, registry: &str) -> ArtifactCount
         stats,
         metric,
     }
+}
+
+/// Store `body` at `key` as NORA would have written it `days` ago: a cache an earlier request
+/// filled, as a reader of its modification time sees it. Local storage only.
+pub async fn put_written_days_ago(ctx: &TestContext, key: &str, body: &[u8], days: u64) {
+    ctx.state.storage.put(key, body).await.unwrap();
+    let then = std::time::SystemTime::now() - std::time::Duration::from_secs(days * 86400);
+    std::fs::File::options()
+        .write(true)
+        .open(std::path::Path::new(&ctx.state.config.storage.path).join(key))
+        .unwrap()
+        .set_modified(then)
+        .unwrap();
+}
+
+/// Wait until no more handles share `storage` than the `holders` it had before the requests
+/// under test ([`Storage::holders`]). A write those requests left running holds a clone of the
+/// store until it ends, so after this none of them can still land. Panics after 30 s.
+pub async fn background_writes_done(storage: &Storage, holders: usize) {
+    let done = async {
+        while storage.holders() > holders {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    };
+    // CANCEL-SAFETY: the loop only reads a count; dropping it on the deadline leaves nothing.
+    tokio::time::timeout(std::time::Duration::from_secs(30), done)
+        .await
+        .expect("a background task still holds the store after 30 s");
+}
+
+/// A SIGHUP on `ctx`: the configuration NORA started with, changed by `customize`, is written
+/// to a file, and the server's own reload reads that file and installs the engine it describes.
+/// The state keeps the configuration NORA started with, as it does in the server.
+pub fn reload_curation(ctx: &TestContext, customize: impl FnOnce(&mut Config)) {
+    let (_dir, file) = reload_file(ctx, customize);
+    // The reload applies the env overrides, so no other test may change them meanwhile.
+    let _lock = crate::test_env::env_lock();
+    let held = crate::HeldQuarantine::of(&ctx.state.config.curation);
+    crate::reload_curation(&ctx.state.reloadable, &held, Some(file))
+        .expect("the reloaded curation builds");
+}
+
+/// The file a SIGHUP on `ctx` would read: the configuration NORA started with, changed by
+/// `customize`. It lives as long as the returned directory.
+pub fn reload_file(
+    ctx: &TestContext,
+    customize: impl FnOnce(&mut Config),
+) -> (tempfile::TempDir, String) {
+    let mut config = (*ctx.state.config).clone();
+    customize(&mut config);
+    // The test server listens on no port; a file the server loads names one, and the reload
+    // does not read it.
+    config.server.port = crate::config::ServerConfig::default().port;
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("config.toml");
+    std::fs::write(
+        &path,
+        toml::to_string(&config).expect("the configuration serializes"),
+    )
+    .unwrap();
+    let file = path.to_string_lossy().into_owned();
+    (dir, file)
+}
+
+/// Quarantine every proxied artifact for 7 days, curation on.
+pub fn quarantine_7d(cfg: &mut Config) {
+    cfg.curation.mode = crate::config::CurationMode::Enforce;
+    cfg.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Enforce);
+    cfg.curation.quarantine_ttl = Some("7d".to_string());
 }
 
 /// The path of every request an upstream mock has received, in order.
@@ -873,4 +1651,173 @@ impl Drop for EgressRecorder {
     fn drop(&mut self) {
         self.task.abort();
     }
+}
+
+/// What the current thread logs while a capture runs, as the text the server's `fmt` layer
+/// writes, for tests that prove what an event says.
+#[derive(Clone, Default)]
+pub struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl LogCapture {
+    /// Capture what this thread logs, at every level, until the guard is dropped. A
+    /// current-thread runtime polls its tasks here too.
+    pub fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+        let capture = Self::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
+        // An event another test emitted first, with no subscriber of its own, may have been
+        // registered as wanted by nobody while this one was being set; ask again.
+        tracing::callsite::rebuild_interest_cache();
+        (capture, guard)
+    }
+
+    /// Everything captured so far.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+    }
+}
+
+impl std::io::Write for LogCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// For each of `needles`, the functions of `source` that contain it on a line
+/// that is not a comment, its `#[cfg(test)]` modules left out: what a white
+/// list over a source file compares with the places a kind of call may be in.
+/// A line outside any function is under the function before it, or `""`.
+pub fn functions_containing(
+    source: &str,
+    needles: &[String],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    let mut found: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        Default::default();
+    let mut function = String::new();
+    let mut after_cfg_test = false;
+    let mut skipping: Option<i64> = None;
+    for line in source.lines() {
+        let trimmed = line.trim();
+        let braces = line.matches('{').count() as i64 - line.matches('}').count() as i64;
+        if let Some(depth) = skipping.as_mut() {
+            *depth += braces;
+            if *depth <= 0 {
+                skipping = None;
+            }
+            continue;
+        }
+        if trimmed == "#[cfg(test)]" {
+            after_cfg_test = true;
+            continue;
+        }
+        if after_cfg_test && trimmed.starts_with("#[") {
+            continue;
+        }
+        if std::mem::take(&mut after_cfg_test)
+            && trimmed
+                .split("mod ")
+                .next()
+                .is_some_and(|before| ["", "pub ", "pub(crate) ", "pub(super) "].contains(&before))
+            && trimmed.contains("mod ")
+            && braces > 0
+        {
+            skipping = Some(braces);
+            continue;
+        }
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        if let Some((_, rest)) = line.split_once("fn ") {
+            function = rest
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("")
+                .to_string();
+        }
+        for needle in needles {
+            if line.contains(needle.as_str()) {
+                found
+                    .entry(needle.clone())
+                    .or_default()
+                    .insert(function.clone());
+            }
+        }
+    }
+    found
+}
+
+// ---------------------------------------------------------------------------
+// Smuggled-byte matrix (shared by the per-format `url_fold` test modules)
+// ---------------------------------------------------------------------------
+
+/// The bytes a name must not carry into an upstream URL, as they stand in a path: control bytes
+/// the URL parser drops (`%09`, `%0A`, `%0D`) and the delimiters it cuts at (`%3F` = `?`, `%23` = `#`).
+pub const SMUGGLED: [&str; 5] = ["%09", "%0A", "%0D", "%3F", "%23"];
+
+/// An upstream that answers every request with 200 and keeps what it was asked.
+pub async fn answering_upstream() -> wiremock::MockServer {
+    use wiremock::matchers::any;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    let up = MockServer::builder().start().await;
+    Mock::given(any())
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UP".to_vec()))
+        .mount(&up)
+        .await;
+    up
+}
+
+/// Every `uri` is refused with `status` (the handler's own refusal), and the upstream is never asked.
+pub async fn assert_refused_as(
+    label: &str,
+    status: axum::http::StatusCode,
+    uris: &[String],
+    configure: impl Fn(&mut Config, &str),
+) {
+    for uri in uris {
+        let up = answering_upstream().await;
+        let ctx = create_test_context_with_config(|cfg| configure(cfg, &up.uri()));
+        let resp = send(&ctx.app, axum::http::Method::GET, uri, "").await;
+        assert_eq!(resp.status(), status, "{label}: {uri}");
+        let asked = upstream_paths(&up).await;
+        assert!(
+            asked.is_empty(),
+            "{label}: {uri} reached upstream as {asked:?}"
+        );
+    }
+}
+
+/// Refused with 400, the status of a name or version the handler rejects.
+pub async fn assert_refused(label: &str, uris: &[String], configure: impl Fn(&mut Config, &str)) {
+    assert_refused_as(label, axum::http::StatusCode::BAD_REQUEST, uris, configure).await;
+}
+
+/// `uri` is a legitimate name: it is not refused, and the upstream is asked for it.
+pub async fn assert_served_upstream(label: &str, uri: &str, configure: impl Fn(&mut Config, &str)) {
+    let up = answering_upstream().await;
+    let ctx = create_test_context_with_config(|cfg| configure(cfg, &up.uri()));
+    let resp = send(&ctx.app, axum::http::Method::GET, uri, "").await;
+    assert_ne!(
+        resp.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "{label}: {uri} refused"
+    );
+    assert!(
+        !upstream_paths(&up).await.is_empty(),
+        "{label}: {uri} never reached upstream"
+    );
 }

@@ -8,7 +8,9 @@ use std::env;
 
 /// Rate limiting configuration
 ///
-/// Controls request rate limits for different endpoint types.
+/// Per client: auth routes by `auth_*`; registry writes (PUT, POST, PATCH, DELETE) by
+/// `upload_*`; registry reads (GET, HEAD, OPTIONS, npm's audit POST) by `general_*`. Until 1.5
+/// a read gets the larger of `general_*` and `upload_*`, setting by setting (#1205).
 ///
 /// # Example
 /// ```toml
@@ -17,17 +19,17 @@ use std::env;
 /// auth_burst = 5
 /// upload_rps = 200
 /// upload_burst = 500
-/// general_rps = 100
-/// general_burst = 200
+/// general_rps = 1000
+/// general_burst = 2000
 /// ```
 ///
 /// # Environment Variables
 /// - `NORA_RATE_LIMIT_AUTH_RPS` - Auth requests per second
 /// - `NORA_RATE_LIMIT_AUTH_BURST` - Auth burst size
-/// - `NORA_RATE_LIMIT_UPLOAD_RPS` - Upload requests per second
-/// - `NORA_RATE_LIMIT_UPLOAD_BURST` - Upload burst size
-/// - `NORA_RATE_LIMIT_GENERAL_RPS` - General requests per second
-/// - `NORA_RATE_LIMIT_GENERAL_BURST` - General burst size
+/// - `NORA_RATE_LIMIT_UPLOAD_RPS` - Registry write requests per second
+/// - `NORA_RATE_LIMIT_UPLOAD_BURST` - Registry write burst size
+/// - `NORA_RATE_LIMIT_GENERAL_RPS` - Registry read requests per second
+/// - `NORA_RATE_LIMIT_GENERAL_BURST` - Registry read burst size
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RateLimitConfig {
     /// Enable rate limiting (default: true). Set `NORA_RATE_LIMIT_ENABLED=false` to disable.
@@ -62,11 +64,12 @@ fn default_upload_rps() -> u64 {
 fn default_upload_burst() -> u32 {
     500
 }
+// Reads: not below the write defaults, so that a default start reads at general_* (#1205).
 fn default_general_rps() -> u64 {
-    100
+    1000
 }
 fn default_general_burst() -> u32 {
-    200
+    2000
 }
 
 impl Default for RateLimitConfig {

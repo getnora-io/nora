@@ -20,9 +20,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 
 use crate::audit::AuditEntry;
-use crate::auth::{AuthenticatedUser, NamespaceAuthority};
+use crate::auth::{AuthenticatedUser, MintLifetimeCeiling, NamespaceAuthority};
 use crate::registry_type::RegistryType;
-use crate::tokens::Role;
+use crate::tokens::{MintLifetime, Role};
 use crate::AppState;
 
 /// Minimum seconds between two accepted reindex calls. A reindex flips dirty
@@ -177,12 +177,6 @@ fn default_admin_token_role() -> String {
     "read".to_string()
 }
 
-#[derive(Serialize)]
-struct AdminCreateTokenResponse {
-    token: String,
-    expires_in_days: u64,
-}
-
 /// Mint an API token of any role — including `admin` — WITHOUT the
 /// `auth.admin_users` self-service check.
 ///
@@ -201,6 +195,7 @@ async fn admin_create_token(
     State(state): State<AppState>,
     Extension(caller): Extension<AuthenticatedUser>,
     Extension(caller_authority): Extension<NamespaceAuthority>,
+    caller_mint_ceiling: Option<Extension<MintLifetimeCeiling>>,
     Json(req): Json<AdminCreateTokenRequest>,
 ) -> Response {
     // Role is proven by the gate, but role is not authority: a minted opaque
@@ -240,23 +235,30 @@ async fn admin_create_token(
             .into_response();
     };
 
-    let role_label = role.to_string();
-    match token_store.create_token(&req.username, req.ttl_days, req.description, role) {
-        Ok(token) => {
-            // Audit the mint with actor + target + role + ttl (never the token itself).
-            let detail = format!("role={} ttl_days={}", role_label, req.ttl_days);
-            state.audit.log(AuditEntry::new(
-                "admin_token_mint",
+    // An OIDC admin is held to its credential as on the UI: the token lives no
+    // longer than the provider ceiling and what is left of the JWT, and a JWT
+    // with nothing left mints nothing.
+    let lifetime = MintLifetime::days(
+        req.ttl_days,
+        caller_mint_ceiling.map(|Extension(MintLifetimeCeiling(secs))| secs),
+    );
+    if lifetime.secs() == 0 {
+        return (
+            StatusCode::FORBIDDEN,
+            "The credential has expired; a token minted from it would outlive it",
+        )
+            .into_response();
+    }
+    match token_store.mint_token(&req.username, lifetime, req.description, role) {
+        Ok(minted) => {
+            state.audit.log(AuditEntry::token_mint(
                 &caller.0,
-                &req.username,
                 "admin",
-                &detail,
+                &minted.owner,
+                &minted.role,
+                minted.ttl_secs,
             ));
-            Json(AdminCreateTokenResponse {
-                token,
-                expires_in_days: req.ttl_days,
-            })
-            .into_response()
+            Json(crate::auth::MintedTokenResponse::from(minted)).into_response()
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }

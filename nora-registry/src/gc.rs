@@ -315,6 +315,7 @@ pub async fn run_gc(
         "rpm/",
         "deb/",
         "cpan/",
+        "composer/",
     ] {
         let keys = storage.list(prefix).await.unwrap_or_else(|e| {
             tracing::error!("GC: storage.list({}) failed: {}", prefix, e);

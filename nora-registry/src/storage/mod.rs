@@ -35,6 +35,13 @@ pub(crate) fn is_reserved_signing_key(key: &str) -> bool {
     key.starts_with(SIGNING_KEY_PREFIX)
 }
 
+/// A storage verdict (reachable, writable) older than this is treated as unknown →
+/// unreachable. Five 30 s maintenance ticks: tolerates missed refreshes + jitter without
+/// flapping, but a stalled or dead maintenance loop un-readies the pod within the window
+/// instead of pinning a stale `true` (#872). Shared by every backend whose `health_check`
+/// serves a verdict the maintenance loop took.
+pub(crate) const HEALTH_MAX_STALE_SECS: i64 = 150;
+
 /// File metadata
 #[derive(Debug, Clone)]
 pub struct FileMeta {
@@ -141,7 +148,13 @@ pub trait StorageBackend: Send + Sync {
     /// Total size of all stored artifacts in bytes
     async fn total_size(&self) -> u64;
     fn backend_name(&self) -> &'static str;
-    /// Refresh any cached size data. No-op for backends without caching.
+    /// Ask the store whether it answers, with one cheap request (the object store: the first
+    /// page of its listing; the local disk: a write probe), and keep the outcome for
+    /// `health_check`, so a probe never waits on the store. No-op for backends whose
+    /// `health_check` asks the store itself.
+    async fn refresh_reachability(&self) {}
+    /// Refresh any cached size data. No-op for backends without caching. It may take as
+    /// long as listing the whole store, and does not say whether the store answers.
     async fn refresh_total_size(&self) {}
     /// Housekeeping at server start, before serving. The local backend opens this
     /// instance's staging directory and removes what dead instances left there; a
@@ -159,7 +172,10 @@ pub trait StorageBackend: Send + Sync {
 
     /// Server-side copy of `src` to `dst` inside the backend — the bytes never
     /// transit this process. `sha256` is the digest of the copied bytes when the
-    /// caller knows it; otherwise `dst` inherits the pin of `src`.
+    /// caller knows it; otherwise `dst` inherits the pin of `src`, and a `src`
+    /// without a pin leaves `dst` without one. An object store copies the
+    /// source's attributes and cannot set others, so there `dst` always carries
+    /// the pin of `src`: a digest given for an unpinned source is not recorded.
     ///
     /// Returns [`StorageError::NotFound`] when `src` does not exist; an existing
     /// `dst` is overwritten.
@@ -179,16 +195,18 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)>;
 
     /// Stream the inclusive byte range `[start, end]` of an object, returning the object's
-    /// total size and a reader over exactly those bytes. The default reads from the start and
-    /// discards the prefix; backends override with an efficient seek / ranged GET.
+    /// total size, its pin and a reader over exactly those bytes — size, pin and bytes of one
+    /// version, as [`get_reader`](Self::get_reader) returns them, so a caller can tell whether
+    /// the range came from the version it described (#1153). The default reads from the start
+    /// and discards the prefix; backends override with an efficient seek / ranged GET.
     async fn get_range(
         &self,
         key: &str,
         start: u64,
         end: u64,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         use tokio::io::AsyncReadExt;
-        let (size, _, mut reader) = self.get_reader(key).await?;
+        let (size, pin, mut reader) = self.get_reader(key).await?;
         let mut to_skip = start;
         let mut buf = [0u8; 64 * 1024];
         while to_skip > 0 {
@@ -200,7 +218,7 @@ pub trait StorageBackend: Send + Sync {
             to_skip -= n as u64;
         }
         let len = end.saturating_sub(start) + 1;
-        Ok((size, Box::pin(reader.take(len))))
+        Ok((size, pin, Box::pin(reader.take(len))))
     }
 }
 
@@ -260,6 +278,13 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn from_backend(inner: Arc<dyn StorageBackend>) -> Self {
         Self { inner }
+    }
+
+    /// Test-only: how many handles share this store. Every clone is one, so a task that may
+    /// still write to the store is counted until it ends.
+    #[cfg(test)]
+    pub(crate) fn holders(&self) -> usize {
+        Arc::strong_count(&self.inner)
     }
 
     pub async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
@@ -600,7 +625,12 @@ impl Storage {
         Ok(RepinOutcome::Updated { old, new: expected })
     }
 
-    /// Refresh cached total_size. No-op for local storage, computes for S3.
+    /// See [`StorageBackend::refresh_reachability`].
+    pub async fn refresh_reachability(&self) {
+        self.inner.refresh_reachability().await;
+    }
+
+    /// Recount the size `total_size` serves, walking the whole store.
     pub async fn refresh_total_size_cache(&self) {
         self.inner.refresh_total_size().await;
     }
@@ -686,7 +716,7 @@ impl Storage {
         key: &str,
         start: u64,
         end: u64,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
+    ) -> Result<(u64, Option<String>, Pin<Box<dyn AsyncRead + Send + Unpin>>)> {
         validate_storage_key(key)?;
         match self.inner.get_range(key, start, end).await {
             Ok(r) => {
@@ -969,6 +999,91 @@ mod tests {
             Some(sha.as_str()),
             "put_from_path must record the hash-pin before returning (#604)"
         );
+    }
+
+    /// #1154: after a write, a key's pin is the digest the write gave; a copy without one
+    /// carries the source's pin, or none — never the pin of the bytes it replaced. Both
+    /// backends agree, and a write that changes no pin appends nothing to the pin file.
+    #[tokio::test]
+    async fn a_write_without_a_digest_leaves_no_pin_of_the_bytes_it_replaced() {
+        use sha2::{Digest, Sha256};
+        let sha = |b: &[u8]| hex::encode(Sha256::digest(b));
+        let dir = TempDir::new().unwrap();
+        let store = dir.path().join("store");
+        let local = Storage::new_local(store.to_str().unwrap());
+        let (_, object) = object_storage();
+        let pin_lines = || {
+            std::fs::read_to_string(store.join(".nora-pins.ndjson"))
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+        for (backend, storage) in [("local", &local), ("object", &object)] {
+            let src = |name: &str, bytes: &[u8]| {
+                let path = dir.path().join(format!("{backend}-{name}"));
+                std::fs::write(&path, bytes).unwrap();
+                path
+            };
+            // P1, P2: a pinned key written again without a digest is unpinned.
+            storage
+                .put_from_path("raw/p", &src("p1", b"v1"), Some(&sha(b"v1")))
+                .await
+                .unwrap();
+            assert_eq!(storage.pin("raw/p").await, Some(sha(b"v1")), "{backend} P1");
+            storage
+                .put_from_path("raw/p", &src("p2", b"v2"), None)
+                .await
+                .unwrap();
+            assert_eq!(storage.pin("raw/p").await, None, "{backend} P2");
+            assert_eq!(
+                &storage.get("raw/p").await.unwrap()[..],
+                b"v2",
+                "{backend} P2"
+            );
+            // P3: a key without a pin written without a digest stays without one.
+            let before = pin_lines();
+            storage
+                .put_from_path("raw/q", &src("p3", b"q"), None)
+                .await
+                .unwrap();
+            assert_eq!(storage.pin("raw/q").await, None, "{backend} P3");
+            assert_eq!(pin_lines(), before, "{backend} P3: nothing appended");
+            // C1: a copy with a digest is pinned to it.
+            storage.put("raw/s", b"s").await.unwrap();
+            await_pin(storage, "raw/s").await;
+            storage
+                .copy("raw/s", "raw/c1", Some(&sha(b"s")))
+                .await
+                .unwrap();
+            assert_eq!(storage.pin("raw/c1").await, Some(sha(b"s")), "{backend} C1");
+            // A store-side copy cannot set attributes: on an object store the copy of an
+            // unpinned source stays unpinned even with a digest, as its source is.
+            storage
+                .copy("raw/q", "raw/c1q", Some(&sha(b"q")))
+                .await
+                .unwrap();
+            let expected = (backend == "local").then(|| sha(b"q"));
+            assert_eq!(storage.pin("raw/c1q").await, expected, "{backend} C1q");
+            // C2: a copy without a digest carries the source's pin over a pinned target.
+            storage.put("raw/c2", b"old").await.unwrap();
+            await_pin(storage, "raw/c2").await;
+            storage.copy("raw/s", "raw/c2", None).await.unwrap();
+            assert_eq!(storage.pin("raw/c2").await, Some(sha(b"s")), "{backend} C2");
+            // C3: a copy of an unpinned source over a pinned target leaves it unpinned.
+            storage.put("raw/c3", b"old").await.unwrap();
+            await_pin(storage, "raw/c3").await;
+            storage.copy("raw/q", "raw/c3", None).await.unwrap();
+            assert_eq!(storage.pin("raw/c3").await, None, "{backend} C3");
+            assert_eq!(
+                &storage.get("raw/c3").await.unwrap()[..],
+                b"q",
+                "{backend} C3"
+            );
+            // C4: a copy of an unpinned source onto a new key appends nothing.
+            let before = pin_lines();
+            storage.copy("raw/q", "raw/c4", None).await.unwrap();
+            assert_eq!(storage.pin("raw/c4").await, None, "{backend} C4");
+            assert_eq!(pin_lines(), before, "{backend} C4: nothing appended");
+        }
     }
 
     /// Regression for #582: a pinned artifact corrupted on disk must NOT be

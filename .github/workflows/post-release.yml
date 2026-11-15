@@ -11,7 +11,13 @@ jobs:
   verify:
     name: Post-Release Verification
     runs-on: ubuntu-latest
-    if: github.event.workflow_run.conclusion == 'success'
+    # Only a successful tag-push run of this repository: a workflow named Release elsewhere
+    # (a fork's pull request) must not reach the Docker Hub credentials.
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
     permissions:
       contents: read
       packages: read
@@ -23,8 +29,19 @@ jobs:
         id: ver
         env:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         run: |
           TAG="${HEAD_BRANCH}"
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::not a release tag: ${TAG}"
+            exit 1
+          fi
+          # v* tags are protected: the run must be the commit the tag names here.
+          TAGGED=$(git ls-remote origin "refs/tags/${TAG}" "refs/tags/${TAG}^{}" | tail -n 1 | cut -f 1)
+          if [ -z "$TAGGED" ] || [ "$TAGGED" != "$HEAD_SHA" ]; then
+            echo "::error::tag ${TAG} is '${TAGGED}', the release run built ${HEAD_SHA}"
+            exit 1
+          fi
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign

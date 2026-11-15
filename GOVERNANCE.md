@@ -6,6 +6,10 @@ This document describes how decisions are made, how releases are shipped, and ho
 For contributor roles and responsibilities, see [CONTRIBUTING.md](CONTRIBUTING.md).
 For vulnerability reporting, see [SECURITY.md](SECURITY.md).
 
+## Maintainers
+
+- Pavel Volkov ([@devitway](https://github.com/devitway)) — creator and maintainer.
+
 ## Decision Process
 
 ### Architecture

@@ -132,11 +132,30 @@ fn byte_range_core_is_bounds_safe() {
 /// A ranged serve reads part of the object, so it cannot rehash it: there is no
 /// server-side integrity check on this path. The client's own checksum (lockfile
 /// hash, content digest) covers it — the precedent docker set in #657.
+///
+/// `size` is the object the caller described: a ranged read of an object of another
+/// size — one replaced since the caller looked — is not served (#1153).
 pub(crate) async fn range_response(
     storage: &Storage,
     keys: &[&str],
     headers: &HeaderMap,
     size: u64,
+    content_type: &str,
+    extra: &[(HeaderName, String)],
+) -> Option<Response> {
+    range_response_of(storage, keys, headers, size, None, content_type, extra).await
+}
+
+/// [`range_response`] for a caller that announces the object's pin as its ETag: the range
+/// is served only from that version, so a 206 never pairs the ETag of one version with the
+/// bytes of another (#1153). On a mismatch the caller serves the full 200 from the reader it
+/// already opened, whose bytes its ETag describes.
+pub(crate) async fn range_response_of(
+    storage: &Storage,
+    keys: &[&str],
+    headers: &HeaderMap,
+    size: u64,
+    pin: Option<&str>,
     content_type: &str,
     extra: &[(HeaderName, String)],
 ) -> Option<Response> {
@@ -157,8 +176,10 @@ pub(crate) async fn range_response(
 
     let mut reader = None;
     for key in keys {
-        if let Ok((_, r)) = storage.get_range(key, start, end).await {
-            reader = Some(r);
+        if let Ok((served_size, served_pin, r)) = storage.get_range(key, start, end).await {
+            if served_size == size && pin.is_none_or(|p| served_pin.as_deref() == Some(p)) {
+                reader = Some(r);
+            }
             break;
         }
     }
@@ -209,6 +230,45 @@ mod tests {
         // and the suffix form against an empty object.
         assert_eq!(parse_byte_range("bytes=5-5", 10), Satisfiable(5, 5)); // single byte (kills `>`→`>=`)
         assert_eq!(parse_byte_range("bytes=-5", 0), Unsatisfiable); // suffix + empty
+    }
+
+    /// #1153: a range is served only from an object of the size the caller described, and
+    /// with a pin, only from the version that pin names; otherwise the caller serves the 200.
+    #[tokio::test]
+    async fn a_range_of_another_version_is_not_served() {
+        use axum::http::{header, HeaderMap, StatusCode};
+        use sha2::Digest;
+        let storage = crate::storage::Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        storage.put("raw/f.bin", b"0123456789").await.unwrap();
+        let pin = hex::encode(sha2::Sha256::digest(b"0123456789"));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::RANGE, "bytes=0-3".parse().unwrap());
+        let serve = |size: u64, pin: Option<&str>| {
+            let (storage, headers, pin) =
+                (storage.clone(), headers.clone(), pin.map(str::to_string));
+            async move {
+                super::range_response_of(
+                    &storage,
+                    &["raw/f.bin"],
+                    &headers,
+                    size,
+                    pin.as_deref(),
+                    "x",
+                    &[],
+                )
+                .await
+                .map(|r| r.status())
+            }
+        };
+        assert_eq!(serve(10, None).await, Some(StatusCode::PARTIAL_CONTENT));
+        assert_eq!(
+            serve(10, Some(&pin)).await,
+            Some(StatusCode::PARTIAL_CONTENT)
+        );
+        assert_eq!(serve(12, None).await, None, "another size");
+        assert_eq!(serve(10, Some(&"0".repeat(64))).await, None, "another pin");
     }
 
     proptest::proptest! {

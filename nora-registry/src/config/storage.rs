@@ -47,10 +47,15 @@ pub struct StorageConfig {
     /// Workload Identity / GCE service accounts need no key material).
     #[serde(default)]
     pub gcs_service_account_path: Option<String>,
-    /// GCS: endpoint override for emulators (fake-gcs-server) or Private
-    /// Google Access endpoints. Unset = https://storage.googleapis.com.
+    /// GCS: endpoint override for emulators or Private Google Access
+    /// endpoints. Unset = https://storage.googleapis.com.
     /// Emulator-only caveat: an `http://` override also disables request
     /// signing — do not point this at a plaintext non-emulator endpoint.
+    /// Writes still ask for a token, so against an emulator also set
+    /// `gcs_service_account_path` to a key file with `"disable_oauth": true`
+    /// (`private_key`, `private_key_id` and `client_email` must be present but
+    /// are not used). The emulator must serve the GCS XML API, including
+    /// object PUT and `x-goog-copy-source` copies: fake-gcs-server does not.
     #[serde(default)]
     pub gcs_base_url: Option<String>,
 }
