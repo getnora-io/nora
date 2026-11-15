@@ -42,12 +42,14 @@ pub(crate) fn storage_key(path: &str) -> String {
 }
 
 /// Whether a request path (as decoded) holds only what a Maven coordinate and its file name
-/// hold: ASCII letters and digits, `.`, `-`, `_`, `+` (versions), and `/`. Anything else —
-/// `\t`, `\n`, `?`, `#` — is dropped or cut by the upstream URL, so the upstream would fetch a
-/// coordinate other than the one curation checked.
+/// hold: ASCII letters and digits, `.`, `-`, `_`, `+` and `~` (versions), and `/`. Maven's version
+/// rule bans `\ / : " < > | ? *` and nothing else (`maven-model-builder` `DefaultModelValidator`,
+/// `ILLEGAL_VERSION_CHARS`), so `~` is a version byte; the group and artifact ids hold letters,
+/// digits, `-`, `_`, `.` (`validateId`). Anything else — `\t`, `\n`, `?`, `#` — is dropped or cut by
+/// the upstream URL, so the upstream would fetch a coordinate other than the one curation checked.
 fn is_maven_path(path: &str) -> bool {
     path.bytes()
-        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'/'))
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'~' | b'/'))
 }
 
 pub fn routes() -> Router<AppState> {
@@ -3295,6 +3297,32 @@ mod url_fold {
         }
         uris.push("/maven2/com/evil/x/1.0%091/x-1.0%091.jar".to_string());
         assert_refused("maven", &uris, maven_proxy).await;
+    }
+
+    /// Maven's version rule bans `\\ / : " < > | ? *` and no other byte (`DefaultModelValidator`), so `~`
+    /// is a legitimate version byte, and the URL parser keeps it.
+    #[tokio::test]
+    async fn legitimate_tilde_version_reaches_upstream_and_deploys() {
+        assert_served_upstream(
+            "maven",
+            "/maven2/org/example/my-lib/1.0~rc1/my-lib-1.0~rc1.jar",
+            maven_proxy,
+        )
+        .await;
+        let ctx = crate::test_helpers::create_test_context();
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            axum::http::Method::PUT,
+            "/maven2/org/example/my-lib/1.0~rc1/my-lib-1.0~rc1.jar",
+            vec![("content-type", "application/octet-stream")],
+            b"x".to_vec(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            axum::http::StatusCode::CREATED,
+            "tilde deploy refused"
+        );
     }
 
     #[tokio::test]
