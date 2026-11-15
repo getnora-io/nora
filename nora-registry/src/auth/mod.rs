@@ -3794,6 +3794,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
                     crate::config::CurationConfig::default(),
                 ),
                 bypass_token: None,
+                loaded_at: 0,
             })),
             auth_failures: Arc::new(crate::auth::AuthFailureTracker::new(5, 900)),
             oidc: Some(Arc::new(oidc_validator)),
