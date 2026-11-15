@@ -374,6 +374,9 @@ pub fn acquire_publish_lock(locks: &PublishLocks, key: &str) -> Arc<tokio::sync:
 pub struct ReloadableConfig {
     pub curation_engine: curation::CurationEngine,
     pub bypass_token: Option<ProtectedString>,
+    /// When this configuration took effect (unix seconds), later at every reload: what a
+    /// registry serves may change with it, so a response it rewrites is no older than this.
+    pub loaded_at: i64,
 }
 
 #[derive(Clone)]
@@ -3540,6 +3543,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     let reloadable = Arc::new(ArcSwap::from_pointee(ReloadableConfig {
         curation_engine,
         bypass_token,
+        loaded_at: chrono::Utc::now().timestamp(),
     }));
 
     let leak_finders = metrics::LeakFinders::new(config.upstream_hostnames());
@@ -5114,9 +5118,15 @@ fn reload_curation(
     let engine = build_curation_engine(&config)?;
     let unreloaded = held.unapplied(&config.curation);
 
+    // Strictly later than the configuration it replaces, even within the same second: a
+    // client's copy dated by the old one is then never current.
+    let loaded_at = chrono::Utc::now()
+        .timestamp()
+        .max(slot.load().loaded_at + 1);
     slot.store(Arc::new(ReloadableConfig {
         curation_engine: engine,
         bypass_token: config.curation.bypass_token,
+        loaded_at,
     }));
 
     if !unreloaded.is_empty() {
@@ -5673,6 +5683,7 @@ mod curation_reload_tests {
         let slot = arc_swap::ArcSwap::from_pointee(super::ReloadableConfig {
             curation_engine: build_curation_engine(&enforce()).unwrap(),
             bypass_token: None,
+            loaded_at: 0,
         });
         let reads = |slot: &arc_swap::ArcSwap<super::ReloadableConfig>| {
             RegistryType::all()
