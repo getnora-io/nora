@@ -1295,7 +1295,7 @@ mod encoding_guard_tests {
     use tower::ServiceExt;
 
     /// The prefix of every route family the server mounts, and none.
-    const PREFIXES: [&str; 19] = [
+    const PREFIXES: [&str; 20] = [
         "/v2",
         "/npm",
         "/go",
@@ -1311,6 +1311,7 @@ mod encoding_guard_tests {
         "/terraform",
         "/ansible",
         "/cpan",
+        "/composer",
         "/hf",
         "/api",
         "/ui",

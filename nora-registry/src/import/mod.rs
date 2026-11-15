@@ -642,6 +642,7 @@ fn curation_name(rt: crate::registry_type::RegistryType, art: &ArtifactRef, key:
         | crate::registry_type::RegistryType::Rpm
         | crate::registry_type::RegistryType::Deb
         | crate::registry_type::RegistryType::Cpan
+        | crate::registry_type::RegistryType::Composer
         | crate::registry_type::RegistryType::HuggingFace => art.path.clone(),
     }
 }
@@ -2085,6 +2086,1071 @@ mod integration_tests {
             asked.contains(&"/files/otherpkg-9.9.9-py3-none-any.whl".to_string()),
             "{asked:?}"
         );
+    }
+
+    /// An imported package is found by search and autocomplete with the versions its flat
+    /// container lists, upstream or not: the records of the import, not a list an upstream gave
+    /// for the id before. Before, search read only the cached upstream list, which an import
+    /// does not write, so an imported package was not found (`totalHits: 0`), and a package
+    /// an upstream had served before was found with the upstream's versions.
+    #[tokio::test]
+    async fn an_imported_nupkg_is_found_by_search_with_the_versions_it_lists() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        // What an upstream served under one id before its import: a version and its list.
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/corp.old/9.9.9/corp.old.9.9.9.nupkg",
+                &b"squatted"[..],
+            ),
+            (
+                "nuget/flatcontainer/corp.old/index.json",
+                br#"{"versions":["9.9.9"]}"#,
+            ),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![
+                (
+                    "Corp.Lib/Corp.Lib.1.0.nupkg".into(),
+                    nupkg("Corp.Lib", "1.0"),
+                ),
+                ("Corp.Old.2.0.nupkg".into(), nupkg("Corp.Old", "2.0")),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (2, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        let get = |path: String| {
+            let app = ctx.app.clone();
+            async move {
+                let resp = send(&app, Method::GET, &path, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{path}");
+                serde_json::from_slice::<serde_json::Value>(&body_bytes(resp).await).unwrap()
+            }
+        };
+        let strings = |values: &serde_json::Value| -> Vec<String> {
+            let values = values.as_array().unwrap().iter();
+            values.map(|v| v.as_str().unwrap().to_string()).collect()
+        };
+        for id in ["corp.lib", "corp.old"] {
+            let listed = get(format!("/nuget/v3/flatcontainer/{id}/index.json")).await;
+            let found = get(format!("/nuget/v3/query?q={id}")).await;
+            assert_eq!(found["totalHits"], 1, "{id}: {found}");
+            let versions: Vec<serde_json::Value> = found["data"][0]["versions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v["version"].clone())
+                .collect();
+            assert_eq!(
+                strings(&serde_json::Value::Array(versions)),
+                strings(&listed["versions"]),
+                "{id}: search and the flat container disagree"
+            );
+        }
+        // An import that stopped after marking the package: hosted, nothing of its own yet, so
+        // nothing found — not what an upstream once listed under the id.
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/corp.cut/9.9.9/corp.cut.9.9.9.nupkg",
+                &b"squatted"[..],
+            ),
+            (
+                "nuget/flatcontainer/corp.cut/index.json",
+                br#"{"versions":["9.9.9"]}"#,
+            ),
+            ("nuget/hosted/corp.cut/imported", b""),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+        let listed = get("/nuget/v3/flatcontainer/corp.cut/index.json".to_string()).await;
+        assert_eq!(listed["versions"], json!([]), "{listed}");
+        let found = get("/nuget/v3/query?q=corp.cut".to_string()).await;
+        assert_eq!(found["totalHits"], 0, "{found}");
+        let names = get("/nuget/v3/autocomplete?q=corp".to_string()).await;
+        assert_eq!(names["data"], json!(["corp.lib", "corp.old"]), "{names}");
+    }
+
+    /// A search repeated over imported packages reads their versions from the index NORA keeps,
+    /// not by listing every package's records again: the records are listed when the index is
+    /// rebuilt, after a write or a reindex, once for the whole repository.
+    #[tokio::test]
+    async fn a_repeated_search_does_not_list_the_records_again() {
+        use crate::test_helpers::{
+            create_test_context_with_storage_and_config, op_counting_storage, send,
+        };
+        use axum::http::{Method, StatusCode};
+
+        let (storage, counts) = op_counting_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        let state = tempfile::tempdir().unwrap();
+        let packages = (0..5)
+            .map(|i| {
+                let id = format!("Corp.Lib{i}");
+                (format!("{id}.1.0.nupkg"), nupkg(&id, "1.0"))
+            })
+            .collect();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            packages,
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (5, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        for path in ["/nuget/v3/query?q=corp", "/nuget/v3/autocomplete?q=corp"] {
+            // The first search builds the index.
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            counts.reset();
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let ops = counts.snapshot();
+            assert_eq!(
+                ops.get("list").copied().unwrap_or(0)
+                    + ops.get("list_with_meta").copied().unwrap_or(0),
+                0,
+                "{path}: listed again: {ops:?}"
+            );
+        }
+    }
+
+    /// With the package source up, search answers from the search host, and NORA's own
+    /// packages are in it as NORA holds them: an imported id the host also returns shows the
+    /// imported versions, an imported id the query matches is added on the first page, and an
+    /// id in an internal namespace is never shown from the host.
+    #[tokio::test]
+    async fn search_through_a_live_upstream_shows_imported_packages_as_held() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let search = paging_search_host(&["Corp.Lib", "Internal.Lib", "Other.Lib"]).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![
+                ("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0")),
+                ("Corp.NewLib.2.0.nupkg".into(), nupkg("Corp.NewLib", "2.0")),
+                (
+                    "Corp.ExtraLib.3.0.nupkg".into(),
+                    nupkg("Corp.ExtraLib", "3.0"),
+                ),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (3, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let found: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert!(
+            !search.received_requests().await.unwrap().is_empty(),
+            "the search host was not asked"
+        );
+        let shown: Vec<(String, Vec<String>)> = found["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let versions = entry["versions"].as_array().unwrap().iter();
+                let versions = versions.map(|v| v["version"].as_str().unwrap().to_string());
+                (
+                    entry["id"].as_str().unwrap().to_lowercase(),
+                    versions.collect(),
+                )
+            })
+            .collect();
+        let want = |id: &str, versions: &[&str]| {
+            (
+                id.to_string(),
+                versions.iter().map(|v| v.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            shown,
+            [
+                want("corp.extralib", &["3.0.0"]),
+                want("corp.lib", &["1.0.0"]),
+                want("corp.newlib", &["2.0.0"]),
+                want("other.lib", &["9.9.9"]),
+            ],
+            "{found}"
+        );
+        // NORA's own 3 and the host's one NORA shows: its Corp.Lib is NORA's, Internal.Lib is
+        // in an internal namespace.
+        assert_eq!(found["totalHits"], 4, "{found}");
+        // A later page: the host's entries without NORA's own, the same total.
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib&skip=3", "").await;
+        let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let ids: Vec<&str> = page["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["Other.Lib"], "{page}");
+        assert_eq!(page["totalHits"], 4, "{page}");
+    }
+
+    /// A package imported after the index was built, while the records cannot be listed: search
+    /// through a live search host does not show the host's versions of it from the listing
+    /// before the import, it answers 503 until the records list again.
+    #[tokio::test]
+    async fn an_import_the_index_cannot_list_is_not_shown_from_a_live_upstream() {
+        use crate::test_helpers::{
+            body_bytes, create_test_context_with_storage_and_config, outage_storage, send,
+        };
+        use axum::http::{Method, StatusCode};
+
+        let search = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalHits": 1,
+                "data": [{ "id": "Corp.Lib", "version": "9.9.9", "versions": [{ "version": "9.9.9" }] }],
+            })))
+            .mount(&search)
+            .await;
+        let (storage, outage) = outage_storage();
+        let uri = search.uri();
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+        });
+        let query = "/nuget/v3/query?q=corp";
+        // Warm: not hosted yet, the host's package is the host's.
+        let resp = send(&ctx.app, Method::GET, query, "").await;
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(body.contains("9.9.9"), "{body}");
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        outage.fail_listings_of("nuget/hosted/");
+        let resp = send(&ctx.app, Method::GET, query, "").await;
+        let status = resp.status();
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(
+            !body.contains("9.9.9"),
+            "the host's version of an import: {body}"
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        // Listed again: the import as NORA holds it.
+        outage.end();
+        ctx.state.repo_index.invalidate("nuget");
+        let resp = send(&ctx.app, Method::GET, query, "").await;
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(
+            body.contains("\"1.0.0\"") && !body.contains("9.9.9"),
+            "{body}"
+        );
+    }
+
+    /// Paging through a merged search, against a search host that pages as it is asked: every
+    /// page holds `take` entries at most, no id is on two pages, `totalHits` is the same on
+    /// every page, and the pages together hold NORA's own packages (as held) and the host's
+    /// others, not an internal id.
+    #[tokio::test]
+    async fn a_merged_search_pages_without_overlap() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let host_ids = ["A.Lib", "Corp.Lib", "B.Lib", "C.Lib", "Internal.X", "D.Lib"];
+        let search = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(move |request: &wiremock::Request| {
+                let param = |name: &str| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == name)
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                };
+                let (skip, take) = (param("skip").unwrap_or(0), param("take").unwrap_or(20));
+                let data: Vec<serde_json::Value> = host_ids
+                    .iter()
+                    .skip(skip)
+                    .take(take)
+                    .map(|id| json!({ "id": id, "version": "9.9.9", "versions": [{ "version": "9.9.9" }] }))
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "totalHits": host_ids.len(), "data": data }))
+            })
+            .mount(&search)
+            .await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![
+                ("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0")),
+                ("Corp.NewLib.2.0.nupkg".into(), nupkg("Corp.NewLib", "2.0")),
+                (
+                    "Corp.ExtraLib.3.0.nupkg".into(),
+                    nupkg("Corp.ExtraLib", "3.0"),
+                ),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (3, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+
+        let take = 2;
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut totals = std::collections::BTreeSet::new();
+        for skip in (0..12).step_by(take) {
+            let path = format!("/nuget/v3/query?q=lib&skip={skip}&take={take}");
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            let data = page["data"].as_array().unwrap();
+            assert!(data.len() <= take, "{path}: {page}");
+            totals.insert(page["totalHits"].as_u64().unwrap());
+            for entry in data {
+                let id = entry["id"].as_str().unwrap().to_lowercase();
+                assert!(
+                    seen.iter().all(|(seen_id, _)| *seen_id != id),
+                    "{path}: {id} on two pages"
+                );
+                seen.push((id, entry["version"].as_str().unwrap().to_string()));
+            }
+        }
+        assert_eq!(
+            totals.into_iter().collect::<Vec<_>>(),
+            [7],
+            "totalHits: the same on every page, and what the pages hold"
+        );
+        let mut ids: Vec<&str> = seen.iter().map(|(id, _)| id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "a.lib",
+                "b.lib",
+                "c.lib",
+                "corp.extralib",
+                "corp.lib",
+                "corp.newlib",
+                "d.lib"
+            ]
+        );
+        let corp = seen.iter().find(|(id, _)| id == "corp.lib").unwrap();
+        assert_eq!(corp.1, "1.0.0", "an import shown as the host has it");
+    }
+
+    /// A search host that pages as it is asked (`skip`, `take`) over `host_ids`, and counts the
+    /// requests it answers.
+    async fn paging_search_host(host_ids: &'static [&'static str]) -> MockServer {
+        let search = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(move |request: &wiremock::Request| {
+                let param = |name: &str| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == name)
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                };
+                let (skip, take) = (param("skip").unwrap_or(0), param("take").unwrap_or(20));
+                let data: Vec<serde_json::Value> = host_ids
+                    .iter()
+                    .skip(skip)
+                    .take(take)
+                    .map(|id| json!({ "id": id, "version": "9.9.9", "versions": [{ "version": "9.9.9" }] }))
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "totalHits": host_ids.len(), "data": data }))
+            })
+            .mount(&search)
+            .await;
+        search
+    }
+
+    /// An autocomplete host that pages as it is asked over `ids`.
+    async fn paging_autocomplete_host(ids: &'static [&'static str]) -> MockServer {
+        let autocomplete = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(move |request: &wiremock::Request| {
+                let param = |name: &str| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == name)
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                };
+                let (skip, take) = (param("skip").unwrap_or(0), param("take").unwrap_or(20));
+                let data: Vec<&str> = ids.iter().skip(skip).take(take).copied().collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "totalHits": ids.len(), "data": data }))
+            })
+            .mount(&autocomplete)
+            .await;
+        autocomplete
+    }
+
+    /// Walks a search page by page (`take` a page) until a page comes back short, as a client
+    /// does: the ids in order, and every `totalHits` seen.
+    async fn walk_search(
+        app: &axum::Router,
+        query: &str,
+        take: usize,
+    ) -> (Vec<String>, std::collections::BTreeSet<u64>) {
+        use crate::test_helpers::{body_bytes, send};
+        use axum::http::{Method, StatusCode};
+        let (mut ids, mut totals) = (Vec::new(), std::collections::BTreeSet::new());
+        let mut ended = false;
+        for skip in (0..).step_by(take).take(200) {
+            let path = format!("/nuget/v3/query?q={query}&skip={skip}&take={take}");
+            let resp = send(app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            totals.insert(page["totalHits"].as_u64().unwrap());
+            let data = page["data"].as_array().unwrap();
+            ids.extend(
+                data.iter()
+                    .map(|e| e["id"].as_str().unwrap().to_lowercase()),
+            );
+            if data.len() < take {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended, "{query}: no short page in 200 pages of {take}");
+        (ids, totals)
+    }
+
+    /// The search host also lists an id NORA hosts, and one in an internal namespace: neither
+    /// takes a place in the merged sequence. A client walking the pages until a short one sees
+    /// every other entry of the host, and `totalHits` counts what the pages hold.
+    #[tokio::test]
+    async fn a_host_entry_nora_does_not_show_takes_no_place_on_the_pages() {
+        use crate::test_helpers::create_test_context_with_config;
+
+        let search = paging_search_host(&["Corp.Lib", "Internal.X", "Other.Lib", "Z.Lib"]).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        for take in [1, 2, 3, 20] {
+            let (ids, totals) = walk_search(&ctx.app, "lib", take).await;
+            assert_eq!(ids, ["corp.lib", "other.lib", "z.lib"], "take={take}");
+            assert_eq!(
+                totals.into_iter().collect::<Vec<_>>(),
+                [3],
+                "take={take}: totalHits"
+            );
+        }
+    }
+
+    /// A host result too large to read whole: the pages still hold every entry once and have no
+    /// gap, `totalHits` is the same on every page and not fewer than the pages hold, and a page
+    /// near the start asks the host little.
+    #[tokio::test]
+    async fn a_large_host_result_pages_without_a_gap_and_a_total_not_below_it() {
+        use crate::test_helpers::create_test_context_with_config;
+
+        let mut host_ids: Vec<&'static str> = vec!["Corp.Lib"];
+        host_ids.extend((0..150).map(|n| &*Box::leak(format!("Lib{n:03}").into_boxed_str())));
+        let search = paging_search_host(Box::leak(host_ids.into_boxed_slice())).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+
+        use crate::test_helpers::{body_bytes, send};
+        use axum::http::Method;
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib&take=20", "").await;
+        let first: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(first["data"].as_array().unwrap().len(), 20, "{first}");
+        let asked: Vec<String> = search
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.query().unwrap_or_default().to_string())
+            .collect();
+        assert!(asked.len() <= 2, "the first page asked the host {asked:?}");
+
+        let (ids, totals) = walk_search(&ctx.app, "lib", 20).await;
+        let mut want = vec!["corp.lib".to_string()];
+        want.extend((0..150).map(|n| format!("lib{n:03}")));
+        assert_eq!(ids, want);
+        let totals: Vec<u64> = totals.into_iter().collect();
+        assert_eq!(
+            totals.len(),
+            1,
+            "totalHits changes with the page: {totals:?}"
+        );
+        assert!(totals[0] >= ids.len() as u64, "{totals:?} < {}", ids.len());
+    }
+
+    /// Autocomplete through a live autocomplete host has NORA's own packages in it, as search
+    /// does: an imported id the query matches comes first, an id in an internal namespace or an
+    /// id NORA hosts but holds no version of is not shown from the host, and a client walking
+    /// the pages sees every other id once, with `totalHits` counting what the pages hold.
+    #[tokio::test]
+    async fn autocomplete_through_a_live_upstream_shows_imported_ids() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let host_ids = ["Corp.Lib", "Internal.X", "Other.Lib", "Z.Lib"];
+        let autocomplete = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(move |request: &wiremock::Request| {
+                let param = |name: &str| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == name)
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                };
+                let (skip, take) = (param("skip").unwrap_or(0), param("take").unwrap_or(20));
+                let data: Vec<&str> = host_ids.iter().skip(skip).take(take).copied().collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "totalHits": host_ids.len(), "data": data }))
+            })
+            .mount(&autocomplete)
+            .await;
+        let uri = autocomplete.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.autocomplete = format!("{uri}/autocomplete");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![
+                ("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0")),
+                ("Corp.NewLib.2.0.nupkg".into(), nupkg("Corp.NewLib", "2.0")),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (2, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+
+        for take in [1, 2, 20] {
+            let (mut ids, mut totals) = (Vec::new(), std::collections::BTreeSet::new());
+            for skip in (0..).step_by(take).take(20) {
+                let path = format!("/nuget/v3/autocomplete?q=lib&skip={skip}&take={take}");
+                let resp = send(&ctx.app, Method::GET, &path, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{path}");
+                let page: serde_json::Value =
+                    serde_json::from_slice(&body_bytes(resp).await).unwrap();
+                totals.insert(page["totalHits"].as_u64().unwrap());
+                let data = page["data"].as_array().unwrap();
+                ids.extend(data.iter().map(|id| id.as_str().unwrap().to_lowercase()));
+                if data.len() < take {
+                    break;
+                }
+            }
+            assert_eq!(
+                ids,
+                ["corp.lib", "corp.newlib", "other.lib", "z.lib"],
+                "take={take}"
+            );
+            assert_eq!(totals.into_iter().collect::<Vec<_>>(), [4], "take={take}");
+        }
+        assert!(
+            !autocomplete.received_requests().await.unwrap().is_empty(),
+            "the autocomplete host was not asked"
+        );
+    }
+
+    /// A search or autocomplete host whose first entries NORA does not show (a run of ids in an
+    /// internal namespace) in a result too large to read whole: the first page still holds the
+    /// first entry NORA shows, and a walk with `take=1` sees every one of them.
+    #[tokio::test]
+    async fn a_run_of_entries_nora_does_not_show_is_read_past() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let mut ids: Vec<&'static str> = (0..6)
+            .map(|n| &*Box::leak(format!("Internal.Lib{n}").into_boxed_str()))
+            .collect();
+        ids.extend((0..95).map(|n| &*Box::leak(format!("Lib{n:03}").into_boxed_str())));
+        let ids: &'static [&'static str] = Box::leak(ids.into_boxed_slice());
+        let search = paging_search_host(ids).await;
+        let autocomplete = paging_autocomplete_host(ids).await;
+        let (search_uri, autocomplete_uri) = (search.uri(), autocomplete.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(search_uri.clone());
+            cfg.nuget.search_service = format!("{search_uri}/query");
+            cfg.nuget.autocomplete = format!("{autocomplete_uri}/autocomplete");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let want: Vec<String> = (0..95).map(|n| format!("lib{n:03}")).collect();
+        let (walked, totals) = walk_search(&ctx.app, "lib", 1).await;
+        assert_eq!(walked, want, "search");
+        assert!(totals.iter().all(|t| *t >= 95), "{totals:?}");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?q=lib&take=1",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(page["data"], json!(["Lib000"]), "autocomplete: {page}");
+    }
+
+    /// A page deeper than NORA reads the host for is not answered as a short or empty page,
+    /// which a client takes for the end: it is a 503.
+    #[tokio::test]
+    async fn a_page_too_deep_to_compose_is_not_an_end_of_results() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let ids: Vec<&'static str> = (0..7000)
+            .map(|n| &*Box::leak(format!("Lib{n:04}").into_boxed_str()))
+            .collect();
+        let search = paging_search_host(Box::leak(ids.into_boxed_slice())).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/query?q=lib&skip=6000&take=20",
+            "",
+        )
+        .await;
+        let status = resp.status();
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            &body[..body.len().min(300)]
+        );
+        // Control: a page NORA can compose is answered.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/query?q=lib&skip=2000&take=20",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(page["data"][0]["id"], "Lib2000", "{}", page["data"][0]);
+        assert_eq!(page["data"].as_array().unwrap().len(), 20);
+    }
+
+    /// `skip` and `take` as large as a query can hold, and a host `totalHits` as large as JSON
+    /// can: nothing overflows. `take` is held to 1000, as nuget.org holds it, so `skip=1` with
+    /// the largest `take` is the host's result past its first entry, and the largest `skip` is
+    /// past the end of a result NORA has read whole: an empty page, the end, as nuget.org
+    /// answers a `skip` past its results.
+    #[tokio::test]
+    async fn the_largest_skip_take_and_host_total_do_not_overflow() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let ids: Vec<&'static str> = (0..151)
+            .map(|n| &*Box::leak(format!("Lib{n:03}").into_boxed_str()))
+            .collect();
+        let ids: &'static [&'static str] = Box::leak(ids.into_boxed_slice());
+        let search = paging_search_host(ids).await;
+        let autocomplete = paging_autocomplete_host(ids).await;
+        let (search_uri, autocomplete_uri) = (search.uri(), autocomplete.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(search_uri.clone());
+            cfg.nuget.search_service = format!("{search_uri}/query");
+            cfg.nuget.autocomplete = format!("{autocomplete_uri}/autocomplete");
+        });
+        let max = u64::MAX;
+        for path in [
+            format!("/nuget/v3/query?q=lib&skip=1&take={max}"),
+            format!("/nuget/v3/autocomplete?q=lib&skip=1&take={max}"),
+        ] {
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(page["data"].as_array().unwrap().len(), 150, "{path}");
+            assert_eq!(page["totalHits"], 151, "{path}");
+        }
+        for path in [
+            format!("/nuget/v3/query?q=lib&skip={max}&take={max}"),
+            format!("/nuget/v3/autocomplete?q=lib&skip={max}&take={max}"),
+        ] {
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(page["data"], json!([]), "{path}");
+            assert_eq!(page["totalHits"], 151, "{path}");
+        }
+
+        // A page holds 1000 entries at most, whatever take asks.
+        let ids: Vec<&'static str> = (0..1200)
+            .map(|n| &*Box::leak(format!("Lib{n:04}").into_boxed_str()))
+            .collect();
+        let ids: &'static [&'static str] = Box::leak(ids.into_boxed_slice());
+        let (search, autocomplete) = (
+            paging_search_host(ids).await,
+            paging_autocomplete_host(ids).await,
+        );
+        let (search_uri, autocomplete_uri) = (search.uri(), autocomplete.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(search_uri.clone());
+            cfg.nuget.search_service = format!("{search_uri}/query");
+            cfg.nuget.autocomplete = format!("{autocomplete_uri}/autocomplete");
+        });
+        for path in [
+            "/nuget/v3/query?q=lib&take=1500",
+            "/nuget/v3/autocomplete?q=lib&take=1500",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(page["data"].as_array().unwrap().len(), 1000, "{path}");
+        }
+
+        // A host's totalHits as large as JSON holds, beside a package of NORA's own.
+        let huge = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalHits": u64::MAX,
+                "data": [{ "id": "Other.Lib", "version": "1.0.0", "versions": [{ "version": "1.0.0" }] }],
+            })))
+            .mount(&huge)
+            .await;
+        let uri = huge.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib&take=1", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(page["totalHits"], u64::MAX, "{page}");
+        let first = page["data"][0]["id"].as_str().map(str::to_lowercase);
+        assert_eq!(first.as_deref(), Some("corp.lib"), "{page}");
+    }
+
+    /// The review's example as it stands: NORA hosts Corp.Lib, the host answers [Corp.Lib,
+    /// A.Lib]; with take=1 the pages are [Corp.Lib] and [A.Lib], and totalHits is 2 on both.
+    #[tokio::test]
+    async fn the_review_example_pages_as_two_entries() {
+        use crate::test_helpers::create_test_context_with_config;
+
+        let search = paging_search_host(&["Corp.Lib", "A.Lib"]).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        let (ids, totals) = walk_search(&ctx.app, "lib", 1).await;
+        assert_eq!(ids, ["corp.lib", "a.lib"]);
+        assert_eq!(totals.into_iter().collect::<Vec<_>>(), [2]);
+    }
+
+    /// The records list but the flat container cannot: the index NORA's own packages are shown
+    /// from is not built, so search and autocomplete cannot show them as held, nor tell a host
+    /// entry of one from another. They answer 503, not a result without NORA's own packages.
+    #[tokio::test]
+    async fn search_answers_503_when_the_index_of_own_packages_cannot_be_built() {
+        use crate::test_helpers::{
+            body_bytes, create_test_context_with_storage_and_config, outage_storage, send,
+        };
+        use axum::http::{Method, StatusCode};
+
+        let search = paging_search_host(&["Corp.Lib", "Other.Lib"]).await;
+        let autocomplete = paging_autocomplete_host(&["Corp.Lib", "Other.Lib"]).await;
+        let (storage, outage) = outage_storage();
+        let (search_uri, autocomplete_uri) = (search.uri(), autocomplete.uri());
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(search_uri.clone());
+            cfg.nuget.search_service = format!("{search_uri}/query");
+            cfg.nuget.autocomplete = format!("{autocomplete_uri}/autocomplete");
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        outage.fail_listings_of(crate::registry::nuget::INDEX_PATTERN.0);
+        for path in ["/nuget/v3/query?q=lib", "/nuget/v3/autocomplete?q=lib"] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            let status = resp.status();
+            let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {body}");
+        }
+        // Listed again: the next search rebuilds the index (nothing has to invalidate it) and
+        // shows NORA's own package as held.
+        outage.end();
+        let held = |body: &str| body.contains("\"1.0.0\"") && body.contains("Other.Lib");
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(held(&body), "{body}");
+        // The same with the records failing and the flat container listing: 503, then held
+        // again once they list, with no write in between.
+        ctx.state.repo_index.invalidate("nuget");
+        outage.fail_listings_of("nuget/hosted/");
+        let status = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib", "")
+            .await
+            .status();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        outage.end();
+        let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(held(&body), "{body}");
+    }
+
+    /// A page NORA's own packages fill asks the host once, for its total, and nothing more: a
+    /// run of entries NORA does not show at the start of a large host result does not make it
+    /// a page NORA cannot compose.
+    #[tokio::test]
+    async fn a_page_nora_own_packages_fill_reads_the_host_once() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let mut ids: Vec<&'static str> = (0..32)
+            .map(|n| &*Box::leak(format!("Internal.Lib{n:02}").into_boxed_str()))
+            .collect();
+        ids.extend((0..69).map(|n| &*Box::leak(format!("Lib{n:03}").into_boxed_str())));
+        let search = paging_search_host(Box::leak(ids.into_boxed_slice())).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/query?q=lib&skip=0&take=1",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        let first = page["data"][0]["id"].as_str().map(str::to_lowercase);
+        assert_eq!(first.as_deref(), Some("corp.lib"), "{page}");
+        assert!(page["totalHits"].as_u64().unwrap() >= 70, "{page}");
+        let asked = search.received_requests().await.unwrap().len();
+        assert_eq!(asked, 1, "the host asked {asked} times for a full page");
+    }
+
+    /// After the host's first page, a request for more of its result that fails — a 429, a 404
+    /// — is the host unavailable, not the end of its result: 503, not an empty page.
+    #[tokio::test]
+    async fn a_failed_read_past_the_first_is_not_the_end_of_results() {
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        for code in [429, 404, 400] {
+            let search = MockServer::builder().start().await;
+            let entry = |id: &str| json!({ "id": id, "version": "9.9.9", "versions": [{ "version": "9.9.9" }] });
+            Mock::given(wiremock::matchers::query_param("skip", "0"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "totalHits": 3,
+                    "data": [entry("Internal.Lib")],
+                })))
+                .with_priority(1)
+                .mount(&search)
+                .await;
+            Mock::given(wiremock::matchers::any())
+                .respond_with(ResponseTemplate::new(code))
+                .with_priority(2)
+                .mount(&search)
+                .await;
+            let uri = search.uri();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = Some(uri.clone());
+                cfg.nuget.search_service = format!("{uri}/query");
+                cfg.nuget.serve_stale = false;
+                cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+            });
+            let status = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib&take=1", "")
+                .await
+                .status();
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "continuation {code}"
+            );
+            assert!(
+                search.received_requests().await.unwrap().len() >= 2,
+                "continuation {code}: not asked past the first page"
+            );
+        }
+    }
+
+    /// When the records cannot be listed, which packages are NORA's own is not known: search
+    /// answers 503 rather than show the list an upstream gave for the id, as the flat container
+    /// does.
+    #[tokio::test]
+    async fn a_package_whose_records_cannot_be_listed_is_not_found_by_an_upstream_list() {
+        use crate::test_helpers::{
+            body_bytes, create_test_context_with_storage_and_config, outage_storage, send,
+        };
+        use axum::http::{Method, StatusCode};
+
+        let (storage, outage) = outage_storage();
+        let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = None;
+        });
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/corp.lib/9.9.9/corp.lib.9.9.9.nupkg",
+                &b"squatted"[..],
+            ),
+            (
+                "nuget/flatcontainer/corp.lib/index.json",
+                br#"{"versions":["9.9.9"]}"#,
+            ),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+        let search = "/nuget/v3/query?q=corp";
+        outage.fail_listings_of("nuget/hosted/");
+        outage.fail_listings_of("nuget/hosted/corp.lib/");
+        let listing = "/nuget/v3/flatcontainer/corp.lib/index.json";
+        let status = send(&ctx.app, Method::GET, listing, "").await.status();
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let resp = send(&ctx.app, Method::GET, search, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let autocomplete = "/nuget/v3/autocomplete?q=corp";
+        let resp = send(&ctx.app, Method::GET, autocomplete, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // Control: listed, the package is not hosted and its cached list is what it has.
+        outage.end();
+        ctx.state.repo_index.invalidate("nuget");
+        let resp = send(&ctx.app, Method::GET, search, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let found: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(found["totalHits"], 1, "{found}");
     }
 
     /// A .nupkg imported from a hosted repository is NORA's own: the flat container lists and

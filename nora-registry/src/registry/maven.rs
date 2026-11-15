@@ -861,7 +861,10 @@ async fn upload(
                 }
             }
             match state.storage.put(&key, &body).await {
-                Ok(()) => StatusCode::CREATED.into_response(),
+                Ok(()) => {
+                    state.repo_index.invalidate("maven");
+                    StatusCode::CREATED.into_response()
+                }
                 Err(e) => {
                     tracing::error!(error = %e, key = %key, "Failed to store Maven checksum");
                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -955,6 +958,7 @@ async fn upload(
             match state.storage.put(&key, &body).await {
                 Ok(()) => {
                     state.metrics.record_upload("maven");
+                    state.repo_index.invalidate("maven");
                     StatusCode::CREATED.into_response()
                 }
                 Err(e) => {
@@ -1228,6 +1232,7 @@ async fn merge_and_cache_proxy_metadata(
             tracing::warn!(key = %key, error = %error, "maven: failed to cache metadata");
         } else {
             compute_and_store_checksums(&state.storage, &key, &data).await;
+            state.repo_index.invalidate("maven");
         }
     }
 
