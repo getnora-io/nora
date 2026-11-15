@@ -97,6 +97,10 @@ impl Default for RegistryIndex {
 /// Main repository index for all registries
 pub struct RepoIndex {
     indexes: HashMap<RegistryType, RegistryIndex>,
+    /// The NuGet packages NORA hosts (imported), by lowercase id, with the versions their
+    /// records list: rebuilt with the NuGet index, from one listing of the records, so search
+    /// does not list every package's records on each request.
+    nuget_hosted: RwLock<Arc<HashMap<String, Vec<String>>>>,
     /// Epoch-seconds of the last accepted admin reindex (0 = never). Used to
     /// debounce operator-triggered reindex so a tight `reindex + read` loop
     /// cannot amplify into repeated full-storage scans (see `try_accept_reindex`).
@@ -111,6 +115,7 @@ impl RepoIndex {
         }
         Self {
             indexes,
+            nuget_hosted: RwLock::new(Arc::default()),
             last_reindex: AtomicU64::new(0),
         }
     }
@@ -180,7 +185,18 @@ impl RepoIndex {
                 RegistryType::Raw => build_raw_index(storage).await,
                 RegistryType::Nuget => {
                     let (p, s) = crate::registry::nuget::INDEX_PATTERN;
-                    build_generic_index(storage, p, s).await
+                    // The hosted records with the packages, or neither: an index whose records
+                    // could not be listed stays dirty, as one whose files could not.
+                    match crate::registry::nuget::hosted_index(storage).await {
+                        Some(hosted) => {
+                            let data = build_generic_index(storage, p, s).await;
+                            if data.is_some() {
+                                *self.nuget_hosted.write() = Arc::new(hosted);
+                            }
+                            data
+                        }
+                        None => None,
+                    }
                 }
                 RegistryType::Gems => build_gems_index(storage).await,
                 RegistryType::Terraform => {
@@ -226,6 +242,13 @@ impl RepoIndex {
         }
 
         index.get_cached()
+    }
+
+    /// The NuGet packages NORA hosts, by lowercase id, with the versions their records list, as
+    /// of the NuGet index (rebuilt first when it is stale).
+    pub async fn nuget_hosted(&self, storage: &Storage) -> Arc<HashMap<String, Vec<String>>> {
+        self.get("nuget", storage).await;
+        Arc::clone(&self.nuget_hosted.read())
     }
 
     /// Get counts for stats (no rebuild, just current state)

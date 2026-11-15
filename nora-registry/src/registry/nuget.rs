@@ -283,6 +283,11 @@ async fn search_query(
             let base_url = nora_base_url(&state);
             let upstream = rewrite_host(&state);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
+            let shown = SearchFilter {
+                prerelease,
+                sem_ver_level: sem_ver_level.as_deref(),
+            };
+            let merged = with_own_packages(&state, rewritten, &query, skip, shown).await;
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -291,9 +296,17 @@ async fn search_query(
                 crate::registry_type::RegistryType::Nuget,
                 "PROXY",
             ));
-            with_json(rewritten.into_bytes())
+            with_json(merged)
         }
-        Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
+        Err(ProxyError::NotFound) => {
+            // The host knows nothing of the query: NORA's own packages may still match.
+            let shown = SearchFilter {
+                prerelease,
+                sem_ver_level: sem_ver_level.as_deref(),
+            };
+            let none = r#"{"totalHits":0,"data":[]}"#.to_string();
+            with_json(with_own_packages(&state, none, &query, skip, shown).await)
+        }
         Err(
             ProxyError::CircuitOpen(_)
             | ProxyError::Network(_)
@@ -1685,16 +1698,18 @@ fn with_json_stale(data: Vec<u8>) -> Response {
 }
 // ── Local search helpers ───────────────────────────────────────────────
 
-/// The versions package `id` lists: a hosted package's records, else the cached flatcontainer
-/// index.json an upstream gave.
-async fn get_cached_versions(storage: &crate::storage::Storage, id: &str) -> Vec<String> {
+/// The versions package `id` lists: a hosted package's records (`hosted`, from
+/// [`crate::repo_index::RepoIndex::nuget_hosted`]), else the cached flatcontainer index.json an
+/// upstream gave.
+async fn get_cached_versions(
+    storage: &crate::storage::Storage,
+    hosted: &std::collections::HashMap<String, Vec<String>>,
+    id: &str,
+) -> Vec<String> {
     // A hosted package's versions are its records, as its flat container lists them: an import
     // writes no upstream list, and one an upstream gave for the id before is not its own.
-    match hosted_versions(storage, &id.to_lowercase()).await {
-        Some(versions) if versions.hosted() => return versions.listed().to_vec(),
-        Some(_) => {}
-        // Nothing is decided on a guess: the package is left out until its records list.
-        None => return Vec::new(),
+    if let Some(versions) = hosted.get(&id.to_lowercase()) {
+        return versions.clone();
     }
     let key = format!("nuget/flatcontainer/{}/index.json", id.to_lowercase());
     let data = match storage.get(&key).await {
@@ -1747,6 +1762,121 @@ fn build_search_entry(
     })
 }
 
+/// Which versions a search shows.
+#[derive(Clone, Copy)]
+struct SearchFilter<'a> {
+    /// Pre-release versions too.
+    prerelease: bool,
+    /// `semVerLevel`: SemVer 2.0 versions only when `"2.0.0"`.
+    sem_ver_level: Option<&'a str>,
+}
+
+impl SearchFilter<'_> {
+    fn shows(&self, version: &str) -> bool {
+        (self.prerelease || !version.contains('-'))
+            && (self.sem_ver_level == Some("2.0.0") || !is_semver2_version(version))
+    }
+}
+
+/// The search entry of local package `pkg` with the versions `shown` lets through (a hosted
+/// package's from its records), `None` when none is left.
+async fn local_search_entry(
+    state: &AppState,
+    hosted: &std::collections::HashMap<String, Vec<String>>,
+    base_url: &str,
+    pkg: &crate::repo_index::RepoInfo,
+    shown: SearchFilter<'_>,
+) -> Option<serde_json::Value> {
+    let versions: Vec<String> = get_cached_versions(&state.storage, hosted, &pkg.name)
+        .await
+        .into_iter()
+        .filter(|v| shown.shows(v))
+        .collect();
+    (!versions.is_empty()).then(|| build_search_entry(base_url, pkg, &versions))
+}
+
+/// The search result of the search host (`upstream`, its URLs already NORA's) with NORA's own
+/// packages in it as NORA holds them: an entry whose id NORA hosts, or which is in an internal
+/// namespace, is replaced by NORA's entry of it (dropped when NORA holds none), and on the
+/// first page (`skip` 0) the hosted packages the query matches that the host did not return
+/// on the page are added before the host's. `totalHits` follows, counted alike on every page. A result that is not the search JSON is
+/// passed on as it is.
+async fn with_own_packages(
+    state: &AppState,
+    upstream: String,
+    query: &str,
+    skip: usize,
+    shown: SearchFilter<'_>,
+) -> Vec<u8> {
+    let Ok(mut result) = serde_json::from_str::<serde_json::Value>(&upstream) else {
+        return upstream.into_bytes();
+    };
+    let Some(entries) = result
+        .get_mut("data")
+        .and_then(|data| data.as_array_mut())
+        .map(std::mem::take)
+    else {
+        return upstream.into_bytes();
+    };
+    let packages = state.repo_index.get("nuget", &state.storage).await;
+    let hosted = state.repo_index.nuget_hosted(&state.storage).await;
+    let engine = &state.curation().curation_engine;
+    let own = |id: &str| {
+        hosted.contains_key(id)
+            || crate::curation::is_internal_namespace(
+                engine,
+                crate::curation::RegistryType::Nuget,
+                id,
+            )
+    };
+    let base_url = nora_base_url(state);
+    let local = |id: &str| packages.iter().find(|pkg| pkg.name.to_lowercase() == id);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::new();
+    let mut dropped: u64 = 0;
+    for entry in entries {
+        let id = entry["id"].as_str().map(str::to_lowercase);
+        match id {
+            Some(id) if own(&id) => {
+                let held = match local(&id) {
+                    Some(pkg) => local_search_entry(state, &hosted, &base_url, pkg, shown).await,
+                    None => None,
+                };
+                match held {
+                    Some(held) => kept.push(held),
+                    None => dropped += 1,
+                }
+                seen.insert(id);
+            }
+            Some(id) => {
+                seen.insert(id);
+                kept.push(entry);
+            }
+            None => kept.push(entry),
+        }
+    }
+    // Counted on every page, so `totalHits` is the same on each; shown on the first.
+    let mut added = Vec::new();
+    let query = query.to_lowercase();
+    for pkg in packages.iter() {
+        let id = pkg.name.to_lowercase();
+        if hosted.contains_key(&id) && !seen.contains(&id) && id.contains(&query) {
+            if let Some(entry) = local_search_entry(state, &hosted, &base_url, pkg, shown).await {
+                added.push(entry);
+            }
+        }
+    }
+    let total = result["totalHits"].as_u64().unwrap_or(kept.len() as u64);
+    result["totalHits"] = (total.saturating_sub(dropped) + added.len() as u64).into();
+    if skip > 0 {
+        added.clear();
+    }
+    added.extend(kept);
+    result["data"] = added.into();
+    serde_json::to_vec(&result).unwrap_or_else(|_| upstream.into_bytes())
+}
+
 /// Build local search results from the in-memory repo index.
 ///
 /// When `prerelease` is false, versions containing a hyphen (SemVer pre-release)
@@ -1762,6 +1892,7 @@ async fn local_search_results(
     sem_ver_level: Option<&str>,
 ) -> Vec<u8> {
     let packages = state.repo_index.get("nuget", &state.storage).await;
+    let hosted = state.repo_index.nuget_hosted(&state.storage).await;
     let base_url = nora_base_url(state);
 
     let query_lower = query.to_lowercase();
@@ -1772,28 +1903,13 @@ async fn local_search_results(
 
     let mut data = Vec::new();
     for pkg in &filtered {
-        let all_versions = get_cached_versions(&state.storage, &pkg.name).await;
-        let versions: Vec<String> = if prerelease {
-            all_versions
-        } else {
-            all_versions
-                .into_iter()
-                .filter(|v| !v.contains('-'))
-                .collect()
+        let shown = SearchFilter {
+            prerelease,
+            sem_ver_level,
         };
-        // Hide SemVer 2.0 versions unless semVerLevel=2.0.0
-        let versions: Vec<String> = if sem_ver_level == Some("2.0.0") {
-            versions
-        } else {
-            versions
-                .into_iter()
-                .filter(|v| !is_semver2_version(v))
-                .collect()
-        };
-        if versions.is_empty() {
-            continue;
+        if let Some(entry) = local_search_entry(state, &hosted, &base_url, pkg, shown).await {
+            data.push(entry);
         }
-        data.push(build_search_entry(&base_url, pkg, &versions));
     }
 
     let total_hits = data.len();
@@ -1820,6 +1936,7 @@ async fn local_autocomplete_results(
     sem_ver_level: Option<&str>,
 ) -> Vec<u8> {
     let packages = state.repo_index.get("nuget", &state.storage).await;
+    let hosted = state.repo_index.nuget_hosted(&state.storage).await;
 
     let query_lower = query.to_lowercase();
     let mut matched: Vec<&str> = Vec::new();
@@ -1827,7 +1944,7 @@ async fn local_autocomplete_results(
         if !query_lower.is_empty() && !pkg.name.to_lowercase().contains(&query_lower) {
             continue;
         }
-        let versions = get_cached_versions(&state.storage, &pkg.name).await;
+        let versions = get_cached_versions(&state.storage, &hosted, &pkg.name).await;
         // Apply prerelease filter
         let versions: Vec<&String> = if prerelease {
             versions.iter().collect()
@@ -2053,6 +2170,38 @@ async fn hosted_versions(
             None
         }
     }
+}
+
+/// Every package NORA hosts, by lowercase id, with the versions its records list (as
+/// [`hosted_versions`] gives them for one package), from one listing of all records; `None`
+/// when the listing failed. What the repository index keeps for search.
+pub(crate) async fn hosted_index(
+    storage: &crate::storage::Storage,
+) -> Option<std::collections::HashMap<String, Vec<String>>> {
+    const ROOT: &str = "nuget/hosted/";
+    crate::validation::validate_storage_key(crate::validation::listing_key(ROOT)).ok()?;
+    let keys = match storage.list(ROOT).await {
+        Ok(keys) => keys,
+        Err(e) => {
+            tracing::warn!(registry = "nuget", error = %e, "nuget: hosted records not listed");
+            return None;
+        }
+    };
+    let mut names: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
+    for (id, name) in keys
+        .iter()
+        .filter_map(|key| key.strip_prefix(ROOT)?.split_once('/'))
+    {
+        names.entry(id).or_default().push(name);
+    }
+    Some(
+        names
+            .into_iter()
+            .map(|(id, names)| (id, hosted::Versions::from_listing(names)))
+            .filter(|(_, versions)| versions.hosted())
+            .map(|(id, versions)| (id.to_string(), versions.listed().to_vec()))
+            .collect(),
+    )
 }
 
 /// What NORA records of a hosted version: the .nuspec's id and version (normalized, in the case
