@@ -2520,7 +2520,8 @@ mod integration_tests {
         use crate::test_helpers::{body_bytes, send};
         use axum::http::{Method, StatusCode};
         let (mut ids, mut totals) = (Vec::new(), std::collections::BTreeSet::new());
-        for skip in (0..).step_by(take).take(50) {
+        let mut ended = false;
+        for skip in (0..).step_by(take).take(200) {
             let path = format!("/nuget/v3/query?q={query}&skip={skip}&take={take}");
             let resp = send(app, Method::GET, &path, "").await;
             assert_eq!(resp.status(), StatusCode::OK, "{path}");
@@ -2532,9 +2533,11 @@ mod integration_tests {
                     .map(|e| e["id"].as_str().unwrap().to_lowercase()),
             );
             if data.len() < take {
+                ended = true;
                 break;
             }
         }
+        assert!(ended, "{query}: no short page in 200 pages of {take}");
         (ids, totals)
     }
 
@@ -2705,6 +2708,107 @@ mod integration_tests {
             !autocomplete.received_requests().await.unwrap().is_empty(),
             "the autocomplete host was not asked"
         );
+    }
+
+    /// A search or autocomplete host whose first entries NORA does not show (a run of ids in an
+    /// internal namespace) in a result too large to read whole: the first page still holds the
+    /// first entry NORA shows, and a walk with `take=1` sees every one of them.
+    #[tokio::test]
+    async fn a_run_of_entries_nora_does_not_show_is_read_past() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let mut ids: Vec<&'static str> = (0..6)
+            .map(|n| &*Box::leak(format!("Internal.Lib{n}").into_boxed_str()))
+            .collect();
+        ids.extend((0..95).map(|n| &*Box::leak(format!("Lib{n:03}").into_boxed_str())));
+        let ids: &'static [&'static str] = Box::leak(ids.into_boxed_slice());
+        let search = paging_search_host(ids).await;
+        let autocomplete = MockServer::builder().start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(move |request: &wiremock::Request| {
+                let param = |name: &str| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == name)
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                };
+                let (skip, take) = (param("skip").unwrap_or(0), param("take").unwrap_or(20));
+                let data: Vec<&str> = ids.iter().skip(skip).take(take).copied().collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "totalHits": ids.len(), "data": data }))
+            })
+            .mount(&autocomplete)
+            .await;
+        let (search_uri, autocomplete_uri) = (search.uri(), autocomplete.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(search_uri.clone());
+            cfg.nuget.search_service = format!("{search_uri}/query");
+            cfg.nuget.autocomplete = format!("{autocomplete_uri}/autocomplete");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let want: Vec<String> = (0..95).map(|n| format!("lib{n:03}")).collect();
+        let (walked, totals) = walk_search(&ctx.app, "lib", 1).await;
+        assert_eq!(walked, want, "search");
+        assert!(totals.iter().all(|t| *t >= 95), "{totals:?}");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?q=lib&take=1",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(page["data"], json!(["Lib000"]), "autocomplete: {page}");
+    }
+
+    /// A page deeper than NORA reads the host for is not answered as a short or empty page,
+    /// which a client takes for the end: it is a 503.
+    #[tokio::test]
+    async fn a_page_too_deep_to_compose_is_not_an_end_of_results() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let ids: Vec<&'static str> = (0..7000)
+            .map(|n| &*Box::leak(format!("Lib{n:04}").into_boxed_str()))
+            .collect();
+        let search = paging_search_host(Box::leak(ids.into_boxed_slice())).await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/query?q=lib&skip=6000&take=20",
+            "",
+        )
+        .await;
+        let status = resp.status();
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{}",
+            &body[..body.len().min(300)]
+        );
+        // Control: a page NORA can compose is answered.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/query?q=lib&skip=2000&take=20",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(page["data"][0]["id"], "Lib2000", "{}", page["data"][0]);
+        assert_eq!(page["data"].as_array().unwrap().len(), 20);
     }
 
     /// When the records cannot be listed, which packages are NORA's own is not known: search

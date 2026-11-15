@@ -295,7 +295,9 @@ async fn search_query(
     .await
     {
         Ok(host) => {
-            let merged = merge_search_page(&own, host, window);
+            let Some(merged) = merge_search_page(&own, host, window) else {
+                return page_too_deep();
+            };
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -308,7 +310,8 @@ async fn search_query(
         }
         Err(ProxyError::NotFound) => {
             // The host knows nothing of the query: NORA's own packages may still match.
-            with_json(merge_search_page(&own, HostRead::nothing(), window))
+            let merged = merge_search_page(&own, HostRead::nothing(), window);
+            merged.map_or_else(page_too_deep, with_json)
         }
         Err(
             e @ (ProxyError::CircuitOpen(_)
@@ -446,9 +449,13 @@ async fn autocomplete_query(
         let window = PageWindow::new(skip, take, own.len());
         let need = window.upstream_need();
         let resource = HostResource::Autocomplete;
-        match read_search_host(&state, resource, &hosted, &own, &qs, need, shown).await {
-            Ok(read) => Ok(merge_search_page(&own, read, window)),
-            Err(ProxyError::NotFound) => Ok(merge_search_page(&own, HostRead::nothing(), window)),
+        let read = match read_search_host(&state, resource, &hosted, &own, &qs, need, shown).await {
+            Err(ProxyError::NotFound) => Ok(HostRead::nothing()),
+            read => read,
+        };
+        match read.map(|read| merge_search_page(&own, read, window)) {
+            Ok(None) => return page_too_deep(),
+            Ok(Some(merged)) => Ok(merged),
             Err(e) => Err(e),
         }
     };
@@ -2013,6 +2020,9 @@ enum HostRead {
     },
     /// A host result that is not the search JSON, passed on as it is.
     Verbatim(String),
+    /// The page lies deeper than NORA reads the host for: it cannot be told which entries are
+    /// on it, and a short or empty page would read as the end of the results.
+    TooDeep,
 }
 
 impl HostRead {
@@ -2031,8 +2041,11 @@ impl HostRead {
 /// internal namespace — is never shown as the host has it: one NORA already shows among its own
 /// (`own`) is dropped, another is replaced by NORA's entry of it, or dropped when NORA holds
 /// none. A dropped entry takes no place: the page is cut from what NORA shows, so no page is
-/// empty or short before the end. The first request's failure is the search's; a later one
-/// fails the search too, since the page cannot be told without it.
+/// empty or short before the end. A request after the first asks for twice what was read
+/// before it at least, so a run of dropped entries is read past; a page that
+/// [`SEARCH_HOST_READS_MAX`] requests do not reach is [`HostRead::TooDeep`]. The first
+/// request's failure is the search's; a later one fails the search too, since the page cannot
+/// be told without it.
 async fn read_search_host(
     state: &AppState,
     resource: HostResource,
@@ -2060,7 +2073,7 @@ async fn read_search_host(
         } else if host_total <= SEARCH_HOST_READ_WHOLE {
             host_total - read
         } else {
-            need.saturating_sub(kept.len())
+            need.saturating_sub(kept.len()).max(read)
         }
         .clamp(1, SEARCH_HOST_TAKE_MAX);
         let url = format!("{}?{}", resource.url(state), with_page(qs, read, take));
@@ -2138,6 +2151,9 @@ async fn read_search_host(
             break;
         }
     }
+    if !whole && kept.len() < need {
+        return Ok(HostRead::TooDeep);
+    }
     let total = if whole && host_total <= SEARCH_HOST_READ_WHOLE {
         kept.len() as u64
     } else {
@@ -2171,10 +2187,15 @@ fn with_page(qs: &str, skip: usize, take: usize) -> String {
 /// first, then the host's entries NORA shows (from [`read_search_host`]) of the window of
 /// [`PageWindow`]. The page holds `take` entries at most; `totalHits` is NORA's own plus the
 /// host's part, the same on every page. A host result that is not the search JSON is passed on
-/// as it is.
-fn merge_search_page(own: &[serde_json::Value], host: HostRead, window: PageWindow) -> Vec<u8> {
+/// as it is; a page NORA could not read the host for is `None`.
+fn merge_search_page(
+    own: &[serde_json::Value],
+    host: HostRead,
+    window: PageWindow,
+) -> Option<Vec<u8>> {
     let (shown, total, mut result) = match host {
-        HostRead::Verbatim(text) => return text.into_bytes(),
+        HostRead::TooDeep => return None,
+        HostRead::Verbatim(text) => return Some(text.into_bytes()),
         HostRead::Entries {
             shown,
             total,
@@ -2195,7 +2216,16 @@ fn merge_search_page(own: &[serde_json::Value], host: HostRead, window: PageWind
     );
     result["totalHits"] = (window.own_total as u64 + total).into();
     result["data"] = page.into();
-    serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
+    Some(serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec()))
+}
+
+/// A merged search page NORA could not read the search host for ([`HostRead::TooDeep`]).
+fn page_too_deep() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        "nuget: this page lies deeper than NORA reads the search host for",
+    )
+        .into_response()
 }
 
 /// Build local search results from the in-memory repo index.
