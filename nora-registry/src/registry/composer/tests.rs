@@ -3261,3 +3261,86 @@ async fn a_stale_copy_of_the_document_asked_for_keeps_the_package_its_upstream_s
     let asked = upstream_paths(&public).await;
     assert!(!asked.iter().any(|p| p.contains("acme/lib")), "{asked:?}");
 }
+
+/// Metadata that names no package — `{"packages":[]}`, `{"packages":{}}`, another package's
+/// document — is an upstream saying it does not have the package, as a 404 is: the next
+/// upstream is asked, and with none having it the answer is 404. An answer that is not
+/// metadata at all (a sign-in page, JSON without `packages`) is still a failure: 502.
+#[tokio::test]
+async fn metadata_naming_no_package_is_not_a_failure() {
+    let no_package = [
+        r#"{"packages":[]}"#,
+        r#"{"packages":{}}"#,
+        r#"{"packages":{"acme/other":[{"name":"acme/other","version":"1.0.0"}]}}"#,
+    ];
+    for body in no_package {
+        for public_has in [false, true] {
+            let private = MockServer::start().await;
+            mount_root(&private).await;
+            answers("/p2/acme/lib.json", ResponseTemplate::new(404))
+                .mount(&private)
+                .await;
+            answers(
+                "/p2/acme/lib~dev.json",
+                ResponseTemplate::new(200).set_body_string(body),
+            )
+            .mount(&private)
+            .await;
+            let public = MockServer::start().await;
+            mount_root(&public).await;
+            if public_has {
+                answers(
+                    "/p2/acme/lib.json",
+                    ResponseTemplate::new(200).set_body_json(lib_doc(
+                        &public.uri(),
+                        "6.6.6",
+                        "publicrel",
+                    )),
+                )
+                .mount(&public)
+                .await;
+            }
+            let (a, b) = (private.uri(), public.uri());
+            let ctx = create_test_context_with_config(move |c| {
+                c.composer.enabled = true;
+                c.composer.proxies = vec![
+                    crate::config::ComposerProxyEntry::Simple(a),
+                    crate::config::ComposerProxyEntry::Simple(b),
+                ];
+            });
+            let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+            let expected = if public_has {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(
+                resp.status(),
+                expected,
+                "{body}, public has it: {public_has}"
+            );
+        }
+    }
+    for (failure, body) in [
+        ("sign-in page", "<html>sign in</html>"),
+        ("JSON without packages", r#"{"error":"forbidden"}"#),
+    ] {
+        let (_private, public, ctx) = private_before_public(|_| {
+            vec![
+                answers("/p2/acme/lib.json", ResponseTemplate::new(404)),
+                answers(
+                    "/p2/acme/lib~dev.json",
+                    ResponseTemplate::new(200).set_body_string(body),
+                ),
+            ]
+        })
+        .await;
+        let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{failure}");
+        let asked = upstream_paths(&public).await;
+        assert!(
+            !asked.iter().any(|p| p.contains("acme/lib")),
+            "{failure}: {asked:?}"
+        );
+    }
+}

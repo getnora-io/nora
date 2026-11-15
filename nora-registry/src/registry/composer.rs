@@ -1113,6 +1113,15 @@ fn is_configured(state: &AppState, origin: Option<&str>) -> bool {
     })
 }
 
+/// Whether an answer is a Composer package list at all: a JSON object whose `packages` is an
+/// object or an array (an empty list is `[]` once PHP has encoded it), whatever it names.
+fn is_package_list(body: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|doc| doc.get("packages").map(|p| p.is_object() || p.is_array()))
+        .unwrap_or(false)
+}
+
 /// Whether a p2 document names `name`, as Composer reads it (`isset($response['packages'][$name])`):
 /// an empty version list names it too.
 fn names_package(body: &[u8], name: &str) -> bool {
@@ -1157,9 +1166,10 @@ async fn upstream_has(
     )
     .await
     {
-        // An answer that is not Composer metadata (a sign-in page) is a failure, as it is for
-        // the document asked for: it says nothing of the package.
-        Ok(Revalidation::Modified { body, .. }) if !is_metadata_document(&body) => {
+        // An answer that is not Composer metadata (a sign-in page, JSON without `packages`) is a
+        // failure: it says nothing of the package. Metadata that names no package
+        // (`{"packages":[]}`, another package's document) says the upstream does not have it.
+        Ok(Revalidation::Modified { body, .. }) if !is_package_list(&body) => {
             tracing::warn!(
                 registry = REGISTRY,
                 url,
