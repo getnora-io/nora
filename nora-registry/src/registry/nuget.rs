@@ -298,26 +298,28 @@ async fn search_query(
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(
-            ProxyError::CircuitOpen(_)
+            e @ (ProxyError::CircuitOpen(_)
             | ProxyError::Network(_)
             | ProxyError::Upstream(_)
             | ProxyError::CredentialsRefused
-            | ProxyError::RateLimited { .. },
+            | ProxyError::RateLimited { .. }),
         ) => {
-            if !state.config.nuget.serve_stale {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            if state.config.nuget.serve_stale {
+                let data = local_search_results(
+                    &state,
+                    &query,
+                    skip,
+                    take,
+                    prerelease,
+                    sem_ver_level.as_deref(),
+                )
+                .await;
+                if has_hits(&data) {
+                    tracing::info!("NuGet search: upstream unavailable, using local index");
+                    return with_json_stale(data);
+                }
             }
-            tracing::info!("NuGet search: upstream unavailable, using local index");
-            let data = local_search_results(
-                &state,
-                &query,
-                skip,
-                take,
-                prerelease,
-                sem_ver_level.as_deref(),
-            )
-            .await;
-            with_json_stale(data)
+            search_unavailable(&e)
         }
     }
 }
@@ -397,26 +399,28 @@ async fn autocomplete_query(
         }
         Err(ProxyError::NotFound) => with_json(br#"{"totalHits":0,"data":[]}"#.to_vec()),
         Err(
-            ProxyError::CircuitOpen(_)
+            e @ (ProxyError::CircuitOpen(_)
             | ProxyError::Network(_)
             | ProxyError::Upstream(_)
             | ProxyError::CredentialsRefused
-            | ProxyError::RateLimited { .. },
+            | ProxyError::RateLimited { .. }),
         ) => {
-            if !state.config.nuget.serve_stale {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            if state.config.nuget.serve_stale {
+                let data = local_autocomplete_results(
+                    &state,
+                    &query,
+                    skip,
+                    take,
+                    prerelease,
+                    sem_ver_level.as_deref(),
+                )
+                .await;
+                if has_hits(&data) {
+                    tracing::info!("NuGet autocomplete: upstream unavailable, using local index");
+                    return with_json_stale(data);
+                }
             }
-            tracing::info!("NuGet autocomplete: upstream unavailable, using local index");
-            let data = local_autocomplete_results(
-                &state,
-                &query,
-                skip,
-                take,
-                prerelease,
-                sem_ver_level.as_deref(),
-            )
-            .await;
-            with_json_stale(data)
+            search_unavailable(&e)
         }
     }
 }
@@ -1665,6 +1669,24 @@ fn with_json_gzip(data: Vec<u8>) -> Response {
 }
 
 /// JSON response with `X-Nora-Stale: true` header indicating degraded/fallback data.
+/// Whether a local search or autocomplete result (`totalHits`) names anything.
+fn has_hits(data: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(data)
+        .ok()
+        .and_then(|result| result["totalHits"].as_u64())
+        .is_some_and(|hits| hits > 0)
+}
+
+/// The answer of search or autocomplete when their host cannot answer and nothing local
+/// does: unavailable (503, as restore answers), never an empty result that says no package
+/// matches.
+fn search_unavailable(e: &ProxyError) -> Response {
+    match e {
+        ProxyError::CircuitOpen(key) => circuit_open_response(key),
+        _ => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 fn with_json_stale(data: Vec<u8>) -> Response {
     (
         StatusCode::OK,
@@ -3570,8 +3592,10 @@ mod integration_tests {
         assert!(json["data"].as_array().unwrap().is_empty());
     }
 
+    /// Nothing local matches and the autocomplete host is unreachable: 503, not an empty
+    /// list that says no package matches.
     #[tokio::test]
-    async fn test_autocomplete_unreachable_upstream_returns_empty() {
+    async fn test_autocomplete_unreachable_upstream_with_nothing_local_is_503() {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.nuget.enabled = true;
             cfg.nuget.proxy = Some("http://127.0.0.1:1".to_string());
@@ -3586,11 +3610,7 @@ mod integration_tests {
             "",
         )
         .await;
-        assert_eq!(resp.status(), StatusCode::OK);
-        let body = body_bytes(resp).await;
-        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(json["totalHits"].as_u64().unwrap(), 0);
-        assert!(json["data"].as_array().unwrap().is_empty());
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
@@ -3639,6 +3659,23 @@ mod integration_tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
+    /// A package held locally under the id `test.pkg`, for the stale fallbacks.
+    async fn seed_test_package(ctx: &crate::test_helpers::TestContext) {
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/test.pkg/1.0.0/test.pkg.1.0.0.nupkg",
+                &b"nupkg"[..],
+            ),
+            (
+                "nuget/flatcontainer/test.pkg/index.json",
+                br#"{"versions":["1.0.0"]}"#,
+            ),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+    }
+
     /// Search fallback adds X-Nora-Stale header when upstream is unreachable (#422)
     #[tokio::test]
     async fn test_search_fallback_has_stale_header() {
@@ -3648,6 +3685,8 @@ mod integration_tests {
             cfg.nuget.search_service = "http://127.0.0.1:1/query".to_string();
             cfg.nuget.serve_stale = true;
         });
+        // What NORA holds of the query is what it answers with, marked stale.
+        seed_test_package(&ctx).await;
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=test", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -3679,6 +3718,8 @@ mod integration_tests {
             cfg.nuget.autocomplete = "http://127.0.0.1:1/autocomplete".to_string();
             cfg.nuget.serve_stale = true;
         });
+        // What NORA holds of the query is what it answers with, marked stale.
+        seed_test_package(&ctx).await;
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/autocomplete?q=test", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
@@ -5175,7 +5216,7 @@ mod nuget_release_dates {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod search_breaker {
-    use crate::test_helpers::{create_test_context_with_config, send, TestContext};
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
     use axum::http::{Method, StatusCode};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -5230,7 +5271,11 @@ mod search_breaker {
             let restore = "/nuget/v3/flatcontainer/before.pkg/index.json";
             assert_eq!(status(&ctx, restore).await, StatusCode::OK, "control");
             for _ in 0..ctx.state.config.circuit_breaker.failure_threshold {
-                assert_eq!(status(&ctx, search_path).await, StatusCode::OK);
+                // Nothing local to answer with: the search is unavailable, not empty.
+                assert_eq!(
+                    status(&ctx, search_path).await,
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
             }
             let restore = "/nuget/v3/flatcontainer/after.pkg/index.json";
             assert_eq!(
@@ -5258,7 +5303,7 @@ mod search_breaker {
         let threshold = ctx.state.config.circuit_breaker.failure_threshold as usize;
         for i in 0..threshold * 2 {
             let path = format!("/nuget/v3/query?q=term{i}");
-            assert_eq!(status(&ctx, &path).await, StatusCode::OK);
+            assert_eq!(status(&ctx, &path).await, StatusCode::SERVICE_UNAVAILABLE);
         }
         // A failure is two attempts (one retry after a 5xx), then the breaker holds.
         assert_eq!(
@@ -5307,7 +5352,10 @@ mod search_breaker {
         ] {
             let ctx = ctx_with(source.uri(), search, autocomplete);
             for _ in 0..ctx.state.config.circuit_breaker.failure_threshold {
-                assert_eq!(status(&ctx, dead_path).await, StatusCode::OK);
+                assert_eq!(
+                    status(&ctx, dead_path).await,
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
             }
             let before = asked(&alive).await;
             assert_eq!(status(&ctx, alive_path).await, StatusCode::OK);
@@ -5316,6 +5364,68 @@ mod search_breaker {
                 before + 1,
                 "{alive_path} not asked after {dead_path} failed"
             );
+        }
+    }
+
+    /// While the search host cannot answer — failing, or its breaker open — search and
+    /// autocomplete answer with what NORA holds of the query (`serve_stale`), and 503 when it
+    /// holds nothing of it or `serve_stale` is off: never an empty result that says the
+    /// packages do not exist.
+    #[tokio::test]
+    async fn an_unavailable_search_host_is_503_unless_something_local_answers() {
+        for serve_stale in [true, false] {
+            let source = answering(200).await;
+            let search = answering(500).await;
+            let ctx = create_test_context_with_config({
+                let (source, search) = (source.uri(), search.uri());
+                move |cfg| {
+                    cfg.nuget.enabled = true;
+                    cfg.nuget.proxy = Some(source);
+                    cfg.nuget.search_service = format!("{search}/query");
+                    cfg.nuget.autocomplete = format!("{search}/autocomplete");
+                    cfg.nuget.serve_stale = serve_stale;
+                    cfg.circuit_breaker.enabled = true;
+                    cfg.circuit_breaker.reset_timeout = 3600;
+                }
+            });
+            for (key, data) in [
+                (
+                    "nuget/flatcontainer/held.pkg/1.0.0/held.pkg.1.0.0.nupkg",
+                    &b"nupkg"[..],
+                ),
+                (
+                    "nuget/flatcontainer/held.pkg/index.json",
+                    br#"{"versions":["1.0.0"]}"#,
+                ),
+            ] {
+                ctx.state.storage.put(key, data).await.unwrap();
+            }
+            ctx.state.repo_index.invalidate("nuget");
+            let threshold = ctx.state.config.circuit_breaker.failure_threshold;
+            // Failing, then with the breaker open.
+            for round in 0..threshold + 2 {
+                for (path, held) in [
+                    ("/nuget/v3/query?q=held", true),
+                    ("/nuget/v3/autocomplete?q=held", true),
+                    ("/nuget/v3/query?q=missing", false),
+                    ("/nuget/v3/autocomplete?q=missing", false),
+                ] {
+                    let resp = send(&ctx.app, Method::GET, path, "").await;
+                    let got = resp.status();
+                    if held && serve_stale {
+                        assert_eq!(got, StatusCode::OK, "round {round}: {path}");
+                        let body: serde_json::Value =
+                            serde_json::from_slice(&body_bytes(resp).await).unwrap();
+                        assert_eq!(body["totalHits"], 1, "round {round}: {path}: {body}");
+                    } else {
+                        assert_eq!(
+                            got,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "round {round}: {path}, serve_stale {serve_stale}"
+                        );
+                    }
+                }
+            }
         }
     }
 
