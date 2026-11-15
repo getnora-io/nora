@@ -1263,12 +1263,31 @@ async fn upstream_document(
                 // that does not exist yet.
                 let seed = from_here.and_then(|c| c.written.map(|w| (&c.body[..], w)));
                 record_first_seen(state, &key, name, &body, seed).await;
+                // A copy another upstream served (or one of unknown origin) loses its origin
+                // first: a new body whose origin then cannot be stored has none, and is not
+                // trusted, rather than the other upstream's — whose credential would go with
+                // the archives this one lists. When the old origin cannot be removed, the new
+                // body is served and not stored.
+                let origin_cleared = from_here.is_some()
+                    || match state.storage.delete(&origin_key(&key)).await {
+                        Ok(()) | Err(crate::storage::StorageError::NotFound) => true,
+                        Err(e) => {
+                            tracing::warn!(registry = REGISTRY, key, error = %e, "origin of the cached metadata not removed, new metadata not cached");
+                            false
+                        }
+                    };
                 // Body first, then where it came from, then its validators: a sidecar never
                 // describes bytes that are not there. A body that could not be stored leaves
                 // the sidecars of the copy before it, which still describe that copy: the next
                 // revalidation asks with the old validators and gets the new body again, where
                 // the new ones would get a 304 that keeps the old copy for good.
-                match state.storage.put(&key, &body).await {
+                let stored = if origin_cleared {
+                    state.storage.put(&key, &body).await
+                } else {
+                    Ok(())
+                };
+                match stored {
+                    Ok(()) if !origin_cleared => {}
                     Ok(()) => {
                         if let Err(e) = state
                             .storage

@@ -2710,3 +2710,82 @@ async fn a_package_whose_upstream_fails_is_not_taken_from_the_next() {
         );
     }
 }
+
+// ── xhigh-6: a document never keeps the origin of the copy before it ──────────────────
+
+/// The cache holds `acme/lib` from the second upstream; then the first, which has archives on
+/// its own host behind its credential, starts serving it. Its document is stored but where it
+/// came from cannot be: the archive it lists must still be fetched with the first upstream's
+/// credential, never under the second's.
+#[tokio::test]
+async fn a_document_whose_origin_was_not_stored_is_not_another_upstream_s() {
+    let private = MockServer::start().await;
+    mount_root(&private).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&private)
+        .await;
+    let public = MockServer::start().await;
+    mount_lib(&public, &public.uri(), None).await;
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let (a, b) = (private.uri(), public.uri());
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+        c.composer.metadata_ttl = 0;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Full(crate::config::ComposerProxy {
+                url: a,
+                auth: Some(crate::secrets::ProtectedString::new("bot:s3cret".into())),
+            }),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    let p2 = "/composer/p2/acme/lib.json";
+    assert_eq!(
+        send(&ctx.app, Method::GET, p2, "").await.status(),
+        StatusCode::OK
+    );
+    // The first upstream now has the package.
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &private.uri(),
+            "2.0.0",
+            "pppp",
+        )))
+        .with_priority(2)
+        .mount(&private)
+        .await;
+    let credential = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("bot:s3cret")
+    );
+    Mock::given(wm_path("/archives/pppp.zip"))
+        .and(wm_header("authorization", credential.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ZIP_1.to_vec()))
+        .with_priority(1)
+        .mount(&private)
+        .await;
+    Mock::given(wm_path("/archives/pppp.zip"))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(2)
+        .mount(&private)
+        .await;
+    outage.fail_writes_of(&origin_key(&p2_key("acme/lib", false)));
+    let doc = json_of(send(&ctx.app, Method::GET, p2, "").await).await;
+    assert_eq!(doc["packages"]["acme/lib"][0]["version"], "2.0.0");
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/2.0.0/pppp.zip",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the archive went out under the other upstream's credential"
+    );
+    assert_eq!(&body_bytes(resp).await[..], ZIP_1);
+}
