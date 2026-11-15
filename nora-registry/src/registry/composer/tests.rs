@@ -256,6 +256,19 @@ fn a_document_serves_the_package_it_is_for_alone() {
     assert_eq!(names, ["acme/lib"]);
 }
 
+/// A document names a package as Composer reads it (`isset($response['packages'][$name])`):
+/// an empty version list names it, so the upstream that sent it has the package.
+#[test]
+fn a_document_names_a_package_as_composer_reads_it() {
+    let names = |body: &str| names_package(body.as_bytes(), "acme/lib");
+    assert!(names(r#"{"packages":{"acme/lib":[]}}"#));
+    assert!(names(r#"{"packages":{"acme/lib":[{"version":"1.0.0"}]}}"#));
+    assert!(!names(r#"{"packages":{"acme/other":[]}}"#));
+    assert!(!names(r#"{"packages":{"acme/lib":null}}"#));
+    assert!(!names(r#"{"packages":[]}"#));
+    assert!(!names("not json"));
+}
+
 #[test]
 fn a_dist_without_a_plain_reference_is_named_by_its_url() {
     let dist = json!({"type": "zip", "url": "https://x/y.zip", "reference": "v1.2.3"});
@@ -612,7 +625,10 @@ async fn a_package_no_upstream_has_is_a_404() {
 
 #[tokio::test]
 async fn the_first_upstream_that_has_a_package_serves_it_with_its_own_credential() {
+    // The first upstream is a repository without the package (its root reads, its p2 is a
+    // 404); one whose root cannot be read failed, and is not passed over.
     let first = MockServer::start().await;
+    mount_root(&first).await;
     let second = MockServer::start().await;
     mount_lib(&second, &second.uri(), None).await;
     let ctx = create_test_context_with_config(|c| {
@@ -905,7 +921,7 @@ async fn an_uploaded_package_is_listed_and_downloads_with_its_sha1() {
 
     let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/greeter.json", "").await;
     assert_eq!(resp.status(), StatusCode::OK);
-    assert!(resp.headers().contains_key(header::LAST_MODIFIED));
+    // Its date: a_hosted_listing_changed_within_its_second_is_never_a_304.
     let doc = json_of(resp).await;
     let versions = versions_of(&doc, "acme/greeter");
     let listed: Vec<&str> = versions
@@ -2231,4 +2247,1106 @@ async fn advisories_offered_only_inline_are_not_a_clean_audit() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+}
+
+// ── xhigh-1: an archive a lock file names stays downloadable once NORA holds it ───────
+
+async fn mount_branch(up: &MockServer, reference: &str, bytes: &[u8]) {
+    Mock::given(wm_path("/p2/acme/lib~dev.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages": {"acme/lib": [
+            {"name": "acme/lib", "version": "dev-main",
+             "dist": {"type": "zip", "url": format!("{}/archives/main-{reference}.zip", up.uri()), "reference": reference}}
+        ]}})))
+        .mount(up)
+        .await;
+    Mock::given(wm_path(format!("/archives/main-{reference}.zip")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+        .mount(up)
+        .await;
+}
+
+/// `composer install` downloads the URL its lock file recorded. A branch that moved on since
+/// leaves that URL out of the current metadata, but the archive under it is the one NORA
+/// fetched and checked then: it is served from the cache, curation still deciding, and a
+/// reference NORA never held is still not asked of anyone.
+#[tokio::test]
+async fn an_archive_a_lock_file_names_is_served_after_its_branch_moves() {
+    let up = MockServer::start().await;
+    mount_root(&up).await;
+    mount_branch(&up, "aaaa", ZIP_1).await;
+    let ctx = proxy_ctx(&up.uri(), |c| c.composer.metadata_ttl = 0);
+    let dev = "/composer/p2/acme/lib~dev.json";
+    let locked = "/composer/dists/acme/lib/dev-main/aaaa.zip";
+    assert_eq!(
+        send(&ctx.app, Method::GET, dev, "").await.status(),
+        StatusCode::OK
+    );
+    let resp = send(&ctx.app, Method::GET, locked, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(resp).await[..], ZIP_1);
+
+    // The branch moves on.
+    up.reset().await;
+    mount_root(&up).await;
+    mount_branch(&up, "bbbb", b"PK\x03\x04 archive two").await;
+    let doc = json_of(send(&ctx.app, Method::GET, dev, "").await).await;
+    let url = doc["packages"]["acme/lib"][0]["dist"]["url"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        url.ends_with("/composer/dists/acme/lib/dev-main/bbbb.zip"),
+        "{url}"
+    );
+
+    let resp = send(&ctx.app, Method::GET, locked, "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the archive NORA holds under the locked reference"
+    );
+    assert_eq!(&body_bytes(resp).await[..], ZIP_1);
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/dev-main/cccc.zip",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let sent = upstream_paths(&up).await;
+    assert!(
+        !sent.iter().any(|p| p.starts_with("/archives/")),
+        "{sent:?}"
+    );
+
+    // Curation decides on a held archive as on any other.
+    let (_dir, blocklist) = blocklist_file("composer", "acme/lib");
+    crate::test_helpers::reload_curation(&ctx, move |c| {
+        c.curation.mode = crate::config::CurationMode::Enforce;
+        c.curation.blocklist_path = Some(blocklist);
+    });
+    assert_eq!(
+        send(&ctx.app, Method::GET, locked, "").await.status(),
+        StatusCode::FORBIDDEN
+    );
+}
+
+// ── xhigh-2: the upstream that has a package answers for both of its documents ────────
+
+fn lib_doc(up: &str, version: &str, reference: &str) -> Value {
+    json!({"packages": {"acme/lib": [
+        {"name": "acme/lib", "version": version,
+         "dist": {"type": "zip", "url": format!("{up}/archives/{reference}.zip"), "reference": reference}}
+    ]}})
+}
+
+/// `[private, public]`, both with `acme/lib`: the private upstream with one of its two
+/// documents (the branches when `private_dev`, else the releases), the public one with both.
+async fn split_upstreams(private_dev: bool) -> (MockServer, MockServer, TestContext) {
+    let private = MockServer::start().await;
+    mount_root(&private).await;
+    let (has, lacks, version, reference) = if private_dev {
+        (
+            "/p2/acme/lib~dev.json",
+            "/p2/acme/lib.json",
+            "dev-main",
+            "privatedev",
+        )
+    } else {
+        (
+            "/p2/acme/lib.json",
+            "/p2/acme/lib~dev.json",
+            "1.0.0",
+            "privaterel",
+        )
+    };
+    Mock::given(wm_path(has))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &private.uri(),
+            version,
+            reference,
+        )))
+        .mount(&private)
+        .await;
+    Mock::given(wm_path(lacks))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&private)
+        .await;
+    let public = MockServer::start().await;
+    mount_root(&public).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &public.uri(),
+            "6.6.6",
+            "publicrel",
+        )))
+        .mount(&public)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib~dev.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &public.uri(),
+            "dev-main",
+            "publicdev",
+        )))
+        .mount(&public)
+        .await;
+    Mock::given(wm_method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ZIP_1.to_vec()))
+        .with_priority(10)
+        .mount(&public)
+        .await;
+    let (a, b) = (private.uri(), public.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    (private, public, ctx)
+}
+
+/// Composer finds a package in a repository by either of its two documents and asks no
+/// later repository for it (`PoolBuilder` drops every name found). Neither document of a
+/// package the first upstream has comes from another, nor does an archive the other lists.
+#[tokio::test]
+async fn the_upstream_that_has_a_package_answers_for_both_of_its_documents() {
+    for private_dev in [false, true] {
+        let (_private, public, ctx) = split_upstreams(private_dev).await;
+        let (own, other) = if private_dev {
+            ("~dev", "")
+        } else {
+            ("", "~dev")
+        };
+        // Composer asks for both at once: the one the private upstream lacks may come first.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/composer/p2/acme/lib{other}.json"),
+            "",
+        )
+        .await;
+        let status = resp.status();
+        let served = if status == StatusCode::OK {
+            versions_of(&json_of(resp).await, "acme/lib").len()
+        } else {
+            0
+        };
+        assert!(
+            status == StatusCode::NOT_FOUND || (status == StatusCode::OK && served == 0),
+            "private_dev={private_dev}: {status}, {served} versions of another upstream's"
+        );
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/composer/p2/acme/lib{own}.json"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        for path in [
+            "/composer/dists/acme/lib/dev-main/publicdev.zip",
+            "/composer/dists/acme/lib/6.6.6/publicrel.zip",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        }
+        let asked = upstream_paths(&public).await;
+        assert!(
+            !asked
+                .iter()
+                .any(|p| p.contains("acme/lib") || p.starts_with("/archives/")),
+            "private_dev={private_dev}: {asked:?}"
+        );
+    }
+}
+
+// ── xhigh-3: concurrent refetches leave a body with the validators that describe it ───
+
+/// Two requests refetch one document while the upstream moves from state one to state two.
+/// The writes interleave as the store lets them — body two, body one, validators one,
+/// validators two — ordered by holding writes at the store, not by timing. Whatever is left
+/// stored, the next revalidation must not be answered "not modified" for a body that was not
+/// the one its validators came with, or the old body stays for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_refetches_never_pin_an_old_body_under_a_new_etag() {
+    let up = MockServer::start().await;
+    mount_root(&up).await;
+    let doc = |state: &str, versions: &[&str]| {
+        let list: Vec<Value> = versions
+            .iter()
+            .map(|v| json!({"name": "acme/lib", "version": v,
+                "dist": {"type": "zip", "url": format!("{}/archives/{v}.zip", up.uri()), "reference": "aaaa"}}))
+            .collect();
+        json!({"packages": {"acme/lib": list}, "x-nora-test": state})
+    };
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .and(wm_header("if-none-match", "\"v2\""))
+        .respond_with(ResponseTemplate::new(304))
+        .with_priority(1)
+        .mount(&up)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v1\"")
+                .set_body_json(doc("state-one", &["1.0.0"])),
+        )
+        .up_to_n_times(1)
+        .with_priority(2)
+        .mount(&up)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v2\"")
+                .set_body_json(doc("state-two", &["2.0.0", "1.0.0"])),
+        )
+        .with_priority(3)
+        .mount(&up)
+        .await;
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let uri = up.uri();
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+        c.composer.proxy = Some(uri);
+        c.composer.metadata_ttl = 0;
+    });
+    let p2 = "/composer/p2/acme/lib.json";
+    let key = p2_key("acme/lib", false);
+    let older_body = outage.hold_write_of(&key, b"state-one");
+    let newer_validators = outage.hold_write_of(&validators_key(&key), b"v2");
+    // CANCEL-SAFETY: a watchdog over the scenario: a hang fails the test instead of stalling
+    // the run; nothing is ordered by it.
+    tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        let app = ctx.app.clone();
+        let first = tokio::spawn(async move { send(&app, Method::GET, p2, "").await.status() });
+        // The first request read state one and is about to store it.
+        older_body.reached().await;
+        let app = ctx.app.clone();
+        let second = tokio::spawn(async move { send(&app, Method::GET, p2, "").await.status() });
+        // The second read state two, stored its body, and is about to store its validators.
+        newer_validators.reached().await;
+        older_body.release();
+        assert_eq!(first.await.unwrap(), StatusCode::OK);
+        newer_validators.release();
+        assert_eq!(second.await.unwrap(), StatusCode::OK);
+    })
+    .await
+    .expect("the ordered refetches finished");
+    let doc = json_of(send(&ctx.app, Method::GET, p2, "").await).await;
+    assert_eq!(
+        versions_of(&doc, "acme/lib").len(),
+        2,
+        "a 304 for the newer ETag kept the older body: {doc}"
+    );
+}
+
+// ── xhigh-4: a hosted name the store cannot be asked about is never an upstream's ─────
+
+/// After an upload, the vendor directory loses its search permission: whether `acme/private`
+/// is hosted cannot be read. It must not be taken for an upstream's name then — neither its
+/// metadata nor an audit may reach an upstream that has a public package by that name.
+#[tokio::test]
+async fn a_hosted_name_the_store_cannot_be_asked_about_is_never_an_upstream_s() {
+    use std::os::unix::fs::PermissionsExt;
+    let up = MockServer::start().await;
+    mount_root(&up).await;
+    Mock::given(wm_path("/p2/acme/private.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages": {"acme/private": [
+            {"name": "acme/private", "version": "6.6.6",
+             "dist": {"type": "zip", "url": format!("{}/archives/evil.zip", up.uri()), "reference": "eeee"}}
+        ]}})))
+        .mount(&up)
+        .await;
+    mount_advisories(&up).await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let resp = send(
+        &ctx.app,
+        Method::PUT,
+        "/composer/packages/upload/acme/private/1.0.0",
+        upload_zip("acme/private", None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let vendor = std::path::Path::new(&ctx.state.config.storage.path).join("composer/hosted/acme");
+    std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let blocked = std::fs::metadata(vendor.join("private")).is_err();
+    let p2 = send(&ctx.app, Method::GET, "/composer/p2/acme/private.json", "").await;
+    let dist = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/private/6.6.6/eeee.zip",
+        "",
+    )
+    .await;
+    let audit = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/api/security-advisories?packages[]=acme/private",
+        "",
+    )
+    .await;
+    std::fs::set_permissions(&vendor, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !blocked {
+        eprintln!("skipped: this user passes through a directory without permissions");
+        return;
+    }
+    for (what, resp) in [("p2", &p2), ("dist", &dist), ("audit", &audit)] {
+        assert!(resp.status().is_server_error(), "{what}: {}", resp.status());
+    }
+    let asked = upstream_paths(&up).await;
+    assert!(
+        !asked.iter().any(|p| p.contains("acme/private")
+            || p.contains("advisories")
+            || p.starts_with("/archives/")),
+        "{asked:?}"
+    );
+}
+
+use wiremock::matchers::path_regex as wm_path_regex;
+
+// ── xhigh-5: an upstream that refused NORA or rate-limited it did not say "not found" ─
+
+/// A 401 or 403 (an expired credential) and a 429 from an upstream whose root was read are
+/// not "no such package": a cached copy is served stale, and without one the miss is a 502
+/// or the 429 — never the 404 that sends Composer to the project's other repositories.
+#[tokio::test]
+async fn a_refusal_or_rate_limit_is_not_a_missing_package() {
+    for refusal in [401u16, 403, 429] {
+        let up = MockServer::start().await;
+        mount_root(&up).await;
+        Mock::given(wm_path("/p2/acme/lib.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+                &up.uri(),
+                "1.0.0",
+                "aaaa",
+            )))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&up)
+            .await;
+        Mock::given(wm_path_regex("^/p2/"))
+            .respond_with(ResponseTemplate::new(refusal).insert_header("retry-after", "30"))
+            .with_priority(2)
+            .mount(&up)
+            .await;
+        let ctx = proxy_ctx(&up.uri(), |c| c.composer.metadata_ttl = 0);
+        let p2 = "/composer/p2/acme/lib.json";
+        assert_eq!(
+            send(&ctx.app, Method::GET, p2, "").await.status(),
+            StatusCode::OK
+        );
+        let resp = send(&ctx.app, Method::GET, p2, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{refusal}: the cached copy");
+        assert_eq!(resp.headers()["x-nora-stale"], "true", "{refusal}");
+        let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/other.json", "").await;
+        let expected = if refusal == 429 {
+            StatusCode::TOO_MANY_REQUESTS
+        } else {
+            StatusCode::BAD_GATEWAY
+        };
+        assert_eq!(resp.status(), expected, "{refusal}: no copy");
+    }
+}
+
+/// The upstream a cached copy came from holds the package. When it fails — refused NORA,
+/// rate-limited it, or is down — a later upstream's package of the same name does not take
+/// its place: the copy is served stale.
+#[tokio::test]
+async fn a_package_whose_upstream_fails_is_not_taken_from_the_next() {
+    for failure in [401u16, 429, 503] {
+        let private = MockServer::start().await;
+        mount_root(&private).await;
+        Mock::given(wm_path("/p2/acme/lib.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+                &private.uri(),
+                "1.0.0",
+                "privaterel",
+            )))
+            .up_to_n_times(1)
+            .with_priority(1)
+            .mount(&private)
+            .await;
+        Mock::given(wm_path("/p2/acme/lib.json"))
+            .respond_with(ResponseTemplate::new(failure))
+            .with_priority(2)
+            .mount(&private)
+            .await;
+        let public = MockServer::start().await;
+        mount_root(&public).await;
+        Mock::given(wm_path("/p2/acme/lib.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+                &public.uri(),
+                "6.6.6",
+                "publicrel",
+            )))
+            .mount(&public)
+            .await;
+        let (a, b) = (private.uri(), public.uri());
+        let ctx = create_test_context_with_config(move |c| {
+            c.composer.enabled = true;
+            c.composer.metadata_ttl = 0;
+            c.composer.proxies = vec![
+                crate::config::ComposerProxyEntry::Simple(a),
+                crate::config::ComposerProxyEntry::Simple(b),
+            ];
+        });
+        let p2 = "/composer/p2/acme/lib.json";
+        assert_eq!(
+            send(&ctx.app, Method::GET, p2, "").await.status(),
+            StatusCode::OK
+        );
+        let resp = send(&ctx.app, Method::GET, p2, "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "{failure}");
+        assert_eq!(resp.headers()["x-nora-stale"], "true", "{failure}");
+        let doc = json_of(resp).await;
+        assert_eq!(
+            doc["packages"]["acme/lib"][0]["version"], "1.0.0",
+            "{failure}"
+        );
+        let asked = upstream_paths(&public).await;
+        assert!(
+            !asked.iter().any(|p| p.contains("acme/lib")),
+            "{failure}: {asked:?}"
+        );
+    }
+}
+
+// ── xhigh-6: a document never keeps the origin of the copy before it ──────────────────
+
+/// The cache holds `acme/lib` from the second upstream; then the first, which has archives on
+/// its own host behind its credential, starts serving it. Its document is stored but where it
+/// came from cannot be: the archive it lists must still be fetched with the first upstream's
+/// credential, never under the second's.
+#[tokio::test]
+async fn a_document_whose_origin_was_not_stored_is_not_another_upstream_s() {
+    let private = MockServer::start().await;
+    mount_root(&private).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&private)
+        .await;
+    let public = MockServer::start().await;
+    mount_lib(&public, &public.uri(), None).await;
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let (a, b) = (private.uri(), public.uri());
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+        c.composer.metadata_ttl = 0;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Full(crate::config::ComposerProxy {
+                url: a,
+                auth: Some(crate::secrets::ProtectedString::new("bot:s3cret".into())),
+            }),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    let p2 = "/composer/p2/acme/lib.json";
+    assert_eq!(
+        send(&ctx.app, Method::GET, p2, "").await.status(),
+        StatusCode::OK
+    );
+    // The first upstream now has the package.
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &private.uri(),
+            "2.0.0",
+            "pppp",
+        )))
+        .with_priority(2)
+        .mount(&private)
+        .await;
+    let credential = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("bot:s3cret")
+    );
+    Mock::given(wm_path("/archives/pppp.zip"))
+        .and(wm_header("authorization", credential.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ZIP_1.to_vec()))
+        .with_priority(1)
+        .mount(&private)
+        .await;
+    Mock::given(wm_path("/archives/pppp.zip"))
+        .respond_with(ResponseTemplate::new(401))
+        .with_priority(2)
+        .mount(&private)
+        .await;
+    outage.fail_writes_of(&origin_key(&p2_key("acme/lib", false)));
+    let doc = json_of(send(&ctx.app, Method::GET, p2, "").await).await;
+    assert_eq!(doc["packages"]["acme/lib"][0]["version"], "2.0.0");
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/2.0.0/pppp.zip",
+        "",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the archive went out under the other upstream's credential"
+    );
+    assert_eq!(&body_bytes(resp).await[..], ZIP_1);
+}
+
+// ── xhigh-7: a hosted listing changed within the second its date names ────────────────
+
+/// Two uploads within one second leave the listing's date at that second. A client given that
+/// date before the second upload would get a 304 for it and never see the new version, so a
+/// date the clock has not yet left is not given. A listing last changed in an earlier second
+/// keeps its date, and that date revalidates. (A date ahead of the clock stands for "this
+/// second", whatever second the test runs in.)
+#[tokio::test]
+async fn a_hosted_listing_changed_within_its_second_is_never_a_304() {
+    let ctx = hosted_ctx();
+    let key = hosted_document_key("acme/lib");
+    let file = std::path::Path::new(&ctx.state.config.storage.path).join(&key);
+    let date = |t: std::time::SystemTime| {
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(t)
+            .unwrap()
+    };
+    let p2 = "/composer/p2/acme/lib.json";
+    let this_second = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+    assert_eq!(put_lib(&ctx, "1.0.0").await.status(), StatusCode::CREATED);
+    date(this_second);
+    let first = send(&ctx.app, Method::GET, p2, "").await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let given = first
+        .headers()
+        .get(header::LAST_MODIFIED)
+        .map(|v| v.to_str().unwrap().to_string());
+    assert_eq!(put_lib(&ctx, "2.0.0").await.status(), StatusCode::CREATED);
+    date(this_second);
+    if let Some(given) = given {
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            p2,
+            vec![("if-modified-since", &given)],
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a 304 left the client without 2.0.0"
+        );
+    }
+    // An earlier second: the date is given, and it revalidates.
+    date(std::time::SystemTime::now() - std::time::Duration::from_secs(10));
+    let resp = send(&ctx.app, Method::GET, p2, "").await;
+    let given = resp.headers()[header::LAST_MODIFIED]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        p2,
+        vec![("if-modified-since", &given)],
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+}
+
+/// The boundary itself: the second a listing was written in gets no date, the one after does.
+#[test]
+fn a_hosted_listing_is_dated_once_the_clock_leaves_its_second() {
+    let t = 1_700_000_000;
+    assert_eq!(hosted_date(t, t), None);
+    assert_eq!(hosted_date(t + 5, t), None);
+    assert_eq!(hosted_date(t, t + 1), Some(t));
+    assert_eq!(hosted_date(t - 10, t), Some(t - 10));
+}
+
+// ── an upstream that failed before any answered: no later upstream answers instead ────
+
+/// `[private, public]`: the private upstream behaves as `mount` makes it; the public one has
+/// `acme/lib` 6.6.6 and its archive.
+async fn private_before_public(
+    mount: impl FnOnce(&MockServer) -> Vec<Mock>,
+) -> (MockServer, MockServer, TestContext) {
+    let private = MockServer::start().await;
+    mount_root(&private).await;
+    for mock in mount(&private) {
+        mock.mount(&private).await;
+    }
+    let public = MockServer::start().await;
+    mount_root(&public).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &public.uri(),
+            "6.6.6",
+            "publicrel",
+        )))
+        .mount(&public)
+        .await;
+    Mock::given(wm_path("/archives/publicrel.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ZIP_1.to_vec()))
+        .mount(&public)
+        .await;
+    let (a, b) = (private.uri(), public.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    (private, public, ctx)
+}
+
+/// A way an upstream fails: its name, NORA's answer, and the upstream's mocks.
+type Failure = (&'static str, StatusCode, fn() -> Vec<Mock>);
+
+fn answers(path: &str, response: ResponseTemplate) -> Mock {
+    Mock::given(wm_path(path)).respond_with(response)
+}
+
+/// Composer stops at a repository it cannot read (`ComposerRepository::asyncFetchFile` rejects
+/// anything but a 404) and never asks the next one for the name. An upstream before the one
+/// that would answer failed — down, refusing NORA's credential, rate-limiting it, answering
+/// with something that is not metadata, or unable to say whether it has the package's other
+/// document — and NORA holds no copy: the failure is the answer, and no later upstream's
+/// package of the same name is served, its archive included.
+#[tokio::test]
+async fn a_failed_upstream_is_not_skipped_for_a_later_one() {
+    let failures: Vec<Failure> = vec![
+        ("down", StatusCode::BAD_GATEWAY, || {
+            vec![answers("/p2/acme/lib.json", ResponseTemplate::new(503))]
+        }),
+        ("credential refused", StatusCode::BAD_GATEWAY, || {
+            vec![answers("/p2/acme/lib.json", ResponseTemplate::new(401))]
+        }),
+        ("forbidden", StatusCode::BAD_GATEWAY, || {
+            vec![answers("/p2/acme/lib.json", ResponseTemplate::new(403))]
+        }),
+        ("rate-limited", StatusCode::TOO_MANY_REQUESTS, || {
+            vec![answers(
+                "/p2/acme/lib.json",
+                ResponseTemplate::new(429).insert_header("retry-after", "30"),
+            )]
+        }),
+        ("not metadata", StatusCode::BAD_GATEWAY, || {
+            vec![answers(
+                "/p2/acme/lib.json",
+                ResponseTemplate::new(200).set_body_string("<html>sign in</html>"),
+            )]
+        }),
+        ("other document unknown", StatusCode::BAD_GATEWAY, || {
+            vec![
+                answers("/p2/acme/lib.json", ResponseTemplate::new(404)),
+                answers("/p2/acme/lib~dev.json", ResponseTemplate::new(503)),
+            ]
+        }),
+        (
+            "other document not metadata",
+            StatusCode::BAD_GATEWAY,
+            || {
+                vec![
+                    answers("/p2/acme/lib.json", ResponseTemplate::new(404)),
+                    answers(
+                        "/p2/acme/lib~dev.json",
+                        ResponseTemplate::new(200).set_body_string("<html>sign in</html>"),
+                    ),
+                ]
+            },
+        ),
+    ];
+    for (failure, expected, mount) in failures {
+        let (_private, public, ctx) = private_before_public(|_| mount()).await;
+        let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+        assert_eq!(resp.status(), expected, "{failure}");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/composer/dists/acme/lib/6.6.6/publicrel.zip",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::OK, "{failure}: the archive");
+        let asked = upstream_paths(&public).await;
+        assert!(
+            !asked
+                .iter()
+                .any(|p| p.contains("acme/lib") || p.starts_with("/archives/")),
+            "{failure}: {asked:?}"
+        );
+    }
+}
+
+/// The control: an upstream that answered it has no such package (neither document) is not a
+/// failure, and the next upstream's package is served.
+#[tokio::test]
+async fn a_package_the_first_upstream_lacks_comes_from_the_next() {
+    let (_private, _public, ctx) = private_before_public(|_| {
+        vec![
+            answers("/p2/acme/lib.json", ResponseTemplate::new(404)),
+            answers("/p2/acme/lib~dev.json", ResponseTemplate::new(404)),
+        ]
+    })
+    .await;
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        json_of(resp).await["packages"]["acme/lib"][0]["version"],
+        "6.6.6"
+    );
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/6.6.6/publicrel.zip",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── third review: a held archive keeps its age and stays reachable; one owner per package ─
+
+/// `dev-main` at `reference`, released at `time`, its archive `bytes`.
+async fn mount_dated_branch(up: &MockServer, reference: &str, time: &str, bytes: &[u8]) {
+    Mock::given(wm_path("/p2/acme/lib~dev.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages": {"acme/lib": [
+            {"name": "acme/lib", "version": "dev-main", "time": time,
+             "dist": {"type": "zip", "url": format!("{}/archives/main-{reference}.zip", up.uri()), "reference": reference}}
+        ]}})))
+        .mount(up)
+        .await;
+    Mock::given(wm_path(format!("/archives/main-{reference}.zip")))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes.to_vec()))
+        .mount(up)
+        .await;
+}
+
+/// A held archive is as old as it was when NORA fetched it. One fetched young (with the bypass
+/// token) is refused for its age after its branch moved on, as it was before; one fetched old
+/// is served.
+#[tokio::test]
+async fn a_held_archive_keeps_its_release_age() {
+    let now = chrono::Utc::now()
+        .format("%Y-%m-%dT%H:%M:%S+00:00")
+        .to_string();
+    for (released, expected) in [
+        (now.as_str(), StatusCode::FORBIDDEN),
+        ("2020-01-01T00:00:00+00:00", StatusCode::OK),
+    ] {
+        let up = MockServer::start().await;
+        mount_root(&up).await;
+        mount_dated_branch(&up, "aaaa", released, ZIP_1).await;
+        let ctx = proxy_ctx(&up.uri(), |c| {
+            c.composer.metadata_ttl = 0;
+            c.server.trust_upstream_dates = true;
+            c.curation.mode = crate::config::CurationMode::Enforce;
+            c.curation.min_release_age = Some("7d".into());
+            c.curation.bypass_token = Some(crate::secrets::ProtectedString::from("let-me-in"));
+        });
+        let locked = "/composer/dists/acme/lib/dev-main/aaaa.zip";
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::GET,
+            locked,
+            vec![("x-nora-bypass-token", "let-me-in")],
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "{released}: fetched");
+        assert_eq!(
+            send(&ctx.app, Method::GET, locked, "").await.status(),
+            expected,
+            "{released}: listed"
+        );
+        up.reset().await;
+        mount_root(&up).await;
+        mount_dated_branch(&up, "bbbb", "2020-01-01T00:00:00+00:00", b"PK\x03\x04 two").await;
+        assert_eq!(
+            send(&ctx.app, Method::GET, "/composer/p2/acme/lib~dev.json", "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&ctx.app, Method::GET, locked, "").await.status(),
+            expected,
+            "{released}: held after the branch moved"
+        );
+        // Without the record of its date, a held archive is young.
+        let record = first_seen_key(&proxied_dist_key("acme/lib", "dev-main", "aaaa", "zip"));
+        ctx.state.storage.delete(&record).await.unwrap();
+        assert_eq!(
+            send(&ctx.app, Method::GET, locked, "").await.status(),
+            StatusCode::FORBIDDEN,
+            "{released}: held without a recorded date"
+        );
+    }
+}
+
+/// A held archive does not depend on the metadata being reachable: the upstream down and
+/// stale metadata not served, the archive a lock file names is still served from the cache;
+/// a reference NORA never held is not.
+#[tokio::test]
+async fn a_held_archive_is_served_while_the_metadata_cannot_be_read() {
+    let up = MockServer::start().await;
+    mount_root(&up).await;
+    mount_branch(&up, "aaaa", ZIP_1).await;
+    let ctx = proxy_ctx(&up.uri(), |c| {
+        c.composer.metadata_ttl = 0;
+        c.composer.serve_stale = false;
+    });
+    let locked = "/composer/dists/acme/lib/dev-main/aaaa.zip";
+    assert_eq!(
+        send(&ctx.app, Method::GET, locked, "").await.status(),
+        StatusCode::OK
+    );
+    up.reset().await;
+    mount_root(&up).await;
+    mount_branch(&up, "bbbb", b"PK\x03\x04 two").await;
+    assert_eq!(
+        send(&ctx.app, Method::GET, "/composer/p2/acme/lib~dev.json", "")
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    up.reset().await;
+    Mock::given(wiremock::matchers::any())
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&up)
+        .await;
+    let resp = send(&ctx.app, Method::GET, locked, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(resp).await[..], ZIP_1);
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/dev-main/cccc.zip",
+        "",
+    )
+    .await;
+    assert_ne!(resp.status(), StatusCode::OK);
+}
+
+/// The package is the first upstream's that has either document, a copy past its TTL
+/// included. The private upstream served the releases (cached, now stale), answers 404 for the
+/// branches and fails for the releases: the branch document is its answer — none — not the
+/// public upstream's, and the releases are its stale copy.
+#[tokio::test]
+async fn a_stale_copy_of_the_other_document_keeps_the_package_its_upstream_s() {
+    let private = MockServer::start().await;
+    mount_root(&private).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &private.uri(),
+            "1.0.0",
+            "privaterel",
+        )))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&private)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(2)
+        .mount(&private)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib~dev.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&private)
+        .await;
+    let public = MockServer::start().await;
+    mount_root(&public).await;
+    Mock::given(wm_path("/p2/acme/lib~dev.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &public.uri(),
+            "dev-main",
+            "publicdev",
+        )))
+        .mount(&public)
+        .await;
+    let (a, b) = (private.uri(), public.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.metadata_ttl = 0;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    let releases = "/composer/p2/acme/lib.json";
+    assert_eq!(
+        send(&ctx.app, Method::GET, releases, "").await.status(),
+        StatusCode::OK
+    );
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib~dev.json", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the branches are the private upstream's answer"
+    );
+    let resp = send(&ctx.app, Method::GET, releases, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-nora-stale"], "true");
+    let asked = upstream_paths(&public).await;
+    assert!(!asked.iter().any(|p| p.contains("acme/lib")), "{asked:?}");
+}
+
+/// The copy of the very document asked for, past its TTL, keeps the package its upstream's
+/// too. The private upstream served the releases (cached, now stale) and answers 404 for both
+/// documents: the releases are its answer — none — not the public upstream's package.
+#[tokio::test]
+async fn a_stale_copy_of_the_document_asked_for_keeps_the_package_its_upstream_s() {
+    let private = MockServer::start().await;
+    mount_root(&private).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &private.uri(),
+            "1.0.0",
+            "privaterel",
+        )))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&private)
+        .await;
+    Mock::given(wm_path_regex("^/p2/acme/lib"))
+        .respond_with(ResponseTemplate::new(404))
+        .with_priority(2)
+        .mount(&private)
+        .await;
+    let public = MockServer::start().await;
+    mount_root(&public).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &public.uri(),
+            "6.6.6",
+            "publicrel",
+        )))
+        .mount(&public)
+        .await;
+    let (a, b) = (private.uri(), public.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.metadata_ttl = 0;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    let releases = "/composer/p2/acme/lib.json";
+    assert_eq!(
+        send(&ctx.app, Method::GET, releases, "").await.status(),
+        StatusCode::OK
+    );
+    let resp = send(&ctx.app, Method::GET, releases, "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the releases are the private upstream's answer"
+    );
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/6.6.6/publicrel.zip",
+        "",
+    )
+    .await;
+    assert_ne!(resp.status(), StatusCode::OK);
+    let asked = upstream_paths(&public).await;
+    assert!(!asked.iter().any(|p| p.contains("acme/lib")), "{asked:?}");
+}
+
+/// Metadata that names no package — `{"packages":[]}`, `{"packages":{}}`, another package's
+/// document — is an upstream saying it does not have the package, as a 404 is: the next
+/// upstream is asked, and with none having it the answer is 404. An answer that is not
+/// metadata at all (a sign-in page, JSON without `packages`, `packages` that is a non-empty array
+/// or not a list) is still a failure: 502.
+#[tokio::test]
+async fn metadata_naming_no_package_is_not_a_failure() {
+    let no_package = [
+        r#"{"packages":[]}"#,
+        r#"{"packages":{}}"#,
+        r#"{"packages":{"acme/other":[{"name":"acme/other","version":"1.0.0"}]}}"#,
+    ];
+    for body in no_package {
+        for public_has in [false, true] {
+            let private = MockServer::start().await;
+            mount_root(&private).await;
+            answers("/p2/acme/lib.json", ResponseTemplate::new(404))
+                .mount(&private)
+                .await;
+            answers(
+                "/p2/acme/lib~dev.json",
+                ResponseTemplate::new(200).set_body_string(body),
+            )
+            .mount(&private)
+            .await;
+            let public = MockServer::start().await;
+            mount_root(&public).await;
+            if public_has {
+                answers(
+                    "/p2/acme/lib.json",
+                    ResponseTemplate::new(200).set_body_json(lib_doc(
+                        &public.uri(),
+                        "6.6.6",
+                        "publicrel",
+                    )),
+                )
+                .mount(&public)
+                .await;
+            }
+            let (a, b) = (private.uri(), public.uri());
+            let ctx = create_test_context_with_config(move |c| {
+                c.composer.enabled = true;
+                c.composer.proxies = vec![
+                    crate::config::ComposerProxyEntry::Simple(a),
+                    crate::config::ComposerProxyEntry::Simple(b),
+                ];
+            });
+            let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+            let expected = if public_has {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            };
+            assert_eq!(
+                resp.status(),
+                expected,
+                "{body}, public has it: {public_has}"
+            );
+        }
+    }
+    for (failure, body) in [
+        ("sign-in page", "<html>sign in</html>"),
+        ("JSON without packages", r#"{"error":"forbidden"}"#),
+        (
+            "a non-empty array",
+            r#"{"packages":["authentication required"]}"#,
+        ),
+        ("packages that are not a list", r#"{"packages":"acme/lib"}"#),
+    ] {
+        let (_private, public, ctx) = private_before_public(|_| {
+            vec![
+                answers("/p2/acme/lib.json", ResponseTemplate::new(404)),
+                answers(
+                    "/p2/acme/lib~dev.json",
+                    ResponseTemplate::new(200).set_body_string(body),
+                ),
+            ]
+        })
+        .await;
+        let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{failure}");
+        let asked = upstream_paths(&public).await;
+        assert!(
+            !asked.iter().any(|p| p.contains("acme/lib")),
+            "{failure}: {asked:?}"
+        );
+    }
 }
