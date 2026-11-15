@@ -2376,7 +2376,7 @@ mod url_fold {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     async fn upstream() -> MockServer {
-        let up = MockServer::start().await;
+        let up = MockServer::builder().start().await;
         Mock::given(any())
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UP".to_vec()))
             .mount(&up)
