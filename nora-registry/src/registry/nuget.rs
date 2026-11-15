@@ -242,7 +242,7 @@ async fn search_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return data.map_or_else(records_unavailable, with_json);
     }
 
     // #68 namespace isolation: never forward a search term that matches an internal
@@ -261,12 +261,28 @@ async fn search_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return data.map_or_else(records_unavailable, with_json);
     }
+
+    // NORA's own packages first, the search host's after them: which ids are NORA's own must
+    // be known before the host is asked, or a package NORA hosts is shown as the host has it.
+    let Some(hosted) = state.repo_index.nuget_hosted(&state.storage).await else {
+        return records_unavailable();
+    };
+    let shown = SearchFilter {
+        prerelease,
+        sem_ver_level: sem_ver_level.as_deref(),
+    };
+    let own = own_matches(&state, &hosted, &query, shown).await;
+    let window = PageWindow::new(skip, take, own.len());
 
     // Try upstream with short timeout (UX-critical path)
     let qs = raw_query.0.unwrap_or_default();
-    let url = format!("{}?{}", state.config.nuget.search_service, qs);
+    let url = format!(
+        "{}?{}",
+        state.config.nuget.search_service,
+        with_page(&qs, window.upstream_skip, window.upstream_take)
+    );
 
     match proxy_fetch_text(
         &state.http_client,
@@ -283,11 +299,7 @@ async fn search_query(
             let base_url = nora_base_url(&state);
             let upstream = rewrite_host(&state);
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
-            let shown = SearchFilter {
-                prerelease,
-                sem_ver_level: sem_ver_level.as_deref(),
-            };
-            let merged = with_own_packages(&state, rewritten, &query, skip, shown).await;
+            let merged = merge_search_page(&state, &hosted, &own, rewritten, window, shown).await;
             state.metrics.record_download("nuget");
             state.metrics.record_cache_miss("nuget");
             state.activity.push(ActivityEntry::new(
@@ -300,12 +312,8 @@ async fn search_query(
         }
         Err(ProxyError::NotFound) => {
             // The host knows nothing of the query: NORA's own packages may still match.
-            let shown = SearchFilter {
-                prerelease,
-                sem_ver_level: sem_ver_level.as_deref(),
-            };
             let none = r#"{"totalHits":0,"data":[]}"#.to_string();
-            with_json(with_own_packages(&state, none, &query, skip, shown).await)
+            with_json(merge_search_page(&state, &hosted, &own, none, window, shown).await)
         }
         Err(
             ProxyError::CircuitOpen(_)
@@ -327,7 +335,7 @@ async fn search_query(
                 sem_ver_level.as_deref(),
             )
             .await;
-            with_json_stale(data)
+            data.map_or_else(records_unavailable, with_json_stale)
         }
     }
 }
@@ -356,7 +364,7 @@ async fn autocomplete_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return data.map_or_else(records_unavailable, with_json);
     }
 
     // #68 namespace isolation: don't forward an internal-namespace autocomplete term.
@@ -374,7 +382,7 @@ async fn autocomplete_query(
             sem_ver_level.as_deref(),
         )
         .await;
-        return with_json(data);
+        return data.map_or_else(records_unavailable, with_json);
     }
 
     let qs = raw_query.0.unwrap_or_default();
@@ -426,7 +434,7 @@ async fn autocomplete_query(
                 sem_ver_level.as_deref(),
             )
             .await;
-            with_json_stale(data)
+            data.map_or_else(records_unavailable, with_json_stale)
         }
     }
 }
@@ -1795,17 +1803,110 @@ async fn local_search_entry(
     (!versions.is_empty()).then(|| build_search_entry(base_url, pkg, &versions))
 }
 
-/// The search result of the search host (`upstream`, its URLs already NORA's) with NORA's own
-/// packages in it as NORA holds them: an entry whose id NORA hosts, or which is in an internal
-/// namespace, is replaced by NORA's entry of it (dropped when NORA holds none), and on the
-/// first page (`skip` 0) the hosted packages the query matches that the host did not return
-/// on the page are added before the host's. `totalHits` follows, counted alike on every page. A result that is not the search JSON is
-/// passed on as it is.
-async fn with_own_packages(
+/// 503 for a search while NORA does not know which packages are its own (the records could not
+/// be listed): a result then could show the search host's versions of a package NORA hosts.
+fn records_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [("retry-after", "30")],
+        "nuget: hosted packages temporarily not listed",
+    )
+        .into_response()
+}
+
+/// NORA's own packages the query matches, as search shows them, ordered by id: the hosted ones
+/// whose id contains the query (case-insensitive) and that have a version `shown` lets through.
+async fn own_matches(
     state: &AppState,
-    upstream: String,
+    hosted: &std::collections::HashMap<String, Vec<String>>,
     query: &str,
-    skip: usize,
+    shown: SearchFilter<'_>,
+) -> Vec<serde_json::Value> {
+    let packages = state.repo_index.get("nuget", &state.storage).await;
+    let base_url = nora_base_url(state);
+    let query = query.to_lowercase();
+    let mut matched: Vec<&crate::repo_index::RepoInfo> = packages
+        .iter()
+        .filter(|pkg| {
+            let id = pkg.name.to_lowercase();
+            hosted.contains_key(&id) && id.contains(&query)
+        })
+        .collect();
+    matched.sort_by_key(|pkg| pkg.name.to_lowercase());
+    let mut entries = Vec::new();
+    for pkg in matched {
+        if let Some(entry) = local_search_entry(state, hosted, &base_url, pkg, shown).await {
+            entries.push(entry);
+        }
+    }
+    entries
+}
+
+/// Where a page (`skip`, `take`) of a merged search falls: NORA's own packages (`own` of them)
+/// come first, the search host's after them, so the host is asked for its part of the page
+/// only, at the offset past NORA's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PageWindow {
+    /// NORA's own packages on the page: `own[own_from..own_from + own_take]`.
+    own_from: usize,
+    own_take: usize,
+    /// What the host is asked for.
+    upstream_skip: usize,
+    upstream_take: usize,
+    /// How many of the host's entries the page has room for.
+    upstream_room: usize,
+    /// NORA's own packages in all.
+    own_total: usize,
+}
+
+impl PageWindow {
+    fn new(skip: usize, take: usize, own_total: usize) -> Self {
+        let own_from = skip.min(own_total);
+        let own_take = (own_total - own_from).min(take);
+        let upstream_room = take - own_take;
+        Self {
+            own_from,
+            own_take,
+            upstream_skip: skip.saturating_sub(own_total),
+            // The host is asked for one entry at least, for its total.
+            upstream_take: upstream_room.max(1),
+            upstream_room,
+            own_total,
+        }
+    }
+}
+
+/// The query string `qs` with `skip` and `take` set to these.
+fn with_page(qs: &str, skip: usize, take: usize) -> String {
+    let mut pairs: Vec<String> = qs
+        .split('&')
+        .filter(|pair| {
+            let key = pair.split_once('=').map_or(*pair, |(key, _)| key);
+            !pair.is_empty()
+                && !key.eq_ignore_ascii_case("skip")
+                && !key.eq_ignore_ascii_case("take")
+        })
+        .map(str::to_string)
+        .collect();
+    pairs.push(format!("skip={skip}"));
+    pairs.push(format!("take={take}"));
+    pairs.join("&")
+}
+
+/// One page of a merged search: NORA's own packages of the page (`own`, from [`own_matches`])
+/// first, then the search host's entries (`upstream`, its URLs already NORA's, asked for the
+/// window of [`PageWindow`]). An entry of the host whose id is NORA's own — hosted, or in an
+/// internal namespace — is never shown as the host has it: one NORA already shows among its
+/// own is dropped, another is replaced by NORA's entry of it, or dropped when NORA holds none.
+/// The page holds `take` entries at most; `totalHits` is NORA's own plus the host's total, the
+/// same on every page (it counts the host's entries a page drops). A host result that is not
+/// the search JSON is passed on as it is.
+async fn merge_search_page(
+    state: &AppState,
+    hosted: &std::collections::HashMap<String, Vec<String>>,
+    own: &[serde_json::Value],
+    upstream: String,
+    window: PageWindow,
     shown: SearchFilter<'_>,
 ) -> Vec<u8> {
     let Ok(mut result) = serde_json::from_str::<serde_json::Value>(&upstream) else {
@@ -1819,61 +1920,45 @@ async fn with_own_packages(
         return upstream.into_bytes();
     };
     let packages = state.repo_index.get("nuget", &state.storage).await;
-    let hosted = state.repo_index.nuget_hosted(&state.storage).await;
     let engine = &state.curation().curation_engine;
-    let own = |id: &str| {
-        hosted.contains_key(id)
+    let base_url = nora_base_url(state);
+    let own_ids: std::collections::HashSet<String> = own
+        .iter()
+        .filter_map(|entry| entry["id"].as_str().map(str::to_lowercase))
+        .collect();
+
+    let mut page: Vec<serde_json::Value> = own
+        .iter()
+        .skip(window.own_from)
+        .take(window.own_take)
+        .cloned()
+        .collect();
+    let mut from_host = Vec::new();
+    for entry in entries {
+        let Some(id) = entry["id"].as_str().map(str::to_lowercase) else {
+            from_host.push(entry);
+            continue;
+        };
+        let nora_own = hosted.contains_key(&id)
             || crate::curation::is_internal_namespace(
                 engine,
                 crate::curation::RegistryType::Nuget,
-                id,
-            )
-    };
-    let base_url = nora_base_url(state);
-    let local = |id: &str| packages.iter().find(|pkg| pkg.name.to_lowercase() == id);
-
-    let mut seen = std::collections::HashSet::new();
-    let mut kept = Vec::new();
-    let mut dropped: u64 = 0;
-    for entry in entries {
-        let id = entry["id"].as_str().map(str::to_lowercase);
-        match id {
-            Some(id) if own(&id) => {
-                let held = match local(&id) {
-                    Some(pkg) => local_search_entry(state, &hosted, &base_url, pkg, shown).await,
-                    None => None,
-                };
-                match held {
-                    Some(held) => kept.push(held),
-                    None => dropped += 1,
+                &id,
+            );
+        if !nora_own {
+            from_host.push(entry);
+        } else if !own_ids.contains(&id) {
+            if let Some(pkg) = packages.iter().find(|pkg| pkg.name.to_lowercase() == id) {
+                if let Some(held) = local_search_entry(state, hosted, &base_url, pkg, shown).await {
+                    from_host.push(held);
                 }
-                seen.insert(id);
-            }
-            Some(id) => {
-                seen.insert(id);
-                kept.push(entry);
-            }
-            None => kept.push(entry),
-        }
-    }
-    // Counted on every page, so `totalHits` is the same on each; shown on the first.
-    let mut added = Vec::new();
-    let query = query.to_lowercase();
-    for pkg in packages.iter() {
-        let id = pkg.name.to_lowercase();
-        if hosted.contains_key(&id) && !seen.contains(&id) && id.contains(&query) {
-            if let Some(entry) = local_search_entry(state, &hosted, &base_url, pkg, shown).await {
-                added.push(entry);
             }
         }
     }
-    let total = result["totalHits"].as_u64().unwrap_or(kept.len() as u64);
-    result["totalHits"] = (total.saturating_sub(dropped) + added.len() as u64).into();
-    if skip > 0 {
-        added.clear();
-    }
-    added.extend(kept);
-    result["data"] = added.into();
+    page.extend(from_host.into_iter().take(window.upstream_room));
+    let host_total = result["totalHits"].as_u64().unwrap_or(0);
+    result["totalHits"] = (window.own_total as u64 + host_total).into();
+    result["data"] = page.into();
     serde_json::to_vec(&result).unwrap_or_else(|_| upstream.into_bytes())
 }
 
@@ -1890,9 +1975,9 @@ async fn local_search_results(
     take: usize,
     prerelease: bool,
     sem_ver_level: Option<&str>,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let packages = state.repo_index.get("nuget", &state.storage).await;
-    let hosted = state.repo_index.nuget_hosted(&state.storage).await;
+    let hosted = state.repo_index.nuget_hosted(&state.storage).await?;
     let base_url = nora_base_url(state);
 
     let query_lower = query.to_lowercase();
@@ -1919,7 +2004,7 @@ async fn local_search_results(
         "totalHits": total_hits,
         "data": page,
     });
-    serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
+    Some(serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec()))
 }
 
 /// Build local autocomplete results from the in-memory repo index.
@@ -1934,9 +2019,9 @@ async fn local_autocomplete_results(
     take: usize,
     prerelease: bool,
     sem_ver_level: Option<&str>,
-) -> Vec<u8> {
+) -> Option<Vec<u8>> {
     let packages = state.repo_index.get("nuget", &state.storage).await;
-    let hosted = state.repo_index.nuget_hosted(&state.storage).await;
+    let hosted = state.repo_index.nuget_hosted(&state.storage).await?;
 
     let query_lower = query.to_lowercase();
     let mut matched: Vec<&str> = Vec::new();
@@ -1970,7 +2055,7 @@ async fn local_autocomplete_results(
         "totalHits": total_hits,
         "data": names,
     });
-    serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec())
+    Some(serde_json::to_vec(&result).unwrap_or_else(|_| br#"{"totalHits":0,"data":[]}"#.to_vec()))
 }
 
 /// Generate NuGet v3 service index from scratch, advertising only resources

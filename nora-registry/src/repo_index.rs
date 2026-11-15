@@ -99,8 +99,10 @@ pub struct RepoIndex {
     indexes: HashMap<RegistryType, RegistryIndex>,
     /// The NuGet packages NORA hosts (imported), by lowercase id, with the versions their
     /// records list: rebuilt with the NuGet index, from one listing of the records, so search
-    /// does not list every package's records on each request.
-    nuget_hosted: RwLock<Arc<HashMap<String, Vec<String>>>>,
+    /// does not list every package's records on each request. `None` until a rebuild has
+    /// listed them, and again when the last rebuild could not: which ids are NORA's own is
+    /// then not known, and search does not guess it from an older listing.
+    nuget_hosted: RwLock<Option<Arc<HashMap<String, Vec<String>>>>>,
     /// Epoch-seconds of the last accepted admin reindex (0 = never). Used to
     /// debounce operator-triggered reindex so a tight `reindex + read` loop
     /// cannot amplify into repeated full-storage scans (see `try_accept_reindex`).
@@ -115,7 +117,7 @@ impl RepoIndex {
         }
         Self {
             indexes,
-            nuget_hosted: RwLock::new(Arc::default()),
+            nuget_hosted: RwLock::new(None),
             last_reindex: AtomicU64::new(0),
         }
     }
@@ -185,18 +187,14 @@ impl RepoIndex {
                 RegistryType::Raw => build_raw_index(storage).await,
                 RegistryType::Nuget => {
                     let (p, s) = crate::registry::nuget::INDEX_PATTERN;
-                    // The hosted records with the packages, or neither: an index whose records
-                    // could not be listed stays dirty, as one whose files could not.
-                    match crate::registry::nuget::hosted_index(storage).await {
-                        Some(hosted) => {
-                            let data = build_generic_index(storage, p, s).await;
-                            if data.is_some() {
-                                *self.nuget_hosted.write() = Arc::new(hosted);
-                            }
-                            data
-                        }
-                        None => None,
-                    }
+                    // An index whose records could not be listed stays dirty, as one whose
+                    // files could not, and its hosted packages are not known until a rebuild
+                    // lists them: never the listing from before the write that made it dirty.
+                    let hosted = crate::registry::nuget::hosted_index(storage).await;
+                    let listed = hosted.is_some();
+                    *self.nuget_hosted.write() = hosted.map(Arc::new);
+                    let data = build_generic_index(storage, p, s).await;
+                    data.filter(|_| listed)
                 }
                 RegistryType::Gems => build_gems_index(storage).await,
                 RegistryType::Terraform => {
@@ -245,10 +243,14 @@ impl RepoIndex {
     }
 
     /// The NuGet packages NORA hosts, by lowercase id, with the versions their records list, as
-    /// of the NuGet index (rebuilt first when it is stale).
-    pub async fn nuget_hosted(&self, storage: &Storage) -> Arc<HashMap<String, Vec<String>>> {
+    /// of the NuGet index (rebuilt first when it is stale); `None` when the last rebuild could
+    /// not list the records.
+    pub async fn nuget_hosted(
+        &self,
+        storage: &Storage,
+    ) -> Option<Arc<HashMap<String, Vec<String>>>> {
         self.get("nuget", storage).await;
-        Arc::clone(&self.nuget_hosted.read())
+        self.nuget_hosted.read().clone()
     }
 
     /// Get counts for stats (no rebuild, just current state)

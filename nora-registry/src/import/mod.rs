@@ -2309,16 +2309,15 @@ mod integration_tests {
             shown,
             [
                 want("corp.extralib", &["3.0.0"]),
-                want("corp.newlib", &["2.0.0"]),
                 want("corp.lib", &["1.0.0"]),
+                want("corp.newlib", &["2.0.0"]),
                 want("other.lib", &["1.0.0"]),
             ],
             "{found}"
         );
-        // The host's 40, one internal entry dropped, two imported packages added.
-        assert_eq!(found["totalHits"], 41, "{found}");
-        // A later page: the host's entries (as NORA holds its own), nothing added, the same
-        // total.
+        // NORA's own 3 and the host's 40.
+        assert_eq!(found["totalHits"], 43, "{found}");
+        // A later page: the host's entries without NORA's own, the same total.
         let resp = send(&ctx.app, Method::GET, "/nuget/v3/query?q=lib&skip=20", "").await;
         let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
         let ids: Vec<&str> = page["data"]
@@ -2327,13 +2326,175 @@ mod integration_tests {
             .iter()
             .map(|entry| entry["id"].as_str().unwrap())
             .collect();
-        assert_eq!(ids, ["corp.lib", "Other.Lib"], "{page}");
-        assert_eq!(page["totalHits"], 41, "{page}");
+        assert_eq!(ids, ["Other.Lib"], "{page}");
+        assert_eq!(page["totalHits"], 43, "{page}");
     }
 
-    /// When the records of a package cannot be listed, whether it is hosted is not known: search
-    /// leaves it out rather than show the list an upstream gave for the id, as its flat
-    /// container answers 503 rather than that list.
+    /// A package imported after the index was built, while the records cannot be listed: search
+    /// through a live search host does not show the host's versions of it from the listing
+    /// before the import, it answers 503 until the records list again.
+    #[tokio::test]
+    async fn an_import_the_index_cannot_list_is_not_shown_from_a_live_upstream() {
+        use crate::test_helpers::{
+            body_bytes, create_test_context_with_storage_and_config, outage_storage, send,
+        };
+        use axum::http::{Method, StatusCode};
+
+        let search = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "totalHits": 1,
+                "data": [{ "id": "Corp.Lib", "version": "9.9.9", "versions": [{ "version": "9.9.9" }] }],
+            })))
+            .mount(&search)
+            .await;
+        let (storage, outage) = outage_storage();
+        let uri = search.uri();
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+        });
+        let query = "/nuget/v3/query?q=corp";
+        // Warm: not hosted yet, the host's package is the host's.
+        let resp = send(&ctx.app, Method::GET, query, "").await;
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(body.contains("9.9.9"), "{body}");
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0"))],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (1, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+        outage.fail_listings_of("nuget/hosted/");
+        let resp = send(&ctx.app, Method::GET, query, "").await;
+        let status = resp.status();
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(
+            !body.contains("9.9.9"),
+            "the host's version of an import: {body}"
+        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+        // Listed again: the import as NORA holds it.
+        outage.end();
+        ctx.state.repo_index.invalidate("nuget");
+        let resp = send(&ctx.app, Method::GET, query, "").await;
+        let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+        assert!(
+            body.contains("\"1.0.0\"") && !body.contains("9.9.9"),
+            "{body}"
+        );
+    }
+
+    /// Paging through a merged search, against a search host that pages as it is asked: every
+    /// page holds `take` entries at most, no id is on two pages, `totalHits` is the same on
+    /// every page, and the pages together hold NORA's own packages (as held) and the host's
+    /// others, not an internal id.
+    #[tokio::test]
+    async fn a_merged_search_pages_without_overlap() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+
+        let host_ids = ["A.Lib", "Corp.Lib", "B.Lib", "C.Lib", "Internal.X", "D.Lib"];
+        let search = MockServer::start().await;
+        Mock::given(wiremock::matchers::any())
+            .respond_with(move |request: &wiremock::Request| {
+                let param = |name: &str| {
+                    request
+                        .url
+                        .query_pairs()
+                        .find(|(key, _)| key == name)
+                        .and_then(|(_, value)| value.parse::<usize>().ok())
+                };
+                let (skip, take) = (param("skip").unwrap_or(0), param("take").unwrap_or(20));
+                let data: Vec<serde_json::Value> = host_ids
+                    .iter()
+                    .skip(skip)
+                    .take(take)
+                    .map(|id| json!({ "id": id, "version": "9.9.9", "versions": [{ "version": "9.9.9" }] }))
+                    .collect();
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "totalHits": host_ids.len(), "data": data }))
+            })
+            .mount(&search)
+            .await;
+        let uri = search.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.search_service = format!("{uri}/query");
+            cfg.curation.internal_namespaces = vec!["internal*".to_string()];
+        });
+        let state = tempfile::tempdir().unwrap();
+        let res = import_as(
+            &ctx.state.storage,
+            crate::registry_type::RegistryType::Nuget,
+            "nuget",
+            vec![
+                ("Corp.Lib.1.0.nupkg".into(), nupkg("Corp.Lib", "1.0")),
+                ("Corp.NewLib.2.0.nupkg".into(), nupkg("Corp.NewLib", "2.0")),
+                (
+                    "Corp.ExtraLib.3.0.nupkg".into(),
+                    nupkg("Corp.ExtraLib", "3.0"),
+                ),
+            ],
+            state.path(),
+        )
+        .await;
+        assert_eq!((res.imported, res.failed), (3, 0), "{res:?}");
+        ctx.state.repo_index.invalidate("nuget");
+
+        let take = 2;
+        let mut seen: Vec<(String, String)> = Vec::new();
+        let mut totals = std::collections::BTreeSet::new();
+        for skip in (0..12).step_by(take) {
+            let path = format!("/nuget/v3/query?q=lib&skip={skip}&take={take}");
+            let resp = send(&ctx.app, Method::GET, &path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let page: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            let data = page["data"].as_array().unwrap();
+            assert!(data.len() <= take, "{path}: {page}");
+            totals.insert(page["totalHits"].as_u64().unwrap());
+            for entry in data {
+                let id = entry["id"].as_str().unwrap().to_lowercase();
+                assert!(
+                    seen.iter().all(|(seen_id, _)| *seen_id != id),
+                    "{path}: {id} on two pages"
+                );
+                seen.push((id, entry["version"].as_str().unwrap().to_string()));
+            }
+        }
+        assert_eq!(
+            totals.len(),
+            1,
+            "totalHits changes with the page: {totals:?}"
+        );
+        let mut ids: Vec<&str> = seen.iter().map(|(id, _)| id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "a.lib",
+                "b.lib",
+                "c.lib",
+                "corp.extralib",
+                "corp.lib",
+                "corp.newlib",
+                "d.lib"
+            ]
+        );
+        let corp = seen.iter().find(|(id, _)| id == "corp.lib").unwrap();
+        assert_eq!(corp.1, "1.0.0", "an import shown as the host has it");
+    }
+
+    /// When the records cannot be listed, which packages are NORA's own is not known: search
+    /// answers 503 rather than show the list an upstream gave for the id, as the flat container
+    /// does.
     #[tokio::test]
     async fn a_package_whose_records_cannot_be_listed_is_not_found_by_an_upstream_list() {
         use crate::test_helpers::{
@@ -2359,22 +2520,24 @@ mod integration_tests {
             ctx.state.storage.put(key, data).await.unwrap();
         }
         ctx.state.repo_index.invalidate("nuget");
-        let found = |app: axum::Router| async move {
-            let resp = send(&app, Method::GET, "/nuget/v3/query?q=corp", "").await;
-            assert_eq!(resp.status(), StatusCode::OK);
-            serde_json::from_slice::<serde_json::Value>(&body_bytes(resp).await).unwrap()
-        };
+        let search = "/nuget/v3/query?q=corp";
         outage.fail_listings_of("nuget/hosted/");
         outage.fail_listings_of("nuget/hosted/corp.lib/");
         let listing = "/nuget/v3/flatcontainer/corp.lib/index.json";
         let status = send(&ctx.app, Method::GET, listing, "").await.status();
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        let result = found(ctx.app.clone()).await;
-        assert_eq!(result["totalHits"], 0, "{result}");
+        let resp = send(&ctx.app, Method::GET, search, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let autocomplete = "/nuget/v3/autocomplete?q=corp";
+        let resp = send(&ctx.app, Method::GET, autocomplete, "").await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         // Control: listed, the package is not hosted and its cached list is what it has.
         outage.end();
         ctx.state.repo_index.invalidate("nuget");
-        assert_eq!(found(ctx.app.clone()).await["totalHits"], 1);
+        let resp = send(&ctx.app, Method::GET, search, "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let found: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+        assert_eq!(found["totalHits"], 1, "{found}");
     }
 
     /// A .nupkg imported from a hosted repository is NORA's own: the flat container lists and
