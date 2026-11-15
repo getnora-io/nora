@@ -59,6 +59,21 @@ const MAX_COMPOSER_JSON: u64 = 1024 * 1024;
 /// lock file: far below this even for a large application.
 const MAX_ADVISORY_QUERY: usize = 1024 * 1024;
 
+/// Distinct package names one advisories query may name. Composer asks 500 at a time
+/// (`ComposerRepository::ADVISORY_API_BATCH_SIZE`, 2.11); each name costs no storage request.
+const MAX_ADVISORY_NAMES: usize = 1000;
+
+/// First-seen ledger of the p2 document cached at `metadata_key`:
+/// `.nora-first-seen/composer/p2/<name>.json`. The prefix is the internal one backup and
+/// migrate carry (npm's ledger lives there too), so no listing, retention or GC walk of the
+/// `composer/` key space reaches it.
+fn first_seen_key(metadata_key: &str) -> String {
+    format!(".nora-first-seen/{metadata_key}")
+}
+
+/// Version (as written) → Unix time NORA first saw it listed in an upstream p2 document.
+type FirstSeen = std::collections::BTreeMap<String, i64>;
+
 /// The marker of a minified (`composer/2.0`) version list.
 const MINIFIED: &str = "composer/2.0";
 
@@ -163,7 +178,12 @@ pub(crate) fn normalize_version(version: &str) -> Option<String> {
         Some(_) => return None,
         None => version,
     };
-    if version.len() > 4 && version[..4].eq_ignore_ascii_case("dev-") {
+    // `get`: a multi-byte character across byte 4 is no `dev-` prefix, not a panic.
+    if version.len() > 4
+        && version
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("dev-"))
+    {
         return Some(format!("dev-{}", &version[4..]));
     }
     let lower = version.to_ascii_lowercase();
@@ -442,7 +462,7 @@ fn rewrite_document(
     name: &str,
     nora_base: &str,
     hosted: bool,
-    keep_source: bool,
+    sources: Sources,
 ) -> Option<Vec<u8>> {
     let mut doc: Value = serde_json::from_slice(body).ok()?;
     let minified = doc.get("minified").and_then(Value::as_str) == Some(MINIFIED);
@@ -463,9 +483,13 @@ fn rewrite_document(
                 .filter_map(|v| v.as_object().cloned())
                 .collect()
         };
-        for version in &mut versions {
-            rewrite_version(version, name, nora_base, hosted, keep_source);
-        }
+        // Under curation a version is listed only with an archive NORA serves: curation runs
+        // on that download, and a `source` (or an archive left on another host) would let the
+        // client fetch the release past it.
+        versions.retain_mut(|version| {
+            let through_nora = rewrite_version(version, name, nora_base, hosted, sources);
+            through_nora || sources != Sources::Curated
+        });
         *list = Value::Array(if minified {
             minify(&versions)
         } else {
@@ -475,29 +499,54 @@ fn rewrite_document(
     serde_json::to_vec(&doc).ok()
 }
 
+/// What a served p2 document keeps of the upstream's `source` entries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Sources {
+    /// Every `source`, and versions without an archive NORA serves (`keep_source = true`).
+    Keep,
+    /// No `source` beside an archive NORA serves; a version without one keeps its own.
+    Drop,
+    /// Curation is on: no `source` anywhere, and only versions with an archive NORA serves.
+    Curated,
+}
+
+impl Sources {
+    /// For a proxied document: curation decides first, then `keep_source`.
+    fn for_proxy(state: &AppState) -> Self {
+        if state.curation().curation_engine.is_active() {
+            Sources::Curated
+        } else if state.config.composer.keep_source {
+            Sources::Keep
+        } else {
+            Sources::Drop
+        }
+    }
+}
+
+/// Point `version`'s archive at NORA; whether it now has one served through NORA.
 fn rewrite_version(
     version: &mut Map<String, Value>,
     name: &str,
     nora_base: &str,
     hosted: bool,
-    keep_source: bool,
-) {
+    sources: Sources,
+) -> bool {
     let Some(written) = version.get("version").and_then(Value::as_str) else {
-        return;
+        return false;
     };
     let segment = if hosted {
         match normalize_version(written) {
             Some(normal) => normal,
-            None => return,
+            None => return false,
         }
     } else {
         version_segment(written)
     };
     let Some(dist) = version.get_mut("dist").and_then(Value::as_object_mut) else {
-        return;
+        return false;
     };
     let Some(token) = dist_token(dist) else {
-        return;
+        return false;
     };
     let url = format!(
         "{}/composer/dists/{name}/{segment}/{token}.{}",
@@ -507,9 +556,10 @@ fn rewrite_version(
     dist.insert("url".to_string(), Value::String(url));
     // Mirrors would send the client past NORA.
     dist.remove("mirrors");
-    if !keep_source {
+    if sources != Sources::Keep {
         version.remove("source");
     }
+    true
 }
 
 // ============================================================================
@@ -601,23 +651,43 @@ fn http_date(unix: u64) -> String {
         .to_string()
 }
 
-/// A metadata document, or 304 when the client's `If-Modified-Since` names the very
-/// `Last-Modified` it would get (Composer revalidates its own cache that way).
+/// A metadata document, or 304 when the client's copy is the one NORA serves now. The
+/// validators describe the served document, not the upstream's: NORA rewrites it (archive
+/// URLs, and sources under curation), so a configuration that took effect after the upstream's
+/// `Last-Modified` dates it — `since`, when the current configuration was loaded. The `ETag` is
+/// the served bytes'. Composer revalidates its own cache with `If-Modified-Since`; an
+/// `If-None-Match`, when sent, decides alone.
 fn metadata_response(
     headers: &HeaderMap,
     body: Vec<u8>,
     last_modified: Option<String>,
     stale: bool,
+    since: i64,
 ) -> Response {
-    let not_modified = last_modified.as_deref().is_some_and(|lm| {
-        headers
-            .get(header::IF_MODIFIED_SINCE)
-            .and_then(|v| v.to_str().ok())
-            == Some(lm)
+    let last_modified = last_modified.map(|lm| match chrono::DateTime::parse_from_rfc2822(&lm) {
+        Ok(date) if date.timestamp() >= since => lm,
+        _ => http_date(since.max(0) as u64),
     });
+    let etag = format!("\"{}\"", &hex::encode(sha2::Sha256::digest(&body))[..32]);
+    let not_modified = match headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(tags) => tags
+            .split(',')
+            .map(str::trim)
+            .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag),
+        None => last_modified.as_deref().is_some_and(|lm| {
+            headers
+                .get(header::IF_MODIFIED_SINCE)
+                .and_then(|v| v.to_str().ok())
+                == Some(lm)
+        }),
+    };
     let mut builder = axum::http::Response::builder()
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE);
+        .header(header::CONTENT_TYPE, JSON_CONTENT_TYPE)
+        .header(header::ETAG, &etag);
     if let Some(lm) = last_modified.as_deref() {
         builder = builder.header(header::LAST_MODIFIED, lm);
     }
@@ -693,6 +763,9 @@ struct UpstreamRoot {
     /// Absolute, with `%package%`.
     metadata_url: String,
     advisories_url: Option<String>,
+    /// The root names advisories (`security-advisories`) but no API to ask for them: they are
+    /// in its metadata only.
+    advisories_inline: bool,
 }
 
 impl UpstreamRoot {
@@ -714,6 +787,25 @@ fn resolve_root_url(base: &str, url: &str) -> Option<String> {
     }
 }
 
+/// Whether `body` is a Composer repository root: a JSON object naming at least one thing a
+/// root offers. `null`, `[]` or an error object answered with a 200 are not one — read as a
+/// root, they would make an outage look like a repository without an advisories API.
+fn is_root_document(body: &[u8]) -> bool {
+    const ROOT_KEYS: [&str; 7] = [
+        "packages",
+        "includes",
+        "metadata-url",
+        "providers-url",
+        "provider-includes",
+        "security-advisories",
+        "available-packages",
+    ];
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|doc| doc.as_object().cloned())
+        .is_some_and(|root| ROOT_KEYS.iter().any(|k| root.contains_key(*k)))
+}
+
 /// The root an upstream's `packages.json` describes; without one (unreachable and never
 /// cached, or not a Composer 2 root) the layout of every Composer 2 repository NORA knows,
 /// `{upstream}/p2/%package%.json`.
@@ -726,21 +818,22 @@ fn parse_root(base: &str, body: Option<&[u8]>) -> UpstreamRoot {
         .and_then(|u| resolve_root_url(base, u))
         .filter(|u| u.contains("%package%"))
         .unwrap_or_else(|| format!("{base}/p2/%package%.json"));
-    let advisories_url = doc
-        .as_ref()
-        .and_then(|d| d.get("security-advisories"))
+    let advisories = doc.as_ref().and_then(|d| d.get("security-advisories"));
+    let advisories_url = advisories
         .and_then(|s| s.get("api-url"))
         .and_then(Value::as_str)
         .and_then(|u| resolve_root_url(base, u));
     UpstreamRoot {
         metadata_url,
+        advisories_inline: advisories.is_some() && advisories_url.is_none(),
         advisories_url,
     }
 }
 
 /// An upstream's root: its `packages.json`, cached for `metadata_ttl`, a stale copy when it
-/// cannot be reached.
-async fn upstream_root(state: &AppState, up: &ComposerProxyEntry) -> UpstreamRoot {
+/// cannot be reached; and whether it was read from the upstream's answer or a cached copy of
+/// one: `false` when it is the default layout because nothing could be read.
+async fn root_of(state: &AppState, up: &ComposerProxyEntry) -> (UpstreamRoot, bool) {
     let base = up.url().trim_end_matches('/');
     let key = format!(
         "composer/roots/{}.json",
@@ -750,7 +843,7 @@ async fn upstream_root(state: &AppState, up: &ComposerProxyEntry) -> UpstreamRoo
     if let Some(data) = &cached {
         if let Some(meta) = state.storage.stat(&key).await {
             if is_within_ttl(meta.modified, state.config.composer.metadata_ttl) {
-                return parse_root(base, Some(data));
+                return (parse_root(base, Some(data)), true);
             }
         }
     }
@@ -765,19 +858,23 @@ async fn upstream_root(state: &AppState, up: &ComposerProxyEntry) -> UpstreamRoo
     )
     .await
     {
-        Ok(body) if serde_json::from_slice::<Value>(&body).is_ok() => {
+        Ok(body) if is_root_document(&body) => {
             if let Err(e) = state.storage.put(&key, &body).await {
                 tracing::warn!(registry = REGISTRY, key, error = %e, "failed to cache upstream root");
             }
-            parse_root(base, Some(&body))
+            (parse_root(base, Some(&body)), true)
         }
         Ok(_) => {
-            tracing::warn!(registry = REGISTRY, url, "upstream root is not JSON");
-            parse_root(base, cached.as_deref())
+            tracing::warn!(
+                registry = REGISTRY,
+                url,
+                "upstream root is not a Composer repository root"
+            );
+            (parse_root(base, cached.as_deref()), cached.is_some())
         }
         Err(e) => {
             tracing::debug!(registry = REGISTRY, url, error = ?e, "upstream root unavailable");
-            parse_root(base, cached.as_deref())
+            (parse_root(base, cached.as_deref()), cached.is_some())
         }
     }
 }
@@ -797,6 +894,8 @@ struct CachedDocument {
     origin: Option<String>,
     fresh: bool,
     last_modified: Option<String>,
+    /// When NORA last wrote it.
+    written: Option<i64>,
 }
 
 async fn cached_document(state: &AppState, key: &str) -> Option<CachedDocument> {
@@ -811,6 +910,7 @@ async fn cached_document(state: &AppState, key: &str) -> Option<CachedDocument> 
         .await
         .ok()
         .map(|o| String::from_utf8_lossy(&o).into_owned());
+    let written = meta.as_ref().map(|m| m.modified as i64);
     let last_modified = read_validators(&state.storage, key)
         .await
         .and_then(|v| v.last_modified)
@@ -820,7 +920,135 @@ async fn cached_document(state: &AppState, key: &str) -> Option<CachedDocument> 
         origin,
         fresh,
         last_modified,
+        written,
     })
+}
+
+/// Whether release ages come from the first-seen ledger: upstream dates are not trusted and
+/// curation runs. Otherwise nothing reads it, and nothing is written.
+fn first_seen_tracked(state: &AppState) -> bool {
+    !state.config.server.trust_upstream_dates && state.curation().curation_engine.is_active()
+}
+
+/// The versions a p2 document lists for `name`, as written.
+fn listed_versions(body: &[u8], name: &str) -> Vec<String> {
+    serde_json::from_slice::<Value>(body)
+        .map(|doc| {
+            versions_of(&doc, name)
+                .iter()
+                .filter_map(|v| v.get("version").and_then(Value::as_str).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Record when NORA first saw each version `body` lists — the upstream p2 document about to be
+/// served for `key`. A version keeps the time it was first recorded, so no revalidation, 200 or
+/// 304, makes a release younger; a version the upstream adds later starts now.
+///
+/// `seed`: NORA's earlier copy at `key` and when it was written. A cache from before the
+/// ledger existed starts the versions it lists at that time — never earlier than NORA saw
+/// them. Awaited before the document is served, so a client cannot ask for a version the ledger
+/// does not hold yet.
+async fn record_first_seen(
+    state: &AppState,
+    key: &str,
+    name: &str,
+    body: &[u8],
+    seed: Option<(&[u8], i64)>,
+) {
+    if !first_seen_tracked(state) {
+        return;
+    }
+    let ledger_key = first_seen_key(key);
+    // LOCK-SAFE: tokio mutex on the ledger's key; it serializes this read-modify-write alone.
+    let lock = state.publish_lock(&ledger_key);
+    let _guard = lock.lock().await;
+    let (mut ledger, existed) = match state.storage.get(&ledger_key).await {
+        Ok(bytes) => match serde_json::from_slice::<FirstSeen>(&bytes) {
+            Ok(ledger) => (ledger, true),
+            Err(e) => {
+                // Rewritten from now on: an unreadable time can only make a release younger.
+                tracing::warn!(registry = REGISTRY, key = %ledger_key, error = %e, "unreadable first-seen ledger");
+                (FirstSeen::new(), false)
+            }
+        },
+        Err(crate::storage::StorageError::NotFound) => match seed {
+            Some((cached, written)) => (
+                listed_versions(cached, name)
+                    .into_iter()
+                    .map(|v| (v, written))
+                    .collect(),
+                false,
+            ),
+            None => (FirstSeen::new(), false),
+        },
+        // Known bad, not merely unread: rewritten, every release starts young again.
+        Err(crate::storage::StorageError::IntegrityViolation) => {
+            tracing::warn!(registry = REGISTRY, key = %ledger_key, "first-seen ledger failed its pin; rewritten");
+            (FirstSeen::new(), false)
+        }
+        Err(e) => {
+            // Not written over a ledger that may exist: a later refetch records the rest.
+            tracing::warn!(registry = REGISTRY, key = %ledger_key, error = %e, "first-seen ledger unreadable");
+            return;
+        }
+    };
+    let now = chrono::Utc::now().timestamp();
+    let known = ledger.len();
+    for version in listed_versions(body, name) {
+        ledger.entry(version).or_insert(now);
+    }
+    if existed && ledger.len() == known {
+        return;
+    }
+    match serde_json::to_vec(&ledger) {
+        Ok(bytes) => {
+            if let Err(e) = state.storage.put(&ledger_key, &bytes).await {
+                tracing::warn!(registry = REGISTRY, key = %ledger_key, error = %e, "failed to record first-seen times");
+            }
+        }
+        Err(e) => {
+            tracing::warn!(registry = REGISTRY, key = %ledger_key, error = %e, "first-seen ledger not encoded")
+        }
+    }
+}
+
+/// When NORA first saw `version` listed in the p2 document cached at `metadata_key`.
+async fn first_seen_date(state: &AppState, metadata_key: &str, version: &str) -> Option<i64> {
+    let bytes = state
+        .storage
+        .get(&first_seen_key(metadata_key))
+        .await
+        .ok()?;
+    let ledger: FirstSeen = serde_json::from_slice(&bytes).ok()?;
+    ledger.get(version).copied()
+}
+
+/// When `version` of `name` was first seen, for its release age. The ledger's record first;
+/// without one, the stored document's write time — only when that document lists the version,
+/// since an age borrowed from a listing that does not hold it would let a release through
+/// early (an upstream added it and neither the ledger nor the new listing could be stored).
+/// Otherwise the release is new now.
+async fn release_first_seen(
+    state: &AppState,
+    metadata_key: &str,
+    name: &str,
+    version: &str,
+) -> i64 {
+    if let Some(date) = first_seen_date(state, metadata_key, version).await {
+        return date;
+    }
+    if let Ok(stored) = state.storage.get(metadata_key).await {
+        if listed_versions(&stored, name).iter().any(|v| v == version) {
+            if let Some(date) =
+                crate::curation::extract_mtime_as_publish_date(&state.storage, metadata_key).await
+            {
+                return date;
+            }
+        }
+    }
+    chrono::Utc::now().timestamp()
 }
 
 /// Whether two spellings of an upstream URL name the same upstream (`…/` is `…`).
@@ -866,7 +1094,9 @@ async fn upstream_document(
     let mut miss = UpstreamMiss::default();
     let mut failed = false;
     for up in &upstreams {
-        let root = upstream_root(state, up).await;
+        // `known`: the address comes from the upstream's root. Without it the address is the
+        // usual layout's guess, and a 4xx there says nothing about the package.
+        let (root, known) = root_of(state, up).await;
         let url = root.p2_url(name, dev);
         let from_here = cached.as_ref().filter(|c| {
             c.origin
@@ -904,6 +1134,16 @@ async fn upstream_document(
                 crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
                     .with_label_values(&[REGISTRY])
                     .inc_by(c.body.len() as u64);
+                // The re-put below bumps the mtime the TTL is read from; the release ages are not
+                // in it. Before it, the ledger takes over a cache from before it existed.
+                record_first_seen(
+                    state,
+                    &key,
+                    name,
+                    &c.body,
+                    c.written.map(|w| (&c.body[..], w)),
+                )
+                .await;
                 // Rewrite the same bytes to restart the TTL.
                 if let Err(e) = state.storage.put(&key, &c.body).await {
                     tracing::warn!(registry = REGISTRY, key, error = %e, "failed to refresh cached metadata");
@@ -926,22 +1166,33 @@ async fn upstream_document(
                     miss.record(&ProxyError::Network("not Composer metadata".into()));
                     continue;
                 }
+                // Versions first seen now; an earlier copy of this upstream's seeds a ledger
+                // that does not exist yet.
+                let seed = from_here.and_then(|c| c.written.map(|w| (&c.body[..], w)));
+                record_first_seen(state, &key, name, &body, seed).await;
                 // Body first, then where it came from, then its validators: a sidecar never
-                // describes bytes that are not there.
-                if let Err(e) = state.storage.put(&key, &body).await {
-                    tracing::warn!(registry = REGISTRY, key, error = %e, "failed to cache metadata");
-                }
-                if let Err(e) = state
-                    .storage
-                    .put(&origin_key(&key), up.url().as_bytes())
-                    .await
-                {
-                    tracing::warn!(registry = REGISTRY, key, error = %e, "failed to record metadata origin");
-                }
-                if validators.is_some() {
-                    write_validators(&state.storage, &key, &validators).await;
-                } else {
-                    let _ = state.storage.delete(&validators_key(&key)).await;
+                // describes bytes that are not there. A body that could not be stored leaves
+                // the sidecars of the copy before it, which still describe that copy: the next
+                // revalidation asks with the old validators and gets the new body again, where
+                // the new ones would get a 304 that keeps the old copy for good.
+                match state.storage.put(&key, &body).await {
+                    Ok(()) => {
+                        if let Err(e) = state
+                            .storage
+                            .put(&origin_key(&key), up.url().as_bytes())
+                            .await
+                        {
+                            tracing::warn!(registry = REGISTRY, key, error = %e, "failed to record metadata origin");
+                        }
+                        if validators.is_some() {
+                            write_validators(&state.storage, &key, &validators).await;
+                        } else {
+                            let _ = state.storage.delete(&validators_key(&key)).await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(registry = REGISTRY, key, error = %e, "failed to cache metadata");
+                    }
                 }
                 state.repo_index.invalidate(REGISTRY);
                 let last_modified = validators
@@ -961,6 +1212,15 @@ async fn upstream_document(
                         .with_label_values(&[REGISTRY])
                         .inc();
                 }
+                let answered = matches!(e, ProxyError::NotFound | ProxyError::Upstream(400..=499));
+                let e = if answered && !known {
+                    // A guessed address that is not there: the package may be elsewhere.
+                    ProxyError::Network(
+                        "metadata address unknown: the root could not be read".into(),
+                    )
+                } else {
+                    e
+                };
                 if !matches!(e, ProxyError::NotFound) {
                     failed = true;
                 }
@@ -984,6 +1244,19 @@ async fn upstream_document(
                 stale: true,
             });
         }
+    }
+    // "No such package" only when every upstream said so: one that failed may hold it, and a
+    // 404 makes Composer look for the name in the project's other repositories.
+    if failed && miss.status() == StatusCode::NOT_FOUND {
+        tracing::warn!(
+            registry = REGISTRY,
+            package = name,
+            "an upstream failed and the others have no such package, returning 502"
+        );
+        return Err(json_error(
+            StatusCode::BAD_GATEWAY,
+            "an upstream could not be read; the package may be there",
+        ));
     }
     Err(miss.response(REGISTRY, &path))
 }
@@ -1058,10 +1331,39 @@ async fn package_metadata(
         Hosted::No => {}
     }
 
-    // An internal package is NORA's own: with no uploaded version it is refused, never asked
-    // of an upstream.
+    // An internal package is NORA's own: never asked of an upstream. What NORA cached of it
+    // before it was made internal is still served, stale or not; without a copy it is refused.
     if is_internal(&state, &name) {
-        return internal_refused(&state, &name);
+        let cached = cached_document(&state, &p2_key(&name, dev))
+            .await
+            .filter(|c| is_configured(&state, c.origin.as_deref()));
+        let Some(c) = cached else {
+            return internal_refused(&state, &name);
+        };
+        // An internal package is the operator's own and not curated (#733): its sources as
+        // configured.
+        let sources = if state.config.composer.keep_source {
+            Sources::Keep
+        } else {
+            Sources::Drop
+        };
+        return match rewrite_document(&c.body, &name, &base, false, sources) {
+            Some(body) => metadata_response(
+                &headers,
+                body,
+                c.last_modified,
+                !c.fresh,
+                state.curation().loaded_at,
+            ),
+            None => {
+                tracing::warn!(
+                    registry = REGISTRY,
+                    package = name,
+                    "cached metadata does not parse"
+                );
+                StatusCode::BAD_GATEWAY.into_response()
+            }
+        };
     }
     if let Some(response) = crate::curation::check_download(
         &state.curation().curation_engine,
@@ -1079,14 +1381,14 @@ async fn package_metadata(
         Ok(doc) => doc,
         Err(response) => return response,
     };
-    match rewrite_document(
-        &doc.body,
-        &name,
-        &base,
-        false,
-        state.config.composer.keep_source,
-    ) {
-        Some(body) => metadata_response(&headers, body, doc.last_modified, doc.stale),
+    match rewrite_document(&doc.body, &name, &base, false, Sources::for_proxy(&state)) {
+        Some(body) => metadata_response(
+            &headers,
+            body,
+            doc.last_modified,
+            doc.stale,
+            state.curation().loaded_at,
+        ),
         None => {
             tracing::warn!(
                 registry = REGISTRY,
@@ -1109,19 +1411,31 @@ async fn hosted_metadata(
         // Uploaded versions are releases: a hosted package has no branch versions, and its
         // `~dev` document is never an upstream's.
         let body = serde_json::json!({ "packages": { name: [] } }).to_string();
-        return metadata_response(headers, body.into_bytes(), None, false);
+        return metadata_response(
+            headers,
+            body.into_bytes(),
+            None,
+            false,
+            state.curation().loaded_at,
+        );
     }
     let key = hosted_document_key(name);
     let body = match state.storage.get(&key).await {
         Ok(body) => body,
         Err(crate::storage::StorageError::NotFound) => {
             // Versions without the document: an upload stopped between the two. Build it.
+            // LOCK-SAFE: tokio mutex, the package's publish lock; held for the scan and one put.
             let lock = state.publish_lock(&key);
             let _guard = lock.lock().await;
-            match regenerate_hosted(state, name).await {
-                Ok(body) => Bytes::from(body),
+            let body = match build_hosted(state, name).await {
+                Ok(body) => body,
                 Err(response) => return response,
+            };
+            if let Err(e) = state.storage.put(&key, &body).await {
+                // Served anyway: the document is still missing, so the next request builds it.
+                tracing::warn!(registry = REGISTRY, package = name, error = %e, "failed to store hosted metadata");
             }
+            Bytes::from(body)
         }
         Err(e) => return crate::registry::local_copy_unreadable(REGISTRY, &key, &e),
     };
@@ -1130,8 +1444,14 @@ async fn hosted_metadata(
         .stat(&key)
         .await
         .map(|m| http_date(m.modified));
-    match rewrite_document(&body, name, base, true, true) {
-        Some(body) => metadata_response(headers, body, last_modified, false),
+    match rewrite_document(&body, name, base, true, Sources::Keep) {
+        Some(body) => metadata_response(
+            headers,
+            body,
+            last_modified,
+            false,
+            state.curation().loaded_at,
+        ),
         None => {
             tracing::error!(registry = REGISTRY, key, "hosted metadata does not parse");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -1139,9 +1459,9 @@ async fn hosted_metadata(
     }
 }
 
-/// Rebuild a hosted package's p2 document from its version documents, newest first, and
-/// store it. Run under the package's publish lock.
-async fn regenerate_hosted(state: &AppState, name: &str) -> Result<Vec<u8>, Response> {
+/// A hosted package's p2 document, built from its version documents, newest first. Not
+/// stored: the caller decides what a failed write means. Run under the package's publish lock.
+async fn build_hosted(state: &AppState, name: &str) -> Result<Vec<u8>, Response> {
     let prefix = format!("composer/hosted/{name}/versions/");
     let keys = state
         .storage
@@ -1168,13 +1488,21 @@ async fn regenerate_hosted(state: &AppState, name: &str) -> Result<Vec<u8>, Resp
     }
     versions.sort_by(|a, b| version_order(&b.0, &a.0));
     let list: Vec<Value> = versions.into_iter().map(|(_, doc)| doc).collect();
-    let body = serde_json::to_vec(&serde_json::json!({ "packages": { name: list } }))
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())?;
-    if let Err(e) = state.storage.put(&hosted_document_key(name), &body).await {
-        // Served anyway; the next request builds it again.
-        tracing::warn!(registry = REGISTRY, package = name, error = %e, "failed to store hosted metadata");
-    }
-    Ok(body)
+    serde_json::to_vec(&serde_json::json!({ "packages": { name: list } })).map_err(|e| {
+        tracing::error!(registry = REGISTRY, package = name, error = %e, "hosted metadata not encoded");
+        StatusCode::INTERNAL_SERVER_ERROR.into_response()
+    })
+}
+
+/// Whether the p2 document `body` lists `version` as written.
+fn lists_version(body: &[u8], name: &str, version: &str) -> bool {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .is_some_and(|doc| {
+            versions_of(&doc, name)
+                .iter()
+                .any(|v| v.get("version").and_then(Value::as_str) == Some(version))
+        })
 }
 
 // ============================================================================
@@ -1229,13 +1557,16 @@ fn find_listed(body: &[u8], name: &str, segment: &str, token: &str, ext: &str) -
 /// looked up in the document Composer lists it in (`~dev.json` for a branch); one there as a
 /// digest in both. A cached document that does not list it is fetched again only once past
 /// its TTL; a fresh one is believed, so a made-up URL costs no upstream request.
-async fn listed_dist(
+/// The listing of an archive in the metadata NORA holds of `name`, as [`listed_dist`] finds
+/// it, asking no upstream. Else the documents worth fetching again: those Composer would list
+/// the version in, unless a fresh copy says it is not there.
+async fn cached_listing(
     state: &AppState,
     name: &str,
     segment: &str,
     token: &str,
     ext: &str,
-) -> Result<(Listed, String, String), Response> {
+) -> Result<(Listed, String, String), Vec<bool>> {
     let expected = (!segment.starts_with('~')).then(|| is_dev_version(segment));
     let documents = match expected {
         Some(dev) => [dev, !dev],
@@ -1258,6 +1589,20 @@ async fn listed_dist(
             refetch.push(dev);
         }
     }
+    Err(refetch)
+}
+
+async fn listed_dist(
+    state: &AppState,
+    name: &str,
+    segment: &str,
+    token: &str,
+    ext: &str,
+) -> Result<(Listed, String, String), Response> {
+    let refetch = match cached_listing(state, name, segment, token, ext).await {
+        Ok(found) => return Ok(found),
+        Err(refetch) => refetch,
+    };
     let mut miss = None;
     for dev in refetch {
         match upstream_document(state, name, dev).await {
@@ -1311,33 +1656,47 @@ async fn download_dist(
         }
         Hosted::No => {}
     }
-    if internal {
-        return internal_refused(&state, &name);
-    }
-
-    let (listed, origin, metadata_key) =
-        match listed_dist(&state, &name, &segment, token, ext).await {
-            Ok(found) => found,
-            Err(response) => return response,
-        };
+    // An internal package's archive is served from what NORA cached of it, found in the
+    // metadata NORA holds; nothing of it is asked of an upstream.
+    let found = if internal {
+        match cached_listing(&state, &name, &segment, token, ext).await {
+            Ok(found) => Ok(found),
+            // Not cached: the documents to fetch again are not fetched for an internal name.
+            Err(_refetch) => Err(internal_refused(&state, &name)),
+        }
+    } else {
+        listed_dist(&state, &name, &segment, token, ext).await
+    };
+    let (listed, origin, metadata_key) = match found {
+        Ok(found) => found,
+        Err(response) => return response,
+    };
+    // Without trusted dates a release is as old as NORA's first sight of it in a listing: the
+    // document's mtime restarts at every revalidation, so a client that asks more often than
+    // the minimum age would never see its release mature.
     let publish_date = if state.config.server.trust_upstream_dates {
         listed
             .time
             .as_deref()
             .and_then(crate::curation::parse_iso8601_to_unix)
+    } else if first_seen_tracked(&state) {
+        Some(release_first_seen(&state, &metadata_key, &name, &listed.version).await)
     } else {
         crate::curation::extract_mtime_as_publish_date(&state.storage, &metadata_key).await
     };
-    if let Some(response) = crate::curation::check_download(
-        &state.curation().curation_engine,
-        state.bypass_token().as_deref(),
-        &headers,
-        crate::curation::RegistryType::Composer,
-        &name,
-        crate::curation::RequestVersion::Known(listed.version.clone()),
-        publish_date,
-    ) {
-        return response;
+    // An internal package is the operator's own: not curated, as its uploads are not (#733).
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Composer,
+            &name,
+            crate::curation::RequestVersion::Known(listed.version.clone()),
+            publish_date,
+        ) {
+            return response;
+        }
     }
 
     let (q_mode, q_secs) = crate::digest_quarantine::resolve_global(
@@ -1432,6 +1791,9 @@ async fn download_dist(
             .audit
             .log(AuditEntry::new("cache_hit", "proxy", &name, REGISTRY, ""));
         return archive_response(data, ext);
+    }
+    if internal {
+        return internal_refused(&state, &name);
     }
 
     let Some(up) = state
@@ -1695,6 +2057,48 @@ async fn hosted_dist(
 // GET|POST /composer/api/security-advisories/
 // ============================================================================
 
+/// "No advisories", for a query no upstream is asked about.
+fn advisories_empty() -> Response {
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, JSON_CONTENT_TYPE)],
+        r#"{"advisories":{}}"#,
+    )
+        .into_response()
+}
+
+/// Listings an advisories query runs at once, one per name asked about.
+const HOSTED_LOOKUP_CONCURRENCY: usize = 16;
+
+/// Which of `names` have anything uploaded: one listing of each name's own hosted space, so a
+/// query costs what it names, not what the registry holds. Any listing that fails fails all.
+async fn hosted_among(
+    state: &AppState,
+    names: &[String],
+) -> Result<std::collections::HashSet<String>, (String, crate::storage::StorageError)> {
+    use futures::StreamExt;
+    let found: Vec<_> = futures::stream::iter(names.iter().cloned().map(|name| {
+        let storage = state.storage.clone();
+        async move {
+            let prefix = hosted_prefix(&name);
+            match storage.list(&prefix).await {
+                Ok(keys) => Ok((!keys.is_empty()).then_some(name)),
+                Err(e) => Err((prefix, e)),
+            }
+        }
+    }))
+    .buffer_unordered(HOSTED_LOOKUP_CONCURRENCY)
+    .collect()
+    .await;
+    let mut hosted = std::collections::HashSet::new();
+    for answer in found {
+        if let Some(name) = answer? {
+            hosted.insert(name);
+        }
+    }
+    Ok(hosted)
+}
+
 /// `composer audit`: the advisories of the packages named in the query (`packages[]=…`, in
 /// the URL or a form body), forwarded to the first upstream whose root names an advisories
 /// API. Names NORA hosts or holds internal are never sent: they would tell an upstream what
@@ -1717,48 +2121,76 @@ async fn security_advisories(
         return json_error(StatusCode::BAD_REQUEST, "unreadable query");
     };
     let mut names = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     let mut others = Vec::new();
     for (key, value) in parsed.query_pairs() {
         if key == "packages" || key.starts_with("packages[") {
             let name = value.to_ascii_lowercase();
-            if split_name(&name).is_some() && !names.contains(&name) {
+            if split_name(&name).is_some() && seen.insert(name.clone()) {
+                if names.len() == MAX_ADVISORY_NAMES {
+                    return json_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        &format!("at most {MAX_ADVISORY_NAMES} package names per query"),
+                    );
+                }
                 names.push(name);
             }
         } else if key == "updatedSince" {
             others.push((key.into_owned(), value.into_owned()));
         }
     }
-    let mut asked = Vec::with_capacity(names.len());
-    for name in names {
-        if is_internal(&state, &name) {
-            continue;
-        }
-        match hosted_state(&state, &name).await {
-            Hosted::No => asked.push(name),
-            // Hosted, or it cannot be told: not an upstream's to answer.
-            Hosted::Yes | Hosted::Unknown(_) => {}
-        }
+    if names.is_empty() {
+        return advisories_empty();
     }
-    let empty = || {
-        (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, JSON_CONTENT_TYPE)],
-            r#"{"advisories":{}}"#,
-        )
-            .into_response()
+    // A hosted name is NORA's own, and a store that cannot say which names are hosted cannot
+    // say which may leave. Internal names need no lookup.
+    let candidates: Vec<String> = names
+        .into_iter()
+        .filter(|name| !is_internal(&state, name))
+        .collect();
+    let hosted = match hosted_among(&state, &candidates).await {
+        Ok(hosted) => hosted,
+        Err((prefix, e)) => return crate::registry::local_copy_unreadable(REGISTRY, &prefix, &e),
     };
+    let asked: Vec<String> = candidates
+        .into_iter()
+        .filter(|name| !hosted.contains(name))
+        .collect();
     if asked.is_empty() {
-        return empty();
+        return advisories_empty();
     }
     let mut target = None;
+    let mut unread = false;
+    let mut inline = false;
     for up in state.config.composer.upstreams() {
-        if let Some(url) = upstream_root(&state, &up).await.advisories_url {
+        let (root, known) = root_of(&state, &up).await;
+        if let Some(url) = root.advisories_url {
             target = Some((up, url));
             break;
         }
+        unread |= !known;
+        inline |= root.advisories_inline;
     }
     let Some((up, url)) = target else {
-        return empty();
+        if inline {
+            // The upstream has advisories, in its metadata only: NORA does not read them there,
+            // so it cannot say there are none.
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "the upstream offers advisories in its metadata only; NORA cannot check them",
+            );
+        }
+        if unread {
+            // An upstream whose root could not be read may have an advisories API: its silence
+            // is an outage, not "no advisories".
+            return json_error(
+                StatusCode::BAD_GATEWAY,
+                "the upstream's advisories API could not be found: its root is unavailable",
+            );
+        }
+        // Every upstream answered, none offers advisories (or none is configured): there is no
+        // advisory source to ask.
+        return advisories_empty();
     };
     let mut out = reqwest::Url::parse("http://query/").expect("static URL parses");
     {
@@ -1798,6 +2230,57 @@ async fn security_advisories(
 // ============================================================================
 // PUT /composer/packages/upload/{vendor}/{package}/{version}
 // ============================================================================
+
+/// Why an upload is not acknowledged.
+enum Unpublished {
+    /// The stored document does not list the version: it is taken back.
+    NotListed(String),
+    /// Whether the stored document lists the version is not known: it is kept.
+    Unknown(String),
+}
+
+/// On a re-upload of an existing version: when the stored document does not list it (an
+/// upload stopped between its version document and the listing), list it now. Under the
+/// package's publish lock, which the caller holds.
+async fn relist_if_missing(state: &AppState, name: &str, document_key: &str, existing: &[u8]) {
+    let Some(version) = serde_json::from_slice::<Value>(existing)
+        .ok()
+        .and_then(|doc| {
+            doc.get("version")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+    else {
+        return;
+    };
+    if let Ok(listing) = state.storage.get(document_key).await {
+        if lists_version(&listing, name, &version) {
+            return;
+        }
+    }
+    match build_hosted(state, name).await {
+        Ok(body) => {
+            if let Err(e) = state.storage.put(document_key, &body).await {
+                tracing::warn!(registry = REGISTRY, package = name, error = %e, "failed to store hosted metadata");
+            } else {
+                tracing::warn!(
+                    registry = REGISTRY,
+                    package = name,
+                    version,
+                    "a stored version was not listed; listed again"
+                );
+                state.repo_index.invalidate(REGISTRY);
+            }
+        }
+        Err(_) => {
+            tracing::warn!(
+                registry = REGISTRY,
+                package = name,
+                "hosted metadata could not be rebuilt"
+            )
+        }
+    }
+}
 
 async fn upload(
     State(state): State<AppState>,
@@ -1897,12 +2380,19 @@ async fn upload(
     let lock = state.publish_lock(&document_key);
     let _guard = lock.lock().await;
 
-    // Versions are immutable: `v1.0.0` and `1.0` are the same version to Composer.
-    if state.storage.stat(&version_key).await.is_some() {
-        return json_error(
-            StatusCode::CONFLICT,
-            &format!("{name} {version} already exists"),
-        );
+    // Versions are immutable: `v1.0.0` and `1.0` are the same version to Composer. Read, not
+    // `stat`: a store that cannot answer is not one without the version, and an upload never
+    // writes over a version it could not rule out.
+    match state.storage.get(&version_key).await {
+        Ok(existing) => {
+            relist_if_missing(&state, &name, &document_key, &existing).await;
+            return json_error(
+                StatusCode::CONFLICT,
+                &format!("{name} {version} already exists"),
+            );
+        }
+        Err(crate::storage::StorageError::NotFound) => {}
+        Err(e) => return crate::registry::local_copy_unreadable(REGISTRY, &version_key, &e),
     }
     if let Err(e) = state.storage.put(&dist_key, &body).await {
         tracing::error!(registry = REGISTRY, key = dist_key, error = %e, "failed to store archive");
@@ -1919,26 +2409,53 @@ async fn upload(
         tracing::error!(registry = REGISTRY, key = version_key, error = %e, "failed to store version");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
-    let regenerated = match regenerate_hosted(&state, &name).await {
-        Ok(body) => body,
-        Err(response) => return response,
+    // A 201 means the version is listed in what is served: the document holding it is stored.
+    // A version the stored document does not hold is taken back, so a retry publishes it
+    // instead of a 409. A write that failed may still have landed (a store can publish the
+    // body and fail after it): then the version is only taken back once the stored document is
+    // read and does not list it — a listed version is never offered for upload again.
+    let listed = match build_hosted(&state, &name).await {
+        Ok(body) if lists_version(&body, &name, &version) => {
+            match state.storage.put(&document_key, &body).await {
+                Ok(()) => Ok(()),
+                Err(e) => match state.storage.get(&document_key).await {
+                    Ok(stored) if !lists_version(&stored, &name, &version) => Err(
+                        Unpublished::NotListed(format!("failed to store hosted metadata: {e}")),
+                    ),
+                    Ok(_) => Err(Unpublished::Unknown(format!(
+                        "hosted metadata stored, the store reported: {e}"
+                    ))),
+                    Err(read) => Err(Unpublished::Unknown(format!(
+                        "failed to store hosted metadata: {e}; reading it back: {read}"
+                    ))),
+                },
+            }
+        }
+        Ok(_) => Err(Unpublished::NotListed(
+            "uploaded version is not listed by the regenerated metadata".to_string(),
+        )),
+        Err(_) => Err(Unpublished::NotListed(
+            "hosted metadata could not be rebuilt".to_string(),
+        )),
     };
-    // A 201 means the version is listed: read it back from what will be served.
-    let listed = serde_json::from_slice::<Value>(&regenerated)
-        .ok()
-        .is_some_and(|doc| {
-            versions_of(&doc, &name)
-                .iter()
-                .any(|v| v.get("version").and_then(Value::as_str) == Some(version.as_str()))
-        });
-    if !listed {
-        tracing::error!(
-            registry = REGISTRY,
-            package = name,
-            version,
-            "uploaded version is not listed by the regenerated metadata"
-        );
-        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    match listed {
+        Ok(()) => {}
+        Err(Unpublished::NotListed(reason)) => {
+            tracing::error!(registry = REGISTRY, package = name, version, reason = %reason, "upload not published");
+            if let Err(e) = state.storage.delete(&version_key).await {
+                // Left listed nowhere: the next upload of this package lists it (the document
+                // is rebuilt from every version), as does a retry of this one.
+                tracing::error!(registry = REGISTRY, key = version_key, error = %e, "failed to take back an unlisted version");
+            }
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(Unpublished::Unknown(reason)) => {
+            tracing::error!(registry = REGISTRY, package = name, version, reason = %reason, "upload outcome unknown; the version is kept");
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &format!("{name} {version} may be published: the store did not confirm it"),
+            );
+        }
     }
 
     state.metrics.record_upload(REGISTRY);
@@ -2100,10 +2617,15 @@ mod zip {
         Unsupported(&'static str),
         TooLarge,
         Corrupt,
+        /// The deflated body does not inflate, and how.
+        Inflate(std::io::ErrorKind),
     }
 
     impl std::fmt::Display for ZipError {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            if let ZipError::Inflate(kind) = self {
+                return write!(f, "composer.json could not be decompressed: {kind}");
+            }
             f.write_str(match self {
                 ZipError::NotAZip => "not a zip archive",
                 ZipError::Truncated => "the archive is truncated",
@@ -2116,7 +2638,9 @@ mod zip {
                 }
                 ZipError::Unsupported(what) => what,
                 ZipError::TooLarge => "composer.json is too large",
-                ZipError::Corrupt => "composer.json could not be decompressed",
+                ZipError::Corrupt | ZipError::Inflate(_) => {
+                    "composer.json could not be decompressed"
+                }
             })
         }
     }
@@ -2125,9 +2649,9 @@ mod zip {
         name: String,
         flags: u16,
         method: u16,
-        compressed: u64,
+        compressed: usize,
         uncompressed: u64,
-        offset: u64,
+        offset: usize,
     }
 
     fn u16_at(data: &[u8], at: usize) -> Result<u16, ZipError> {
@@ -2184,9 +2708,10 @@ mod zip {
                 name: String::from_utf8_lossy(name).into_owned(),
                 flags: u16_at(data, at + 8)?,
                 method: u16_at(data, at + 10)?,
-                compressed: u64::from(compressed),
+                // u32 widens losslessly into usize, as `start` and `size` above.
+                compressed: compressed as usize,
                 uncompressed: u64::from(uncompressed),
-                offset: u64::from(offset),
+                offset: offset as usize,
             });
             at += 46 + name_len + extra_len + comment_len;
             if at > end {
@@ -2252,14 +2777,14 @@ mod zip {
         if entry.uncompressed > super::MAX_COMPOSER_JSON {
             return Err(ZipError::TooLarge);
         }
-        let at = usize::try_from(entry.offset).map_err(|_| ZipError::Truncated)?;
+        let at = entry.offset;
         if u32_at(data, at)? != LOCAL {
             return Err(ZipError::NotAZip);
         }
         let name_len = usize::from(u16_at(data, at + 26)?);
         let extra_len = usize::from(u16_at(data, at + 28)?);
         let body_at = at + 30 + name_len + extra_len;
-        let compressed = usize::try_from(entry.compressed).map_err(|_| ZipError::Truncated)?;
+        let compressed = entry.compressed;
         let body = data
             .get(body_at..body_at.checked_add(compressed).ok_or(ZipError::Truncated)?)
             .ok_or(ZipError::Truncated)?;
@@ -2270,7 +2795,7 @@ mod zip {
                 flate2::read::DeflateDecoder::new(body)
                     .take(super::MAX_COMPOSER_JSON + 1)
                     .read_to_end(&mut out)
-                    .map_err(|_| ZipError::Corrupt)?;
+                    .map_err(|e| ZipError::Inflate(e.kind()))?;
                 out
             }
             _ => {

@@ -389,12 +389,6 @@ export const REGISTRIES: RegistryContract[] = [
     list: {
       slug: 'rpm',
       title: 'RPM (yum/dnf)',
-    slug: 'deb',
-    displayName: 'Debian (APT)',
-    sidebarName: 'Debian',
-    list: {
-      slug: 'deb',
-      title: 'Debian (APT)',
       columnHeaders: ['Name', 'Items', 'Size', 'Updated'],
       countColumnLabel: 'Items',
       isHierarchical: false,
@@ -407,6 +401,22 @@ export const REGISTRIES: RegistryContract[] = [
       hasInstallCommand: true,
       installSectionLabel: 'Install Command',
       installCommandPattern: /dnf config-manager .+/,
+      tableColumnHeaders: ['Items', 'Size', 'Published'],
+      hasMetadataPanel: false,
+      hasClickableVersionRows: false,
+    },
+  },
+  {
+    slug: 'deb',
+    displayName: 'Debian (APT)',
+    sidebarName: 'Debian',
+    list: {
+      slug: 'deb',
+      title: 'Debian (APT)',
+      columnHeaders: ['Name', 'Items', 'Size', 'Updated'],
+      countColumnLabel: 'Items',
+      isHierarchical: false,
+      hasSearch: true,
       searchEndpoint: '/api/ui/deb/search',
     },
     detail: {

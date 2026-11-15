@@ -188,7 +188,8 @@ fn upstream_doc(dist_host: &str) -> Value {
 #[test]
 fn every_dist_url_points_at_nora_and_the_listing_finds_the_original() {
     let raw = serde_json::to_vec(&upstream_doc("https://up.example")).unwrap();
-    let served = rewrite_document(&raw, "acme/lib", "http://nora:4000", false, true).unwrap();
+    let served =
+        rewrite_document(&raw, "acme/lib", "http://nora:4000", false, Sources::Keep).unwrap();
     let doc: Value = serde_json::from_slice(&served).unwrap();
     assert_eq!(doc["minified"], MINIFIED, "stays minified");
     assert_eq!(doc["security-advisories"][0]["advisoryId"], "PKSA-1");
@@ -237,7 +238,7 @@ fn without_keep_source_a_version_served_through_nora_has_no_source() {
         .unwrap()
         .push(json!({"version": "0.1.0", "dist": "__unset", "source": {"type": "git", "url": "https://github.com/acme/lib.git", "reference": "cccc"}}));
     let raw = serde_json::to_vec(&doc).unwrap();
-    let served = rewrite_document(&raw, "acme/lib", "http://nora", false, false).unwrap();
+    let served = rewrite_document(&raw, "acme/lib", "http://nora", false, Sources::Drop).unwrap();
     let versions = versions_of(&serde_json::from_slice(&served).unwrap(), "acme/lib");
     assert!(versions[..3].iter().all(|v| !v.contains_key("source")));
     assert!(versions[3].contains_key("source") && !versions[3].contains_key("dist"));
@@ -249,7 +250,7 @@ fn a_document_serves_the_package_it_is_for_alone() {
     doc["packages"]["corp/internal"] = json!([{"name": "corp/internal", "version": "9.9.9",
         "dist": {"type": "zip", "url": "https://evil.example/x.zip", "reference": "eeee"}}]);
     let raw = serde_json::to_vec(&doc).unwrap();
-    let served = rewrite_document(&raw, "acme/lib", "http://nora", false, true).unwrap();
+    let served = rewrite_document(&raw, "acme/lib", "http://nora", false, Sources::Keep).unwrap();
     let served: Value = serde_json::from_slice(&served).unwrap();
     let names: Vec<&String> = served["packages"].as_object().unwrap().keys().collect();
     assert_eq!(names, ["acme/lib"]);
@@ -397,9 +398,11 @@ async fn a_package_installs_through_the_proxy_and_its_archive_is_cached() {
     let ctx = proxy_ctx(&up.uri(), |_| {});
     let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
     assert_eq!(resp.status(), StatusCode::OK);
+    // The served document is NORA's rewrite: dated no earlier than the configuration that
+    // shapes it, whatever the upstream's 2020 date.
     assert_eq!(
         resp.headers()[header::LAST_MODIFIED],
-        "Wed, 01 Jan 2020 00:00:00 GMT"
+        http_date(ctx.state.curation().loaded_at as u64).as_str()
     );
     let doc = json_of(resp).await;
     let url = doc["packages"]["acme/lib"][0]["dist"]["url"]
@@ -1260,4 +1263,972 @@ async fn composer_audit_is_a_read_under_anonymous_read() {
         StatusCode::UNAUTHORIZED,
         "an upload is a write"
     );
+}
+
+// ── review findings (#1228) ────────────────────────────────────────────────────
+
+#[test]
+fn non_ascii_versions_are_rejected_without_panicking() {
+    for version in [
+        "aéé",
+        "déév-x",
+        "1.0é",
+        "é",
+        "v1.é",
+        "dev\u{e9}x",
+        "1.0-béta",
+    ] {
+        let outcome = std::panic::catch_unwind(|| normalize_version(version));
+        assert!(outcome.is_ok(), "{version:?} panics");
+    }
+    assert_eq!(normalize_version("aéé"), None);
+    assert_eq!(normalize_version("1.0é"), None);
+}
+
+#[tokio::test]
+async fn a_non_ascii_version_in_an_upload_is_a_400() {
+    let ctx = hosted_ctx();
+    let resp = send(
+        &ctx.app,
+        Method::PUT,
+        "/composer/packages/upload/acme/lib/a%C3%A9%C3%A9",
+        upload_zip("acme/lib", None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = send(
+        &ctx.app,
+        Method::PUT,
+        "/composer/packages/upload/acme/lib/1.0.0",
+        upload_zip("acme/lib", Some("aéé")),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `n` distinct package names as a `composer audit` form body.
+fn audit_form(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("packages%5B{i}%5D=vendor%2Fpkg{i}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+async fn mount_advisories(up: &MockServer) {
+    Mock::given(wm_method("POST"))
+        .and(wm_path("/api/security-advisories/"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"advisories": {}})))
+        .mount(up)
+        .await;
+}
+
+#[tokio::test]
+async fn an_advisories_query_over_the_name_cap_is_refused_unforwarded() {
+    let up = upstream().await;
+    mount_advisories(&up).await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::POST,
+        "/composer/api/security-advisories/",
+        vec![("content-type", "application/x-www-form-urlencoded")],
+        audit_form(MAX_ADVISORY_NAMES + 1),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert!(!upstream_paths(&up)
+        .await
+        .contains(&"/api/security-advisories/".to_string()));
+
+    // At the cap, a query is answered: Composer itself asks 500 names at a time.
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::POST,
+        "/composer/api/security-advisories/",
+        vec![("content-type", "application/x-www-form-urlencoded")],
+        audit_form(MAX_ADVISORY_NAMES),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_advisories_query_costs_the_store_at_most_one_lookup_per_name() {
+    let up = upstream().await;
+    mount_advisories(&up).await;
+    let (storage, counts) = crate::test_helpers::op_counting_storage();
+    let uri = up.uri();
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+        c.composer.proxy = Some(uri);
+    });
+    let mut cost = Vec::new();
+    for n in [1, 400] {
+        counts.reset();
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/composer/api/security-advisories/",
+            vec![("content-type", "application/x-www-form-urlencoded")],
+            audit_form(n),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        cost.push((n, counts.total(), counts.snapshot()));
+    }
+    assert!(cost[1].1 - cost[0].1 <= 399, "{cost:?}");
+}
+
+#[tokio::test]
+async fn an_advisories_query_does_not_walk_the_hosted_space() {
+    let up = upstream().await;
+    mount_advisories(&up).await;
+    let (storage, counts) = crate::test_helpers::op_counting_storage();
+    let uri = up.uri();
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+        c.composer.proxy = Some(uri);
+    });
+    // A registry with packages of its own: what one query for a public name costs must not
+    // grow with them.
+    for i in 0..60 {
+        for key in ["p2.json", "versions/1.0.0.0.json", "dists/1.0.0.0.zip"] {
+            ctx.state
+                .storage
+                .put(&format!("composer/hosted/acme/pkg{i}/{key}"), b"{}")
+                .await
+                .unwrap();
+        }
+    }
+    counts.reset();
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::POST,
+        "/composer/api/security-advisories/",
+        vec![("content-type", "application/x-www-form-urlencoded")],
+        "packages%5B%5D=vendor%2Fpublic",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        counts.listed_keys(),
+        0,
+        "one public name enumerated the hosted space: {:?}",
+        counts.snapshot()
+    );
+}
+
+#[tokio::test]
+async fn a_hosted_name_is_still_never_forwarded() {
+    let up = upstream().await;
+    mount_advisories(&up).await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    assert_eq!(put_lib(&ctx, "1.0.0").await.status(), StatusCode::CREATED);
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/api/security-advisories?packages[]=acme/lib&packages[]=vendor/public",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let posted = up
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.method.as_str() == "POST")
+        .expect("vendor/public is asked");
+    let form = String::from_utf8_lossy(&posted.body).to_string();
+    assert!(form.contains("vendor%2Fpublic"), "{form}");
+    assert!(!form.contains("acme"), "a hosted name left NORA: {form}");
+}
+
+#[tokio::test]
+async fn a_repeated_name_is_asked_once() {
+    let up = upstream().await;
+    mount_advisories(&up).await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/api/security-advisories?packages[]=vendor/a&packages[]=VENDOR/A&packages[]=vendor/b&packages[]=vendor/a",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let posted = up
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.method.as_str() == "POST")
+        .unwrap();
+    let body = String::from_utf8(posted.body.clone()).unwrap();
+    assert_eq!(body, "packages%5B%5D=vendor%2Fa&packages%5B%5D=vendor%2Fb");
+}
+
+#[tokio::test]
+async fn cold_audit_root_failure_is_not_empty_success() {
+    let up = MockServer::start().await;
+    Mock::given(wm_path("/packages.json"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&up)
+        .await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::POST,
+        "/composer/api/security-advisories/",
+        vec![("content-type", "application/x-www-form-urlencoded")],
+        "packages%5B%5D=vendor%2Fpublic",
+    )
+    .await;
+    assert!(
+        resp.status().is_server_error(),
+        "an outage is not 'no advisories': {}",
+        resp.status()
+    );
+}
+
+#[tokio::test]
+async fn an_audit_that_cannot_tell_hosted_names_is_not_empty_success() {
+    let up = upstream().await;
+    mount_advisories(&up).await;
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let uri = up.uri();
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+        c.composer.proxy = Some(uri);
+    });
+    // Whichever way the store is asked about vendor/public — the hosted space or the name.
+    outage.fail_listings_of("composer/hosted/");
+    outage.fail_listings_of("composer/hosted/vendor/public/");
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/api/security-advisories?packages[]=vendor/public",
+        "",
+    )
+    .await;
+    assert!(resp.status().is_server_error(), "{}", resp.status());
+}
+
+async fn put_lib(ctx: &TestContext, version: &str) -> Response {
+    send(
+        &ctx.app,
+        Method::PUT,
+        &format!("/composer/packages/upload/acme/lib/{version}"),
+        upload_zip("acme/lib", None),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn failed_p2_write_does_not_acknowledge_an_unlisted_version() {
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+    });
+    assert_eq!(put_lib(&ctx, "1.0.0").await.status(), StatusCode::CREATED);
+    outage.fail_writes_of("composer/hosted/acme/lib/p2.json");
+    let resp = put_lib(&ctx, "2.0.0").await;
+    assert!(
+        resp.status().is_server_error(),
+        "a version the listing does not hold is not created: {}",
+        resp.status()
+    );
+    outage.end();
+    // The retry publishes it, and it is listed.
+    assert_eq!(put_lib(&ctx, "2.0.0").await.status(), StatusCode::CREATED);
+    let doc = json_of(send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await).await;
+    let listed: Vec<String> = versions_of(&doc, "acme/lib")
+        .iter()
+        .map(|v| v["version"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(listed, ["2.0.0", "1.0.0"]);
+}
+
+#[tokio::test]
+async fn a_version_left_out_of_a_stale_listing_is_listed_again() {
+    let ctx = hosted_ctx();
+    assert_eq!(put_lib(&ctx, "1.0.0").await.status(), StatusCode::CREATED);
+    let key = "composer/hosted/acme/lib/p2.json";
+    let before = ctx.state.storage.get(key).await.unwrap();
+    assert_eq!(put_lib(&ctx, "2.0.0").await.status(), StatusCode::CREATED);
+    // An upload stopped after its version document, before the listing.
+    ctx.state.storage.put(key, &before).await.unwrap();
+    assert_eq!(put_lib(&ctx, "2.0.0").await.status(), StatusCode::CONFLICT);
+    let doc = json_of(send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await).await;
+    assert_eq!(versions_of(&doc, "acme/lib").len(), 2, "{doc}");
+}
+
+#[tokio::test]
+async fn existing_version_survives_stat_failure() {
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+    });
+    let first = upload_zip("acme/lib", None);
+    let resp = send(
+        &ctx.app,
+        Method::PUT,
+        "/composer/packages/upload/acme/lib/1.0.0",
+        first.clone(),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    // The same version, other bytes: a valid upload the version's immutability refuses.
+    let second = upload_zip("acme/lib", Some("1.0.0"));
+    assert_ne!(second, first);
+    let version_doc = "composer/hosted/acme/lib/versions/1.0.0.0.json";
+    outage.fail_stats_of(version_doc);
+    outage.fail_reads_of(version_doc);
+    let resp = send(
+        &ctx.app,
+        Method::PUT,
+        "/composer/packages/upload/acme/lib/1.0.0",
+        second.clone(),
+    )
+    .await;
+    assert_ne!(resp.status(), StatusCode::CREATED);
+    outage.end();
+    let stored = ctx
+        .state
+        .storage
+        .get("composer/hosted/acme/lib/dists/1.0.0.0.zip")
+        .await
+        .unwrap();
+    assert_eq!(
+        &stored[..],
+        &first[..],
+        "an immutable version was overwritten"
+    );
+}
+
+#[tokio::test]
+async fn cached_internal_metadata_and_archive_are_served_without_upstream() {
+    let up = upstream().await;
+    let ctx = proxy_ctx(&up.uri(), |c| c.composer.metadata_ttl = 0);
+    let p2 = "/composer/p2/acme/lib.json";
+    let dist = "/composer/dists/acme/lib/1.0.0/aaaa.zip";
+    assert_eq!(
+        send(&ctx.app, Method::GET, p2, "").await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        send(&ctx.app, Method::GET, dist, "").await.status(),
+        StatusCode::OK
+    );
+    crate::test_helpers::reload_curation(&ctx, |c| {
+        c.curation.internal_namespaces = vec!["acme/*".to_string()];
+    });
+    up.reset().await;
+    // Stale (TTL 0) and internal: served from what NORA holds, never asked upstream.
+    let resp = send(&ctx.app, Method::GET, p2, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        json_of(resp).await["packages"]["acme/lib"][0]["version"],
+        "1.0.0"
+    );
+    let resp = send(&ctx.app, Method::GET, dist, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(&body_bytes(resp).await[..], ZIP_1);
+    assert!(upstream_paths(&up).await.is_empty());
+    // Listed in the cached metadata, archive not cached: refused, not fetched.
+    let archive_key = proxied_dist_key("acme/lib", "1.0.0", "aaaa", "zip");
+    ctx.state.storage.delete(&archive_key).await.unwrap();
+    let resp = send(&ctx.app, Method::GET, dist, "").await;
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // What NORA does not hold stays refused.
+    for path in [
+        "/composer/p2/acme/lib~dev.json",
+        "/composer/p2/acme/none.json",
+        "/composer/dists/acme/lib/2.0.0/bbbb.zip",
+    ] {
+        let resp = send(&ctx.app, Method::GET, path, "").await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
+    assert!(upstream_paths(&up).await.is_empty());
+}
+
+#[tokio::test]
+async fn metadata_revalidation_does_not_restart_release_age() {
+    let up = MockServer::start().await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .and(wm_header("if-none-match", "\"v1\""))
+        .respond_with(ResponseTemplate::new(304))
+        .with_priority(1)
+        .mount(&up)
+        .await;
+    mount_lib(&up, &up.uri(), Some(&sha1_hex(ZIP_1))).await;
+    let ctx = proxy_ctx(&up.uri(), |c| {
+        c.composer.metadata_ttl = 0;
+        c.server.trust_upstream_dates = false;
+        c.curation.mode = crate::config::CurationMode::Enforce;
+        c.curation.min_release_age = Some("7d".into());
+    });
+    let p2 = "/composer/p2/acme/lib.json";
+    let dist = "/composer/dists/acme/lib/1.0.0/aaaa.zip";
+    assert_eq!(
+        send(&ctx.app, Method::GET, p2, "").await.status(),
+        StatusCode::OK
+    );
+    // NORA first saw the listing ten days ago: a cache older than any record of it.
+    let key = p2_key("acme/lib", false);
+    let body = ctx.state.storage.get(&key).await.unwrap();
+    let _ = ctx.state.storage.delete(&first_seen_key(&key)).await;
+    crate::test_helpers::put_written_days_ago(&ctx, &key, &body, 10).await;
+    // Revalidated (304) over and over: the release keeps its age.
+    for _ in 0..3 {
+        assert_eq!(
+            send(&ctx.app, Method::GET, p2, "").await.status(),
+            StatusCode::OK
+        );
+    }
+    let resp = send(&ctx.app, Method::GET, dist, "").await;
+    assert_eq!(resp.status(), StatusCode::OK, "the 304s restarted the age");
+}
+
+#[tokio::test]
+async fn a_version_an_upstream_adds_later_starts_young() {
+    let up = MockServer::start().await;
+    mount_lib(&up, &up.uri(), Some(&sha1_hex(ZIP_1))).await;
+    let ctx = proxy_ctx(&up.uri(), |c| {
+        c.composer.metadata_ttl = 0;
+        c.composer.revalidate = false;
+        c.server.trust_upstream_dates = false;
+        c.curation.mode = crate::config::CurationMode::Enforce;
+        c.curation.min_release_age = Some("7d".into());
+    });
+    let p2 = "/composer/p2/acme/lib.json";
+    assert_eq!(
+        send(&ctx.app, Method::GET, p2, "").await.status(),
+        StatusCode::OK
+    );
+    let key = p2_key("acme/lib", false);
+    let body = ctx.state.storage.get(&key).await.unwrap();
+    let _ = ctx.state.storage.delete(&first_seen_key(&key)).await;
+    crate::test_helpers::put_written_days_ago(&ctx, &key, &body, 10).await;
+    // The upstream now lists 2.0.0 too.
+    up.reset().await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages": {"acme/lib": [
+            {"name": "acme/lib", "version": "2.0.0", "time": "2020-01-01T00:00:00+00:00",
+             "dist": {"type": "zip", "url": format!("{}/archives/lib-2.0.0.zip", up.uri()), "reference": "bbbb"}},
+            {"name": "acme/lib", "version": "1.0.0", "time": "2020-01-01T00:00:00+00:00",
+             "dist": {"type": "zip", "url": format!("{}/archives/lib-1.0.0.zip", up.uri()), "reference": "aaaa", "shasum": sha1_hex(ZIP_1)}}
+        ]}})))
+        .mount(&up)
+        .await;
+    Mock::given(wm_path("/archives/lib-1.0.0.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ZIP_1.to_vec()))
+        .mount(&up)
+        .await;
+    assert_eq!(
+        send(&ctx.app, Method::GET, p2, "").await.status(),
+        StatusCode::OK
+    );
+    let old = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/1.0.0/aaaa.zip",
+        "",
+    )
+    .await;
+    assert_eq!(old.status(), StatusCode::OK, "a refetch made 1.0.0 young");
+    let new = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/2.0.0/bbbb.zip",
+        "",
+    )
+    .await;
+    assert_eq!(new.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn the_first_seen_ledger_is_internal_state_backup_carries() {
+    let key = first_seen_key(&p2_key("acme/lib", false));
+    assert!(
+        crate::registry::npm::INTERNAL_PREFIXES
+            .iter()
+            .any(|prefix| key.starts_with(prefix)),
+        "{key}"
+    );
+    let ctx = hosted_ctx();
+    ctx.state.storage.put(&key, b"{}").await.unwrap();
+    let listed = ctx.state.storage.list("").await.unwrap();
+    assert!(!listed.contains(&key), "a listing shows the ledger");
+}
+
+// ── second review (#1228): writes whose outcome is unknown, roots that are not roots ──
+
+#[tokio::test]
+async fn an_upload_whose_listing_landed_is_not_taken_back() {
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+    });
+    assert_eq!(put_lib(&ctx, "1.0.0").await.status(), StatusCode::CREATED);
+    // The listing naming 2.0.0 is stored, and the store reports a failure after it (the
+    // rename published it; the directory sync did not answer).
+    outage.fail_writes_after_landing_of("composer/hosted/acme/lib/p2.json");
+    let resp = put_lib(&ctx, "2.0.0").await;
+    assert_ne!(resp.status(), StatusCode::CREATED);
+    outage.end();
+    let first = upload_zip("acme/lib", None);
+    let other = upload_zip("acme/lib", Some("2.0.0"));
+    assert_ne!(other, first);
+    let resp = send(
+        &ctx.app,
+        Method::PUT,
+        "/composer/packages/upload/acme/lib/2.0.0",
+        other,
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "a listed version was published again"
+    );
+    let stored = ctx
+        .state
+        .storage
+        .get("composer/hosted/acme/lib/dists/2.0.0.0.zip")
+        .await
+        .unwrap();
+    assert_eq!(&stored[..], &first[..], "a listed archive was replaced");
+}
+
+async fn mount_root(up: &MockServer) {
+    Mock::given(wm_method("GET"))
+        .and(wm_path("/packages.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [],
+            "metadata-url": "/p2/%package%.json"
+        })))
+        .mount(up)
+        .await;
+}
+
+#[tokio::test]
+async fn validators_never_describe_a_body_that_was_not_stored() {
+    let up = MockServer::start().await;
+    mount_lib(&up, &up.uri(), Some(&sha1_hex(ZIP_1))).await;
+    let (storage, outage) = crate::test_helpers::outage_storage();
+    let uri = up.uri();
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.composer.enabled = true;
+        c.composer.proxy = Some(uri);
+        c.composer.metadata_ttl = 0;
+    });
+    let p2 = "/composer/p2/acme/lib.json";
+    assert_eq!(
+        send(&ctx.app, Method::GET, p2, "").await.status(),
+        StatusCode::OK
+    );
+    // The upstream moves on to a document listing 2.0.0 too, under a new ETag.
+    up.reset().await;
+    mount_root(&up).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .and(wm_header("if-none-match", "\"v2\""))
+        .respond_with(ResponseTemplate::new(304))
+        .with_priority(1)
+        .mount(&up)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("etag", "\"v2\"")
+                .set_body_json(json!({"packages": {"acme/lib": [
+                    {"name": "acme/lib", "version": "2.0.0", "dist": {"type": "zip", "url": format!("{}/archives/lib-2.0.0.zip", up.uri()), "reference": "bbbb"}},
+                    {"name": "acme/lib", "version": "1.0.0", "dist": {"type": "zip", "url": format!("{}/archives/lib-1.0.0.zip", up.uri()), "reference": "aaaa"}}
+                ]}})),
+        )
+        .mount(&up)
+        .await;
+    // The new body cannot be stored.
+    outage.fail_writes_of(&p2_key("acme/lib", false));
+    assert_eq!(
+        send(&ctx.app, Method::GET, p2, "").await.status(),
+        StatusCode::OK
+    );
+    outage.end();
+    let doc = json_of(send(&ctx.app, Method::GET, p2, "").await).await;
+    assert_eq!(
+        versions_of(&doc, "acme/lib").len(),
+        2,
+        "a 304 for the new ETag kept serving the old body: {doc}"
+    );
+}
+
+#[tokio::test]
+async fn a_version_with_no_age_of_its_own_is_young() {
+    let up = MockServer::start().await;
+    mount_lib(&up, &up.uri(), Some(&sha1_hex(ZIP_1))).await;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_str().unwrap().to_string();
+    let (storage, outage) = crate::test_helpers::local_outage_storage(&path);
+    let uri = up.uri();
+    let ctx = crate::test_helpers::create_test_context_with_storage_and_config(storage, |c| {
+        c.storage.path = path.clone();
+        c.composer.enabled = true;
+        c.composer.proxy = Some(uri);
+        c.composer.metadata_ttl = 0;
+        c.composer.revalidate = false;
+        c.server.trust_upstream_dates = false;
+        c.curation.mode = crate::config::CurationMode::Enforce;
+        c.curation.min_release_age = Some("7d".into());
+    });
+    let p2 = "/composer/p2/acme/lib.json";
+    assert_eq!(
+        send(&ctx.app, Method::GET, p2, "").await.status(),
+        StatusCode::OK
+    );
+    // A listing cached ten days ago, before any record of first sight.
+    let key = p2_key("acme/lib", false);
+    let body = ctx.state.storage.get(&key).await.unwrap();
+    let _ = ctx.state.storage.delete(&first_seen_key(&key)).await;
+    crate::test_helpers::put_written_days_ago(&ctx, &key, &body, 10).await;
+    // The upstream adds 2.0.0, and neither the ledger nor the new listing can be stored.
+    up.reset().await;
+    mount_root(&up).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages": {"acme/lib": [
+            {"name": "acme/lib", "version": "2.0.0", "dist": {"type": "zip", "url": format!("{}/archives/lib-2.0.0.zip", up.uri()), "reference": "bbbb"}},
+            {"name": "acme/lib", "version": "1.0.0", "dist": {"type": "zip", "url": format!("{}/archives/lib-1.0.0.zip", up.uri()), "reference": "aaaa", "shasum": sha1_hex(ZIP_1)}}
+        ]}})))
+        .mount(&up)
+        .await;
+    for archive in ["lib-1.0.0.zip", "lib-2.0.0.zip"] {
+        Mock::given(wm_path(format!("/archives/{archive}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(ZIP_1.to_vec()))
+            .mount(&up)
+            .await;
+    }
+    outage.fail_writes_of(&first_seen_key(&key));
+    outage.fail_writes_of(&key);
+    let new = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/2.0.0/bbbb.zip",
+        "",
+    )
+    .await;
+    assert_eq!(
+        new.status(),
+        StatusCode::FORBIDDEN,
+        "2.0.0 took the age of a listing that does not hold it"
+    );
+    // The listing that holds 1.0.0 still gives it its age.
+    let old = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/1.0.0/aaaa.zip",
+        "",
+    )
+    .await;
+    assert_eq!(old.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_audit_against_a_root_that_is_not_one_is_not_empty_success() {
+    for root in [
+        json!(null),
+        json!([]),
+        json!({"error": "service unavailable"}),
+    ] {
+        let up = MockServer::start().await;
+        Mock::given(wm_path("/packages.json"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(root.clone()))
+            .mount(&up)
+            .await;
+        mount_advisories(&up).await;
+        let ctx = proxy_ctx(&up.uri(), |_| {});
+        let resp = send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/composer/api/security-advisories/",
+            vec![("content-type", "application/x-www-form-urlencoded")],
+            "packages%5B%5D=vendor%2Fpublic",
+        )
+        .await;
+        assert!(
+            resp.status().is_server_error(),
+            "root {root}: {}",
+            resp.status()
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_root_without_an_advisories_api_is_still_a_root() {
+    // A repository that offers no advisories (a private Satis, say) has none to report.
+    let up = MockServer::start().await;
+    mount_root(&up).await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::POST,
+        "/composer/api/security-advisories/",
+        vec![("content-type", "application/x-www-form-urlencoded")],
+        "packages%5B%5D=vendor%2Fpublic",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ── final review (#1228): no way around curation, an unread root, a bounded audit ──
+
+async fn mount_source_only(up: &MockServer) {
+    mount_root(up).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).insert_header("last-modified", "Wed, 01 Jan 2020 00:00:00 GMT").set_body_json(json!({"packages": {"acme/lib": [
+            {"name": "acme/lib", "version": "2.0.0",
+             "source": {"type": "git", "url": "https://git.example.invalid/acme/lib.git", "reference": "bbbb"}},
+            {"name": "acme/lib", "version": "1.0.0", "time": "2020-01-01T00:00:00+00:00",
+             "dist": {"type": "zip", "url": format!("{}/archives/lib-1.0.0.zip", up.uri()), "reference": "aaaa"},
+             "source": {"type": "git", "url": "https://git.example.invalid/acme/lib.git", "reference": "aaaa"}}
+        ]}})))
+        .mount(up)
+        .await;
+}
+
+#[tokio::test]
+async fn a_curated_proxy_lists_no_way_around_nora() {
+    let up = MockServer::start().await;
+    mount_source_only(&up).await;
+    let ctx = proxy_ctx(&up.uri(), |c| {
+        assert!(c.composer.keep_source, "the default keeps sources");
+        c.curation.mode = crate::config::CurationMode::Enforce;
+        c.curation.min_release_age = Some("7d".into());
+    });
+    let doc = json_of(send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await).await;
+    let versions = versions_of(&doc, "acme/lib");
+    let listed: Vec<&str> = versions
+        .iter()
+        .filter_map(|v| v.get("version").and_then(Value::as_str))
+        .collect();
+    assert_eq!(
+        listed,
+        ["1.0.0"],
+        "a version NORA cannot curate is listed: {doc}"
+    );
+    assert!(
+        versions.iter().all(|v| !v.contains_key("source")),
+        "a source lets the client past curation: {doc}"
+    );
+}
+
+#[tokio::test]
+async fn without_curation_sources_are_kept_as_configured() {
+    let up = MockServer::start().await;
+    mount_source_only(&up).await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let doc = json_of(send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await).await;
+    let versions = versions_of(&doc, "acme/lib");
+    assert_eq!(versions.len(), 2, "{doc}");
+    assert!(versions.iter().all(|v| v.contains_key("source")), "{doc}");
+}
+
+#[tokio::test]
+async fn an_unread_root_and_a_guessed_path_is_not_a_missing_package() {
+    // A repository whose metadata lives elsewhere than `/p2/`: its root is the only place
+    // that says so, and it is down.
+    let up = MockServer::start().await;
+    Mock::given(wm_path("/packages.json"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&up)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&up)
+        .await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "an outage read as 'no such package'"
+    );
+}
+
+#[tokio::test]
+async fn a_read_root_and_a_missing_package_is_a_404() {
+    let up = MockServer::start().await;
+    mount_root(&up).await;
+    Mock::given(wm_path("/p2/acme/none.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&up)
+        .await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/none.json", "").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+// ── after the final review (#1228): a client's copy of what NORA served, upstreams that failed ──
+
+#[tokio::test]
+async fn a_conditional_request_answers_for_what_is_served_now() {
+    let up = MockServer::start().await;
+    mount_source_only(&up).await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let p2 = "/composer/p2/acme/lib.json";
+    let first = send(&ctx.app, Method::GET, p2, "").await;
+    assert_eq!(first.status(), StatusCode::OK);
+    let last_modified = first.headers()[header::LAST_MODIFIED]
+        .to_str()
+        .unwrap()
+        .to_string();
+    // Unchanged, the client's copy is current.
+    let again = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        p2,
+        vec![("if-modified-since", last_modified.as_str())],
+        "",
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    // Curation turned on: the served document is another one (no source-only version, no source).
+    crate::test_helpers::reload_curation(&ctx, |c| {
+        c.curation.mode = crate::config::CurationMode::Enforce;
+        c.curation.min_release_age = Some("7d".into());
+        c.curation.quarantine = Some(crate::digest_quarantine::QuarantineMode::Observe);
+    });
+    // As Composer asks: `If-Modified-Since` alone.
+    let conditions = vec![("if-modified-since", last_modified.as_str())];
+    let after = send_with_headers(&ctx.app, Method::GET, p2, conditions, "").await;
+    assert_eq!(
+        after.status(),
+        StatusCode::OK,
+        "a 304 kept the client on a document NORA no longer serves"
+    );
+    let doc = json_of(after).await;
+    assert!(
+        versions_of(&doc, "acme/lib")
+            .iter()
+            .all(|v| !v.contains_key("source")),
+        "{doc}"
+    );
+}
+
+#[tokio::test]
+async fn an_etag_names_the_served_document() {
+    let up = upstream().await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let p2 = "/composer/p2/acme/lib.json";
+    let first = send(&ctx.app, Method::GET, p2, "").await;
+    let etag = first.headers()[header::ETAG].to_str().unwrap().to_string();
+    let again = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        p2,
+        vec![("if-none-match", etag.as_str())],
+        "",
+    )
+    .await;
+    assert_eq!(again.status(), StatusCode::NOT_MODIFIED);
+    let other = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        p2,
+        vec![("if-none-match", "\"something-else\"")],
+        "",
+    )
+    .await;
+    assert_eq!(other.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_not_found_beside_a_failed_upstream_is_not_a_missing_package() {
+    let first = MockServer::start().await;
+    mount_root(&first).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&first)
+        .await;
+    let second = MockServer::start().await;
+    mount_root(&second).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&second)
+        .await;
+    let (a, b) = (first.uri(), second.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "the package may be on the upstream that failed"
+    );
+}
+
+#[tokio::test]
+async fn every_upstream_saying_not_found_is_a_404() {
+    let first = MockServer::start().await;
+    mount_root(&first).await;
+    let second = MockServer::start().await;
+    mount_root(&second).await;
+    for up in [&first, &second] {
+        Mock::given(wm_path("/p2/acme/lib.json"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(up)
+            .await;
+    }
+    let (a, b) = (first.uri(), second.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn every_reload_dates_a_newer_configuration() {
+    // What a served document's `Last-Modified` stands on: a reload within the same second as
+    // the last one still dates the new configuration later.
+    let ctx = hosted_ctx();
+    let mut dates = vec![ctx.state.curation().loaded_at];
+    for _ in 0..3 {
+        crate::test_helpers::reload_curation(&ctx, |_| {});
+        dates.push(ctx.state.curation().loaded_at);
+    }
+    assert!(dates.windows(2).all(|w| w[1] > w[0]), "{dates:?}");
+}
+
+#[tokio::test]
+async fn advisories_offered_only_inline_are_not_a_clean_audit() {
+    // The root says the repository has advisories, in its metadata only: NORA has no API to
+    // ask, and an empty answer would read as "no vulnerabilities".
+    let up = MockServer::start().await;
+    Mock::given(wm_path("/packages.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "packages": [],
+            "metadata-url": "/p2/%package%.json",
+            "security-advisories": {"metadata": true}
+        })))
+        .mount(&up)
+        .await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::POST,
+        "/composer/api/security-advisories/",
+        vec![("content-type", "application/x-www-form-urlencoded")],
+        "packages%5B%5D=vendor%2Fpublic",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
