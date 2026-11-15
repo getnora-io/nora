@@ -89,7 +89,8 @@ struct Claims {
 /// Seconds within which a `GET` with Basic credentials is taken for containerd's retry of a
 /// password grant just refused: it falls back from the `POST` form to a `GET` at once.
 const RETRY_SECS: u64 = 30;
-/// The most refused password grants remembered; past it a retry is checked and counted again.
+/// The most refused password grants remembered, over all addresses and credentials; past it a
+/// retry is checked and counted again.
 const RETRIES_MAX: usize = 4096;
 
 /// The signing key of Docker tokens, and the password grants just refused.
@@ -99,7 +100,9 @@ pub(crate) struct DockerTokens {
     /// credentials (never the password itself). containerd (1.7.25 and 2.2.1, measured 15.11) follows
     /// a refused grant with a `GET` carrying the same credentials as Basic, whatever the
     /// status: without this one wrong password counted twice toward the lockout.
-    refused: tokio::sync::Mutex<std::collections::HashMap<[u8; 32], std::time::Instant>>,
+    /// One entry per refusal: two clients behind one address refused the same credentials
+    /// have a retry spared each.
+    refused: tokio::sync::Mutex<std::collections::HashMap<[u8; 32], Vec<std::time::Instant>>>,
 }
 
 impl std::fmt::Debug for DockerTokens {
@@ -132,9 +135,15 @@ impl DockerTokens {
     async fn note_refused_grant(&self, ip: std::net::IpAddr, encoded: &str) {
         let key = self.retry_key(ip, encoded);
         let mut refused = self.refused.lock().await;
-        refused.retain(|_, at| at.elapsed().as_secs() < RETRY_SECS);
-        if refused.len() < RETRIES_MAX {
-            refused.insert(key, std::time::Instant::now());
+        refused.retain(|_, at| {
+            at.retain(|at| at.elapsed().as_secs() < RETRY_SECS);
+            !at.is_empty()
+        });
+        if refused.values().map(Vec::len).sum::<usize>() < RETRIES_MAX {
+            refused
+                .entry(key)
+                .or_default()
+                .push(std::time::Instant::now());
         }
     }
 
@@ -143,9 +152,18 @@ impl DockerTokens {
     async fn is_retry_of_refused_grant(&self, ip: std::net::IpAddr, encoded: &str) -> bool {
         let key = self.retry_key(ip, encoded);
         let mut refused = self.refused.lock().await;
-        refused
-            .remove(&key)
-            .is_some_and(|at| at.elapsed().as_secs() < RETRY_SECS)
+        let Some(at) = refused.get_mut(&key) else {
+            return false;
+        };
+        at.retain(|at| at.elapsed().as_secs() < RETRY_SECS);
+        let spared = !at.is_empty();
+        if spared {
+            at.remove(0);
+        }
+        if at.is_empty() {
+            refused.remove(&key);
+        }
+        spared
     }
 
     /// The MAC over the prefix and the encoded claims.
@@ -887,6 +905,35 @@ mod tests {
                 .status(),
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    /// Two containerd clients behind one address with the same wrong password, interleaved:
+    /// POST, POST, GET, GET. Each refused grant spares its own retry, so the four requests
+    /// count twice, not three times.
+    #[tokio::test]
+    async fn two_interleaved_retries_of_one_wrong_password_count_once_each() {
+        let ctx = ctx();
+        let wrong = basic("alice", "wrong");
+        let post = || {
+            send_with_headers(
+                &ctx.app,
+                Method::POST,
+                "/api/docker/token",
+                vec![("content-type", "application/x-www-form-urlencoded")],
+                "grant_type=password&username=alice&password=wrong&service=nora".to_string(),
+            )
+        };
+        let mut statuses = vec![post().await.status(), post().await.status()];
+        for _ in 0..2 {
+            statuses.push(token(&ctx, vec![("authorization", &wrong)]).await.0);
+        }
+        // Two counted. Three more wrong passwords reach five; the next is locked out.
+        for _ in 0..4 {
+            statuses.push(token(&ctx, vec![("authorization", &wrong)]).await.0);
+        }
+        let mut want = vec![StatusCode::UNAUTHORIZED; 7];
+        want.push(StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(statuses, want);
     }
 
     /// Only a retry of the same credentials is spared: a client that only POSTs wrong
