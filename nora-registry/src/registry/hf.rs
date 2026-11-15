@@ -1653,9 +1653,8 @@ fn parse_file_request(rest: &str) -> Result<FileRequest<'_>, FileRefusal> {
         }
         decoded_segments.push(decoded);
     }
-    // Any part with a byte the upstream URL drops or cuts at is refused as a name, whatever its
-    // place in the route.
-    if decoded_segments.iter().any(|d| !delimiter_free(d)) {
+    // A control byte in any part is refused as a name, whatever its place in the route.
+    if decoded_segments.iter().any(|d| !control_free(d)) {
         return Err(FileRefusal::BadName);
     }
     let start = |i: usize| -> usize { segments[..i].iter().map(|s| s.len() + 1).sum() };
@@ -1711,9 +1710,9 @@ fn models_api_upstream(base: &str, rest: &str, query: Option<&str>) -> Result<St
         if !plain_segment(&decoded) {
             return Err(Refusal::BadPath);
         }
-        // The repo id is the first one or two segments; any part may not hold a byte the upstream
-        // URL drops or cuts at.
-        if !delimiter_free(&decoded) || (i < 2 && !hf_name_segment(&decoded)) {
+        // The repo id is the first one or two segments, and holds the Hub's name bytes; no part may
+        // hold a control byte.
+        if !control_free(&decoded) || (i < 2 && !hf_name_segment(&decoded)) {
             return Err(Refusal::BadPath);
         }
         if i > 0
@@ -1777,12 +1776,13 @@ fn hf_name_segment(decoded: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
-/// Whether a decoded part holds no control byte and no `?` or `#`: the bytes the URL parser of the
-/// upstream URL drops (`\t\n\r` and the other controls) or cuts at.
-fn delimiter_free(decoded: &str) -> bool {
-    decoded
-        .bytes()
-        .all(|b| b >= 0x20 && b != 0x7f && b != b'?' && b != b'#')
+/// Whether a decoded part of a file or metadata request holds no control byte. The URL parser drops
+/// them (`\t\n\r` and the rest), and no client has a reason to send one. `?` and `#` are not refused
+/// here: the upstream URL keeps the client's escape for every part past the repo id (`files` and
+/// `models_api_upstream` forward the path as encoded), so the Hub resolves them, and the URL parser
+/// never cuts at an escaped `?` or `#`.
+fn control_free(decoded: &str) -> bool {
+    decoded.bytes().all(|b| b >= 0x20 && b != 0x7f)
 }
 
 /// A path segment decoded, or `None` when it holds a byte outside RFC 3986, a broken
@@ -5655,6 +5655,11 @@ mod url_fold {
         cfg.hf.proxy = Some(up.to_string());
     }
 
+    /// The control bytes the URL parser drops: refused in every part of a request. `?` and `#` in a
+    /// file name or a revision are not here: the upstream URL keeps the client's escape (see
+    /// `number_sign_and_question_mark_in_a_file_or_revision_go_upstream_escaped`).
+    const CONTROLS: [&str; 3] = ["%09", "%0A", "%0D"];
+
     #[tokio::test]
     async fn file_request_with_a_smuggled_byte_is_refused() {
         let mut uris = Vec::new();
@@ -5662,6 +5667,8 @@ mod url_fold {
             uris.push(format!("/hf/ev{s}il/repo/resolve/main/model.bin"));
             uris.push(format!("/hf/org/rep{s}o/resolve/main/model.bin"));
             uris.push(format!("/hf/gpt{s}2/resolve/main/model.bin"));
+        }
+        for s in CONTROLS {
             uris.push(format!("/hf/org/repo/resolve/ma{s}in/model.bin"));
             uris.push(format!("/hf/org/repo/resolve/main/mo{s}del.bin"));
         }
@@ -5678,10 +5685,43 @@ mod url_fold {
         for s in SMUGGLED {
             uris.push(format!("/hf/api/models/ev{s}il/repo"));
             uris.push(format!("/hf/api/models/org/rep{s}o"));
+        }
+        for s in CONTROLS {
             uris.push(format!("/hf/api/models/org/repo/tree/ma{s}in/dir"));
             uris.push(format!("/hf/api/models/org/repo/revision/mai{s}n"));
         }
         assert_refused("hf metadata", &uris, hf_proxy).await;
+    }
+
+    /// `#` and `?` in a file name or a revision are sent as the client encoded them, so the Hub gets
+    /// the same escape and resolves the file the client asked for: the URL parser never cuts there.
+    #[tokio::test]
+    async fn number_sign_and_question_mark_in_a_file_or_revision_go_upstream_escaped() {
+        use crate::test_helpers::{
+            answering_upstream, create_test_context_with_config, send, upstream_paths,
+        };
+        use axum::http::{Method, StatusCode};
+        for (uri, escaped) in [
+            (
+                "/hf/org/repo/resolve/main/model%231.bin",
+                "/org/repo/resolve/main/model%231.bin",
+            ),
+            (
+                "/hf/org/repo/resolve/main/model%3F1.bin",
+                "/org/repo/resolve/main/model%3F1.bin",
+            ),
+            (
+                "/hf/org/repo/resolve/release%231/model.bin",
+                "/org/repo/resolve/release%231/model.bin",
+            ),
+        ] {
+            let up = answering_upstream().await;
+            let ctx = create_test_context_with_config(|cfg| hf_proxy(cfg, &up.uri()));
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_ne!(resp.status(), StatusCode::BAD_REQUEST, "{uri} refused");
+            let asked = upstream_paths(&up).await;
+            assert_eq!(asked.first().map(String::as_str), Some(escaped), "{uri}");
+        }
     }
 
     #[tokio::test]
