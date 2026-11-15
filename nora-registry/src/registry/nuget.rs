@@ -2505,8 +2505,16 @@ async fn registration_leaf(
     // The version's own listing, as the registration NORA stored gives it — served without the
     // upstream, internal package or not. The flatcontainer index names the version but not whether
     // it is listed, so it decides nothing here.
-    if let Some(listed) = stored_listing(state, &id_lower, version).await {
-        return with_json(serde_json::to_vec(&leaf_for(listed)).unwrap_or_default());
+    match stored_listing(state, &id_lower, version).await {
+        Ok(Some(listed)) => {
+            return with_json(serde_json::to_vec(&leaf_for(listed)).unwrap_or_default());
+        }
+        Ok(None) => {}
+        // A stored registration that cannot be read decides nothing, and neither does the
+        // upstream in its place: it may list the version otherwise.
+        Err(UnreadableDocument(key)) => {
+            return crate::registry::storage_unavailable("nuget", &key);
+        }
     }
 
     // Not stored: asked of the upstream, as the registration index is — never for an
@@ -2593,23 +2601,42 @@ fn stored_leaf(doc: &[u8], version: &str) -> StoredLeaf {
     }
 }
 
+/// A stored document that exists but cannot be read, by its storage key.
+struct UnreadableDocument(String);
+
 /// The `listed` flag the registration NORA stored gives `version`: the index's leaf, or the leaf
-/// on the page the index names for it. `None` when nothing stored says it, or it cannot be read.
-async fn stored_listing(state: &AppState, id_lower: &str, version: &str) -> Option<bool> {
+/// on the page the index names for it. `Ok(None)` when nothing stored says it (no document, or
+/// none naming the version); an error when a stored document cannot be read.
+async fn stored_listing(
+    state: &AppState,
+    id_lower: &str,
+    version: &str,
+) -> Result<Option<bool>, UnreadableDocument> {
+    let read = |key: String| async move {
+        match state.storage.get(&key).await {
+            Ok(doc) => Ok(Some(doc)),
+            Err(crate::storage::StorageError::NotFound) => Ok(None),
+            Err(_) => Err(UnreadableDocument(key)),
+        }
+    };
     let index_key = format!("nuget/registration/{id_lower}/index.json");
-    let doc = state.storage.get(&index_key).await.ok()?;
-    match stored_leaf(&doc, version) {
+    let Some(doc) = read(index_key).await? else {
+        return Ok(None);
+    };
+    Ok(match stored_leaf(&doc, version) {
         StoredLeaf::Inline(listed) => Some(listed),
         StoredLeaf::OnPage { lower, upper } => {
             let page_key = format!("nuget/registration/{id_lower}/page/{lower}/{upper}.json");
-            let page = state.storage.get(&page_key).await.ok()?;
-            match stored_leaf(&page, version) {
-                StoredLeaf::Inline(listed) => Some(listed),
-                _ => None,
+            match read(page_key).await? {
+                Some(page) => match stored_leaf(&page, version) {
+                    StoredLeaf::Inline(listed) => Some(listed),
+                    _ => None,
+                },
+                None => None,
             }
         }
         StoredLeaf::Absent => None,
-    }
+    })
 }
 
 /// Rewrite upstream registration URLs in NuGet registration index/page responses: registration5-*
@@ -6829,6 +6856,51 @@ mod review_1233_third_pass {
             json["@id"],
             "http://nora.example/nuget/v3/registration/testpkg/1.0.0.json"
         );
+    }
+
+    /// A stored registration (index, or the page the index names for the version) that cannot
+    /// be read decides nothing: the leaf is a 503, not a 404 that tells the client the version
+    /// does not exist.
+    #[tokio::test]
+    async fn a_stored_registration_that_cannot_be_read_is_not_a_missing_leaf() {
+        use crate::test_helpers::{create_test_context_with_storage_and_config, outage_storage};
+
+        let paged = serde_json::to_vec(&serde_json::json!({
+            "count": 1,
+            "items": [{
+                "@id": "https://api.nuget.org/v3/registration5-gz-semver2/testpkg/page/1.0.0/2.0.0.json",
+                "lower": "1.0.0",
+                "upper": "2.0.0",
+                "count": 2,
+            }],
+        }))
+        .unwrap();
+        let page = stored_registration("1.0.0", true);
+        for (failing, index) in [
+            (
+                "nuget/registration/testpkg/index.json",
+                stored_registration("1.0.0", true),
+            ),
+            ("nuget/registration/testpkg/page/1.0.0/2.0.0.json", paged),
+        ] {
+            let (storage, outage) = outage_storage();
+            let ctx = create_test_context_with_storage_and_config(storage, |cfg| {
+                cfg.nuget.enabled = true;
+                cfg.nuget.proxy = None;
+                cfg.curation.internal_namespaces = vec!["testpkg*".to_string()];
+            });
+            for (key, doc) in [
+                ("nuget/registration/testpkg/index.json", &index),
+                ("nuget/registration/testpkg/page/1.0.0/2.0.0.json", &page),
+            ] {
+                ctx.state.storage.put(key, doc).await.unwrap();
+            }
+            let (status, json) = leaf(&ctx, "1.0.0").await;
+            assert_eq!(status, StatusCode::OK, "{failing} readable: {json}");
+            outage.fail_reads_of(failing);
+            let (status, _) = leaf(&ctx, "1.0.0").await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{failing}");
+        }
     }
 
     /// Finding 2 for an internal package: the stored registration serves the leaf, the upstream
