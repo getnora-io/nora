@@ -778,6 +778,11 @@ async fn upload(
     if name.is_empty() || version.is_empty() {
         return (StatusCode::BAD_REQUEST, "Missing name or version").into_response();
     }
+    // A project name with a byte the upstream URL drops or cuts at is no name of the registry: it
+    // would be stored under a key the reads refuse (`download_file`, `package_versions`).
+    if !is_pypi_name(&name) {
+        return (StatusCode::BAD_REQUEST, "Invalid project name").into_response();
+    }
 
     let data = match file_data {
         Some(d) if !d.is_empty() => d,
@@ -1471,6 +1476,13 @@ fn is_pypi_name(name: &str) -> bool {
 }
 
 fn is_valid_pypi_filename(name: &str) -> bool {
+    has_pypi_filename_chars(name) && nora_registry::pypi_files::served_extension(name).is_some()
+}
+
+/// The characters a PyPI file name holds (wheel and sdist names: ASCII letters, digits, `.`,
+/// `-`, `_`, and `+`, `!` for local versions and epochs), with no traversal. A control byte, `?`
+/// or `#` is dropped or cut by the upstream URL: the upstream would fetch another file.
+fn has_pypi_filename_chars(name: &str) -> bool {
     !name.is_empty()
         && !name.contains("..")
         && !name.contains('/')
@@ -1479,7 +1491,6 @@ fn is_valid_pypi_filename(name: &str) -> bool {
         && name
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'!'))
-        && nora_registry::pypi_files::served_extension(name).is_some()
 }
 
 /// Extract filename from PyPI download URL.
@@ -5126,5 +5137,88 @@ mod url_fold {
     #[tokio::test]
     async fn legitimate_name_still_reaches_upstream() {
         assert_served_upstream("pypi", "/simple/My_Pkg.name/", pypi_proxy).await;
+    }
+
+    /// Every file name the measured pip corpus (`packaging` 26.2, `testdata/pypi/file-versions.tsv`)
+    /// takes as a candidate, case, or egg, and that is ASCII, has the characters a file name holds:
+    /// none may be refused.
+    /// (The extension gate, `served_extension`, is older than this check and is not measured here.)
+    #[test]
+    fn every_corpus_accepted_file_name_is_accepted() {
+        let corpus = include_str!("../../testdata/pypi/file-versions.tsv");
+        let refused: Vec<&str> = corpus
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+            .map(|line| line.split('\t').collect::<Vec<_>>())
+            .filter(|cols| {
+                matches!(
+                    cols.get(2),
+                    Some(&"candidate") | Some(&"case") | Some(&"egg")
+                )
+            })
+            .filter_map(|cols| cols.get(1).copied())
+            // Names with Unicode lookalikes (a Cyrillic `К` in `FlasK`) are fuzz inputs: PyPI
+            // file names are ASCII, and `validate_storage_key` refuses non-ASCII keys anyway.
+            .filter(|file| file.is_ascii())
+            .filter(|file| !super::has_pypi_filename_chars(file))
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "legitimate file names refused: {refused:?}"
+        );
+    }
+
+    /// A multipart upload form (`:action`, `name`, `version`, `content`) as `twine` posts it.
+    fn upload_form(name: &str) -> (String, Vec<u8>) {
+        let b = "NORA-URL-FOLD-BOUNDARY";
+        let form = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\":action\"\r\n\r\nfile_upload\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\n{name}\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"version\"\r\n\r\n1.0.0\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"content\"; filename=\"evil-1.0.0.tar.gz\"\r\n\
+Content-Type: application/octet-stream\r\n\r\nx\r\n--{b}--\r\n"
+        );
+        (
+            format!("multipart/form-data; boundary={b}"),
+            form.into_bytes(),
+        )
+    }
+
+    /// An upload whose project name holds a byte the upstream URL drops or cuts at is refused
+    /// with a 400 before anything is stored (the storage key would hold that byte).
+    #[tokio::test]
+    async fn upload_name_with_a_smuggled_byte_is_refused() {
+        for s in SMUGGLED {
+            let ctx = crate::test_helpers::create_test_context();
+            let (ctype, body) = upload_form(&format!("ev{s}il"));
+            let resp = crate::test_helpers::send_with_headers(
+                &ctx.app,
+                axum::http::Method::POST,
+                "/simple/",
+                vec![("content-type", ctype.as_str())],
+                body,
+            )
+            .await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "upload name ev{s}il"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_legitimate_name_is_accepted() {
+        let ctx = crate::test_helpers::create_test_context();
+        let (ctype, body) = upload_form("evil");
+        let resp = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            axum::http::Method::POST,
+            "/simple/",
+            vec![("content-type", ctype.as_str())],
+            body,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "legitimate upload refused");
     }
 }
