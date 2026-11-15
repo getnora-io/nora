@@ -625,7 +625,10 @@ async fn a_package_no_upstream_has_is_a_404() {
 
 #[tokio::test]
 async fn the_first_upstream_that_has_a_package_serves_it_with_its_own_credential() {
+    // The first upstream is a repository without the package (its root reads, its p2 is a
+    // 404); one whose root cannot be read failed, and is not passed over.
     let first = MockServer::start().await;
+    mount_root(&first).await;
     let second = MockServer::start().await;
     mount_lib(&second, &second.uri(), None).await;
     let ctx = create_test_context_with_config(|c| {
@@ -2863,4 +2866,134 @@ fn a_hosted_listing_is_dated_once_the_clock_leaves_its_second() {
     assert_eq!(hosted_date(t + 5, t), None);
     assert_eq!(hosted_date(t, t + 1), Some(t));
     assert_eq!(hosted_date(t - 10, t), Some(t - 10));
+}
+
+// ── an upstream that failed before any answered: no later upstream answers instead ────
+
+/// `[private, public]`: the private upstream behaves as `mount` makes it; the public one has
+/// `acme/lib` 6.6.6 and its archive.
+async fn private_before_public(
+    mount: impl FnOnce(&MockServer) -> Vec<Mock>,
+) -> (MockServer, MockServer, TestContext) {
+    let private = MockServer::start().await;
+    mount_root(&private).await;
+    for mock in mount(&private) {
+        mock.mount(&private).await;
+    }
+    let public = MockServer::start().await;
+    mount_root(&public).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &public.uri(),
+            "6.6.6",
+            "publicrel",
+        )))
+        .mount(&public)
+        .await;
+    Mock::given(wm_path("/archives/publicrel.zip"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ZIP_1.to_vec()))
+        .mount(&public)
+        .await;
+    let (a, b) = (private.uri(), public.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    (private, public, ctx)
+}
+
+/// A way an upstream fails: its name, NORA's answer, and the upstream's mocks.
+type Failure = (&'static str, StatusCode, fn() -> Vec<Mock>);
+
+fn answers(path: &str, response: ResponseTemplate) -> Mock {
+    Mock::given(wm_path(path)).respond_with(response)
+}
+
+/// Composer stops at a repository it cannot read (`ComposerRepository::asyncFetchFile` rejects
+/// anything but a 404) and never asks the next one for the name. An upstream before the one
+/// that would answer failed — down, refusing NORA's credential, rate-limiting it, answering
+/// with something that is not metadata, or unable to say whether it has the package's other
+/// document — and NORA holds no copy: the failure is the answer, and no later upstream's
+/// package of the same name is served, its archive included.
+#[tokio::test]
+async fn a_failed_upstream_is_not_skipped_for_a_later_one() {
+    let failures: Vec<Failure> = vec![
+        ("down", StatusCode::BAD_GATEWAY, || {
+            vec![answers("/p2/acme/lib.json", ResponseTemplate::new(503))]
+        }),
+        ("credential refused", StatusCode::BAD_GATEWAY, || {
+            vec![answers("/p2/acme/lib.json", ResponseTemplate::new(401))]
+        }),
+        ("forbidden", StatusCode::BAD_GATEWAY, || {
+            vec![answers("/p2/acme/lib.json", ResponseTemplate::new(403))]
+        }),
+        ("rate-limited", StatusCode::TOO_MANY_REQUESTS, || {
+            vec![answers(
+                "/p2/acme/lib.json",
+                ResponseTemplate::new(429).insert_header("retry-after", "30"),
+            )]
+        }),
+        ("not metadata", StatusCode::BAD_GATEWAY, || {
+            vec![answers(
+                "/p2/acme/lib.json",
+                ResponseTemplate::new(200).set_body_string("<html>sign in</html>"),
+            )]
+        }),
+        ("other document unknown", StatusCode::BAD_GATEWAY, || {
+            vec![
+                answers("/p2/acme/lib.json", ResponseTemplate::new(404)),
+                answers("/p2/acme/lib~dev.json", ResponseTemplate::new(503)),
+            ]
+        }),
+    ];
+    for (failure, expected, mount) in failures {
+        let (_private, public, ctx) = private_before_public(|_| mount()).await;
+        let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+        assert_eq!(resp.status(), expected, "{failure}");
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/composer/dists/acme/lib/6.6.6/publicrel.zip",
+            "",
+        )
+        .await;
+        assert_ne!(resp.status(), StatusCode::OK, "{failure}: the archive");
+        let asked = upstream_paths(&public).await;
+        assert!(
+            !asked
+                .iter()
+                .any(|p| p.contains("acme/lib") || p.starts_with("/archives/")),
+            "{failure}: {asked:?}"
+        );
+    }
+}
+
+/// The control: an upstream that answered it has no such package (neither document) is not a
+/// failure, and the next upstream's package is served.
+#[tokio::test]
+async fn a_package_the_first_upstream_lacks_comes_from_the_next() {
+    let (_private, _public, ctx) = private_before_public(|_| {
+        vec![
+            answers("/p2/acme/lib.json", ResponseTemplate::new(404)),
+            answers("/p2/acme/lib~dev.json", ResponseTemplate::new(404)),
+        ]
+    })
+    .await;
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        json_of(resp).await["packages"]["acme/lib"][0]["version"],
+        "6.6.6"
+    );
+    let resp = send(
+        &ctx.app,
+        Method::GET,
+        "/composer/dists/acme/lib/6.6.6/publicrel.zip",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
 }

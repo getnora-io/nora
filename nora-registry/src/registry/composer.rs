@@ -1161,8 +1161,9 @@ async fn upstream_has(
 
 /// The upstream p2 document of `name`: the fresh cached copy, else the first upstream that
 /// has the package (a 304 keeps the cached copy) — by either of its two documents, as Composer
-/// finds a package — else the stale copy when every upstream that did not say "not found"
-/// failed, else the miss as a response.
+/// finds a package. Upstreams are asked in order while each says "not found"; the first that
+/// fails ends the walk, as it may have the package: then the stale copy, else the miss as a
+/// response.
 async fn upstream_document(
     state: &AppState,
     name: &str,
@@ -1219,7 +1220,7 @@ async fn upstream_document(
                     // A 304 to a request without validators: not an answer to rely on.
                     failed = true;
                     miss.record(&ProxyError::Upstream(304));
-                    continue;
+                    break;
                 };
                 crate::metrics::PROXY_UPSTREAM_304_TOTAL
                     .with_label_values(&[REGISTRY])
@@ -1257,7 +1258,7 @@ async fn upstream_document(
                     );
                     failed = true;
                     miss.record(&ProxyError::Network("not Composer metadata".into()));
-                    continue;
+                    break;
                 }
                 // Versions first seen now; an earlier copy of this upstream's seeds a ledger
                 // that does not exist yet.
@@ -1338,11 +1339,11 @@ async fn upstream_document(
                 }
                 tracing::debug!(registry = REGISTRY, url, error = ?e, "upstream metadata miss");
                 miss.record(&e);
-                // The upstream the cached copy came from has the package. Failing now — down,
-                // refusing NORA's credential, rate-limiting it — it is not replaced by a later
-                // upstream's package of the same name: the copy is served stale, or the failure
-                // answered.
-                if from_here.is_some() && !matches!(e, ProxyError::NotFound) {
+                // An upstream that failed — down, refusing NORA's credential, rate-limiting it —
+                // may have the package: no later upstream's package of the same name answers in
+                // its place. Composer stops at a repository it cannot read, too (it rejects any
+                // answer but a 404). A copy is served stale, else the failure is the answer.
+                if !matches!(e, ProxyError::NotFound) {
                     break;
                 }
                 // An upstream without this document that has the package's other one has the
@@ -1352,10 +1353,12 @@ async fn upstream_document(
                     match upstream_has(state, up, &root, name, !dev).await {
                         Ok(true) => break,
                         Ok(false) => {}
+                        // Whether it has the package cannot be told: as a failure of its own.
                         Err(e) => {
                             tracing::debug!(registry = REGISTRY, package = name, error = ?e, "upstream's other document unavailable");
                             failed = true;
                             miss.record(&e);
+                            break;
                         }
                     }
                 }
