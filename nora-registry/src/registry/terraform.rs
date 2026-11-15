@@ -28,7 +28,8 @@ use crate::activity_log::{ActionType, ActivityEntry};
 use crate::audit::AuditEntry;
 use crate::config::UpstreamAuth;
 use crate::registry::{
-    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text, ProxyError, UpstreamMiss,
+    circuit_open_response, nora_base_url, proxy_fetch, proxy_fetch_text,
+    proxy_fetch_text_with_retry, ProxyError, Retry, UpstreamMiss,
 };
 use crate::registry_type::RegistryType;
 use crate::secrets::expose_opt;
@@ -243,14 +244,14 @@ async fn provider_versions(
         ptype
     );
 
-    match proxy_fetch_text(
+    match proxy_fetch_text_with_retry(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
         expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
-        None,
         &state.circuit_breaker,
         RegistryType::Terraform,
+        retry_unless_stale(&state, cached_data.is_some()),
     )
     .await
     {
@@ -274,7 +275,7 @@ async fn provider_versions(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(provider = format!("{}/{}", ns, ptype), error = ?e, "Terraform upstream error");
-            serve_stale_or_bad_gateway(&state, cached_data, "provider_versions")
+            serve_stale_or_bad_gateway(&state, cached_data, "provider_versions", &e)
         }
     }
 }
@@ -363,14 +364,14 @@ async fn provider_download_meta(
         arch
     );
 
-    match proxy_fetch_text(
+    match proxy_fetch_text_with_retry(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
         expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
-        None,
         &state.circuit_breaker,
         RegistryType::Terraform,
+        retry_unless_stale(&state, cached_data.is_some()),
     )
     .await
     {
@@ -397,7 +398,7 @@ async fn provider_download_meta(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform download metadata error");
-            serve_stale_or_bad_gateway(&state, cached_data, "provider_download_meta")
+            serve_stale_or_bad_gateway(&state, cached_data, "provider_download_meta", &e)
         }
     }
 }
@@ -657,14 +658,14 @@ async fn module_versions(
         provider
     );
 
-    match proxy_fetch_text(
+    match proxy_fetch_text_with_retry(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
         expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
-        None,
         &state.circuit_breaker,
         RegistryType::Terraform,
+        retry_unless_stale(&state, cached_data.is_some()),
     )
     .await
     {
@@ -688,7 +689,7 @@ async fn module_versions(
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform module versions error");
-            serve_stale_or_bad_gateway(&state, cached_data, "module_versions")
+            serve_stale_or_bad_gateway(&state, cached_data, "module_versions", &e)
         }
     }
 }
@@ -1064,12 +1065,13 @@ async fn mirror_provider_index(
     };
 
     // An internal provider's version list comes from the cache only (#68/#733).
-    let versions_json = match mirror_fetch_versions(&state, &ns, &ptype, internal).await {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
+    let versions =
+        match mirror_fetch_versions(&state, &ns, &ptype, internal, "mirror_provider_index").await {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        };
 
-    let mirror = build_mirror_index(&versions_json);
+    let mirror = build_mirror_index(&versions.json);
     debug_assert!(
         mirror
             .get("versions")
@@ -1078,7 +1080,7 @@ async fn mirror_provider_index(
         "mirror index must carry a `versions` object"
     );
     state.metrics.record_download("terraform");
-    with_json(serde_json::to_vec(&mirror).unwrap_or_default())
+    versions.answer(serde_json::to_vec(&mirror).unwrap_or_default())
 }
 
 /// `{version}.json` — List Available Installation Packages (network mirror protocol).
@@ -1114,11 +1116,13 @@ async fn mirror_provider_version(
     };
 
     // Version list drives the platform enumeration.
-    let versions_json = match mirror_fetch_versions(&state, &ns, &ptype, internal).await {
-        Ok(v) => v,
-        Err(resp) => return *resp,
-    };
-    let platforms = extract_platforms(&versions_json, ver);
+    let versions =
+        match mirror_fetch_versions(&state, &ns, &ptype, internal, "mirror_provider_version").await
+        {
+            Ok(v) => v,
+            Err(resp) => return *resp,
+        };
+    let platforms = extract_platforms(&versions.json, ver);
     if platforms.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -1181,19 +1185,46 @@ async fn mirror_provider_version(
     }
 
     state.metrics.record_download("terraform");
-    with_json(serde_json::to_vec(&serde_json::json!({ "archives": archives })).unwrap_or_default())
+    // Built from a version list the upstream could not revalidate, the answer is stale as well.
+    versions.answer(
+        serde_json::to_vec(&serde_json::json!({ "archives": archives })).unwrap_or_default(),
+    )
+}
+
+/// A provider's Registry-Protocol version list for the mirror handlers, and whether it is a stored
+/// copy the upstream could not revalidate.
+struct VersionList {
+    json: serde_json::Value,
+    stale: bool,
+}
+
+impl VersionList {
+    fn current(json: serde_json::Value) -> Self {
+        Self { json, stale: false }
+    }
+
+    /// The JSON answer built from this list: marked stale when the list is (#1230).
+    fn answer(&self, body: Vec<u8>) -> Response {
+        if self.stale {
+            with_stale_json(body)
+        } else {
+            with_json(body)
+        }
+    }
 }
 
 /// Fetch + parse the Registry-Protocol versions JSON for the mirror handlers.
 /// Mirrors `provider_versions`' cache/TTL/namespace-isolation/serve-stale logic but
 /// returns parsed JSON. `Err(Response)` carries the terminal response (block, 404,
-/// circuit-open, 502) to return verbatim.
+/// circuit-open, 502) to return verbatim. A stored copy served because the upstream failed is
+/// returned `stale`, asked of the upstream once, logged and counted under `endpoint` (#1230).
 async fn mirror_fetch_versions(
     state: &AppState,
     ns: &str,
     ptype: &str,
     internal: bool,
-) -> Result<serde_json::Value, Box<Response>> {
+    endpoint: &'static str,
+) -> Result<VersionList, Box<Response>> {
     let storage_key = format!("terraform/providers/{}/{}/versions.json", ns, ptype);
     let (cached_data, read_failure) =
         crate::registry::cached_read(state.storage.get(&storage_key).await);
@@ -1203,7 +1234,7 @@ async fn mirror_fetch_versions(
         if let Some(meta) = state.storage.stat(&storage_key).await {
             if is_within_ttl(meta.modified, state.config.terraform.metadata_ttl) {
                 state.metrics.record_cache_hit("terraform");
-                return parse_json(data);
+                return parse_json(data).map(VersionList::current);
             }
         }
     }
@@ -1213,7 +1244,7 @@ async fn mirror_fetch_versions(
     if internal {
         if let Some(ref data) = cached_data {
             state.metrics.record_cache_hit("terraform");
-            return parse_json(data);
+            return parse_json(data).map(VersionList::current);
         }
         if let Some(e) = &read_failure {
             return Err(Box::new(crate::registry::local_copy_unreadable(
@@ -1231,7 +1262,7 @@ async fn mirror_fetch_versions(
     // No upstream when the operator switched it off: what is stored is all there is.
     let Some(proxy_url) = upstream_url(state) else {
         return match cached_data {
-            Some(ref data) => parse_json(data),
+            Some(ref data) => parse_json(data).map(VersionList::current),
             None => Err(Box::new(StatusCode::NOT_FOUND.into_response())),
         };
     };
@@ -1241,21 +1272,21 @@ async fn mirror_fetch_versions(
         ns,
         ptype
     );
-    match proxy_fetch_text(
+    match proxy_fetch_text_with_retry(
         &state.http_client,
         &url,
         Duration::from_secs(state.config.terraform.proxy_timeout),
         expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
-        None,
         &state.circuit_breaker,
         RegistryType::Terraform,
+        retry_unless_stale(state, cached_data.is_some()),
     )
     .await
     {
         Ok(text) => {
             state.metrics.record_cache_miss("terraform");
             state.spawn_cache("terraform", storage_key, Bytes::from(text.clone()));
-            parse_json(text.as_bytes())
+            parse_json(text.as_bytes()).map(VersionList::current)
         }
         Err(ProxyError::NotFound) => Err(Box::new(StatusCode::NOT_FOUND.into_response())),
         Err(ProxyError::CircuitOpen(reg)) => Err(Box::new(circuit_open_response(&reg))),
@@ -1264,8 +1295,9 @@ async fn mirror_fetch_versions(
             // Serve stale parsed metadata if allowed, else 502.
             if let Some(ref data) = cached_data {
                 if state.config.terraform.serve_stale {
-                    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(data) {
-                        return Ok(v);
+                    if let Ok(json) = serde_json::from_slice::<serde_json::Value>(data) {
+                        note_stale(endpoint, &e);
+                        return Ok(VersionList { json, stale: true });
                     }
                 }
             }
@@ -1751,34 +1783,61 @@ fn with_json(data: Vec<u8>) -> Response {
         .into_response()
 }
 
+/// How often a metadata request whose upstream fails is sent: once when a stored copy is there to
+/// serve stale, since a second attempt would only hold that copy back by another timeout; twice
+/// when there is nothing to fall back to (#1230).
+fn retry_unless_stale(state: &AppState, cached: bool) -> Retry {
+    Retry::unless_fallback(cached && state.config.terraform.serve_stale)
+}
+
+/// A stored copy served because the upstream could not revalidate it: logged and counted (#1230).
+fn note_stale(endpoint: &str, error: &ProxyError) {
+    tracing::warn!(
+        registry = "terraform",
+        endpoint,
+        error = ?error,
+        "Upstream unreachable, serving stale cached metadata"
+    );
+    crate::metrics::PROXY_STALE_SERVED_TOTAL
+        .with_label_values(&["terraform"])
+        .inc();
+}
+
+/// Metadata from a stored copy the upstream could not revalidate: `X-Nora-Stale: true`, and a
+/// `Cache-Control` that lets no client keep it as fresh (#532).
+fn with_stale_json(data: Vec<u8>) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            ),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("public, max-age=0, must-revalidate"),
+            ),
+            (
+                axum::http::header::HeaderName::from_static("x-nora-stale"),
+                axum::http::header::HeaderValue::from_static("true"),
+            ),
+        ],
+        data,
+    )
+        .into_response()
+}
+
 /// Serve stale cached metadata when upstream is unreachable, or 502 if no cache.
-fn serve_stale_or_bad_gateway(state: &AppState, cached: Option<Bytes>, endpoint: &str) -> Response {
+fn serve_stale_or_bad_gateway(
+    state: &AppState,
+    cached: Option<Bytes>,
+    endpoint: &str,
+    error: &ProxyError,
+) -> Response {
     if let Some(data) = cached {
         if state.config.terraform.serve_stale {
-            tracing::warn!(
-                registry = "terraform",
-                endpoint,
-                "Upstream unreachable, serving stale cached metadata"
-            );
-            return (
-                StatusCode::OK,
-                [
-                    (
-                        header::CONTENT_TYPE,
-                        HeaderValue::from_static("application/json"),
-                    ),
-                    (
-                        header::CACHE_CONTROL,
-                        HeaderValue::from_static("public, max-age=0, must-revalidate"),
-                    ),
-                    (
-                        axum::http::header::HeaderName::from_static("x-nora-stale"),
-                        axum::http::header::HeaderValue::from_static("true"),
-                    ),
-                ],
-                data.to_vec(),
-            )
-                .into_response();
+            note_stale(endpoint, error);
+            return with_stale_json(data.to_vec());
         }
     }
     StatusCode::BAD_GATEWAY.into_response()
@@ -5277,8 +5336,9 @@ mod terraform_decides_once {
         "mirror_provider_index",
         "mirror_provider_version",
     ];
-    const SERVES_OR_FETCHES: [&str; 11] = [
+    const SERVES_OR_FETCHES: [&str; 12] = [
         "with_json(",
+        "with_stale_json(",
         "with_binary(",
         "NO_CONTENT",
         "proxy_fetch",
@@ -5542,5 +5602,353 @@ mod terraform_release_age_decided {
                 assert_eq!(resp.status(), expected, "{url}");
             }
         }
+    }
+}
+
+/// A stored copy the upstream cannot revalidate is answered within one upstream timeout, marked
+/// stale, on every Terraform metadata path (#1230): the upstream is asked once — a second attempt
+/// would only delay the copy the answer falls back to — and the answer says the copy is stale
+/// (`X-Nora-Stale: true`, `Cache-Control: public, max-age=0, must-revalidate`), with a warning in
+/// the log and a count in `nora_proxy_stale_served_total`. With no copy to fall back to the failed
+/// request is still retried once before the 502, a fresh copy is served without the upstream, and
+/// a revalidation the upstream answers carries no stale marks. A provider archive or a module
+/// source that is stored is served without waiting for the upstream at all.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod stale_copy_within_one_timeout {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, LogCapture};
+    use axum::http::{Method, StatusCode};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// The upstream timeout of these tests, in seconds.
+    const TIMEOUT: u64 = 1;
+    const SHASUM: &str = "5f8a5d2a4c2e0f7b9c1d3e5f7a9b1c3d5e7f9a1b3c5d7e9f1a3b5c7d9e1f3a5b";
+    const VERSIONS: &str = r#"{"versions":[{"version":"3.9.1","protocols":["5.0"],"platforms":[{"os":"linux","arch":"amd64"}]}]}"#;
+    const MODULE_VERSIONS: &str = r#"{"modules":[{"versions":[{"version":"0.1.0"}]}]}"#;
+
+    fn platform_meta() -> String {
+        serde_json::json!({
+            "os": "linux",
+            "arch": "amd64",
+            "filename": "terraform-provider-random_3.9.1_linux_amd64.zip",
+            "download_url": "http://localhost:4000/terraform/v1/providers/download/hashicorp/random/3.9.1/terraform-provider-random_3.9.1_linux_amd64.zip",
+            "shasum": SHASUM,
+            "_nora_upstream_url": "https://releases.example.invalid/terraform-provider-random_3.9.1_linux_amd64.zip",
+        })
+        .to_string()
+    }
+
+    /// Every Terraform metadata path, with what its stale answer must hold of the stored copy.
+    const PATHS: [&str; 5] = [
+        "/terraform/registry.terraform.io/hashicorp/random/index.json",
+        "/terraform/registry.terraform.io/hashicorp/random/3.9.1.json",
+        "/terraform/v1/providers/hashicorp/random/versions",
+        "/terraform/v1/providers/hashicorp/random/3.9.1/download/linux/amd64",
+        "/terraform/v1/modules/hashicorp/consul/aws/versions",
+    ];
+
+    /// The answer to `uri` holds the stored copy.
+    fn holds_the_copy(uri: &str, body: &[u8]) {
+        let json: serde_json::Value = serde_json::from_slice(body).unwrap();
+        match uri {
+            u if u.ends_with("index.json") => {
+                assert!(json["versions"]["3.9.1"].is_object(), "{uri}: {json}")
+            }
+            u if u.ends_with("3.9.1.json") => assert_eq!(
+                json["archives"]["linux_amd64"]["hashes"][0],
+                format!("zh:{SHASUM}"),
+                "{uri}: {json}"
+            ),
+            u if u.ends_with("/download/linux/amd64") => {
+                assert_eq!(json["shasum"], SHASUM, "{uri}: {json}");
+                assert!(json.get("_nora_upstream_url").is_none(), "{uri}: {json}");
+            }
+            u if u.contains("/modules/") => {
+                assert_eq!(json["modules"][0]["versions"][0]["version"], "0.1.0")
+            }
+            _ => assert_eq!(json["versions"][0]["version"], "3.9.1", "{uri}: {json}"),
+        }
+    }
+
+    /// An upstream that accepts every connection and never answers, as an address routed nowhere
+    /// does — not one that refuses the connection. Counts the connections NORA opened to it. Its
+    /// own thread accepts, so the count does not wait on the test's runtime.
+    async fn blackhole() -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let opened = Arc::new(AtomicUsize::new(0));
+        let count = opened.clone();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for socket in listener.incoming().flatten() {
+                held.push(socket);
+                count.store(held.len(), Ordering::SeqCst);
+            }
+        });
+        (url, opened)
+    }
+
+    /// A NORA asking `upstream`, holding a copy of every path stored `ttl` seconds of
+    /// `metadata_ttl` ago (`0` — expired).
+    async fn warm(
+        upstream: String,
+        ttl: i64,
+        serve_stale: bool,
+    ) -> crate::test_helpers::TestContext {
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(upstream);
+            cfg.terraform.proxy_timeout = TIMEOUT;
+            cfg.terraform.metadata_ttl = ttl;
+            cfg.terraform.serve_stale = serve_stale;
+        });
+        for (key, body) in [
+            (
+                "terraform/providers/hashicorp/random/versions.json",
+                VERSIONS.to_string(),
+            ),
+            (
+                "terraform/providers/hashicorp/random/3.9.1/linux_amd64.json",
+                platform_meta(),
+            ),
+            (
+                "terraform/modules/hashicorp/consul/aws/versions.json",
+                MODULE_VERSIONS.to_string(),
+            ),
+        ] {
+            ctx.state.storage.put(key, body.as_bytes()).await.unwrap();
+        }
+        ctx
+    }
+
+    fn header<'a>(resp: &'a axum::http::Response<axum::body::Body>, name: &str) -> Option<&'a str> {
+        resp.headers().get(name).and_then(|v| v.to_str().ok())
+    }
+
+    /// The reporter's case on every metadata path: a warm, expired copy and an upstream that never
+    /// answers. One attempt, the copy within one timeout, marked stale, a warning logged.
+    #[tokio::test]
+    async fn a_copy_the_upstream_cannot_revalidate_is_served_within_one_timeout_marked_stale() {
+        // The warning's callsite is registered here first, before any capture starts: one first
+        // hit on another test's thread, while this test's capture is the only one, would cache
+        // that thread's "not wanted" for it (tracing-core 0.1.36, `callsite.rs` `JustOne`), and
+        // the warning would never reach this capture. Each capture below rebuilds its interest.
+        let primer = warm("http://127.0.0.1:1".to_string(), 0, true).await;
+        for uri in PATHS {
+            send(&primer.app, Method::GET, uri, "").await;
+        }
+        let mut wrong = Vec::new();
+        for uri in PATHS {
+            let (upstream, opened) = blackhole().await;
+            let ctx = warm(upstream, 0, true).await;
+            let (log, _capture) = LogCapture::start();
+            let started = Instant::now();
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            let took = started.elapsed();
+            let asked = opened.load(Ordering::SeqCst);
+            let status = resp.status();
+            let stale = header(&resp, "x-nora-stale").map(str::to_string);
+            let cache = header(&resp, "cache-control").map(str::to_string);
+            let warned = log
+                .text()
+                .lines()
+                .any(|l| l.contains("WARN") && l.contains("stale") && l.contains("terraform"));
+            if status != StatusCode::OK
+                || stale.as_deref() != Some("true")
+                || cache.as_deref() != Some("public, max-age=0, must-revalidate")
+                || asked != 1
+                || took >= Duration::from_secs(2 * TIMEOUT)
+                || !warned
+            {
+                wrong.push(format!(
+                    "{uri}: {status}, x-nora-stale {stale:?}, cache-control {cache:?}, \
+                     upstream asked {asked}x, answered after {took:.1?}, warned {warned}"
+                ));
+                continue;
+            }
+            holds_the_copy(uri, &body_bytes(resp).await);
+        }
+        assert!(
+            wrong.is_empty(),
+            "a stale copy must come within one {TIMEOUT} s timeout, asked once, marked, logged:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// Every stale answer is counted, on every metadata path. Many requests, so parallel tests
+    /// cannot make up the count; an upstream that refuses the connection keeps them quick.
+    #[tokio::test]
+    async fn every_stale_answer_is_counted() {
+        let ctx = warm("http://127.0.0.1:1".to_string(), 0, true).await;
+        let served = || {
+            crate::metrics::PROXY_STALE_SERVED_TOTAL
+                .with_label_values(&["terraform"])
+                .get()
+        };
+        const N: u64 = 16;
+        let mut uncounted = Vec::new();
+        for uri in PATHS {
+            let before = served();
+            for _ in 0..N {
+                let resp = send(&ctx.app, Method::GET, uri, "").await;
+                assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            }
+            if served() < before + N {
+                uncounted.push(uri);
+            }
+        }
+        assert!(
+            uncounted.is_empty(),
+            "stale answers not counted: {uncounted:?}"
+        );
+    }
+
+    /// No copy to fall back to: the failed request is still asked twice, and the answer is 502.
+    /// The same with a copy the operator does not want served stale.
+    #[tokio::test]
+    async fn without_a_copy_to_serve_the_upstream_is_still_asked_twice() {
+        for uri in PATHS {
+            let (upstream, opened) = blackhole().await;
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.terraform.enabled = true;
+                cfg.terraform.proxy = Some(upstream);
+                cfg.terraform.proxy_timeout = TIMEOUT;
+            });
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{uri}");
+            assert!(resp.headers().get("x-nora-stale").is_none(), "{uri}");
+            assert_eq!(
+                opened.load(Ordering::SeqCst),
+                2,
+                "{uri}: cold miss not retried"
+            );
+        }
+        for uri in PATHS {
+            let (upstream, opened) = blackhole().await;
+            let ctx = warm(upstream, 0, false).await;
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{uri}");
+            assert!(resp.headers().get("x-nora-stale").is_none(), "{uri}");
+            assert_eq!(
+                opened.load(Ordering::SeqCst),
+                2,
+                "{uri}: serve_stale=false, not retried"
+            );
+        }
+    }
+
+    /// A copy within its metadata TTL is answered without the upstream, unmarked.
+    #[tokio::test]
+    async fn a_fresh_copy_is_served_without_the_upstream() {
+        for uri in PATHS {
+            let (upstream, opened) = blackhole().await;
+            let ctx = warm(upstream, 300, true).await;
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            assert!(resp.headers().get("x-nora-stale").is_none(), "{uri}");
+            assert_eq!(
+                header(&resp, "cache-control"),
+                Some("public, max-age=60, must-revalidate"),
+                "{uri}"
+            );
+            assert_eq!(
+                opened.load(Ordering::SeqCst),
+                0,
+                "{uri}: fresh copy revalidated"
+            );
+            holds_the_copy(uri, &body_bytes(resp).await);
+        }
+    }
+
+    /// An expired copy the upstream revalidates is answered from the upstream, with no stale mark.
+    #[tokio::test]
+    async fn a_revalidation_the_upstream_answers_carries_no_stale_marks() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        for (route, body) in [
+            (
+                "/v1/providers/hashicorp/random/versions",
+                VERSIONS.to_string(),
+            ),
+            (
+                "/v1/providers/hashicorp/random/3.9.1/download/linux/amd64",
+                platform_meta(),
+            ),
+            (
+                "/v1/modules/hashicorp/consul/aws/versions",
+                MODULE_VERSIONS.to_string(),
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+        }
+        for uri in PATHS {
+            let ctx = warm(server.uri(), 0, true).await;
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            assert!(resp.headers().get("x-nora-stale").is_none(), "{uri}");
+            assert_eq!(
+                header(&resp, "cache-control"),
+                Some("public, max-age=60, must-revalidate"),
+                "{uri}"
+            );
+            holds_the_copy(uri, &body_bytes(resp).await);
+        }
+    }
+
+    /// A stored provider archive and a stored module source address are answered without asking
+    /// the upstream, however long it would take to answer.
+    #[tokio::test]
+    async fn a_stored_archive_does_not_wait_for_the_upstream() {
+        let (upstream, opened) = blackhole().await;
+        let ctx = warm(upstream, 0, true).await;
+        let archive = b"PK\x03\x04 provider archive";
+        ctx.state
+            .storage
+            .put(
+                "terraform/download/hashicorp/random/3.9.1/terraform-provider-random_3.9.1_linux_amd64.zip",
+                archive,
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put(
+                "terraform/modules/hashicorp/consul/aws/0.1.0/_source_url",
+                b"https://example.invalid/consul-0.1.0.tar.gz",
+            )
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/providers/download/hashicorp/random/3.9.1/terraform-provider-random_3.9.1_linux_amd64.zip",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_bytes(resp).await.as_ref(), archive);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/terraform/v1/modules/hashicorp/consul/aws/0.1.0/download",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert!(resp.headers().get("x-terraform-get").is_some());
+        assert!(started.elapsed() < Duration::from_secs(TIMEOUT));
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            0,
+            "a stored file waited for the upstream"
+        );
     }
 }
