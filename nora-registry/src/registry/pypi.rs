@@ -362,6 +362,12 @@ async fn download_file(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
+    // A byte outside a file name's characters is a bad name, refused as such (400) before any
+    // storage or upstream access: a byte the URL parser drops or cuts at would fetch another file.
+    if !pypi_filename_bytes_allowed(&filename) {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
     // Block download of internal bookkeeping files (dates.json, etc.) that
     // live alongside packages in storage but are not real artifacts (#891).
     if !is_valid_pypi_filename(&filename) {
@@ -1488,9 +1494,14 @@ fn has_pypi_filename_chars(name: &str) -> bool {
         && !name.contains('/')
         && !name.contains('\\')
         && !name.contains('\0')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'!'))
+        && pypi_filename_bytes_allowed(name)
+}
+
+/// Whether every byte of a file name is one a PyPI file name holds: ASCII letters, digits, and
+/// `.`, `-`, `_`, `+`, `!`. Any other byte is a bad name (400 on download), not a missing file.
+fn pypi_filename_bytes_allowed(name: &str) -> bool {
+    name.bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+' | b'!'))
 }
 
 /// Extract filename from PyPI download URL.
@@ -5104,9 +5115,7 @@ mod url_fold {
     //! A name or version holding a byte the upstream URL drops or cuts at (`%09`, `%0A`, `%0D`,
     //! `%3F`, `%23`) is refused by this handler with a 400 before curation, storage or the upstream
     //! sees it, and the upstream is never asked. Legitimate names of the format still reach it.
-    use crate::test_helpers::{
-        assert_refused, assert_refused_as, assert_served_upstream, SMUGGLED,
-    };
+    use crate::test_helpers::{assert_refused, assert_served_upstream, SMUGGLED};
     use axum::http::StatusCode;
 
     fn pypi_proxy(cfg: &mut crate::config::Config, up: &str) {
@@ -5124,14 +5133,14 @@ mod url_fold {
     }
 
     #[tokio::test]
-    async fn file_name_with_a_smuggled_byte_is_not_found() {
-        // The handler's own file-name gate (`is_valid_pypi_filename`): 404, before storage or the
-        // upstream. The project name here is clean, so the gate is what refuses.
+    async fn file_name_with_a_smuggled_byte_is_refused() {
+        // A file name with a byte the URL parser drops or cuts at is a bad name: 400, before storage
+        // or the upstream. The project name here is clean, so the file name is what refuses.
         let files: Vec<String> = SMUGGLED
             .iter()
             .map(|s| format!("/simple/evil/ev{s}il-1.0.tar.gz"))
             .collect();
-        assert_refused_as("pypi file", StatusCode::NOT_FOUND, &files, pypi_proxy).await;
+        assert_refused("pypi file", &files, pypi_proxy).await;
     }
 
     #[tokio::test]
