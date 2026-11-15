@@ -3120,3 +3120,67 @@ async fn a_held_archive_is_served_while_the_metadata_cannot_be_read() {
     .await;
     assert_ne!(resp.status(), StatusCode::OK);
 }
+
+/// The package is the first upstream's that has either document, a copy past its TTL
+/// included. The private upstream served the releases (cached, now stale), answers 404 for the
+/// branches and fails for the releases: the branch document is its answer — none — not the
+/// public upstream's, and the releases are its stale copy.
+#[tokio::test]
+async fn a_stale_copy_of_the_other_document_keeps_the_package_its_upstream_s() {
+    let private = MockServer::start().await;
+    mount_root(&private).await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &private.uri(),
+            "1.0.0",
+            "privaterel",
+        )))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&private)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib.json"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(2)
+        .mount(&private)
+        .await;
+    Mock::given(wm_path("/p2/acme/lib~dev.json"))
+        .respond_with(ResponseTemplate::new(404))
+        .mount(&private)
+        .await;
+    let public = MockServer::start().await;
+    mount_root(&public).await;
+    Mock::given(wm_path("/p2/acme/lib~dev.json"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(lib_doc(
+            &public.uri(),
+            "dev-main",
+            "publicdev",
+        )))
+        .mount(&public)
+        .await;
+    let (a, b) = (private.uri(), public.uri());
+    let ctx = create_test_context_with_config(move |c| {
+        c.composer.enabled = true;
+        c.composer.metadata_ttl = 0;
+        c.composer.proxies = vec![
+            crate::config::ComposerProxyEntry::Simple(a),
+            crate::config::ComposerProxyEntry::Simple(b),
+        ];
+    });
+    let releases = "/composer/p2/acme/lib.json";
+    assert_eq!(
+        send(&ctx.app, Method::GET, releases, "").await.status(),
+        StatusCode::OK
+    );
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib~dev.json", "").await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the branches are the private upstream's answer"
+    );
+    let resp = send(&ctx.app, Method::GET, releases, "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()["x-nora-stale"], "true");
+    let asked = upstream_paths(&public).await;
+    assert!(!asked.iter().any(|p| p.contains("acme/lib")), "{asked:?}");
+}

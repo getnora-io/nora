@@ -1122,8 +1122,9 @@ fn names_package(body: &[u8], name: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether the upstream `up` has `name` by its document `dev`: the fresh copy it served, else
-/// its answer now. An answer other than the document or "not found" is the error.
+/// Whether the upstream `up` has `name` by its document `dev`: a copy it served that names the
+/// package (fresh or not) or a fresh one that does not, else its answer now. An answer other
+/// than the document or "not found" is the error.
 async fn upstream_has(
     state: &AppState,
     up: &ComposerProxyEntry,
@@ -1131,13 +1132,17 @@ async fn upstream_has(
     name: &str,
     dev: bool,
 ) -> Result<bool, ProxyError> {
+    // A copy it served says it has the package, past its TTL too: a package does not change
+    // hands because its upstream cannot be asked now. A fresh copy says either way.
     if let Some(c) = cached_document(state, &p2_key(name, dev)).await {
-        if c.fresh
-            && c.origin
-                .as_deref()
-                .is_some_and(|o| same_upstream(o, up.url()))
+        if c.origin
+            .as_deref()
+            .is_some_and(|o| same_upstream(o, up.url()))
         {
-            return Ok(names_package(&c.body, name));
+            let names = names_package(&c.body, name);
+            if names || c.fresh {
+                return Ok(names);
+            }
         }
     }
     let url = root.p2_url(name, dev);
