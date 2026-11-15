@@ -1669,12 +1669,14 @@ fn with_json_gzip(data: Vec<u8>) -> Response {
 }
 
 /// JSON response with `X-Nora-Stale: true` header indicating degraded/fallback data.
-/// Whether a local search or autocomplete result (`totalHits`) names anything.
+/// Whether the page of a local search or autocomplete result (`data`, after `skip` and `take`)
+/// names anything: a page past what NORA holds of the query is no answer while the host is
+/// down, though `totalHits` counts the matches before it.
 fn has_hits(data: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(data)
         .ok()
-        .and_then(|result| result["totalHits"].as_u64())
-        .is_some_and(|hits| hits > 0)
+        .and_then(|result| result["data"].as_array().map(|page| !page.is_empty()))
+        .unwrap_or(false)
 }
 
 /// The answer of search or autocomplete when their host cannot answer and nothing local
@@ -5426,6 +5428,44 @@ mod search_breaker {
                     }
                 }
             }
+        }
+    }
+
+    /// The local index answers for the page asked: a page past what it holds of the query is
+    /// not an empty end of the result while the search host is down, it is 503.
+    #[tokio::test]
+    async fn a_page_past_the_local_matches_is_503_while_the_search_host_is_down() {
+        let source = answering(200).await;
+        let ctx = ctx(source.uri(), "http://127.0.0.1:1".to_string());
+        for (key, data) in [
+            (
+                "nuget/flatcontainer/held.pkg/1.0.0/held.pkg.1.0.0.nupkg",
+                &b"nupkg"[..],
+            ),
+            (
+                "nuget/flatcontainer/held.pkg/index.json",
+                br#"{"versions":["1.0.0"]}"#,
+            ),
+        ] {
+            ctx.state.storage.put(key, data).await.unwrap();
+        }
+        ctx.state.repo_index.invalidate("nuget");
+        for (path, want) in [
+            ("/nuget/v3/query?q=held&skip=0&take=20", StatusCode::OK),
+            (
+                "/nuget/v3/query?q=held&skip=1&take=20",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "/nuget/v3/autocomplete?q=held&skip=0&take=20",
+                StatusCode::OK,
+            ),
+            (
+                "/nuget/v3/autocomplete?q=held&skip=1&take=20",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            assert_eq!(status(&ctx, path).await, want, "{path}");
         }
     }
 
