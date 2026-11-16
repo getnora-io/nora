@@ -3115,18 +3115,32 @@ async fn list_tags(
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    // Also include legacy non-namespaced keys during migration
-    if prefix != legacy_prefix {
+    // The bare keys hold this registry's own pushes (`put_manifest` writes them there, and
+    // `get_manifest` reads that layout as hosted). A name with one is hosted: its listing is
+    // answered from local storage alone, so the upstream is not asked. The legacy keys are
+    // listed here whether or not a namespace separates them, and a failure to list them is a
+    // failure to know whether the name is hosted, so it answers 503 as the namespaced list does.
+    let legacy_keys = if prefix != legacy_prefix {
         match state.storage.list(&legacy_prefix).await {
-            Ok(legacy_keys) => {
-                keys.extend(legacy_keys);
-                keys.sort();
-                keys.dedup();
-            }
+            Ok(legacy_keys) => legacy_keys,
             Err(e) => {
-                tracing::warn!(error = ?e, "docker: failed to list legacy manifests, continuing with namespaced only");
+                tracing::error!(error = ?e, "docker: failed to list legacy manifests for tags");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
         }
+    } else {
+        keys.clone()
+    };
+    let hosted = legacy_keys.iter().any(|k| {
+        k.strip_prefix(&legacy_prefix)
+            .and_then(tag_from_manifest_file)
+            .is_some()
+    });
+    // Also include legacy non-namespaced keys during migration
+    if prefix != legacy_prefix {
+        keys.extend(legacy_keys);
+        keys.sort();
+        keys.dedup();
     }
     let mut tags: Vec<String> = keys
         .iter()
@@ -3138,7 +3152,7 @@ async fn list_tags(
         })
         .collect();
     let mut miss = UpstreamMiss::default();
-    let remote = if internal {
+    let remote = if internal || hosted {
         Vec::new()
     } else {
         list_upstream_tags(&state, &upstreams_to_try, &name, &mut miss).await
@@ -3212,9 +3226,10 @@ async fn list_upstream_tags(
     tags
 }
 
-/// One upstream's tags for a name. A name with no slash that the upstream does not list falls to
-/// `library/<name>`, the official images of Docker Hub, as a manifest does; a failure under either
-/// name decides the answer, since a 4xx under one says nothing about the other.
+/// One upstream's tags for a name. A short name is also the official image of Docker Hub, and a
+/// manifest resolves a tag the name lacks through `library/<name>`, so the listing carries the
+/// tags of both (#1218). A failure under either name decides the answer: a 4xx under one says
+/// nothing about the other, while an upstream that failed to answer may have held more tags.
 async fn tags_from_upstream(
     state: &AppState,
     upstream: &crate::config::DockerUpstream,
@@ -3229,29 +3244,32 @@ async fn tags_from_upstream(
         basic_auth: expose_opt(&upstream.auth),
         cb: &state.circuit_breaker,
     };
-    let first = fetch_tags_from_upstream(listing).await;
-    let answered_nothing = match &first {
-        Ok(listed) => listed.is_empty(),
-        Err(ProxyError::NotFound) => true,
-        Err(ProxyError::Upstream(code)) => (400..500).contains(code),
-        Err(_) => false,
-    };
-    if !name.contains('/') && answered_nothing {
-        let official = format!("library/{name}");
-        let second = fetch_tags_from_upstream(TagListing {
-            name: &official,
-            ..listing
-        })
-        .await;
-        match second {
-            Ok(listed) if !listed.is_empty() => return Ok(listed),
-            Err(e) if !matches!(e, ProxyError::NotFound | ProxyError::Upstream(400..=499)) => {
-                return Err(e)
-            }
-            _ => {}
-        }
+    let own = fetch_tags_from_upstream(listing).await;
+    if name.contains('/') {
+        return own;
     }
-    first
+    let official = format!("library/{name}");
+    let official = fetch_tags_from_upstream(TagListing {
+        name: &official,
+        ..listing
+    })
+    .await;
+    match (own, official) {
+        (Err(e), _) if is_upstream_failure(&e) => Err(e),
+        (_, Err(e)) if is_upstream_failure(&e) => Err(e),
+        (Ok(mut tags), Ok(more)) => {
+            tags.extend(more);
+            Ok(tags)
+        }
+        (Ok(tags), Err(_)) | (Err(_), Ok(tags)) => Ok(tags),
+        (Err(e), Err(_)) => Err(e),
+    }
+}
+
+/// Whether an upstream's answer to a listing is a failure to answer, rather than an answer
+/// ("not found" or a 4xx): only a failure makes the listing incomplete.
+fn is_upstream_failure(e: &ProxyError) -> bool {
+    !matches!(e, ProxyError::NotFound | ProxyError::Upstream(400..=499))
 }
 
 // ============================================================================
@@ -4925,6 +4943,14 @@ async fn fetch_tags_page(
             .limited(&cb_key, retry_after.map(|v| v.as_bytes())));
     }
 
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        // The registry will not list this repository for NORA: a refusal, not an absent name, so
+        // it must not read as "no tags" (#1218). A persistent 401 is left as absent (accepted).
+        cb.record_alive(&cb_key, probe);
+        tracing::warn!(url = %url, "upstream refused NORA the tag list of a repository (403)");
+        return Err(ProxyError::CredentialsRefused);
+    }
+
     if !response.status().is_success() {
         let status = response.status().as_u16();
         tracing::warn!(status = %response.status(), url = %url, "Upstream returned non-success status for the tag list");
@@ -4936,14 +4962,16 @@ async fn fetch_tags_page(
         return Err(ProxyError::Upstream(status));
     }
 
-    let next = match response
+    // RFC 8288 §B.1: a `Link` may come in several header fields; the next page is named in any.
+    let next_target = response
         .headers()
-        .get(reqwest::header::LINK)
-        .and_then(|v| v.to_str().ok())
-        .and_then(next_link_target)
-    {
+        .get_all(reqwest::header::LINK)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|link| next_link_target(link).map(String::from));
+    let next = match next_target {
         None => None,
-        Some(target) => match same_origin_url(url, target) {
+        Some(target) => match same_origin_url(url, &target) {
             Some(next) => Some(next),
             None => {
                 tracing::warn!(upstream = %upstream_url, "upstream's next tag page leaves its origin, refusing the list");
@@ -4994,9 +5022,15 @@ fn is_listable_tag(tag: &str) -> bool {
 fn next_link_target(link: &str) -> Option<&str> {
     link.split(',').find_map(|entry| {
         let (target, params) = entry.trim().strip_prefix('<')?.split_once('>')?;
+        // `rel` is a list of relation types separated by spaces, compared without case.
         let is_next = params.split(';').any(|p| {
             let p = p.trim();
-            p.eq_ignore_ascii_case("rel=\"next\"") || p.eq_ignore_ascii_case("rel=next")
+            p.get(..4)
+                .is_some_and(|key| key.eq_ignore_ascii_case("rel="))
+                && p[4..]
+                    .trim_matches('"')
+                    .split_whitespace()
+                    .any(|rel| rel.eq_ignore_ascii_case("next"))
         });
         is_next.then_some(target)
     })
@@ -6967,6 +7001,290 @@ mod integration_tests {
         let resp = send(&ctx.app, Method::GET, "/v2/alpine/tags/list", Body::empty()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(listed_tags(resp).await, vec!["3.19", "3.20"]);
+    }
+
+    /// A name with a local push is hosted: its listing is answered from local storage, so an
+    /// outage of the upstream cannot turn it into a 502, and the upstream's tags are not mixed in.
+    #[tokio::test]
+    async fn tags_list_of_a_hosted_name_is_answered_from_local_storage_only() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.serve_stale = false;
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+        // `put_manifest` stores a push under the bare key, without the upstream namespace.
+        ctx.state
+            .storage
+            .put("docker/team/app/manifests/v1.json", b"{}")
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/app/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["v1"]);
+        assert!(
+            hub.received_requests().await.unwrap().is_empty(),
+            "a hosted name was asked of the upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_list_of_a_hosted_name_does_not_merge_the_upstreams_tags() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "team/app", "tags": ["x9"]
+            })))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+        ctx.state
+            .storage
+            .put("docker/team/app/manifests/v1.json", b"{}")
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/app/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(listed_tags(resp).await, vec!["v1"]);
+        assert!(hub.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tags_list_refused_with_403_is_a_refusal_not_an_empty_list() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/private/tags/list",
+            Body::empty(),
+        )
+        .await;
+        // The registry said NORA may not list this repository: that is not "no tags".
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_bytes(resp).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("DENIED"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// The upstream's own tags are not the whole list while its official ones cannot be read:
+    /// the listing is an outage, not the partial answer `foo:edge` alone would be.
+    #[tokio::test]
+    async fn tags_list_of_a_short_name_is_an_outage_when_its_official_tags_fail() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/foo/tags/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "foo", "tags": ["edge"]
+            })))
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/foo/tags/list"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(&ctx.app, Method::GET, "/v2/foo/tags/list", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn tags_list_of_a_short_name_also_lists_its_official_tags() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // `foo:edge` is the upstream's own repository; `library/foo:stable` is the official one,
+        // which `/v2/foo/manifests/stable` resolves through the fallback.
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/foo/tags/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "foo", "tags": ["edge"]
+            })))
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/foo/tags/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "library/foo", "tags": ["stable"]
+            })))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(&ctx.app, Method::GET, "/v2/foo/tags/list", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["edge", "stable"]);
+    }
+
+    #[tokio::test]
+    async fn tags_list_follows_a_next_link_given_in_a_second_link_field() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .and(query_param_is_missing("last"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header(
+                        "Link",
+                        "</v2/library/alpine/tags/list?last=3.18>; rel=\"next\"",
+                    )
+                    .set_body_json(serde_json::json!({"name": "library/alpine", "tags": ["3.18"]})),
+            )
+            .mount(&hub)
+            .await;
+        // The second page names its previous page and then its next one, each in its own field.
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .and(query_param("last", "3.18"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header(
+                        "Link",
+                        "</v2/library/alpine/tags/list?last=3.17>; rel=\"prev\"",
+                    )
+                    .append_header(
+                        "Link",
+                        "</v2/library/alpine/tags/list?last=3.19>; rel=\"next\"",
+                    )
+                    .set_body_json(serde_json::json!({"name": "library/alpine", "tags": ["3.19"]})),
+            )
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .and(query_param("last", "3.19"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "library/alpine", "tags": ["3.20"]})),
+            )
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["3.18", "3.19", "3.20"]);
+    }
+
+    /// A persistent 401 after a token is "absent" for a listing too (the accepted rule for a
+    /// persistent 401, measured on Docker Hub: a missing repository and one without access answer
+    /// the same way), so the listing answers as an empty repository, not an outage. Pinned here
+    /// so that a change of that rule is a change of this test.
+    #[tokio::test]
+    async fn tags_list_answered_401_after_a_token_is_absent_not_an_outage() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        let realm = format!("{}/token", hub.uri());
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "t"})),
+            )
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/team/gone/tags/list"))
+            .respond_with(ResponseTemplate::new(401).append_header(
+                "WWW-Authenticate",
+                format!(
+                    "Bearer realm=\"{realm}\",service=\"hub\",scope=\"repository:team/gone:pull\""
+                ),
+            ))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/gone/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(listed_tags(resp).await.is_empty());
+    }
+
+    #[test]
+    fn next_link_target_reads_a_rel_list_and_skips_other_relations() {
+        assert_eq!(
+            super::next_link_target("</a?last=1>; rel=\"prev next\""),
+            Some("/a?last=1")
+        );
+        assert_eq!(
+            super::next_link_target("</a>; rel=\"prev\", </b>; rel=\"NEXT\""),
+            Some("/b")
+        );
+        assert_eq!(super::next_link_target("</a>; rel=\"prev\""), None);
     }
 
     /// #1195: a name behind a registry host no upstream serves is not answered by another
