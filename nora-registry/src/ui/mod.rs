@@ -3035,6 +3035,15 @@ mod registry_pages {
             assert_eq!(status, StatusCode::OK, "{uri}");
             assert!(detail.contains(&digest), "{uri} names the cached file");
             assert!(!detail.contains("stray"), "{uri} lists cached files only");
+            // The rows are cached files named by digest, not versions.
+            assert!(
+                detail.contains(">Digest</th>"),
+                "{uri} names the column by what it holds"
+            );
+            assert!(
+                !detail.contains(">Versions</th>") && !detail.contains(">Versions ("),
+                "{uri} does not call the files versions"
+            );
             assert!(
                 detail.contains("HF_ENDPOINT="),
                 "{uri} shows how to download"

@@ -1500,7 +1500,7 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         install_label = _t.install_command,
         cmd = html_escape(&install_cmd),
         metadata_panel = metadata_panel,
-        versions_label = if rt == Some(RegistryType::Raw) {
+        versions_label = if matches!(rt, Some(RegistryType::Raw | RegistryType::HuggingFace)) {
             _t.files
         } else if matches!(rt, Some(RegistryType::Rpm | RegistryType::Deb)) {
             _t.items
@@ -1512,6 +1512,9 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         prerelease = prerelease_toggle,
         col_version = if rt == Some(RegistryType::Raw) {
             _t.filename
+        } else if rt == Some(RegistryType::HuggingFace) {
+            // Hugging Face files are cached by content, named by their digest.
+            _t.digest
         } else if matches!(rt, Some(RegistryType::Rpm | RegistryType::Deb)) {
             _t.items
         } else {
