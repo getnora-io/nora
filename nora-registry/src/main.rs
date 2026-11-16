@@ -2086,7 +2086,7 @@ async fn main() {
 
     // Initialize logging (JSON for server, plain for CLI commands)
     let is_server = matches!(cli.command, None | Some(Commands::Serve));
-    let _log_guard = init_logging(is_server);
+    let (_log_guard, log_known) = init_logging(is_server);
 
     // Healthcheck is a client-side probe (Docker HEALTHCHECK) — handle it before
     // loading the full server config, which it does not need and which can abort
@@ -2101,10 +2101,20 @@ async fn main() {
             // A clean, non-retried stop: the units list EXIT_CONFIG in
             // RestartPreventExitStatus= (#1025).
             error!(error = %e, "Cannot start with this configuration");
-            eprintln!("nora: {e}");
+            // stderr is not written through the log filter: the same filter, by hand.
+            eprintln!("nora: {}", log_known.redact_text(&e.to_string()));
             std::process::exit(config::EXIT_CONFIG);
         }
     };
+    // The userinfo of a configured upstream that the log filter cannot find by reading a URL
+    // (a password with a space, an address the parser cannot read) is masked wherever it
+    // appears from here on. SIGHUP reloads curation only, so the upstreams do not change.
+    log_known.mask_also(
+        config
+            .every_upstream_url()
+            .iter()
+            .flat_map(|url| url_userinfo::texts_the_filter_misses(url)),
+    );
 
     // Initialize storage based on mode
     let storage = match config.storage.mode {
@@ -2919,7 +2929,15 @@ mod explain_spec_tests {
 /// using a non-blocking writer. The file layer uses the same format and level
 /// filter as stdout. Returns a guard that must be held for the process lifetime
 /// to ensure the non-blocking writer flushes on shutdown.
-fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+/// The log layers, and the set of texts they also mask ([`log_redact::KnownTexts`]), filled
+/// once the configuration is read.
+fn init_logging(
+    json_format: bool,
+) -> (
+    Option<tracing_appender::non_blocking::WorkerGuard>,
+    log_redact::KnownTexts,
+) {
+    let known = log_redact::KnownTexts::default();
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Optional file output via NORA_LOG_FILE
@@ -2935,7 +2953,10 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
             let file_filter =
                 EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
             (
-                Some(log_redact::layer(json_format, non_blocking).with_filter(file_filter)),
+                Some(
+                    log_redact::layer(json_format, non_blocking, known.clone())
+                        .with_filter(file_filter),
+                ),
                 Some(guard),
             )
         }
@@ -2943,10 +2964,14 @@ fn init_logging(json_format: bool) -> Option<tracing_appender::non_blocking::Wor
     };
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(log_redact::layer(json_format, std::io::stdout))
+        .with(log_redact::layer(
+            json_format,
+            std::io::stdout,
+            known.clone(),
+        ))
         .with(file_layer)
         .init();
-    guard
+    (guard, known)
 }
 
 /// Open a log file for non-blocking writes. Creates parent directories as needed.

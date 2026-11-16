@@ -101,14 +101,8 @@ impl DockerUpstream {
     /// name that reaches NORA cannot carry one, `:` is refused before routing. Each of
     /// [`DOCKER_HUB_HOSTS`] names an upstream that any other of them names.
     pub fn serves_host(&self, host: &str) -> bool {
-        let url_host = self
-            .url
-            .strip_prefix("https://")
-            .or_else(|| self.url.strip_prefix("http://"))
-            .unwrap_or(&self.url)
-            .split(['/', ':'])
-            .next()
-            .unwrap_or_default();
+        let url_host = crate::url_userinfo::written_host(&self.url).unwrap_or_default();
+        let url_host = url_host.as_str();
         let named = |h: &str| {
             h.eq_ignore_ascii_case(host) || (is_docker_hub_host(h) && is_docker_hub_host(host))
         };
@@ -180,18 +174,13 @@ fn internal_pattern_meets_mask(pattern: &str, mask: &str) -> bool {
     }
 }
 
-/// Derive a storage namespace from a Docker registry URL.
+/// Derive a storage namespace from a Docker registry URL: its host as written, read after the
+/// parser takes the userinfo out ([`crate::url_userinfo::written_host`]), so a user is never a
+/// namespace (a storage key, a name `/api/ui/docker/list` shows). A URL without userinfo gives
+/// the namespace it always gave; one the parser cannot read but with an `@` gives `default`.
 pub fn extract_docker_namespace(url: &str) -> String {
-    let host = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .unwrap_or(url)
-        .split('/')
-        .next()
-        .unwrap_or("default")
-        .split(':')
-        .next()
-        .unwrap_or("default");
+    let host = crate::url_userinfo::written_host(url).unwrap_or_else(|| "default".to_string());
+    let host = host.as_str();
     let host = host.strip_prefix("registry-1.").unwrap_or(host);
     let host = host.strip_prefix("registry.").unwrap_or(host);
     host.to_string()

@@ -248,3 +248,44 @@ fn a_signing_key_nora_will_not_sign_with_stops_with_ex_config() {
     // The refusal leaves the operator's file as it was.
     assert_eq!(std::fs::read_to_string(&ecdsa_path).unwrap(), ecdsa);
 }
+
+/// A configuration refused for an npm upstream address stops with EX_CONFIG, and stderr, which
+/// is not written through the log filter, names the entry without the address's userinfo: in
+/// every spelling the validator refuses, one the parser cannot read included.
+#[test]
+fn a_refused_upstream_address_is_reported_without_its_userinfo() {
+    for url in [
+        "HTTPS:/ci-bot:s3cr3t@mirror.example/npm",
+        "https:/ci-bot:s3cr3t@mirror.example/npm",
+        "https:ci-bot:s3cr3t@mirror.example/npm",
+        "HTTPS:/ci-bot:pa ss@mirror.example/npm",
+        "ci-bot:s3cr3t@mirror.example/npm",
+    ] {
+        refused_without_userinfo(&format!("[npm]\nproxies = [\"{url}\"]\n"), "npm.proxies[0]");
+    }
+    // A file that is not TOML: the parser's error quotes the line, address and all.
+    refused_without_userinfo(
+        "[npm]\nproxy = \"https://ci-bot:s3cr3t@mirror.example/npm\" oops\n",
+        "invalid TOML",
+    );
+}
+
+/// `nora serve` with `config` stops with EX_CONFIG, says `why` on stderr, and shows no userinfo.
+fn refused_without_userinfo(config_text: &str, why: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, config_text).unwrap();
+    match serve(&[("NORA_CONFIG_PATH", config.to_str().unwrap())]) {
+        Outcome::Exited(code, stderr) => {
+            assert_eq!(code, Some(78), "{config_text}: {stderr}");
+            assert!(stderr.contains(why), "{config_text}: {stderr}");
+            for secret in ["ci-bot", "s3cr3t", "pa ss", "pa%20ss"] {
+                assert!(
+                    !stderr.contains(secret),
+                    "{config_text}: stderr shows {secret}: {stderr}"
+                );
+            }
+        }
+        Outcome::Serving => panic!("{config_text}: served with a configuration it should refuse"),
+    }
+}

@@ -11,12 +11,77 @@
 use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
 use std::io;
+use std::sync::Arc;
 use tracing_subscriber::fmt::MakeWriter;
 use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::Layer;
 
 /// The text that replaces a URL's userinfo.
 const MASK: &[u8] = b"***";
+
+/// Userinfo the filter cannot find by reading a URL, masked wherever it appears: one set per
+/// process, made with its log layers ([`layer`]) and filled from the configured upstreams once
+/// the configuration is read ([`KnownTexts::mask_also`]).
+#[derive(Clone, Default)]
+pub(crate) struct KnownTexts(Arc<parking_lot::RwLock<Vec<Vec<u8>>>>);
+
+impl KnownTexts {
+    /// Mask `texts` too, wherever they appear in a line, from now on: the userinfo of
+    /// configured upstreams that [`redact_userinfo`] cannot find
+    /// ([`crate::url_userinfo::texts_the_filter_misses`]). Adds to what was set before.
+    pub(crate) fn mask_also(&self, texts: impl IntoIterator<Item = String>) {
+        let mut known = self.0.write();
+        known.extend(
+            texts
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .map(String::into_bytes),
+        );
+        // Longest first, so a text that holds another is masked whole.
+        known.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        known.dedup();
+    }
+
+    /// `text` as a line is written: the known texts masked, then the userinfo of every URL
+    /// ([`redact_userinfo`]).
+    pub(crate) fn redact_line<'a>(&self, text: &'a [u8]) -> Cow<'a, [u8]> {
+        let known = self.0.read();
+        let mut current: Cow<'a, [u8]> = Cow::Borrowed(text);
+        for secret in known.iter() {
+            if find(&current, secret).is_some() {
+                current = Cow::Owned(replace_all(&current, secret, MASK));
+            }
+        }
+        match current {
+            Cow::Borrowed(text) => redact_userinfo(text),
+            Cow::Owned(owned) => Cow::Owned(redact_userinfo(&owned).into_owned()),
+        }
+    }
+
+    /// `text` (an error or a message written outside the log) as a log line is written.
+    pub(crate) fn redact_text<'a>(&self, text: &'a str) -> Cow<'a, str> {
+        match self.redact_line(text.as_bytes()) {
+            Cow::Borrowed(_) => Cow::Borrowed(text),
+            Cow::Owned(bytes) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+        }
+    }
+}
+
+fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+fn replace_all(text: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut i = 0;
+    while let Some(at) = find(&text[i..], from) {
+        out.extend_from_slice(&text[i..i + at]);
+        out.extend_from_slice(to);
+        i += at + from.len();
+    }
+    out.extend_from_slice(&text[i..]);
+    out
+}
 
 /// Replace the userinfo of every URL in `text` with [`MASK`].
 ///
@@ -129,12 +194,16 @@ fn authority_start(text: &[u8], colon: usize) -> Option<usize> {
 /// A `fmt` layer writing `writer`'s events through [`RedactUserinfo`]: JSON with each event's
 /// target, or text without. The one way the server builds a log layer, stdout and file alike;
 /// the redacting writer cannot be made or unwrapped outside this module.
-pub(crate) fn layer<S, M>(json: bool, writer: M) -> Box<dyn Layer<S> + Send + Sync>
+pub(crate) fn layer<S, M>(
+    json: bool,
+    writer: M,
+    known: KnownTexts,
+) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> LookupSpan<'a>,
     M: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
-    let writer = RedactUserinfo(writer);
+    let writer = RedactUserinfo(writer, known);
     if json {
         tracing_subscriber::fmt::layer()
             .json()
@@ -149,29 +218,29 @@ where
     }
 }
 
-/// A [`MakeWriter`] whose writers pass every event through [`redact_userinfo`].
-#[derive(Clone, Copy)]
-struct RedactUserinfo<M>(M);
+/// A [`MakeWriter`] whose writers pass every event through [`KnownTexts::redact_line`].
+#[derive(Clone)]
+struct RedactUserinfo<M>(M, KnownTexts);
 
 impl<'a, M: MakeWriter<'a>> MakeWriter<'a> for RedactUserinfo<M> {
     type Writer = RedactingWriter<M::Writer>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        RedactingWriter(self.0.make_writer())
+        RedactingWriter(self.0.make_writer(), self.1.clone())
     }
 
     fn make_writer_for(&'a self, meta: &tracing::Metadata<'_>) -> Self::Writer {
-        RedactingWriter(self.0.make_writer_for(meta))
+        RedactingWriter(self.0.make_writer_for(meta), self.1.clone())
     }
 }
 
 /// Writes the redacted form of each buffer in full, so the caller's `write_all` never
 /// splits an event (and with it a URL) across two calls.
-struct RedactingWriter<W>(W);
+struct RedactingWriter<W>(W, KnownTexts);
 
 impl<W: io::Write> io::Write for RedactingWriter<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.0.write_all(&redact_userinfo(buf))?;
+        self.0.write_all(&self.1.redact_line(buf))?;
         Ok(buf.len())
     }
 
@@ -215,6 +284,16 @@ mod tests {
     #[test]
     fn every_form_the_client_reads_is_masked_in_a_line() {
         use crate::url_userinfo::check::{holds_no_secret, same_target};
+        // As the server does once its configuration is read.
+        let known = KnownTexts::default();
+        known.mask_also(
+            crate::url_userinfo::FORMS
+                .iter()
+                .flat_map(|(form, _)| crate::url_userinfo::texts_the_filter_misses(form)),
+        );
+        let redact = |text: &str| {
+            String::from_utf8(known.redact_line(text.as_bytes()).into_owned()).unwrap()
+        };
         for (form, secrets) in crate::url_userinfo::FORMS {
             for line in [
                 form.to_string(),
@@ -223,6 +302,8 @@ mod tests {
                 format!("\x1b[2m=\x1b[0m{form}"),
                 format!("upstream maven:{form} temporarily unavailable"),
                 format!("error sending request for url ({form})"),
+                // A JSON log line escapes the URL: `"` and `\` are written with a `\`.
+                format!(r#"{{"url":{}}}"#, serde_json::to_string(form).unwrap()),
             ] {
                 holds_no_secret(&redact(&line), form, secrets);
             }
@@ -252,6 +333,35 @@ mod tests {
         for unreadable in ["https://ci-bot:pa/ss@mirror.example", "ci-bot:s3cr3t@host"] {
             assert_eq!(RecordedUrl::new(unreadable).as_str(), "***", "{unreadable}");
         }
+    }
+
+    /// An upstream configured as an address the parser cannot read but with an `@` is masked
+    /// whole in every line that holds it, a request URL built on it included: a handler logs
+    /// the URL it asked as it is (`url = %url`), and the filter finds no URL in it.
+    #[test]
+    fn an_unreadable_configured_address_is_masked_whole() {
+        use crate::url_userinfo::check::holds_no_secret;
+        // Its own text: the known texts are shared by the tests of this process.
+        let configured = "robot:t0ken-unread@other.example";
+        let known = KnownTexts::default();
+        known.mask_also(crate::url_userinfo::texts_the_filter_misses(configured));
+        for line in [
+            format!("ERROR Failed to send request to upstream url={configured}/v2/library/a"),
+            format!(r#"{{"fields":{{"url":"{configured}/v2/x"}}}}"#),
+        ] {
+            let out = String::from_utf8(known.redact_line(line.as_bytes()).into_owned()).unwrap();
+            holds_no_secret(&out, configured, &["robot", "t0ken-unread"]);
+            assert!(out.contains("***"), "{out}");
+        }
+    }
+
+    /// A known text that holds another is masked whole, not around the one it holds.
+    #[test]
+    fn a_known_text_holding_another_is_masked_whole() {
+        let known = KnownTexts::default();
+        known.mask_also(["q7 u".to_string(), "q7 u v".to_string()]);
+        let out = known.redact_line(b"user=q7 u v end");
+        assert_eq!(String::from_utf8(out.into_owned()).unwrap(), "user=*** end");
     }
 
     #[test]
@@ -313,7 +423,11 @@ mod tests {
         use tracing_subscriber::prelude::*;
         for json in [true, false] {
             let sink = Captured::default();
-            emit(tracing_subscriber::registry().with(layer(json, sink.clone())));
+            emit(tracing_subscriber::registry().with(layer(
+                json,
+                sink.clone(),
+                KnownTexts::default(),
+            )));
             assert_clean(&sink);
         }
     }

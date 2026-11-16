@@ -61,16 +61,84 @@ pub(crate) fn without_userinfo(url: &str) -> Option<Cow<'_, str>> {
     }
 }
 
-/// `url` for a record or a log line: as written, its userinfo replaced by [`MASK`]
+/// `url` for a record, a log line or an error: its userinfo replaced by [`MASK`]
 /// (`https://***@host/x`), or [`MASK`] alone when it is not an address but has an `@`.
+///
+/// What is userinfo is the parser's call. The written spelling is kept when the log filter's
+/// mask of it reads, to the parser, as the same address with [`MASK`] for its only user;
+/// otherwise (a password with a space, `"`, `<` or `>`, which the parser takes and the filter
+/// stops at) the parser's own spelling is written, with [`MASK`] for the user.
 pub(crate) fn masked(url: &str) -> Cow<'_, str> {
     match read(url) {
+        Reading::Clean => Cow::Borrowed(url),
         Reading::Unreadable if url.contains('@') => Cow::Borrowed(MASK),
-        _ => match crate::log_redact::redact_userinfo(url.as_bytes()) {
-            Cow::Borrowed(_) => Cow::Borrowed(url),
-            // Only ASCII between ASCII delimiters is replaced, so the text stays UTF-8.
-            Cow::Owned(bytes) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
-        },
+        Reading::Unreadable => Cow::Borrowed(url),
+        Reading::WithUserinfo(mut parsed) => {
+            if let Cow::Owned(bytes) = crate::log_redact::redact_userinfo(url.as_bytes()) {
+                if let Ok(text) = String::from_utf8(bytes) {
+                    if masks_only_userinfo(&text, &parsed) {
+                        return Cow::Owned(text);
+                    }
+                }
+            }
+            let _ = parsed.set_username(MASK);
+            let _ = parsed.set_password(None);
+            Cow::Owned(parsed.to_string())
+        }
+    }
+}
+
+/// Whether `text` reads as `parsed` with [`MASK`] for its user and no password.
+fn masks_only_userinfo(text: &str, parsed: &reqwest::Url) -> bool {
+    reqwest::Url::parse(text).is_ok_and(|t| {
+        t.username() == MASK
+            && t.password().is_none()
+            && t.scheme() == parsed.scheme()
+            && t.host() == parsed.host()
+            && t.port() == parsed.port()
+            && t.path() == parsed.path()
+            && t.query() == parsed.query()
+            && t.fragment() == parsed.fragment()
+    })
+}
+
+/// The host of `url` as written, read after its userinfo is taken out by the parser: the text
+/// between `http(s)://` and the first `/` or `:`. An address without userinfo gives the same
+/// host it always gave, so a Docker storage namespace derived from it does not move. `None`
+/// when it is not an address but has an `@`.
+pub(crate) fn written_host(url: &str) -> Option<String> {
+    let clean = without_userinfo(url)?;
+    let rest = clean
+        .strip_prefix("https://")
+        .or_else(|| clean.strip_prefix("http://"))
+        .unwrap_or(&clean);
+    rest.split(['/', ':']).next().map(str::to_string)
+}
+
+/// The texts of `url`'s userinfo that the log filter cannot find by reading a URL, for it to
+/// mask wherever they appear: the whole text of an address the parser cannot read but that
+/// has an `@`; a user or password holding a space, `"`, `<` or `>` (the parser takes them
+/// and encodes them, the filter stops at them), as written and as a JSON string holds it.
+pub(crate) fn texts_the_filter_misses(url: &str) -> Vec<String> {
+    match read(url) {
+        Reading::Unreadable if url.contains('@') => vec![url.to_string()],
+        Reading::WithUserinfo(parsed) => [parsed.username(), parsed.password().unwrap_or("")]
+            .into_iter()
+            .map(|part| {
+                percent_encoding::percent_decode_str(part)
+                    .decode_utf8_lossy()
+                    .into_owned()
+            })
+            .filter(|part| {
+                part.bytes()
+                    .any(|b| matches!(b, b'"' | b'<' | b'>') || b.is_ascii_whitespace())
+            })
+            .flat_map(|part| {
+                let json = part.replace('\\', "\\\\").replace('"', "\\\"");
+                [part, json]
+            })
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -140,6 +208,22 @@ pub(crate) const FORMS: &[(&str, &[&str])] = &[
     (
         "http://ci-bot:s3cr3t@127.0.0.1:1/repo?ref=a@b#c@d",
         &["ci-bot", "s3cr3t"],
+    ),
+    (
+        "https://ci-bot:pa ss@mirror.example/x",
+        &["ci-bot", "pa ss", "pa%20ss"],
+    ),
+    (
+        "https://ci-bot:pa\"ss@mirror.example/x",
+        &["ci-bot", "pa\"ss", "pa\\\"ss", "pa%22ss"],
+    ),
+    (
+        "https://ci-bot:pa<s>s@mirror.example/x",
+        &["ci-bot", "pa<s>s", "pa%3Cs%3Es"],
+    ),
+    (
+        "https://ci bot:s3cr3t@mirror.example/x",
+        &["ci bot", "ci%20bot", "s3cr3t"],
     ),
 ];
 
@@ -265,16 +349,22 @@ mod tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod one_judge_tests {
-    //! Userinfo is judged in one place. A new output that cuts it by hand, or reads it off a
-    //! parsed URL, is how each leak of the family came in (the breaker key, the log filter, the
-    //! proxy log line), so every place in the server's code that does either is listed here,
-    //! by file and function, with why it may: a new one fails until it is.
+    //! Userinfo is judged in one place. A new output that cuts it by hand, reads it off a parsed
+    //! URL, or takes a host from an address by hand (and takes the user for it) is how each
+    //! leak of the family came in: the breaker key, the log filter, the proxy log line, the
+    //! Docker namespace, the leak detector's host. Every place in the server's code that does
+    //! one of these is listed here, by file and function, with why it may: a new one fails
+    //! until it is.
     use std::collections::BTreeSet;
     use std::path::Path;
 
-    /// Text that cuts userinfo by hand or reads it off a parsed URL.
-    const HAND_CUTS: [&str; 9] = [
+    /// Text that cuts userinfo by hand, reads it off a parsed URL, or takes a host by hand.
+    const HAND_CUTS: [&str; 13] = [
         "find(\"://\")",
+        "split_once(\"://\")",
+        "split(\"://\")",
+        "strip_prefix(\"https://\")",
+        "strip_prefix(\"http://\")",
         "find('@')",
         "split_once('@')",
         "split('@')",
@@ -291,6 +381,41 @@ mod one_judge_tests {
             "url_userinfo.rs",
             "read",
             "the one judge: the client parser",
+        ),
+        (
+            "url_userinfo.rs",
+            "masked",
+            "the one judge: the client parser",
+        ),
+        (
+            "url_userinfo.rs",
+            "masks_only_userinfo",
+            "the one judge: the client parser",
+        ),
+        (
+            "url_userinfo.rs",
+            "written_host",
+            "the one judge: a host read after the parser took the userinfo out",
+        ),
+        (
+            "url_userinfo.rs",
+            "texts_the_filter_misses",
+            "the one judge: the client parser",
+        ),
+        (
+            "config/server.rs",
+            "public_host",
+            "NORA's own public URL, not an upstream",
+        ),
+        (
+            "npm_links.rs",
+            "upstream_url_forms",
+            "the http and https spellings an upstream link may take, searched for, not shown",
+        ),
+        (
+            "upstream_rewrite.rs",
+            "url_path_component",
+            "the path after the authority, searched for, not shown",
         ),
         (
             "url_userinfo.rs",
@@ -437,10 +562,12 @@ mod one_judge_tests {
             .iter()
             .map(|(file, function, _)| (file.to_string(), function.to_string()))
             .collect();
-        assert_eq!(
-            found, allowed,
-            "a place that cuts userinfo by hand: show the address through crate::url_userinfo, \
-             or list the place with why"
+        let new: Vec<_> = found.difference(&allowed).collect();
+        let stale: Vec<_> = allowed.difference(&found).collect();
+        assert!(
+            new.is_empty() && stale.is_empty(),
+            "places that cut userinfo or read a host by hand, not listed: {new:?}; listed, gone: \
+             {stale:?}. Show the address through crate::url_userinfo, or list the place with why"
         );
     }
 
@@ -458,5 +585,86 @@ mod one_judge_tests {
         let tests =
             "#[cfg(test)]\nmod tests {\n    fn t() { \"a@b\".find('@'); }\n}\n// url.find('@')\n";
         assert!(hand_cuts("x.rs", tests).is_empty());
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod hosts_tests {
+    //! A host derived from an address is the host the client sends to, never its user.
+    use super::check::holds_no_secret;
+    use super::FORMS;
+    use crate::config::{extract_docker_namespace, Config, DockerUpstream};
+
+    /// The host the client sends `form` to.
+    fn sent_host(form: &str) -> String {
+        let sent = reqwest::Client::new().get(form).build().unwrap();
+        sent.url().host_str().unwrap().to_string()
+    }
+
+    /// A Docker storage namespace is a storage key and a name `/api/ui/docker/list` shows,
+    /// anonymously under `anonymous_read`: for every spelling it is the host, not the user.
+    #[test]
+    fn a_docker_namespace_is_the_host_never_the_user() {
+        assert_eq!(
+            extract_docker_namespace("https://robot-token:x@mirror.example"),
+            "mirror.example"
+        );
+        for (form, secrets) in FORMS {
+            let namespace = extract_docker_namespace(form);
+            holds_no_secret(&namespace, form, secrets);
+            // An IPv6 host has always given `[2001`: kept, so no namespace moves.
+            if !form.contains('[') {
+                assert_eq!(namespace, sent_host(form), "{form}");
+            }
+            let upstream = DockerUpstream {
+                url: form.to_string(),
+                auth: None,
+                namespace: None,
+                prefix: None,
+                namespaces: Vec::new(),
+            };
+            assert!(
+                !upstream.serves_host("ci-bot"),
+                "{form}: the user is not a host"
+            );
+            assert!(upstream.serves_host(&namespace), "{form}");
+        }
+        // Without userinfo, the namespace it always had: the cache stays where it is.
+        for (url, namespace) in [
+            ("https://registry-1.docker.io", "docker.io"),
+            ("https://ghcr.io/", "ghcr.io"),
+            ("http://Mirror.Example:5000/v2", "Mirror.Example"),
+            ("https://registry.gitlab.com", "gitlab.com"),
+        ] {
+            assert_eq!(extract_docker_namespace(url), namespace, "{url}");
+        }
+    }
+
+    /// The leak detector looks for the host in served bodies and logs it when found: for
+    /// every spelling it is the host, not the user.
+    #[test]
+    fn a_leak_detector_host_is_the_host_never_the_user() {
+        for (form, secrets) in FORMS {
+            let mut config = Config::default();
+            config.cargo.proxy = Some(form.to_string());
+            let hosts = config.upstream_hostnames();
+            let cargo: Vec<&str> = hosts
+                .iter()
+                .filter(|(registry, _)| registry == "cargo")
+                .map(|(_, host)| host.as_str())
+                .collect();
+            // An IPv6 host has always given `[2001`, kept as it was; the loopback is not looked
+            // for.
+            let host = sent_host(form);
+            if host == "127.0.0.1" {
+                assert!(cargo.is_empty(), "{form}");
+            } else if !form.contains('[') {
+                assert_eq!(cargo, [host.as_str()], "{form}");
+            }
+            for (_, host) in &hosts {
+                holds_no_secret(host, form, secrets);
+            }
+        }
     }
 }

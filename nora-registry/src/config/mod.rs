@@ -936,6 +936,78 @@ impl Config {
         }
     }
 
+    /// The upstream addresses configured for `reg`, as written: every one its proxy asks.
+    /// The match is exhaustive, so a new format has to say here where its upstreams are.
+    pub fn upstream_urls_of(&self, reg: RegistryType) -> Vec<String> {
+        match reg {
+            RegistryType::Docker => self
+                .docker
+                .upstreams
+                .iter()
+                .map(|u| u.url.clone())
+                .collect(),
+            RegistryType::Maven => self
+                .maven
+                .proxies
+                .iter()
+                .map(|p| p.url().to_string())
+                .collect(),
+            RegistryType::Npm => self
+                .npm
+                .upstream_urls()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            RegistryType::Cargo => self.cargo.proxy.clone().into_iter().collect(),
+            RegistryType::PyPI => self
+                .pypi
+                .upstreams()
+                .iter()
+                .map(|u| u.url().to_string())
+                .collect(),
+            RegistryType::Go => self.go.proxy.clone().into_iter().collect(),
+            RegistryType::Raw => vec![],
+            RegistryType::Gems => self.gems.proxy.clone().into_iter().collect(),
+            RegistryType::Terraform => self.terraform.proxy.clone().into_iter().collect(),
+            RegistryType::Ansible => self.ansible.proxy.clone().into_iter().collect(),
+            RegistryType::Nuget => self.nuget.proxy.clone().into_iter().collect(),
+            RegistryType::PubDart => self.pub_dart.proxy.clone().into_iter().collect(),
+            RegistryType::Conan => self.conan.proxy.clone().into_iter().collect(),
+            RegistryType::Rpm => self
+                .rpm
+                .proxies
+                .values()
+                .map(|p| p.url().to_string())
+                .collect(),
+            RegistryType::Deb => self
+                .deb
+                .proxies
+                .values()
+                .map(|p| p.url().to_string())
+                .collect(),
+            RegistryType::Cpan => self.cpan.proxy.clone().into_iter().collect(),
+            RegistryType::Composer => self
+                .composer
+                .upstreams()
+                .iter()
+                .map(|u| u.url().to_string())
+                .collect(),
+            RegistryType::HuggingFace => self.hf.proxy.clone().into_iter().collect(),
+        }
+    }
+
+    /// Every upstream address NORA may ask, as written: each format's
+    /// ([`Self::upstream_urls_of`]) and the NuGet search and autocomplete services.
+    pub fn every_upstream_url(&self) -> Vec<String> {
+        let mut urls: Vec<String> = RegistryType::all()
+            .iter()
+            .flat_map(|reg| self.upstream_urls_of(*reg))
+            .collect();
+        urls.push(self.nuget.search_service.clone());
+        urls.push(self.nuget.autocomplete.clone());
+        urls
+    }
+
     /// Collect all configured upstream hostnames for leak detection (#386).
     ///
     /// Returns `(registry_name, hostname)` pairs extracted from proxy URLs.
@@ -943,13 +1015,10 @@ impl Config {
     pub fn upstream_hostnames(&self) -> Vec<(String, String)> {
         let mut result = Vec::new();
 
+        // The host as written, read after the parser takes the userinfo out: a user is not a
+        // host to look for in served bodies, and must not be logged as one.
         let extract_host = |url: &str| -> Option<String> {
-            let without_scheme = url
-                .strip_prefix("https://")
-                .or_else(|| url.strip_prefix("http://"))
-                .unwrap_or(url);
-            let host = without_scheme.split('/').next()?;
-            let host = host.split(':').next()?;
+            let host = crate::url_userinfo::written_host(url)?;
             if host.is_empty() || host == "localhost" || host == "127.0.0.1" {
                 return None;
             }
