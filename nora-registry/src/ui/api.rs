@@ -213,19 +213,11 @@ pub async fn api_dashboard(
     Json(build_dashboard_response(&state, authenticated).await)
 }
 
-/// The upstream address `url` as the dashboard shows it: read by the parser the proxy client
-/// sends with (`reqwest::Url`), so every spelling it accepts (`https:///u:p@host`, a
-/// backslash for a slash) is judged as it is sent, then shown without its credentials. `None`
-/// for an address that is not an `http(s)` URL with a host: it is not shown at all, since
-/// whatever it carries cannot be told apart.
+/// The upstream address `url` as the dashboard shows it: an `http(s)` address without its
+/// userinfo, judged by the client's parser ([`crate::url_userinfo::for_dashboard`]); `None`
+/// for one that is not shown.
 fn shown_address(url: &str) -> Option<String> {
-    let mut parsed = reqwest::Url::parse(url).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return None;
-    }
-    parsed.set_username("").ok()?;
-    parsed.set_password(None).ok()?;
-    Some(parsed.to_string())
+    crate::url_userinfo::for_dashboard(url).map(std::borrow::Cow::into_owned)
 }
 
 /// Build the dashboard JSON payload.
@@ -261,68 +253,7 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
             size_bytes: size,
         });
 
-        let configured: Vec<String> = match reg {
-            RegistryType::Docker => state
-                .config
-                .docker
-                .upstreams
-                .iter()
-                .map(|u| u.url.clone())
-                .collect(),
-            RegistryType::Maven => state
-                .config
-                .maven
-                .proxies
-                .iter()
-                .map(|p| p.url().to_string())
-                .collect(),
-            RegistryType::Npm => state
-                .config
-                .npm
-                .upstream_urls()
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
-            RegistryType::PyPI => state
-                .config
-                .pypi
-                .upstreams()
-                .iter()
-                .map(|u| u.url().to_string())
-                .collect(),
-            RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
-            RegistryType::Raw => vec![],
-            RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
-            RegistryType::Terraform => state.config.terraform.proxy.clone().into_iter().collect(),
-            RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
-            RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
-            RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
-            RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
-            RegistryType::Rpm => state
-                .config
-                .rpm
-                .proxies
-                .values()
-                .map(|p| p.url().to_string())
-                .collect(),
-            RegistryType::Deb => state
-                .config
-                .deb
-                .proxies
-                .values()
-                .map(|p| p.url().to_string())
-                .collect(),
-            RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
-            RegistryType::Composer => state
-                .config
-                .composer
-                .upstreams()
-                .iter()
-                .map(|u| u.url().to_string())
-                .collect(),
-            RegistryType::HuggingFace => state.config.hf.proxy.clone().into_iter().collect(),
-        };
+        let configured = state.config.upstream_urls_of(*reg);
         // A caller NORA does not know sees no address; a known one sees each address the
         // client parser reads, and an address it cannot read stays hidden.
         let proxy_upstreams: Vec<String> = if authenticated {

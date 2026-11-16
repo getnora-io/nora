@@ -28,20 +28,14 @@ use std::time::{Duration, Instant};
 /// upstream, and keying on them would let it mint unbounded breaker entries and
 /// `nora_circuit_breaker_state` series. This is the key overrides are written
 /// against (`[circuit_breaker.overrides."docker:https://registry-1.docker.io"]`).
+///
+/// The userinfo is judged by the client's parser ([`crate::url_userinfo::without_userinfo`]):
+/// an address it reads none in keeps its spelling, so an override keeps matching; one it
+/// cannot read but that has an `@` is keyed as `<registry>:***`.
 pub(crate) fn upstream_key(registry: &str, upstream_url: &str) -> String {
-    let url = upstream_url.trim_end_matches('/');
-    let url = match url.find("://") {
-        Some(sep) => {
-            let (scheme, rest) = url.split_at(sep + 3);
-            let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-            match rest[..authority_end].rfind('@') {
-                Some(at) => Cow::Owned(format!("{scheme}{}", &rest[at + 1..])),
-                None => Cow::Borrowed(url),
-            }
-        }
-        None => Cow::Borrowed(url),
-    };
-    format!("{registry}:{url}")
+    let shown = crate::url_userinfo::without_userinfo(upstream_url);
+    let url = shown.as_deref().unwrap_or(crate::url_userinfo::MASK);
+    format!("{registry}:{}", url.trim_end_matches('/'))
 }
 
 /// The format part of a breaker key: `"pypi:https://…"` → `"pypi"`, `"npm"` → `"npm"`.

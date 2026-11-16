@@ -2843,6 +2843,48 @@ mod upstream_failure_cases {
         }
     }
 
+    /// Every spelling of an upstream with userinfo that the client sends: once its breaker
+    /// opens, neither the 503 body nor `/metrics` (anonymous by default) names the userinfo,
+    /// and both name the upstream the client was sending to.
+    #[tokio::test]
+    async fn an_open_upstream_never_shows_its_userinfo() {
+        use crate::url_userinfo::check::{holds_no_secret, same_target};
+        for (form, secrets) in crate::url_userinfo::FORMS {
+            // Refused at once: nothing listens on port 9 of the loopback.
+            let url = form
+                .replace("mirror.example:8443", "127.0.0.1:9")
+                .replace("mirror.example", "127.0.0.1:9")
+                .replace("[2001:db8::1]:8443", "127.0.0.1:9")
+                .replace("127.0.0.1:1/", "127.0.0.1:9/");
+            let configured = url.clone();
+            let ctx = create_test_context_with_config(move |c| {
+                c.circuit_breaker.enabled = true;
+                c.circuit_breaker.failure_threshold = 1;
+                c.circuit_breaker.reset_timeout = 3600;
+                c.maven.proxies = vec![MavenProxyEntry::Simple(configured)];
+            });
+            let path = "/maven2/com/example/lib/1.0.0/lib-1.0.0.jar";
+            send(&ctx.app, Method::GET, path, "").await; // trips the breaker
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{form}");
+            let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+            holds_no_secret(&body, form, secrets);
+            let named = body
+                .strip_prefix("upstream maven:")
+                .and_then(|rest| rest.strip_suffix(" temporarily unavailable"))
+                .unwrap_or_else(|| panic!("{form}: {body}"));
+            same_target(named, &url);
+
+            let metrics = send(&ctx.app, Method::GET, "/metrics", "").await;
+            let metrics = String::from_utf8(body_bytes(metrics).await.to_vec()).unwrap();
+            assert!(
+                metrics.contains("registry=\"maven:"),
+                "{form}: a series per upstream"
+            );
+            holds_no_secret(&metrics, form, secrets);
+        }
+    }
+
     /// an open breaker on a maven upstream is still 503, not 502.
     #[tokio::test]
     async fn open_breaker_is_still_503() {

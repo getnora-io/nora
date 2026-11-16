@@ -231,6 +231,7 @@ impl NpmConfig {
         for (i, entry) in self.proxies.iter().enumerate() {
             let url = entry.url();
             if !(url.starts_with("https://") || url.starts_with("http://")) {
+                let url = crate::url_userinfo::masked(url);
                 errors.push(format!(
                     "npm.proxies[{i}]: url \"{url}\" must start with http:// or https://"
                 ));

@@ -248,3 +248,88 @@ fn a_signing_key_nora_will_not_sign_with_stops_with_ex_config() {
     // The refusal leaves the operator's file as it was.
     assert_eq!(std::fs::read_to_string(&ecdsa_path).unwrap(), ecdsa);
 }
+
+/// A configuration refused for an npm upstream address stops with EX_CONFIG, and stderr, which
+/// is not written through the log filter, names the entry without the address's userinfo: in
+/// every spelling the validator refuses, one the parser cannot read included.
+#[test]
+fn a_refused_upstream_address_is_reported_without_its_userinfo() {
+    for url in [
+        "HTTPS:/ci-bot:s3cr3t@mirror.example/npm",
+        "https:/ci-bot:s3cr3t@mirror.example/npm",
+        "https:ci-bot:s3cr3t@mirror.example/npm",
+        "HTTPS:/ci-bot:pa ss@mirror.example/npm",
+        "ci-bot:s3cr3t@mirror.example/npm",
+    ] {
+        refused_without_userinfo(&format!("[npm]\nproxies = [\"{url}\"]\n"), "npm.proxies[0]");
+    }
+    // A file that is not TOML: the parser's error used to quote the line, address and all.
+    // It names the line and column instead, and a value it quotes is masked.
+    for password in ["s3cr3t", "pa ss", "pa %73s"] {
+        refused_without_userinfo(
+            &format!("[npm]\nproxy = \"https://ci-bot:{password}@mirror.example/npm\" oops\n"),
+            "invalid TOML: line 2, column",
+        );
+        refused_without_userinfo(
+            &format!("[server]\nport = \"https://ci-bot:{password}@mirror.example/npm\"\n"),
+            "invalid TOML: line 2, column",
+        );
+    }
+}
+
+/// A `config.toml` in the working directory that is not TOML is skipped with a warning; the
+/// warning names the line, not its text. The start is then refused by an environment override,
+/// so the whole output of a process that stopped is read.
+#[test]
+fn a_skipped_config_file_is_reported_without_its_userinfo() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("config.toml"),
+        "[npm]\nproxy = \"https://ci-bot:pa ss@mirror.example/npm\" oops\n",
+    )
+    .unwrap();
+    let data = dir.path().join("data");
+    let (code, output) = common::run_to_exit(
+        dir.path(),
+        &[
+            ("NORA_STORAGE_PATH", data.to_str().unwrap()),
+            ("NORA_STORAGE_MODE", "bogus"),
+        ],
+    );
+    assert_eq!(code, Some(78), "{output}");
+    assert!(output.contains("line 2, column"), "{output}");
+    for secret in ["ci-bot", "pa ss", "pa%20ss"] {
+        assert!(!output.contains(secret), "output shows {secret}: {output}");
+    }
+}
+
+/// `nora serve` with `config` stops with EX_CONFIG, says `why` on stderr, and shows no userinfo.
+fn refused_without_userinfo(config_text: &str, why: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.toml");
+    std::fs::write(&config, config_text).unwrap();
+    let data = dir.path().join("data");
+    // stdout too: the log says why before stderr does.
+    let (code, output) = common::run_to_exit(
+        dir.path(),
+        &[
+            ("NORA_CONFIG_PATH", config.to_str().unwrap()),
+            ("NORA_STORAGE_PATH", data.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code, Some(78), "{config_text}: {output}");
+    assert!(output.contains(why), "{config_text}: {output}");
+    for secret in [
+        "ci-bot",
+        "s3cr3t",
+        "pa ss",
+        "pa%20ss",
+        "pa %73s",
+        "pa%20%73s",
+    ] {
+        assert!(
+            !output.contains(secret),
+            "{config_text}: output shows {secret}: {output}"
+        );
+    }
+}
