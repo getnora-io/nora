@@ -89,6 +89,7 @@ Which formats NORA proxies and hosts, the upstream each proxies by default, and 
 | Tarball on another host (redirect) | Full | A tarball is fetched only for a version the upstream's packument lists (else 404, no tarball request). Redirects are followed to any http(s) host, at most 10 for the whole chain and within one `npm.proxy_timeout`; the upstream's credentials go only to its own origin, never past a hop that left it. An 11th redirect answers 502. Works with registries that serve tarballs from a storage host (GitHub Packages). |
 | Scoped upstream (`npm.proxies` with a scope) | Full | Metadata is read from the upstream's own origin only: a packument redirect to another origin answers 502. |
 | Tarball URL rewriting | Full | Points to NORA, not upstream |
+| Store moved to another address | Partial | Tarball links follow the address that serves them, for a version whose tarball is in the store. A version whose tarball is not there stays out of the packument while the upstream is down, as no tarball can be fetched for it. |
 | Publish (`npm publish`) | Full | Immutable versions |
 | Unpublish | — | Immutable; use quarantine/blocklist to disable a version |
 | Dist-tags (`latest`, `next`) | Partial | Read from metadata, no explicit management |
