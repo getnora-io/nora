@@ -324,6 +324,16 @@ impl UpstreamMiss {
         }
     }
 
+    /// Whether no upstream answered at all: every one asked failed (5xx, unreachable, timed out)
+    /// or was skipped for its open breaker, and none said "not found", refused NORA's credentials
+    /// or rate-limited it. The miss is then an outage, and says nothing of the artifact.
+    pub(crate) fn unanswered(&self) -> bool {
+        (self.failed || self.open.is_some())
+            && !self.not_found
+            && !self.refused
+            && self.limited.is_none()
+    }
+
     /// The breaker key of the first upstream skipped for its open breaker, when that made the
     /// miss a 503.
     pub(crate) fn open_key(&self) -> Option<&str> {
@@ -1428,6 +1438,54 @@ mod tests {
             folded(&[hub, asked(&[ProxyError::NotFound])]),
             StatusCode::NOT_FOUND
         );
+    }
+
+    /// A miss is unanswered only when every upstream asked failed or was skipped for its open
+    /// breaker: one "not found", one refused credential or one rate limit is an answer, and a miss
+    /// that asked nobody is not an outage.
+    #[test]
+    fn a_miss_is_unanswered_only_when_every_upstream_failed_or_was_skipped() {
+        let miss = |answers: &[ProxyError]| {
+            let mut m = UpstreamMiss::default();
+            for a in answers {
+                m.record(a);
+            }
+            m
+        };
+        let down = || ProxyError::Upstream(503);
+        let unreachable = || ProxyError::Network("refused".into());
+        let open = || ProxyError::CircuitOpen("docker".into());
+        let limited = || ProxyError::RateLimited {
+            key: "docker".into(),
+            retry_after: 7,
+        };
+        for answers in [
+            vec![down()],
+            vec![unreachable()],
+            vec![open()],
+            vec![down(), open()],
+            vec![unreachable(), down()],
+        ] {
+            assert!(miss(&answers).unanswered(), "{answers:?}");
+        }
+        for answers in [
+            vec![],
+            vec![ProxyError::NotFound],
+            vec![ProxyError::Upstream(404)],
+            vec![down(), ProxyError::NotFound],
+            vec![ProxyError::CredentialsRefused],
+            vec![down(), ProxyError::CredentialsRefused],
+            vec![open(), ProxyError::CredentialsRefused],
+            vec![limited()],
+            vec![unreachable(), limited()],
+        ] {
+            assert!(!miss(&answers).unanswered(), "{answers:?}");
+        }
+        // Folded over the names one upstream was asked under: a failure under one name and
+        // "not found" under the other is a failed upstream, so still no answer.
+        let mut folded = UpstreamMiss::default();
+        folded.record_upstream(&miss(&[ProxyError::NotFound, down()]));
+        assert!(folded.unanswered());
     }
 
     /// An upstream that answered 429 with `retry_after` seconds.

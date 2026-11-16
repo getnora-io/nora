@@ -2702,6 +2702,35 @@ async fn get_manifest(
     for asked in &misses {
         miss.record_upstream(asked);
     }
+    // A referrers tag (`sha256-<hex>`, OCI referrers tag schema) is how a client looks for an
+    // image's signatures and attestations, and Docker ends the pull on a 5xx for it. With
+    // serve_stale on, no upstream answering at all (failed or skipped for its open breaker) and
+    // no copy of the tag held (serve_stale would have served one above), it is answered as a
+    // registry without referrers answers it: 404, marked stale. The 404 holds only while the
+    // upstream is silent, so no HTTP cache may keep it (`no-store`): a 404 is heuristically
+    // cacheable, and a kept one would hide the tag's signatures and attestations once the upstream
+    // is back. The subject need not be held: a client whose content store already has the image
+    // asks for nothing but the tag and this one. Any other tag stays the gateway failure, or a
+    // client would conclude the image does not exist; a refused credential and a rate limit keep
+    // their own answers (#1196, #1191).
+    if state.config.docker.serve_stale && miss.unanswered() && is_referrers_tag(&reference) {
+        tracing::warn!(
+            registry = "docker",
+            name = %name,
+            reference = %reference,
+            "Upstream failed and no copy of this referrers tag is cached; answering 404, no referrers"
+        );
+        let mut response = manifest_unknown_response(&name, &reference);
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-nora-stale"),
+            axum::http::header::HeaderValue::from_static("true"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::header::HeaderValue::from_static("no-store"),
+        );
+        return response;
+    }
     docker_miss_response(
         &miss,
         Missed::Manifest {
@@ -2709,6 +2738,15 @@ async fn get_manifest(
             reference: &reference,
         },
     )
+}
+
+/// Whether a reference is a tag of the OCI referrers tag schema: `sha256-<64 lowercase hex>`, the
+/// tag that holds the referrers of `sha256:<hex>`. Not a digest, nor cosign's `sha256-<hex>.sig`.
+/// Pure: the whole test is this function.
+fn is_referrers_tag(reference: &str) -> bool {
+    reference.strip_prefix("sha256-").is_some_and(|hex| {
+        hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
 }
 
 /// Serve a manifest from local cache with all required headers and side-effects.
@@ -4925,6 +4963,27 @@ pub(crate) async fn flush_pull_stats(state: &AppState) {
 mod tests {
     use super::*;
 
+    /// Only `sha256-` followed by exactly 64 lowercase hex digits is a referrers tag.
+    #[test]
+    fn is_referrers_tag_takes_only_the_schema_form() {
+        let hex = "0123456789abcdef".repeat(4);
+        assert!(is_referrers_tag(&format!("sha256-{hex}")));
+        for other in [
+            format!("sha256:{hex}"),
+            format!("sha256-{hex}.sig"),
+            format!("sha256-{hex}0"),
+            format!("sha256-{}", &hex[1..]),
+            format!("sha256-{}", hex.to_uppercase()),
+            format!("sha256-{}g", &hex[1..]),
+            format!("sha512-{hex}"),
+            format!("x-sha256-{hex}"),
+            "latest".to_string(),
+            "sha256-".to_string(),
+        ] {
+            assert!(!is_referrers_tag(&other), "{other}");
+        }
+    }
+
     /// A file under `manifests/` stores a tag only if its name is a valid tag and not a sidecar.
     #[test]
     fn tag_from_manifest_file_accepts_only_tags() {
@@ -6815,6 +6874,591 @@ mod integration_tests {
             Some(b"true".as_slice())
         );
         assert_eq!(body_bytes(resp).await.as_ref(), manifest.as_slice());
+    }
+
+    const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+    const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+
+    fn sha256_of(data: &[u8]) -> String {
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(data)))
+    }
+
+    /// An image as BuildKit and Docker Hub publish it: an index naming one platform manifest and
+    /// the attestation manifest that describes it (`vnd.docker.reference.type:
+    /// attestation-manifest`), and the blobs the two reference. `(digest, bytes)` throughout.
+    struct AttestedImage {
+        index: (String, Vec<u8>),
+        manifest: (String, Vec<u8>),
+        attestation: (String, Vec<u8>),
+        /// The platform config first, then its layer, the attestation's config and statement.
+        blobs: Vec<(String, Vec<u8>)>,
+    }
+
+    impl AttestedImage {
+        fn new() -> Self {
+            let blob = |b: &[u8]| (sha256_of(b), b.to_vec());
+            let config = blob(br#"{"architecture":"amd64","os":"linux","rootfs":{"type":"layers","diff_ids":[]}}"#);
+            let layer = blob(b"platform layer");
+            let att_config = blob(br#"{"architecture":"unknown","os":"unknown","rootfs":{"type":"layers","diff_ids":[]}}"#);
+            let statement = blob(br#"{"_type":"https://in-toto.io/Statement/v0.1","predicateType":"https://slsa.dev/provenance/v0.2"}"#);
+            let image_manifest =
+                |config: &(String, Vec<u8>), layer: &(String, Vec<u8>), kind: &str| {
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "schemaVersion": 2,
+                        "mediaType": OCI_MANIFEST,
+                        "config": {
+                            "mediaType": "application/vnd.oci.image.config.v1+json",
+                            "digest": config.0,
+                            "size": config.1.len(),
+                        },
+                        "layers": [{ "mediaType": kind, "digest": layer.0, "size": layer.1.len() }],
+                    }))
+                    .unwrap();
+                    (sha256_of(&body), body)
+                };
+            let manifest = image_manifest(
+                &config,
+                &layer,
+                "application/vnd.oci.image.layer.v1.tar+gzip",
+            );
+            let attestation =
+                image_manifest(&att_config, &statement, "application/vnd.in-toto+json");
+            let index = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": OCI_INDEX,
+                "manifests": [
+                    {
+                        "mediaType": OCI_MANIFEST,
+                        "digest": manifest.0,
+                        "size": manifest.1.len(),
+                        "platform": { "architecture": "amd64", "os": "linux" },
+                    },
+                    {
+                        "mediaType": OCI_MANIFEST,
+                        "digest": attestation.0,
+                        "size": attestation.1.len(),
+                        "platform": { "architecture": "unknown", "os": "unknown" },
+                        "annotations": {
+                            "vnd.docker.reference.digest": manifest.0,
+                            "vnd.docker.reference.type": "attestation-manifest",
+                        },
+                    },
+                ],
+            }))
+            .unwrap();
+            Self {
+                index: (sha256_of(&index), index),
+                manifest,
+                attestation,
+                blobs: vec![config, layer, att_config, statement],
+            }
+        }
+
+        /// The attestation manifest's tag in the OCI referrers tag schema: `sha256-<hex>`.
+        fn referrers_tag(&self) -> String {
+            self.attestation.0.replacen(':', "-", 1)
+        }
+
+        /// Serve the image under `name` from `server` as a registry without referrers does: every
+        /// manifest (by tag and by digest) and blob, and `404 MANIFEST_UNKNOWN` for the
+        /// referrers tag.
+        async fn mount(&self, server: &wiremock::MockServer, name: &str) {
+            use wiremock::matchers::{method, path};
+            use wiremock::{Mock, ResponseTemplate};
+            let manifests = [
+                ("latest".to_string(), &self.index.1, OCI_INDEX),
+                (self.index.0.clone(), &self.index.1, OCI_INDEX),
+                (self.manifest.0.clone(), &self.manifest.1, OCI_MANIFEST),
+                (
+                    self.attestation.0.clone(),
+                    &self.attestation.1,
+                    OCI_MANIFEST,
+                ),
+            ];
+            for (reference, body, kind) in manifests {
+                Mock::given(method("GET"))
+                    .and(path(format!("/v2/{name}/manifests/{reference}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("Content-Type", kind)
+                            .set_body_bytes(body.clone()),
+                    )
+                    .mount(server)
+                    .await;
+            }
+            for (digest, body) in &self.blobs {
+                Mock::given(method("GET"))
+                    .and(path(format!("/v2/{name}/blobs/{digest}")))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(body.clone()))
+                    .mount(server)
+                    .await;
+            }
+            Mock::given(method("GET"))
+                .and(path(format!(
+                    "/v2/{name}/manifests/{}",
+                    self.referrers_tag()
+                )))
+                .respond_with(ResponseTemplate::new(404).set_body_json(serde_json::json!({
+                    "errors": [{ "code": "MANIFEST_UNKNOWN", "message": "manifest unknown" }]
+                })))
+                .mount(server)
+                .await;
+        }
+
+        /// The requests a Docker 29 client (containerd image store) makes to pull `name:latest`,
+        /// in order, with the status each needs for the pull to complete, as measured through
+        /// NORA: the referrers API (NORA has none) and the referrers tag schema fallback answer
+        /// 404, "no referrers"; everything else 200. A failure on any of them ends the pull.
+        fn client_pull(&self, name: &str) -> Vec<(Method, String, StatusCode)> {
+            let m = |r: &str| format!("/v2/{name}/manifests/{r}");
+            let b = |d: &str| format!("/v2/{name}/blobs/{d}");
+            let ok = StatusCode::OK;
+            let mut steps = vec![
+                (Method::HEAD, m("latest"), ok),
+                (Method::GET, m(&self.index.0), ok),
+                (Method::GET, m(&self.manifest.0), ok),
+                (Method::GET, b(&self.blobs[0].0), ok),
+                (Method::GET, m(&self.attestation.0), ok),
+                (
+                    Method::GET,
+                    format!("/v2/{name}/referrers/{}", self.attestation.0),
+                    StatusCode::NOT_FOUND,
+                ),
+                (Method::GET, m(&self.referrers_tag()), StatusCode::NOT_FOUND),
+            ];
+            steps.extend(self.blobs[1..].iter().map(|(d, _)| (Method::GET, b(d), ok)));
+            steps
+        }
+
+        /// Wait, with a deadline, until every manifest and blob of the image is stored: copies
+        /// are written in the background after the answer.
+        async fn await_cached(&self, storage: &crate::storage::Storage) {
+            let mut want: Vec<String> = [&self.index.0, &self.manifest.0, &self.attestation.0]
+                .iter()
+                .map(|d| format!("/manifests/{d}.json"))
+                .collect();
+            want.push("/manifests/latest.json".to_string());
+            want.extend(self.blobs.iter().map(|(d, _)| format!("/blobs/{d}")));
+            for _ in 0..500 {
+                if let Ok(keys) = storage.list("docker/").await {
+                    if want.iter().all(|w| keys.iter().any(|k| k.ends_with(w))) {
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            panic!("the image was not cached: {want:?}");
+        }
+    }
+
+    /// Run the client's requests, one after the other: what each was answered.
+    async fn run_pull(
+        app: &axum::Router,
+        steps: &[(Method, String, StatusCode)],
+    ) -> Vec<(String, StatusCode)> {
+        let mut got = Vec::new();
+        for (m, uri, _) in steps {
+            let resp = send(app, m.clone(), uri, Body::empty()).await;
+            got.push((format!("{m} {uri}"), resp.status()));
+        }
+        got
+    }
+
+    fn wanted(steps: &[(Method, String, StatusCode)]) -> Vec<(String, StatusCode)> {
+        steps
+            .iter()
+            .map(|(m, uri, status)| (format!("{m} {uri}"), *status))
+            .collect()
+    }
+
+    /// How the upstream of a cached image stops answering.
+    #[derive(Debug, Clone, Copy)]
+    enum Outage {
+        /// NORA restarted (breaker closed) and the upstream cannot be reached: the issue's case.
+        Unreachable,
+        /// The upstream answers 503 to everything, NORA still running.
+        Answers5xx,
+        /// Its circuit breaker is open: the upstream is not asked (#1198).
+        BreakerOpen,
+        /// It rate-limits NORA (#1191).
+        RateLimited,
+        /// It refuses NORA's credentials (#1196).
+        RefusesCredentials,
+    }
+
+    /// Warm NORA with an attested image through `upstream`, then stop the upstream answering as
+    /// `outage` says. The context that answers afterwards is returned with the one that warmed
+    /// (whose storage and tempdir it shares).
+    async fn warm_then(
+        outage: Outage,
+        upstream: &wiremock::MockServer,
+        name: &str,
+        img: &AttestedImage,
+        bind: &[&str],
+        others: Vec<String>,
+    ) -> (
+        crate::test_helpers::TestContext,
+        Option<crate::test_helpers::TestContext>,
+    ) {
+        use crate::circuit_breaker::upstream_key;
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, ResponseTemplate};
+
+        img.mount(upstream, name).await;
+        let url = upstream.uri();
+        let namespaces: Vec<String> = bind.iter().map(|s| s.to_string()).collect();
+        let mut entries = vec![(url.clone(), namespaces.clone())];
+        entries.extend(others.iter().map(|u| (u.clone(), Vec::new())));
+        let warm_entries = entries.clone();
+        let warm = create_test_context_with_config(move |cfg| {
+            cfg.circuit_breaker.enabled = true;
+            cfg.circuit_breaker.reset_timeout = 3600;
+            cfg.docker.proxy_timeout = 1;
+            cfg.docker.upstreams = upstreams_of(warm_entries);
+        });
+        let steps = img.client_pull(name);
+        assert_eq!(run_pull(&warm.app, &steps).await, wanted(&steps), "warm");
+        img.await_cached(&warm.state.storage).await;
+
+        let refuse = |status: u16| async move {
+            upstream.reset().await;
+            let mut template = ResponseTemplate::new(status);
+            if status == 429 {
+                template = template.insert_header("Retry-After", "7");
+            }
+            if status == 401 {
+                template = template.insert_header("Www-Authenticate", "Basic realm=\"harbor\"");
+            }
+            Mock::given(any())
+                .respond_with(template)
+                .mount(upstream)
+                .await;
+        };
+        let restarted = match outage {
+            Outage::Unreachable => {
+                let mut entries = entries;
+                entries[0].0 = "http://127.0.0.1:9".to_string();
+                Some(create_test_context_with_storage_and_config(
+                    warm.state.storage.clone(),
+                    move |cfg| {
+                        cfg.docker.proxy_timeout = 1;
+                        cfg.docker.upstreams = upstreams_of(entries);
+                    },
+                ))
+            }
+            Outage::Answers5xx => {
+                refuse(503).await;
+                None
+            }
+            Outage::BreakerOpen => {
+                warm.state
+                    .circuit_breaker
+                    .open_for_test(&upstream_key("docker", &url));
+                None
+            }
+            Outage::RateLimited => {
+                refuse(429).await;
+                None
+            }
+            Outage::RefusesCredentials => {
+                refuse(401).await;
+                None
+            }
+        };
+        (warm, restarted)
+    }
+
+    /// A cached proxied image pulls while its upstream does not answer (unreachable, 5xx, or
+    /// skipped for its open breaker), with `serve_stale` on (the default). A Docker 29 client
+    /// asks for the attestation manifest's referrers tag (`sha256-<hex>`, OCI referrers tag
+    /// schema); the upstream answered 404 for it, and NORA, holding no copy of that tag, answers
+    /// 404 too rather than failing the pull with a 5xx. The answer is marked stale.
+    #[tokio::test]
+    async fn a_cached_image_pulls_while_its_upstream_does_not_answer() {
+        let name = "myorg/app";
+        let img = AttestedImage::new();
+        let steps = img.client_pull(name);
+        for outage in [Outage::Unreachable, Outage::Answers5xx, Outage::BreakerOpen] {
+            let upstream = wiremock::MockServer::start().await;
+            let (warm, restarted) = warm_then(outage, &upstream, name, &img, &[], Vec::new()).await;
+            let app = restarted.as_ref().map_or(&warm.app, |c| &c.app);
+            assert_eq!(run_pull(app, &steps).await, wanted(&steps), "{outage:?}");
+            let tag = format!("/v2/{name}/manifests/{}", img.referrers_tag());
+            for m in [Method::GET, Method::HEAD] {
+                let resp = send(app, m.clone(), &tag, Body::empty()).await;
+                assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{outage:?} {m}");
+                assert_eq!(
+                    resp.headers().get("x-nora-stale").map(|v| v.as_bytes()),
+                    Some(b"true".as_slice()),
+                    "{outage:?} {m}"
+                );
+                if m == Method::GET {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&body_bytes(resp).await).unwrap();
+                    assert_eq!(body["errors"][0]["code"], "MANIFEST_UNKNOWN", "{outage:?}");
+                }
+            }
+        }
+    }
+
+    /// Whether a `Cache-Control` value forbids a cache to answer from a stored copy without asking
+    /// NORA again (RFC 9111 §5.2.2): `no-store` or `no-cache`, or a lifetime of zero that must be
+    /// revalidated once stale. A bare `max-age=0` is not enough: a disconnected cache may still
+    /// serve a stale response (RFC 9111 §4.2.4).
+    fn forbids_reuse(cache_control: &str) -> bool {
+        let directives: Vec<String> = cache_control
+            .split(',')
+            .map(|d| d.trim().to_ascii_lowercase())
+            .collect();
+        let has = |d: &str| directives.iter().any(|v| v == d);
+        has("no-store")
+            || has("no-cache")
+            || ((has("max-age=0") || has("s-maxage=0"))
+                && (has("must-revalidate") || has("proxy-revalidate")))
+    }
+
+    /// NORA's 404 for a referrers tag while no upstream answers holds only for that moment. A 404
+    /// is heuristically cacheable (RFC 9110 §15.5.5), so without a directive an HTTP cache in front
+    /// of NORA may keep it and, once the upstream is back, go on hiding the signatures and
+    /// attestations under the tag. The 404 forbids reuse, on GET and HEAD; and once the upstream
+    /// answers with the tag, NORA serves it.
+    #[tokio::test]
+    async fn a_referrers_404_while_the_upstream_is_down_is_not_kept_by_a_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let name = "myorg/app";
+        let img = AttestedImage::new();
+        let upstream = wiremock::MockServer::start().await;
+        let (warm, _) = warm_then(Outage::Answers5xx, &upstream, name, &img, &[], Vec::new()).await;
+        let tag = format!("/v2/{name}/manifests/{}", img.referrers_tag());
+        for m in [Method::GET, Method::HEAD] {
+            let resp = send(&warm.app, m.clone(), &tag, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{m}");
+            let cache_control = resp
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                forbids_reuse(&cache_control),
+                "{m}: Cache-Control {cache_control:?}"
+            );
+        }
+
+        // The upstream is back, and now holds a referrers index for the attestation manifest.
+        let referrers = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX,
+            "manifests": [{
+                "mediaType": OCI_MANIFEST,
+                "digest": img.manifest.0,
+                "size": img.manifest.1.len(),
+                "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            }],
+        }))
+        .unwrap();
+        upstream.reset().await;
+        Mock::given(method("GET"))
+            .and(path(tag.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", OCI_INDEX)
+                    .set_body_bytes(referrers.clone()),
+            )
+            .mount(&upstream)
+            .await;
+        let resp = send(&warm.app, Method::GET, &tag, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("x-nora-stale").is_none());
+        assert_eq!(body_bytes(resp).await.as_ref(), referrers.as_slice());
+    }
+
+    /// The rule the test above judges `Cache-Control` by: directives that forbid reuse without
+    /// asking again, and lifetimes that allow it.
+    #[test]
+    fn forbids_reuse_reads_the_directives() {
+        for allows in [
+            "",
+            "public",
+            "max-age=0",
+            "public, max-age=60",
+            "must-revalidate",
+        ] {
+            assert!(!forbids_reuse(allows), "{allows:?}");
+        }
+        for forbids in [
+            "no-store",
+            "No-Store",
+            "private, no-cache",
+            "public, max-age=0, must-revalidate",
+            "s-maxage=0, proxy-revalidate",
+        ] {
+            assert!(forbids_reuse(forbids), "{forbids:?}");
+        }
+    }
+
+    /// A client whose content store already holds the image (pulled before, through NORA or not)
+    /// resolves the tag and looks up the attestation's referrers, and asks for nothing else — as
+    /// measured with Docker 29 through NORA against Docker Hub. NORA then holds the index but not
+    /// the attestation manifest the referrers tag names; the pull still completes while the
+    /// upstream cannot be reached.
+    #[tokio::test]
+    async fn a_client_holding_the_content_repulls_while_the_upstream_is_unreachable() {
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+
+        let name = "myorg/app";
+        let img = AttestedImage::new();
+        let upstream = wiremock::MockServer::start().await;
+        img.mount(&upstream, name).await;
+        let ok = StatusCode::OK;
+        let not_found = StatusCode::NOT_FOUND;
+        let steps = vec![
+            (Method::HEAD, format!("/v2/{name}/manifests/latest"), ok),
+            (
+                Method::GET,
+                format!("/v2/{name}/referrers/{}", img.attestation.0),
+                not_found,
+            ),
+            (
+                Method::GET,
+                format!("/v2/{name}/manifests/{}", img.referrers_tag()),
+                not_found,
+            ),
+        ];
+        let entries = vec![(upstream.uri(), Vec::new())];
+        let warm = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = upstreams_of(entries);
+        });
+        assert_eq!(run_pull(&warm.app, &steps).await, wanted(&steps), "warm");
+        let mut cached = false;
+        for _ in 0..500 {
+            if let Ok(keys) = warm.state.storage.list("docker/").await {
+                if keys.iter().any(|k| k.ends_with("/manifests/latest.json")) {
+                    cached = keys.iter().all(|k| !k.contains(&img.attestation.0));
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            cached,
+            "the tag is cached and the attestation manifest is not"
+        );
+
+        let entries = vec![("http://127.0.0.1:9".to_string(), Vec::new())];
+        let offline =
+            create_test_context_with_storage_and_config(warm.state.storage.clone(), move |cfg| {
+                cfg.docker.proxy_timeout = 1;
+                cfg.docker.upstreams = upstreams_of(entries);
+            });
+        assert_eq!(run_pull(&offline.app, &steps).await, wanted(&steps));
+    }
+
+    /// #1188: the owner of a bound namespace is the only upstream asked for its names, down or
+    /// not. Its cached image pulls while it does not answer, and the chain is not asked for the
+    /// referrers tag instead.
+    #[tokio::test]
+    async fn a_bound_cached_image_pulls_without_asking_the_chain() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let name = "team-a/app";
+        let img = AttestedImage::new();
+        let (owner, chain) = (MockServer::start().await, MockServer::start().await);
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&chain)
+            .await;
+        let (warm, restarted) = warm_then(
+            Outage::Unreachable,
+            &owner,
+            name,
+            &img,
+            &["team-a"],
+            vec![chain.uri()],
+        )
+        .await;
+        let app = &restarted.as_ref().unwrap().app;
+        let steps = img.client_pull(name);
+        assert_eq!(run_pull(app, &steps).await, wanted(&steps));
+        chain.verify().await;
+        drop(warm);
+    }
+
+    /// What NORA cannot vouch for stays the gateway failure it is while the upstream does not
+    /// answer: a tag that is not a referrers tag (the client would conclude the image does not
+    /// exist), a near-miss of the `sha256-<64 lowercase hex>` form, and the referrers tag itself
+    /// with `serve_stale` off. While the upstream answers, its own 404 for the referrers tag is
+    /// not marked stale. An upstream that answered without the tag keeps its own answer for it:
+    /// a rate limit stays 429 (#1191), a refused credential stays the named 502 (#1196).
+    #[tokio::test]
+    async fn a_tag_nora_cannot_vouch_for_stays_a_gateway_failure() {
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+
+        let name = "myorg/app";
+        let img = AttestedImage::new();
+        let upstream = wiremock::MockServer::start().await;
+        let (warm, restarted) =
+            warm_then(Outage::Unreachable, &upstream, name, &img, &[], Vec::new()).await;
+        let resp = send(
+            &warm.app,
+            Method::GET,
+            &format!("/v2/{name}/manifests/{}", img.referrers_tag()),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(resp.headers().get("x-nora-stale").is_none());
+
+        let offline = restarted.unwrap();
+        let referrers_tag = img.referrers_tag();
+        let hex = referrers_tag.trim_start_matches("sha256-");
+        let rows = [
+            ("a tag never cached", "2.0".to_string()),
+            ("cosign signature tag", format!("{referrers_tag}.sig")),
+            ("uppercase hex", format!("sha256-{}", hex.to_uppercase())),
+            ("63 hex digits", format!("sha256-{}", &hex[1..])),
+        ];
+        for (row, reference) in &rows {
+            let uri = format!("/v2/{name}/manifests/{reference}");
+            let resp = send(&offline.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{row}");
+        }
+
+        let entries = vec![("http://127.0.0.1:9".to_string(), Vec::new())];
+        let strict =
+            create_test_context_with_storage_and_config(warm.state.storage.clone(), move |cfg| {
+                cfg.docker.serve_stale = false;
+                cfg.docker.proxy_timeout = 1;
+                cfg.docker.upstreams = upstreams_of(entries);
+            });
+        let uri = format!("/v2/{name}/manifests/{referrers_tag}");
+        let resp = send(&strict.app, Method::GET, &uri, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "serve_stale off");
+
+        for (outage, status, code) in [
+            (
+                Outage::RateLimited,
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOOMANYREQUESTS",
+            ),
+            (
+                Outage::RefusesCredentials,
+                StatusCode::BAD_GATEWAY,
+                "DENIED",
+            ),
+        ] {
+            let upstream = wiremock::MockServer::start().await;
+            let (answering, _) = warm_then(outage, &upstream, name, &img, &[], Vec::new()).await;
+            let resp = send(&answering.app, Method::GET, &uri, Body::empty()).await;
+            assert_eq!(resp.status(), status, "{outage:?}");
+            let body: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
+            assert_eq!(body["errors"][0]["code"], code, "{outage:?}");
+        }
     }
 
     /// #1189: every miss on the proxy path answers an OCI error body with
