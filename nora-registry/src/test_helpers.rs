@@ -93,6 +93,26 @@ pub fn create_test_context_with_storage_and_config(
     build_context_with(false, &[], false, customize, Some(storage))
 }
 
+/// Build a test context over a store in memory, with custom config tweaks: for a test whose
+/// subject is what lands in the store, which a local store's fsync of every write only slows
+/// down (by seconds on a loaded disk).
+pub fn create_test_context_in_memory(customize: impl FnOnce(&mut Config)) -> TestContext {
+    let storage = Storage::from_backend(Arc::new(crate::storage::ObjectStorage::in_memory()));
+    create_test_context_with_storage_and_config(storage, customize)
+}
+
+/// A Docker upstream at `url` with nothing else set: no credentials, prefix, namespace or
+/// bound namespaces.
+pub fn docker_upstream(url: impl Into<String>) -> DockerUpstream {
+    DockerUpstream {
+        url: url.into(),
+        auth: None,
+        namespace: None,
+        prefix: None,
+        namespaces: Vec::new(),
+    }
+}
+
 /// Build a test context with auth + anonymous_read + custom config tweaks.
 /// Auth required for every request (no anonymous read), plus a custom config.
 pub fn create_test_context_with_auth_and_config(
