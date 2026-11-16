@@ -2172,8 +2172,8 @@ mod mount_points {
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(
                 mount(&json, "npm")["proxy_upstreams"],
-                serde_json::json!(["https://registry.npmjs.org/"]),
-                "an address without credentials shows as the client reads it"
+                serde_json::json!(["https://registry.npmjs.org"]),
+                "an address without credentials shows as written"
             );
             assert_eq!(
                 mount(&json, "PyPI")["proxy_upstreams"],

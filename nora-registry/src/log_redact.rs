@@ -18,25 +18,33 @@ use tracing_subscriber::Layer;
 /// The text that replaces a URL's userinfo.
 const MASK: &[u8] = b"***";
 
-/// Replace the userinfo of every `scheme://userinfo@host` in `text` with [`MASK`].
+/// Replace the userinfo of every URL in `text` with [`MASK`].
 ///
-/// The authority ends at the first `/`, `?`, `#`, whitespace, quote, backslash or
-/// bracket after `://` (a JSON string, a `Debug` string and prose all end a URL that
-/// way); an `@` inside it marks userinfo, and everything up to the last such `@` is
-/// masked. Text without userinfo is returned unchanged and unallocated.
+/// A URL is found where the proxy client's parser (`reqwest::Url`) would find its authority:
+/// after `http:` or `https:` in any letter case and any run of `/` and `\`
+/// (`https:///user:secret@host` and `https:/user:secret@host` are read as userinfo for
+/// `host`), and after `://` for any other scheme. What precedes the scheme is not read: a
+/// colored log line puts an escape code right before it (`\x1b[0mhttps://…`). The authority ends at the first `/`, `\`,
+/// `?` or `#`, as the parser ends it, or at whitespace, `"`, `<` or `>`, which a URL in a
+/// log line, a JSON string or a `Debug` string does not hold unescaped; an `@` inside it
+/// marks userinfo, and everything up to the last such `@` is masked. `'`, `(` and `)` may
+/// stand in a password unescaped and do not end it. Text without userinfo is returned
+/// unchanged and unallocated. Which spellings the parser reads as userinfo is pinned by the
+/// table of [`crate::url_userinfo::FORMS`].
 pub(crate) fn redact_userinfo(text: &[u8]) -> Cow<'_, [u8]> {
     let mut out: Option<Vec<u8>> = None;
     let mut copied = 0;
     let mut i = 0;
-    while let Some(pos) = find(&text[i..], b"://") {
-        let start = i + pos + 3;
+    while let Some(colon) = text[i..].iter().position(|&b| b == b':').map(|p| i + p) {
+        let Some(start) = authority_start(text, colon) else {
+            i = colon + 1;
+            continue;
+        };
         let end = text[start..]
             .iter()
             .position(|&b| {
-                matches!(
-                    b,
-                    b'/' | b'?' | b'#' | b'"' | b'\'' | b'\\' | b'<' | b'>' | b'(' | b')'
-                ) || b.is_ascii_whitespace()
+                matches!(b, b'/' | b'\\' | b'?' | b'#' | b'"' | b'<' | b'>')
+                    || b.is_ascii_whitespace()
             })
             .map_or(text.len(), |n| start + n);
         if let Some(at) = text[start..end].iter().rposition(|&b| b == b'@') {
@@ -45,7 +53,7 @@ pub(crate) fn redact_userinfo(text: &[u8]) -> Cow<'_, [u8]> {
             buf.extend_from_slice(MASK);
             copied = start + at;
         }
-        i = end;
+        i = end.max(colon + 1);
     }
     match out {
         Some(mut buf) => {
@@ -61,11 +69,7 @@ pub(crate) fn redact_userinfo(text: &[u8]) -> Cow<'_, [u8]> {
 /// log: a credential belongs in userinfo or a header, and a query is part of what names the
 /// file.
 pub(crate) fn url_for_record(url: &str) -> Cow<'_, str> {
-    match redact_userinfo(url.as_bytes()) {
-        Cow::Borrowed(_) => Cow::Borrowed(url),
-        // Only ASCII between ASCII delimiters is replaced, so the text stays UTF-8.
-        Cow::Owned(bytes) => Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
-    }
+    crate::url_userinfo::masked(url)
 }
 
 /// A URL as a record keeps it: built only through [`url_for_record`], from a URL being recorded
@@ -100,8 +104,26 @@ impl<'de> Deserialize<'de> for RecordedUrl {
     }
 }
 
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|w| w == needle)
+/// Where the authority of a URL whose scheme ends at `colon` starts, if `colon` ends one:
+/// after the run of `/` and `\` that follows `http:` or `https:`, after `//` otherwise.
+fn authority_start(text: &[u8], colon: usize) -> Option<usize> {
+    let rest = &text[colon + 1..];
+    let before = &text[..colon];
+    let special = [&b"http"[..], b"https"].iter().any(|s| {
+        before.len() >= s.len() && before[before.len() - s.len()..].eq_ignore_ascii_case(s)
+    });
+    if special {
+        // The parser skips every `/` and `\` between a special scheme and its authority.
+        let slashes = rest
+            .iter()
+            .position(|&b| b != b'/' && b != b'\\')
+            .unwrap_or(rest.len());
+        Some(colon + 1 + slashes)
+    } else if rest.starts_with(b"//") {
+        Some(colon + 3)
+    } else {
+        None
+    }
 }
 
 /// A `fmt` layer writing `writer`'s events through [`RedactUserinfo`]: JSON with each event's
@@ -185,6 +207,51 @@ mod tests {
         // The last @ of the authority is the delimiter: an @ in the password is masked too.
         assert_eq!(redact("https://u:p@ss@host/x"), "https://***@host/x");
         assert_eq!(redact("https://u:secret@host"), "https://***@host");
+    }
+
+    /// Every spelling the client reads userinfo in, wherever a log line holds it: alone, as a
+    /// field, in a JSON string, after a color code, as a breaker key, in prose. Alone, it still
+    /// names the target the client sends to, with `***` as its only user.
+    #[test]
+    fn every_form_the_client_reads_is_masked_in_a_line() {
+        use crate::url_userinfo::check::{holds_no_secret, same_target};
+        for (form, secrets) in crate::url_userinfo::FORMS {
+            for line in [
+                form.to_string(),
+                format!("url={form} status=502"),
+                format!(r#"{{"url":"{form}","n":1}}"#),
+                format!("\x1b[2m=\x1b[0m{form}"),
+                format!("upstream maven:{form} temporarily unavailable"),
+                format!("error sending request for url ({form})"),
+            ] {
+                holds_no_secret(&redact(&line), form, secrets);
+            }
+            let alone = redact(form);
+            same_target(&alone, form);
+            let parsed = reqwest::Url::parse(&alone).unwrap();
+            assert_eq!(
+                (parsed.username(), parsed.password()),
+                ("***", None),
+                "{form}"
+            );
+        }
+    }
+
+    /// A record of each spelling, written or read back from a journal line written before
+    /// masking, holds none of its userinfo.
+    #[test]
+    fn every_form_is_masked_in_a_record() {
+        use crate::url_userinfo::check::holds_no_secret;
+        for (form, secrets) in crate::url_userinfo::FORMS {
+            let written = serde_json::to_string(&RecordedUrl::new(form)).unwrap();
+            holds_no_secret(&written, form, secrets);
+            let line = serde_json::to_string(form).unwrap();
+            let read: RecordedUrl = serde_json::from_str(&line).unwrap();
+            holds_no_secret(read.as_str(), form, secrets);
+        }
+        for unreadable in ["https://ci-bot:pa/ss@mirror.example", "ci-bot:s3cr3t@host"] {
+            assert_eq!(RecordedUrl::new(unreadable).as_str(), "***", "{unreadable}");
+        }
     }
 
     #[test]

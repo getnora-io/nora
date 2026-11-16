@@ -176,20 +176,17 @@ pub fn is_blocked_url_host(url: &str, allow_private: bool) -> bool {
 /// error Display can echo the full URL including embedded credentials; never let
 /// that reach a log line (review Security #6).
 pub fn redact_url(url: &str) -> String {
-    match reqwest::Url::parse(url) {
+    // The userinfo is cut as the client reads it; an address it cannot read is shown only
+    // without an `@`.
+    let Some(clean) = crate::url_userinfo::without_userinfo(url) else {
+        return crate::url_userinfo::MASK.to_string();
+    };
+    match reqwest::Url::parse(&clean) {
         Ok(mut u) => {
-            let _ = u.set_username("");
-            let _ = u.set_password(None);
             u.set_query(None);
             u.to_string()
         }
-        // Unparsable: fall back to a coarse redaction of any `scheme://a:b@host`.
-        Err(_) => match (url.find("://"), url.find('@')) {
-            (Some(s), Some(at)) if at > s + 3 => {
-                format!("{}//{}", &url[..s + 1], &url[at + 1..])
-            }
-            _ => url.to_string(),
-        },
+        Err(_) => clean.into_owned(),
     }
 }
 

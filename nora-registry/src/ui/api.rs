@@ -213,19 +213,11 @@ pub async fn api_dashboard(
     Json(build_dashboard_response(&state, authenticated).await)
 }
 
-/// The upstream address `url` as the dashboard shows it: read by the parser the proxy client
-/// sends with (`reqwest::Url`), so every spelling it accepts (`https:///u:p@host`, a
-/// backslash for a slash) is judged as it is sent, then shown without its credentials. `None`
-/// for an address that is not an `http(s)` URL with a host: it is not shown at all, since
-/// whatever it carries cannot be told apart.
+/// The upstream address `url` as the dashboard shows it: an `http(s)` address without its
+/// userinfo, judged by the client's parser ([`crate::url_userinfo::for_dashboard`]); `None`
+/// for one that is not shown.
 fn shown_address(url: &str) -> Option<String> {
-    let mut parsed = reqwest::Url::parse(url).ok()?;
-    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-        return None;
-    }
-    parsed.set_username("").ok()?;
-    parsed.set_password(None).ok()?;
-    Some(parsed.to_string())
+    crate::url_userinfo::for_dashboard(url).map(std::borrow::Cow::into_owned)
 }
 
 /// Build the dashboard JSON payload.

@@ -69,6 +69,7 @@ mod storage;
 mod supervise;
 mod tokens;
 mod ui;
+mod url_userinfo;
 mod validation;
 
 #[cfg(test)]
@@ -506,15 +507,7 @@ impl AppState {
 ///
 /// `http://user:pass@proxy:3128` → `http://***@proxy:3128`
 fn sanitize_proxy_url(url: &str) -> String {
-    // Try to find userinfo (anything before @ in authority)
-    if let Some(at_pos) = url.find('@') {
-        // Find the scheme separator
-        let scheme_end = url.find("://").map(|p| p + 3).unwrap_or(0);
-        if at_pos > scheme_end {
-            return format!("{}***@{}", &url[..scheme_end], &url[at_pos + 1..]);
-        }
-    }
-    url.to_string()
+    url_userinfo::masked(url).into_owned()
 }
 
 /// Log detected outbound proxy configuration from environment variables.
