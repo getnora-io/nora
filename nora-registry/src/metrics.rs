@@ -170,6 +170,19 @@ pub static PROXY_REVALIDATION_ERRORS_TOTAL: LazyLock<IntCounterVec> = LazyLock::
     .expect("failed to create PROXY_REVALIDATION_ERRORS_TOTAL metric at startup")
 });
 
+/// Answers served from a stored copy because the upstream could not revalidate it — failed,
+/// timed out or unreachable — and `serve_stale` allowed it. Each such answer carries
+/// `X-Nora-Stale: true`. A steady rise means clients are running on copies NORA cannot refresh
+/// (#1230).
+pub static PROXY_STALE_SERVED_TOTAL: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
+        "nora_proxy_stale_served_total",
+        "Answers served from a stored copy the upstream could not revalidate",
+        &["registry"]
+    )
+    .expect("failed to create PROXY_STALE_SERVED_TOTAL metric at startup")
+});
+
 /// Concurrent upstream fetches collapsed into one by the single-flight
 /// coalescer: a follower served the leader's in-memory result without making
 /// its own upstream round-trip (#595).

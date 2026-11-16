@@ -544,7 +544,7 @@ pub(crate) async fn proxy_fetch_hop(
     proxy_fetch_core_with(
         client,
         url,
-        timeout,
+        (timeout, Retry::Once),
         auth,
         None,
         (
@@ -574,7 +574,7 @@ where
     proxy_fetch_core_with(
         client,
         url,
-        timeout,
+        (timeout, Retry::Once),
         auth,
         extra_headers,
         (extract, |_: &reqwest::Response| None),
@@ -583,13 +583,44 @@ where
     .await
 }
 
+/// Whether an upstream request that failed — a 5xx, a network error, a timeout — is sent once
+/// more, a second later, before the caller gets the failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retry {
+    /// Sent once more: the caller has nothing else to answer with.
+    Once,
+    /// Not sent again: the caller answers from a stored copy when the upstream fails, and a
+    /// second attempt would hold that answer back by another timeout (#1230).
+    Never,
+}
+
+impl Retry {
+    /// [`Retry::Never`] for a caller that falls back to a stored copy when the upstream fails,
+    /// [`Retry::Once`] for one that has nothing to fall back to.
+    pub(crate) fn unless_fallback(fallback: bool) -> Self {
+        if fallback {
+            Retry::Never
+        } else {
+            Retry::Once
+        }
+    }
+
+    /// How many times a request is sent at most.
+    fn attempts(self) -> u32 {
+        match self {
+            Retry::Once => 2,
+            Retry::Never => 1,
+        }
+    }
+}
+
 /// [`proxy_fetch_core`] reading a response with `(extract, redirected)`: a redirect handed back
 /// unfollowed is answered by `redirected` when it makes something of it, else an `Upstream`
 /// error of its status.
 async fn proxy_fetch_core_with<T, F, Fut, R>(
     client: &reqwest::Client,
     url: &str,
-    timeout: Duration,
+    (timeout, retry): (Duration, Retry),
     auth: Option<UpstreamAuth<'_>>,
     extra_headers: Option<(&str, &str)>,
     (extract, redirected): (F, R),
@@ -604,8 +635,10 @@ where
     let registry_str = scope.registry().as_str();
     let cb_key = scope.key();
     let probe = cb.check(&cb_key)?;
+    let attempts = retry.attempts();
 
-    for attempt in 0..2 {
+    for attempt in 0..attempts {
+        let last = attempt + 1 == attempts;
         let mut request = client.get(url).timeout(timeout);
         if let Some(value) = &auth_header {
             request = request.header(header::AUTHORIZATION, value.clone());
@@ -674,7 +707,7 @@ where
                     cb.record_alive(&cb_key, probe);
                     return Err(ProxyError::NotFound);
                 }
-                if attempt == 0 {
+                if !last {
                     UPSTREAM_REQUEST_DURATION
                         .with_label_values(&[registry_str, "5xx"])
                         .observe(elapsed);
@@ -694,7 +727,7 @@ where
                 UPSTREAM_REQUEST_DURATION
                     .with_label_values(&[registry_str, status_label])
                     .observe(elapsed);
-                if attempt == 0 {
+                if !last {
                     tracing::debug!(url, error = %e, "upstream error, retrying in 1s");
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
@@ -726,6 +759,33 @@ pub(crate) async fn proxy_fetch(
         |r| async { r.bytes().await.map(|b| b.to_vec()) },
         cb,
         scope,
+    )
+    .await
+}
+
+/// [`proxy_fetch_text`] with the retry the caller chooses, and no extra header: a caller that
+/// answers from a stored copy when the upstream fails asks it once ([`Retry::Never`]), so the copy
+/// comes within one timeout (#1230).
+pub(crate) async fn proxy_fetch_text_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+    retry: Retry,
+) -> Result<String, ProxyError> {
+    proxy_fetch_core_with(
+        client,
+        url,
+        (timeout, retry),
+        auth,
+        None,
+        (
+            |r: reqwest::Response| r.text(),
+            |_: &reqwest::Response| None,
+        ),
+        (cb, scope.into()),
     )
     .await
 }
@@ -4082,5 +4142,97 @@ mod curation_label_whitelist {
                 "{file} names another registry to curation"
             );
         }
+    }
+}
+
+/// The retry an upstream request gets is the caller's choice (#1230): asked once more after a
+/// failure by default — every format but Terraform's stale-capable metadata paths still is — and
+/// once only for a caller that falls back to a stored copy.
+#[cfg(test)]
+mod retry_choice {
+    #![allow(clippy::unwrap_used)]
+
+    use super::{proxy_fetch_text, proxy_fetch_text_with_retry, ProxyError, Retry};
+    use crate::circuit_breaker::CircuitBreakerRegistry;
+    use crate::registry_type::RegistryType;
+    use crate::test_helpers::{create_test_context_with_config, send};
+    use axum::http::{Method, StatusCode};
+    use std::time::Duration;
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn failing() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn asked(server: &MockServer, ending: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path().ends_with(ending))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_is_asked_again_unless_the_caller_has_a_copy() {
+        let cb = CircuitBreakerRegistry::new(crate::config::CircuitBreakerConfig::default());
+        let client = reqwest::Client::new();
+        for (retry, times) in [(None, 2), (Some(Retry::Once), 2), (Some(Retry::Never), 1)] {
+            let server = failing().await;
+            let url = format!("{}/thing", server.uri());
+            let timeout = Duration::from_secs(5);
+            let got = match retry {
+                None => {
+                    proxy_fetch_text(&client, &url, timeout, None, None, &cb, RegistryType::Maven)
+                        .await
+                }
+                Some(retry) => {
+                    proxy_fetch_text_with_retry(
+                        &client,
+                        &url,
+                        timeout,
+                        None,
+                        &cb,
+                        RegistryType::Maven,
+                        retry,
+                    )
+                    .await
+                }
+            };
+            assert!(
+                matches!(got, Err(ProxyError::Upstream(503))),
+                "{retry:?}: {got:?}"
+            );
+            assert_eq!(asked(&server, "/thing").await, times, "{retry:?}");
+        }
+        assert_eq!(Retry::unless_fallback(true), Retry::Never);
+        assert_eq!(Retry::unless_fallback(false), Retry::Once);
+    }
+
+    /// Another format's cold miss is still asked of its upstream twice before the 502.
+    #[tokio::test]
+    async fn another_format_still_asks_twice() {
+        let server = failing().await;
+        let url = server.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(url)];
+            cfg.maven.proxy_timeout = 5;
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/example/lib/1.0/lib-1.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(asked(&server, "lib-1.0.jar").await, 2);
     }
 }

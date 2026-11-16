@@ -24,10 +24,22 @@ pub struct TerraformConfig {
     pub metadata_ttl: i64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
+    /// Seconds a metadata request waits for the upstream when a stored copy is there to serve
+    /// stale (`proxy_timeout`, if lower): when the upstream has not answered by then, the copy
+    /// is. It stays below the 10 s Terraform waits for each mirror request, so an upstream that
+    /// does not answer leaves `terraform init` on a warm cache working (#1230). A request with
+    /// no stored copy to fall back to waits the full `proxy_timeout`.
+    #[serde(default = "default_tf_revalidate_timeout")]
+    pub revalidate_timeout: u64,
 }
 
 fn default_terraform_proxy() -> Option<String> {
     Some("https://registry.terraform.io".to_string())
+}
+
+/// 5 s: half the 10 s Terraform 1.9.8 waits for a network mirror request (measured, #1230).
+fn default_tf_revalidate_timeout() -> u64 {
+    5
 }
 
 impl Default for TerraformConfig {
@@ -40,6 +52,7 @@ impl Default for TerraformConfig {
             proxy_timeout_dl: 120,
             metadata_ttl: 300,
             serve_stale: true,
+            revalidate_timeout: default_tf_revalidate_timeout(),
         }
     }
 }
@@ -74,6 +87,13 @@ impl TerraformConfig {
         }
         if let Ok(val) = env::var("NORA_TF_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");
+        }
+        if let Ok(val) = env::var("NORA_TF_REVALIDATE_TIMEOUT") {
+            super::super::parse_env_warn(
+                "NORA_TF_REVALIDATE_TIMEOUT",
+                &val,
+                &mut self.revalidate_timeout,
+            );
         }
     }
 }
