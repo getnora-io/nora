@@ -2706,10 +2706,13 @@ async fn get_manifest(
     // image's signatures and attestations, and Docker ends the pull on a 5xx for it. With
     // serve_stale on, no upstream answering at all (failed or skipped for its open breaker) and
     // no copy of the tag held (serve_stale would have served one above), it is answered as a
-    // registry without referrers answers it: 404, marked stale. The subject need not be held: a
-    // client whose content store already has the image asks for nothing but the tag and this one.
-    // Any other tag stays the gateway failure, or a client would conclude the image does not
-    // exist; a refused credential and a rate limit keep their own answers (#1196, #1191).
+    // registry without referrers answers it: 404, marked stale. The 404 holds only while the
+    // upstream is silent, so no HTTP cache may keep it (`no-store`): a 404 is heuristically
+    // cacheable, and a kept one would hide the tag's signatures and attestations once the upstream
+    // is back. The subject need not be held: a client whose content store already has the image
+    // asks for nothing but the tag and this one. Any other tag stays the gateway failure, or a
+    // client would conclude the image does not exist; a refused credential and a rate limit keep
+    // their own answers (#1196, #1191).
     if state.config.docker.serve_stale && miss.unanswered() && is_referrers_tag(&reference) {
         tracing::warn!(
             registry = "docker",
@@ -2721,6 +2724,10 @@ async fn get_manifest(
         response.headers_mut().insert(
             axum::http::header::HeaderName::from_static("x-nora-stale"),
             axum::http::header::HeaderValue::from_static("true"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::header::HeaderValue::from_static("no-store"),
         );
         return response;
     }
@@ -7163,10 +7170,10 @@ mod integration_tests {
     }
 
     /// A cached proxied image pulls while its upstream does not answer (unreachable, 5xx, or
-    /// skipped for its open breaker), with `serve_stale` on (the default). A Docker 29 client asks for the attestation manifest's referrers tag
-    /// (`sha256-<hex>`, OCI referrers tag schema); the upstream answered 404 for it, and NORA,
-    /// holding no copy of that tag, answers 404 too rather than failing the pull with a 5xx. The
-    /// answer is marked stale.
+    /// skipped for its open breaker), with `serve_stale` on (the default). A Docker 29 client
+    /// asks for the attestation manifest's referrers tag (`sha256-<hex>`, OCI referrers tag
+    /// schema); the upstream answered 404 for it, and NORA, holding no copy of that tag, answers
+    /// 404 too rather than failing the pull with a 5xx. The answer is marked stale.
     #[tokio::test]
     async fn a_cached_image_pulls_while_its_upstream_does_not_answer() {
         let name = "myorg/app";
@@ -7192,6 +7199,104 @@ mod integration_tests {
                     assert_eq!(body["errors"][0]["code"], "MANIFEST_UNKNOWN", "{outage:?}");
                 }
             }
+        }
+    }
+
+    /// Whether a `Cache-Control` value forbids a cache to answer from a stored copy without asking
+    /// NORA again (RFC 9111 §5.2.2): `no-store` or `no-cache`, or a lifetime of zero that must be
+    /// revalidated once stale. A bare `max-age=0` is not enough: a disconnected cache may still
+    /// serve a stale response (RFC 9111 §4.2.4).
+    fn forbids_reuse(cache_control: &str) -> bool {
+        let directives: Vec<String> = cache_control
+            .split(',')
+            .map(|d| d.trim().to_ascii_lowercase())
+            .collect();
+        let has = |d: &str| directives.iter().any(|v| v == d);
+        has("no-store")
+            || has("no-cache")
+            || ((has("max-age=0") || has("s-maxage=0"))
+                && (has("must-revalidate") || has("proxy-revalidate")))
+    }
+
+    /// NORA's 404 for a referrers tag while no upstream answers holds only for that moment. A 404
+    /// is heuristically cacheable (RFC 9110 §15.5.5), so without a directive an HTTP cache in front
+    /// of NORA may keep it and, once the upstream is back, go on hiding the signatures and
+    /// attestations under the tag. The 404 forbids reuse, on GET and HEAD; and once the upstream
+    /// answers with the tag, NORA serves it.
+    #[tokio::test]
+    async fn a_referrers_404_while_the_upstream_is_down_is_not_kept_by_a_cache() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+
+        let name = "myorg/app";
+        let img = AttestedImage::new();
+        let upstream = wiremock::MockServer::start().await;
+        let (warm, _) = warm_then(Outage::Answers5xx, &upstream, name, &img, &[], Vec::new()).await;
+        let tag = format!("/v2/{name}/manifests/{}", img.referrers_tag());
+        for m in [Method::GET, Method::HEAD] {
+            let resp = send(&warm.app, m.clone(), &tag, Body::empty()).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{m}");
+            let cache_control = resp
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                forbids_reuse(&cache_control),
+                "{m}: Cache-Control {cache_control:?}"
+            );
+        }
+
+        // The upstream is back, and now holds a referrers index for the attestation manifest.
+        let referrers = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": OCI_INDEX,
+            "manifests": [{
+                "mediaType": OCI_MANIFEST,
+                "digest": img.manifest.0,
+                "size": img.manifest.1.len(),
+                "artifactType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+            }],
+        }))
+        .unwrap();
+        upstream.reset().await;
+        Mock::given(method("GET"))
+            .and(path(tag.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", OCI_INDEX)
+                    .set_body_bytes(referrers.clone()),
+            )
+            .mount(&upstream)
+            .await;
+        let resp = send(&warm.app, Method::GET, &tag, Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(resp.headers().get("x-nora-stale").is_none());
+        assert_eq!(body_bytes(resp).await.as_ref(), referrers.as_slice());
+    }
+
+    /// The rule the test above judges `Cache-Control` by: directives that forbid reuse without
+    /// asking again, and lifetimes that allow it.
+    #[test]
+    fn forbids_reuse_reads_the_directives() {
+        for allows in [
+            "",
+            "public",
+            "max-age=0",
+            "public, max-age=60",
+            "must-revalidate",
+        ] {
+            assert!(!forbids_reuse(allows), "{allows:?}");
+        }
+        for forbids in [
+            "no-store",
+            "No-Store",
+            "private, no-cache",
+            "public, max-age=0, must-revalidate",
+            "s-maxage=0, proxy-revalidate",
+        ] {
+            assert!(forbids_reuse(forbids), "{forbids:?}");
         }
     }
 
