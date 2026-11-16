@@ -591,6 +591,28 @@ fn build_http_client(
     builder.build().expect("Failed to build HTTP client")
 }
 
+/// The `[tls] ca_cert` certificates for the S3 or GCS client, read where a store is built so a
+/// deployment on local storage never reads them for it. A bundle that cannot be read or taken
+/// stops the start as a configuration error (#1186).
+fn storage_root_certificates(tls: &TlsConfig) -> Vec<storage::RootCertificate> {
+    match storage::root_certificates(tls.ca_cert.as_deref()) {
+        Ok(roots) => {
+            if !roots.is_empty() {
+                info!(
+                    count = roots.len(),
+                    "Object store trusts the tls.ca_cert certificates too"
+                );
+            }
+            roots
+        }
+        Err(e) => {
+            error!(error = %e, "Cannot start with this configuration");
+            eprintln!("nora: {e}");
+            std::process::exit(config::EXIT_CONFIG);
+        }
+    }
+}
+
 /// The client that never follows a redirect, for a format whose answer depends on what each
 /// hop said (hf: the commit rides on the Hub's redirect). Built by [`build_http_client`]
 /// (custom CA, user agent, proxy settings); the test context builds it here too, so the
@@ -2137,6 +2159,7 @@ async fn main() {
                 expose_opt(&config.storage.s3_access_key),
                 expose_opt(&config.storage.s3_secret_key),
                 config.storage.s3_virtual_hosted,
+                &storage_root_certificates(&config.tls),
             )
         }
         StorageMode::Gcs => {
@@ -2152,6 +2175,7 @@ async fn main() {
                 &config.storage.bucket,
                 config.storage.gcs_service_account_path.as_deref(),
                 config.storage.gcs_base_url.as_deref(),
+                &storage_root_certificates(&config.tls),
             )
         }
     };
@@ -2360,11 +2384,13 @@ async fn main() {
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
                     config.storage.s3_virtual_hosted,
+                    &storage_root_certificates(&config.tls),
                 ),
                 "gcs" => Storage::new_gcs(
                     &config.storage.bucket,
                     config.storage.gcs_service_account_path.as_deref(),
                     config.storage.gcs_base_url.as_deref(),
+                    &storage_root_certificates(&config.tls),
                 ),
                 _ => {
                     error!("Invalid source: '{}'. Use 'local', 's3', or 'gcs'", from);
@@ -2381,11 +2407,13 @@ async fn main() {
                     expose_opt(&config.storage.s3_access_key),
                     expose_opt(&config.storage.s3_secret_key),
                     config.storage.s3_virtual_hosted,
+                    &storage_root_certificates(&config.tls),
                 ),
                 "gcs" => Storage::new_gcs(
                     &config.storage.bucket,
                     config.storage.gcs_service_account_path.as_deref(),
                     config.storage.gcs_base_url.as_deref(),
+                    &storage_root_certificates(&config.tls),
                 ),
                 _ => {
                     error!("Invalid destination: '{}'. Use 'local', 's3', or 'gcs'", to);
