@@ -211,7 +211,9 @@ NORA serves both Terraform protocols against the same upstream: the **Registry P
 is asked of the upstream once, for at most `revalidate_timeout`. When the upstream has not answered
 by then, has failed, or its circuit breaker is open, the stored copy is served with
 `X-Nora-Stale: true` and `Cache-Control: public, max-age=0, must-revalidate`, logged as a warning
-and counted in `nora_proxy_stale_served_total`. Terraform waits 10 s for each network mirror request
+and counted in `nora_proxy_stale_served_total`. With `trust_upstream_dates` on, the release-date
+query to registry.terraform.io shares the same time with the revalidation. A stored copy that is not
+JSON is no fallback: it is never served. Terraform waits 10 s for each network mirror request
 (measured with Terraform 1.9.8), so the 5 s default keeps `terraform init` working on a warm cache
 while the upstream is down. Metadata with no stored copy waits the full `proxy_timeout`, is asked
 twice, and then answers 502 (503 with `Retry-After` while the breaker is open). A stored provider
