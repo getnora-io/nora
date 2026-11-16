@@ -2466,6 +2466,22 @@ fn manifest_cache_fresh(
             .unwrap_or(false)
 }
 
+/// The staleness window of the tag copies stored under `namespace` (#1222): the `metadata_ttl` of
+/// the upstream whose storage namespace it is (the first one with that namespace, in config
+/// order), else the global `[docker] metadata_ttl`. A copy from a fallback chain is stored under
+/// its first upstream's namespace, so it takes that upstream's window.
+fn docker_metadata_ttl(config: &crate::config::DockerConfig, namespace: Option<&str>) -> i64 {
+    namespace
+        .and_then(|ns| {
+            config
+                .upstreams
+                .iter()
+                .find(|u| u.resolved_namespace() == ns)
+        })
+        .and_then(|u| u.metadata_ttl)
+        .unwrap_or(config.metadata_ttl)
+}
+
 async fn get_manifest(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -2604,7 +2620,7 @@ async fn get_manifest(
         manifest_cache_fresh(
             is_digest,
             revalidate,
-            state.config.docker.metadata_ttl,
+            docker_metadata_ttl(&state.config.docker, ns.as_deref()),
             modified,
         )
     } else {
@@ -5678,6 +5694,7 @@ mod integration_tests {
                 cfg.docker.upstreams = entries
                     .into_iter()
                     .map(|url| DockerUpstream {
+                        metadata_ttl: None,
                         url,
                         auth: None,
                         namespace: None,
@@ -5755,6 +5772,7 @@ mod integration_tests {
             };
             for harbor_first in [true, false] {
                 let bound = DockerUpstream {
+                    metadata_ttl: None,
                     url: harbor_url.clone(),
                     auth: None,
                     namespace: None,
@@ -5762,6 +5780,7 @@ mod integration_tests {
                     namespaces: vec!["team-*".to_string()],
                 };
                 let hub = DockerUpstream {
+                    metadata_ttl: None,
                     url: squatter.uri(),
                     auth: None,
                     namespace: None,
@@ -5834,6 +5853,7 @@ mod integration_tests {
             cfg.docker.default_action = DefaultAction::Deny;
             cfg.docker.upstreams = vec![
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: hub_url,
                     auth: None,
                     namespace: Some("docker.io".to_string()),
@@ -5841,6 +5861,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                 },
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: harbor_url,
                     auth: None,
                     namespace: Some("harbor.example".to_string()),
@@ -5921,6 +5942,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: hub_url,
                     auth: None,
                     namespace: Some("docker.io".to_string()),
@@ -5928,6 +5950,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                 },
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: harbor_url,
                     auth: None,
                     namespace: Some("harbor.example".to_string()),
@@ -6003,6 +6026,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.serve_stale = false;
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: harbor_url,
                 auth: None,
                 namespace: None,
@@ -6099,6 +6123,7 @@ mod integration_tests {
         let hub_url = hub.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: hub_url,
                 auth: None,
                 namespace: Some("docker.io".to_string()),
@@ -6287,6 +6312,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: url.clone(),
                     auth: None,
                     namespace: Some("docker.io".to_string()),
@@ -6294,6 +6320,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                 },
                 DockerUpstream {
+                    metadata_ttl: None,
                     url,
                     auth: None,
                     namespace: Some("hubmirror".to_string()),
@@ -6462,6 +6489,7 @@ mod integration_tests {
         let url = quay.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: Some("quay.io".to_string()),
@@ -6624,6 +6652,7 @@ mod integration_tests {
                 cfg.circuit_breaker.enabled = true;
                 cfg.circuit_breaker.failure_threshold = 3;
                 cfg.docker.upstreams = vec![DockerUpstream {
+                    metadata_ttl: None,
                     url: registry_url,
                     auth: credential.then(|| "robot:secret".to_string().into()),
                     namespace: None,
@@ -6695,6 +6724,7 @@ mod integration_tests {
                 cfg.docker.upstreams = [first, second]
                     .into_iter()
                     .map(|url| DockerUpstream {
+                        metadata_ttl: None,
                         url,
                         auth: Some("robot:secret".to_string().into()),
                         namespace: None,
@@ -6713,6 +6743,7 @@ mod integration_tests {
         entries
             .into_iter()
             .map(|(url, namespaces)| crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: None,
@@ -7579,6 +7610,7 @@ mod integration_tests {
                 cfg.circuit_breaker.reset_timeout = 3600;
                 cfg.docker.proxy_timeout = 1;
                 cfg.docker.upstreams = vec![crate::config::DockerUpstream {
+                    metadata_ttl: None,
                     url,
                     auth: None,
                     namespace: None,
@@ -7941,6 +7973,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.serve_stale = false;
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: None,
@@ -8076,6 +8109,7 @@ mod integration_tests {
                 .set_body_bytes(body.to_vec())
         };
         let upstream = |url: String, prefix: Option<&str>| DockerUpstream {
+            metadata_ttl: None,
             url,
             auth: None,
             namespace: None,
@@ -8204,6 +8238,7 @@ mod integration_tests {
             .mount(&server)
             .await;
         let upstream = DockerUpstream {
+            metadata_ttl: None,
             url: server.uri(),
             auth: None,
             namespace: None,
@@ -8321,6 +8356,7 @@ mod integration_tests {
         let uri = server.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: uri,
                 auth: None,
                 namespace: None,
@@ -8423,6 +8459,7 @@ mod integration_tests {
             .mount(&server)
             .await;
         let upstream = DockerUpstream {
+            metadata_ttl: None,
             url: server.uri(),
             auth: None,
             namespace: None,
@@ -8510,6 +8547,7 @@ mod integration_tests {
         use crate::config::DockerUpstream;
         let (storage, ops) = crate::test_helpers::op_counting_storage();
         let upstream = DockerUpstream {
+            metadata_ttl: None,
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
             namespace: None,
@@ -8545,6 +8583,7 @@ mod integration_tests {
         use sha2::Digest;
         let (storage, ops) = crate::test_helpers::op_counting_storage();
         let upstream = DockerUpstream {
+            metadata_ttl: None,
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
             namespace: None,
@@ -8819,6 +8858,7 @@ mod integration_tests {
                 .mount(&server)
                 .await;
             let upstream = DockerUpstream {
+                metadata_ttl: None,
                 url: server.uri(),
                 auth: None,
                 namespace: None,
@@ -9296,6 +9336,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -9769,6 +9810,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -9851,6 +9893,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -11185,6 +11228,7 @@ mod integration_tests {
             cfg.circuit_breaker.reset_timeout = 3600;
             // Unreachable upstream
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: None,
@@ -11437,6 +11481,7 @@ mod integration_tests {
             cfg.circuit_breaker.reset_timeout = 3600;
             cfg.docker.upstreams = vec![
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: "http://127.0.0.1:1".into(), // upstream A (will be tripped)
                     auth: None,
                     namespace: None,
@@ -11444,6 +11489,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                 },
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
                     auth: None,
                     namespace: None,
@@ -11585,6 +11631,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_prefix_routing() {
         let upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             namespace: Some("docker.io".to_string()),
@@ -11603,6 +11650,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_hostname_detection() {
         let upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             namespace: Some("docker.io".to_string()),
@@ -11629,6 +11677,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_fallback() {
         let upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             namespace: Some("docker.io".to_string()),
@@ -11700,6 +11749,7 @@ mod integration_tests {
     fn test_canonicalize_multi_upstream() {
         let upstreams = vec![
             crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
                 namespace: Some("docker.io".to_string()),
@@ -11707,6 +11757,7 @@ mod integration_tests {
                 namespaces: Vec::new(),
             },
             crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: "https://ghcr.io".to_string(),
                 auth: None,
                 namespace: Some("ghcr.io".to_string()),
@@ -11736,6 +11787,7 @@ mod integration_tests {
     fn test_canonicalize_deny_mode_blocks_unmatched() {
         let upstreams = vec![
             crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
                 namespace: Some("docker.io".to_string()),
@@ -11743,6 +11795,7 @@ mod integration_tests {
                 namespaces: Vec::new(),
             },
             crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: "https://ghcr.io".to_string(),
                 auth: None,
                 namespace: Some("ghcr.io".to_string()),
@@ -11774,6 +11827,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_deny_mode_allows_known_hostname() {
         let upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             namespace: Some("docker.io".to_string()),
@@ -11794,6 +11848,7 @@ mod integration_tests {
     fn bound_upstreams() -> Vec<crate::config::DockerUpstream> {
         let entry = |url: &str, ns: &str, prefix: Option<&str>, masks: &[&str]| {
             crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: url.to_string(),
                 auth: None,
                 namespace: Some(ns.to_string()),
@@ -11899,6 +11954,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_registry_host_decision_table() {
         let entry = |url: &str, ns: Option<&str>, masks: &[&str]| crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: url.to_string(),
             auth: None,
             namespace: ns.map(str::to_string),
@@ -11995,6 +12051,7 @@ mod integration_tests {
     #[test]
     fn test_denied_response_format() {
         let upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             namespace: Some("docker.io".to_string()),
@@ -12047,6 +12104,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream.uri(),
                 auth: None,
                 namespace: None,
@@ -12132,6 +12190,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream.uri(),
                 auth: None,
                 namespace: None,
@@ -12188,6 +12247,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream.uri(),
                 auth: None,
                 namespace: None,
@@ -12309,6 +12369,7 @@ mod integration_tests {
 
     fn unreachable_upstream() -> crate::config::DockerUpstream {
         crate::config::DockerUpstream {
+            metadata_ttl: None,
             // Reserved port on localhost — connect fails fast, no real network.
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
@@ -12396,6 +12457,247 @@ mod integration_tests {
         );
         let body = body_bytes(resp).await;
         assert_eq!(body.as_ref(), b"{\"legacy\":true}");
+    }
+
+    const WINDOW_MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","size":0,"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"layers":[]}"#;
+
+    /// `[docker] metadata_ttl = 3600` with two upstreams. `/v2/a/…` is asked of `up-a`, whose own
+    /// window is 60 seconds; `/v2/b/…` of `up-b`, which has none and follows the global one.
+    fn window_config(url: String) -> impl FnOnce(&mut crate::config::Config) {
+        move |cfg| {
+            cfg.docker.metadata_ttl = 3600;
+            cfg.docker.upstreams = vec![
+                crate::config::DockerUpstream {
+                    url: url.clone(),
+                    auth: None,
+                    namespace: Some("up-a".to_string()),
+                    prefix: Some("a".to_string()),
+                    namespaces: Vec::new(),
+                    metadata_ttl: Some(60),
+                },
+                crate::config::DockerUpstream {
+                    url,
+                    auth: None,
+                    namespace: Some("up-b".to_string()),
+                    prefix: Some("b".to_string()),
+                    namespaces: Vec::new(),
+                    metadata_ttl: None,
+                },
+            ];
+        }
+    }
+
+    async fn hub_serving_app() -> wiremock::MockServer {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                WINDOW_MANIFEST,
+                "application/vnd.docker.distribution.manifest.v2+json",
+            ))
+            .mount(&hub)
+            .await;
+        hub
+    }
+
+    /// The copy of `app:v1` that an upstream's namespace stores.
+    fn window_key(namespace: &str) -> String {
+        super::manifest_key(Some(namespace), "app", "v1")
+    }
+
+    /// Both upstreams' copies of `app:v1`, stored as an earlier pull left them.
+    async fn seed_window_copies(storage: &crate::storage::Storage) {
+        for namespace in ["up-a", "up-b"] {
+            storage
+                .put(&window_key(namespace), WINDOW_MANIFEST)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Pull `app:v1` through the path of one upstream. Returns the status, and how many requests
+    /// the hub has received so far.
+    async fn pull_through(
+        ctx: &crate::test_helpers::TestContext,
+        hub: &wiremock::MockServer,
+        prefix: &str,
+    ) -> (StatusCode, usize) {
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/{prefix}/app/manifests/v1"),
+            Body::empty(),
+        )
+        .await;
+        let asked = hub.received_requests().await.unwrap().len();
+        (resp.status(), asked)
+    }
+
+    /// A context on local storage whose copies are `age_a` and `age_b` seconds old (#1222).
+    async fn window_ctx_local(
+        hub: &wiremock::MockServer,
+        age_a: u64,
+        age_b: u64,
+    ) -> crate::test_helpers::TestContext {
+        let ctx = create_test_context_with_config(window_config(hub.uri()));
+        seed_window_copies(&ctx.state.storage).await;
+        let root = std::path::Path::new(&ctx.state.config.storage.path).to_path_buf();
+        for (namespace, age) in [("up-a", age_a), ("up-b", age_b)] {
+            let then = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            std::fs::File::options()
+                .write(true)
+                .open(root.join(window_key(namespace)))
+                .unwrap()
+                .set_modified(then)
+                .unwrap();
+        }
+        ctx
+    }
+
+    /// The object store stamps every object with the time it was written, which a test cannot
+    /// set. This stands in for an object store whose objects are `age` seconds old: a key takes
+    /// the age of the first fragment it contains (#1222).
+    struct AgedObjects {
+        inner: crate::storage::ObjectStorage,
+        ages: Vec<(&'static str, u64)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for AgedObjects {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(key, data, sha256).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            self.inner.get(key).await
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+        async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
+            let mut meta = self.inner.stat(key).await?;
+            let age = self
+                .ages
+                .iter()
+                .find(|(fragment, _)| key.contains(fragment))
+                .map_or(0, |(_, age)| *age);
+            meta.modified = meta.modified.saturating_sub(age);
+            Some(meta)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "aged-objects-test"
+        }
+        async fn copy(
+            &self,
+            src: &str,
+            dst: &str,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+    }
+
+    /// A context on an object store whose copies are `age_a` and `age_b` seconds old (#1222).
+    async fn window_ctx_objects(
+        hub: &wiremock::MockServer,
+        age_a: u64,
+        age_b: u64,
+    ) -> crate::test_helpers::TestContext {
+        let storage = crate::storage::Storage::from_backend(std::sync::Arc::new(AgedObjects {
+            inner: crate::storage::ObjectStorage::in_memory(),
+            ages: vec![("/up-a/", age_a), ("/up-b/", age_b)],
+        }));
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            storage,
+            window_config(hub.uri()),
+        );
+        seed_window_copies(&ctx.state.storage).await;
+        ctx
+    }
+
+    /// A copy inside its upstream's own window is served from cache, and so is a copy of the other
+    /// upstream inside the global window (#1222). Local storage.
+    #[tokio::test]
+    async fn docker_upstream_window_serves_a_copy_inside_it_local() {
+        let hub = hub_serving_app().await;
+        let ctx = window_ctx_local(&hub, 30, 120).await;
+        assert_eq!(pull_through(&ctx, &hub, "a").await, (StatusCode::OK, 0));
+        assert_eq!(pull_through(&ctx, &hub, "b").await, (StatusCode::OK, 0));
+    }
+
+    /// A copy past its upstream's own window is revalidated, though the global window would still
+    /// serve it; a copy past the global window is revalidated as before (#1222). Local storage.
+    #[tokio::test]
+    async fn docker_upstream_window_revalidates_a_copy_past_it_local() {
+        let hub = hub_serving_app().await;
+        let ctx = window_ctx_local(&hub, 120, 7200).await;
+        assert_eq!(pull_through(&ctx, &hub, "a").await, (StatusCode::OK, 1));
+        assert_eq!(pull_through(&ctx, &hub, "b").await, (StatusCode::OK, 2));
+    }
+
+    /// The same as `docker_upstream_window_serves_a_copy_inside_it_local`, on an object store (#1222).
+    #[tokio::test]
+    async fn docker_upstream_window_serves_a_copy_inside_it_objects() {
+        let hub = hub_serving_app().await;
+        let ctx = window_ctx_objects(&hub, 30, 120).await;
+        assert_eq!(pull_through(&ctx, &hub, "a").await, (StatusCode::OK, 0));
+        assert_eq!(pull_through(&ctx, &hub, "b").await, (StatusCode::OK, 0));
+    }
+
+    /// The same as `docker_upstream_window_revalidates_a_copy_past_it_local`, on an object store
+    /// (#1222).
+    #[tokio::test]
+    async fn docker_upstream_window_revalidates_a_copy_past_it_objects() {
+        let hub = hub_serving_app().await;
+        let ctx = window_ctx_objects(&hub, 120, 7200).await;
+        assert_eq!(pull_through(&ctx, &hub, "a").await, (StatusCode::OK, 1));
+        assert_eq!(pull_through(&ctx, &hub, "b").await, (StatusCode::OK, 2));
+    }
+
+    /// `metadata_ttl` is optional on an upstream: set, it is read; unset, the upstream follows the
+    /// global window (#1222).
+    #[test]
+    fn docker_upstream_metadata_ttl_is_optional() {
+        let parsed: crate::config::DockerConfig = toml::from_str(
+            "[[upstreams]]\nurl = \"https://registry-1.docker.io\"\nmetadata_ttl = 60\n\n[[upstreams]]\nurl = \"https://private.example\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.upstreams[0].metadata_ttl, Some(60));
+        assert_eq!(parsed.upstreams[1].metadata_ttl, None);
     }
 }
 
@@ -12527,6 +12829,7 @@ mod stream_spool_tests {
         use crate::config::DockerUpstream;
         create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream,
                 auth: None,
                 namespace: None,
@@ -12922,6 +13225,7 @@ mod stream_spool_tests {
         let upstream = slow_blob_upstream(blob.clone(), 2, Duration::from_millis(50)).await;
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream,
                 auth: None,
                 namespace: None,
@@ -13169,6 +13473,7 @@ mod upstream_resume_tests {
         create_test_context_with_config(move |cfg| {
             cfg.docker.proxy_timeout = proxy_timeout;
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: None,
@@ -13456,6 +13761,7 @@ mod upstream_resume_tests {
             cfg.circuit_breaker.failure_threshold = 1;
             cfg.docker.proxy_timeout = 5;
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream_url,
                 auth: None,
                 namespace: None,
@@ -13539,6 +13845,7 @@ mod upstream_resume_tests {
             cfg.circuit_breaker.reset_timeout = 3600;
             cfg.docker.proxy_timeout = 5;
             cfg.docker.upstreams = vec![crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: upstream_url,
                 auth: None,
                 namespace: None,
@@ -13874,6 +14181,7 @@ mod blob_single_flight_tests {
             cfg.curation.blocklist_path = Some(bl);
             cfg.curation.bypass_token = Some(ProtectedString::from("let-me-in"));
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: None,
@@ -14262,6 +14570,7 @@ mod upstream_failure_cases {
             let url = flip.uri();
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
+                    metadata_ttl: None,
                     url,
                     auth: None,
                     namespace: None,
@@ -14306,6 +14615,7 @@ mod upstream_failure_edge_cases {
             let url = bad.uri();
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
+                    metadata_ttl: None,
                     url,
                     auth: None,
                     namespace: None,
@@ -14406,6 +14716,7 @@ mod hosted_pull_stats_and_re_push {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -14524,6 +14835,7 @@ mod hosted_pull_stats_and_re_push {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -14713,6 +15025,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
         use sha2::Digest as _;
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -14986,6 +15299,7 @@ mod hosted_pull_stats_after_a_delete {
     fn ctx() -> crate::test_helpers::TestContext {
         crate::test_helpers::create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -15181,6 +15495,7 @@ mod manifest_before_metadata_one_lock_order {
         let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = if upstream_ns {
                 vec![DockerUpstream {
+                    metadata_ttl: None,
                     url: "http://127.0.0.1:1".into(),
                     auth: None,
                     namespace: Some("docker.io".into()),

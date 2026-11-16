@@ -74,6 +74,13 @@ pub struct DockerUpstream {
     /// is asked for nothing else.
     #[serde(default)]
     pub namespaces: Vec<String>,
+    /// Staleness window, in seconds, of the tag copies this upstream serves, as
+    /// `[docker] metadata_ttl`: a positive value serves a copy from cache for that long, and a
+    /// value that is not positive (the default `-1` among them) revalidates every pull. Unset:
+    /// the global value applies. A copy takes the window of the upstream whose storage namespace
+    /// it is stored under (#1222).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_ttl: Option<i64>,
 }
 
 impl DockerUpstream {
@@ -204,6 +211,7 @@ fn default_docker_metadata_ttl() -> i64 {
 /// divergence class — a bare default on a `Vec` yields an empty list).
 fn default_docker_upstreams() -> Vec<DockerUpstream> {
     vec![DockerUpstream {
+        metadata_ttl: None,
         url: "https://registry-1.docker.io".to_string(),
         auth: None,
         namespace: None,
@@ -385,6 +393,7 @@ impl DockerConfig {
                         })
                         .unwrap_or_default();
                     DockerUpstream {
+                        metadata_ttl: None,
                         url: parts[0].to_string(),
                         auth,
                         namespace: None,
