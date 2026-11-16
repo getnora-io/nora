@@ -537,7 +537,7 @@ const COUNTED_METHODS: [&str; 12] = [
     "list",
     "stat",
     "list_with_meta",
-    "list_legacy_with_meta",
+    "list_with_meta_as_read",
     "put_from_path",
     "copy",
     "get_reader",
@@ -672,19 +672,20 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         Ok(keys)
     }
 
-    async fn list_legacy_with_meta(
+    async fn list_with_meta_as_read(
         &self,
         prefix: &str,
-    ) -> crate::storage::Result<Option<Vec<(String, crate::storage::FileMeta)>>> {
-        // Counted when the store is asked: without an older encoding for `prefix` it is not.
-        let listed = self.inner.list_legacy_with_meta(prefix).await;
-        if !matches!(listed, Ok(None)) {
-            self.counts.hit("list_legacy_with_meta");
+    ) -> crate::storage::Result<crate::storage::ListedAsRead> {
+        // One count per listing the store is asked for: the current key form, and the older
+        // form where the store keeps one for `prefix`.
+        self.counts.hit("list_with_meta_as_read");
+        let listed = self.inner.list_with_meta_as_read(prefix).await?;
+        self.counts.enumerated(listed.current.len());
+        if let Some(older) = &listed.older {
+            self.counts.hit("list_with_meta_as_read");
+            self.counts.enumerated(older.len());
         }
-        if let Ok(Some(keys)) = &listed {
-            self.counts.enumerated(keys.len());
-        }
-        listed
+        Ok(listed)
     }
 
     async fn health_check(&self) -> bool {
@@ -869,8 +870,8 @@ impl StorageOutage {
     }
 
     /// Fail only the listing of `prefix` under an older key encoding
-    /// ([`StorageBackend::list_legacy_with_meta`](crate::storage::StorageBackend::list_legacy_with_meta))
-    /// with a network error; its current listing and every read answer.
+    /// (the second listing of [`Storage::list_with_meta_as_read`]) with a network error; its
+    /// current listing and every read answer.
     pub fn fail_older_listings_of(&self, prefix: &str) {
         self.faults().older_listings.push(prefix.to_string());
     }
@@ -1109,22 +1110,24 @@ impl crate::storage::StorageBackend for OutageBackend {
         self.inner.list_with_meta(prefix).await
     }
 
-    async fn list_legacy_with_meta(
+    async fn list_with_meta_as_read(
         &self,
         prefix: &str,
-    ) -> crate::storage::Result<Option<Vec<(String, crate::storage::FileMeta)>>> {
+    ) -> crate::storage::Result<crate::storage::ListedAsRead> {
         self.outage.wait_answer().await;
-        // A fault meets only a listing the store is asked for: without an older encoding for
-        // `prefix` the store is not asked and answers `None`, down or not.
-        let listed = self.inner.list_legacy_with_meta(prefix).await?;
-        let refused = self.outage.listing_fails(prefix)
-            || self
-                .outage
-                .faults()
-                .older_listings
-                .iter()
-                .any(|p| p == prefix);
-        if listed.is_some() && refused {
+        if self.outage.listing_fails(prefix) {
+            return Err(network_error());
+        }
+        // A fault of the older form meets only a listing the store is asked for: where it
+        // keeps no older form for `prefix` it is not asked.
+        let listed = self.inner.list_with_meta_as_read(prefix).await?;
+        let older_refused = self
+            .outage
+            .faults()
+            .older_listings
+            .iter()
+            .any(|p| p == prefix);
+        if listed.older.is_some() && older_refused {
             return Err(network_error());
         }
         Ok(listed)
@@ -1422,6 +1425,134 @@ pub fn hang_health_probe(base: &std::path::Path) -> HungProbe {
     let marker = base.join(DISK_HANGS);
     std::fs::write(&marker, b"").unwrap();
     HungProbe(marker)
+}
+
+/// An in-memory object store that counts the listings it is asked for.
+pub struct ListCounting {
+    inner: Arc<object_store::memory::InMemory>,
+    listings: Arc<Listings>,
+}
+
+/// The listings a [`list_counting_storage`] store was asked for.
+#[derive(Default)]
+pub struct Listings {
+    all: AtomicUsize,
+    old_form: AtomicUsize,
+}
+
+impl Listings {
+    /// Forget the listings counted so far.
+    pub fn reset(&self) {
+        self.all.store(0, Ordering::Relaxed);
+        self.old_form.store(0, Ordering::Relaxed);
+    }
+
+    /// Listings asked for since the last reset, and of them those under a prefix in the old
+    /// `_at_` key form (#534).
+    pub fn counts(&self) -> (usize, usize) {
+        (
+            self.all.load(Ordering::Relaxed),
+            self.old_form.load(Ordering::Relaxed),
+        )
+    }
+
+    fn asked(&self, prefix: Option<&object_store::path::Path>) {
+        self.all.fetch_add(1, Ordering::Relaxed);
+        if prefix.is_some_and(|p| p.as_ref().contains("_at_")) {
+            self.old_form.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// An in-memory object store standing for `backend` (`"s3"` or `"gcs"`): its [`Storage`], the
+/// raw store (to write objects NORA itself would not write today), and the listings the
+/// store has been asked for.
+pub fn list_counting_storage(
+    backend: &'static str,
+) -> (Storage, Arc<object_store::memory::InMemory>, Arc<Listings>) {
+    let inner = Arc::new(object_store::memory::InMemory::new());
+    let listings = Arc::new(Listings::default());
+    let store = ListCounting {
+        inner: Arc::clone(&inner),
+        listings: Arc::clone(&listings),
+    };
+    let backend = crate::storage::ObjectStorage::over_named(Box::new(store), backend);
+    (Storage::from_backend(Arc::new(backend)), inner, listings)
+}
+
+impl std::fmt::Display for ListCounting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ListCounting")
+    }
+}
+
+impl std::fmt::Debug for ListCounting {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "ListCounting")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for ListCounting {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.listings.asked(prefix);
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.listings.asked(prefix);
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
 }
 
 /// A [`Storage`] over a [`SlowListing`] store with `delay` between listed objects.

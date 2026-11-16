@@ -8,13 +8,13 @@ use object_store::aws::AmazonS3Builder;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::path::Path;
 use object_store::{
-    Attribute, AttributeValue, Attributes, GetOptions, ObjectStore, ObjectStoreExt,
+    Attribute, AttributeValue, Attributes, GetOptions, ObjectMeta, ObjectStore, ObjectStoreExt,
     PutMultipartOptions, PutOptions, PutPayload, WriteMultipart,
 };
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use super::{FileMeta, Result, StorageBackend, StorageError};
+use super::{FileMeta, ListedAsRead, Result, StorageBackend, StorageError};
 
 /// Downloads stream store -> server -> client under backpressure, so a slow
 /// download client paces the store read. object_store's request timeout covers
@@ -194,9 +194,15 @@ impl ObjectStorage {
     /// S3/GCS. Reachability is unknown until the first refresh, as on a real store.
     #[cfg(test)]
     pub(crate) fn over(store: Box<dyn ObjectStore>) -> Self {
+        Self::over_named(store, "s3")
+    }
+
+    /// [`over`](Self::over), as the backend `name` (`"s3"` or `"gcs"`) the store stands for.
+    #[cfg(test)]
+    pub(crate) fn over_named(store: Box<dyn ObjectStore>, name: &'static str) -> Self {
         Self {
             store,
-            name: "s3",
+            name,
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
             cached_reachable: std::sync::atomic::AtomicBool::new(false),
@@ -273,6 +279,30 @@ fn encode_object_key_legacy(key: &str) -> String {
 /// where a literal `_at_` (e.g. `cargo/look_at_this/`) would be wrongly decoded.
 fn decode_object_key(key: &str) -> String {
     key.replace("%2540", "@").replace("%40", "@")
+}
+
+/// `object_store` path parts, percent-decoded once: `Path::from` encodes `%`, `~`, `^`, `#`
+/// and the rest of its set in each part. `None` for a part that decodes to a `/` or to bytes
+/// that are not UTF-8 — no key a NORA write names.
+fn part_as_read(location: &str) -> Option<String> {
+    let parts: Option<Vec<String>> = location
+        .split('/')
+        .map(|part| {
+            let decoded = percent_encoding::percent_decode_str(part)
+                .decode_utf8()
+                .ok()?;
+            (!decoded.contains('/')).then(|| decoded.into_owned())
+        })
+        .collect();
+    Some(parts?.join("/"))
+}
+
+/// The key a read finds the object at `location` under: the inverse of
+/// `Path::from(encode_object_key(key))` — the parts decoded, then `%40` back to `@`.
+/// [`decode_object_key`] reverses only the `@`, so a listed key holding another encoded
+/// character (`~` as `%7E`) is not the key a `get` or `stat` of it reads (#1172).
+fn key_as_read(location: &str) -> Option<String> {
+    Some(part_as_read(location)?.replace("%40", "@"))
 }
 
 /// User-defined object metadata carrying the SHA-256 integrity pin — written
@@ -439,48 +469,73 @@ impl StorageBackend for ObjectStorage {
             .collect())
     }
 
-    async fn list_legacy_with_meta(&self, prefix: &str) -> Result<Option<Vec<(String, FileMeta)>>> {
-        // Without `@` the two encodings write the same key: nothing else to list.
-        if !prefix.contains('@') {
-            return Ok(None);
+    async fn list_with_meta_as_read(&self, prefix: &str) -> Result<ListedAsRead> {
+        let modified =
+            |meta: &ObjectMeta| meta.last_modified.timestamp().try_into().unwrap_or(0u64);
+        let current_prefix = Path::from(encode_object_key(prefix));
+        let current = self
+            .store
+            .list((!prefix.is_empty()).then_some(&current_prefix))
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(map_err)?
+            .into_iter()
+            .filter_map(|meta| {
+                let name = key_as_read(meta.location.as_ref())?;
+                let file = FileMeta {
+                    size: meta.size,
+                    modified: modified(&meta),
+                };
+                Some((name, file))
+            })
+            .filter(|(key, _)| !super::is_reserved_signing_key(key))
+            .collect();
+
+        // Only the S3 backend wrote `@` as `_at_` (NORA 0.9.2 and earlier, before #534); the
+        // GCS backend came in 1.0.1 (#842) and never did. Without `@` both forms are one key.
+        if self.name != "s3" || !prefix.contains('@') {
+            return Ok(ListedAsRead {
+                current,
+                older: None,
+            });
         }
-        let legacy_prefix = Path::from(encode_object_key_legacy(prefix));
+        let older_prefix = Path::from(encode_object_key_legacy(prefix));
         let objects: Vec<_> = self
             .store
-            .list(Some(&legacy_prefix))
+            .list(Some(&older_prefix))
             .try_collect()
             .await
             .map_err(map_err)?;
 
-        // Named as a read finds them: the prefix as asked, then the rest of the stored key.
-        // `stat`/`get` of that name miss the current encoding and fall back to this object.
-        // The old encoding wrote every `@` as `_at_`, so a rest holding an encoded `@` is an
-        // object of the current encoding under another key, which that name would not read.
+        // Named as a read finds them: the prefix as asked, then the rest of the stored key
+        // decoded. `stat`/`get` of that name miss the current form and fall back to this
+        // object. The old form wrote every `@` as `_at_`, so a rest that decodes to an encoded
+        // `@` belongs to an object of the current form under another key.
         let base = prefix.trim_end_matches('/');
-        Ok(Some(
-            objects
-                .into_iter()
-                .filter_map(|meta| {
-                    let rest = meta
-                        .location
-                        .as_ref()
-                        .strip_prefix(legacy_prefix.as_ref())?
-                        .strip_prefix('/')?;
-                    if decode_object_key(rest) != rest {
-                        return None;
-                    }
-                    let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
-                    Some((
-                        format!("{base}/{rest}"),
-                        FileMeta {
-                            size: meta.size,
-                            modified,
-                        },
-                    ))
-                })
-                .filter(|(key, _)| !super::is_reserved_signing_key(key))
-                .collect(),
-        ))
+        let older = objects
+            .into_iter()
+            .filter_map(|meta| {
+                let rest = meta
+                    .location
+                    .as_ref()
+                    .strip_prefix(older_prefix.as_ref())?
+                    .strip_prefix('/')?;
+                let rest = part_as_read(rest)?;
+                if rest.contains("%40") {
+                    return None;
+                }
+                let file = FileMeta {
+                    size: meta.size,
+                    modified: modified(&meta),
+                };
+                Some((format!("{base}/{rest}"), file))
+            })
+            .filter(|(key, _)| !super::is_reserved_signing_key(key))
+            .collect();
+        Ok(ListedAsRead {
+            current,
+            older: Some(older),
+        })
     }
 
     async fn stat(&self, key: &str) -> Option<FileMeta> {
@@ -726,72 +781,100 @@ mod tests {
         );
     }
 
-    /// #1172: the older-encoding listing names each object as a read finds it — a `stat` of
-    /// the name returns that object — lists nothing a read under the current encoding finds
-    /// first, and asks the store nothing when the prefix has no `@`.
+    /// #1172: the as-read listing names every object by the key a read finds it under — a
+    /// `stat` of the name returns that object — in the current form whatever characters
+    /// `object_store` encodes in the key, and in the old `_at_` form on S3 only; and leaves out
+    /// of the old form an object of the current form whose key starts the same way.
     #[tokio::test]
-    async fn the_older_encoding_listing_names_each_object_as_a_read_finds_it() {
-        let object = ObjectStorage::in_memory();
-        let put_raw = |path: &str, data: &'static [u8]| {
-            let path = Path::from(path);
-            let store = object.store();
-            async move {
-                store
-                    .put(&path, object_store::PutPayload::from_static(data))
-                    .await
-                    .unwrap();
-            }
-        };
-        // As 0.9.2 wrote `go/example.com/m/@v/...`, and one file of another key under the
-        // current encoding that happens to start with the same old-form prefix.
-        put_raw("go/example.com/m/_at_v/v1.0.0.zip", b"legacy").await;
-        put_raw("go/example.com/m/_at_v/list", b"v1.0.0\n").await;
+    async fn the_as_read_listing_names_each_object_as_a_read_finds_it() {
         let sha = hex::encode(sha2::Sha256::digest(b"current"));
-        object
-            .put("go/example.com/m/@v/v1.1.0.zip", b"current", &sha)
-            .await
-            .unwrap();
-        object
-            .put("go/example.com/m/_at_v/@v/v9.zip", b"current", &sha)
-            .await
-            .unwrap();
-
-        let listed = object
-            .list_legacy_with_meta("go/example.com/m/@v/")
-            .await
-            .unwrap()
-            .expect("a prefix with @ has an older form");
-        let mut names: Vec<_> = listed.iter().map(|(k, m)| (k.as_str(), m.size)).collect();
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            [
-                ("go/example.com/m/@v/list", 7),
-                ("go/example.com/m/@v/v1.0.0.zip", 6)
-            ]
-        );
-        for (name, meta) in &listed {
-            let read = object
-                .stat(name)
+        for (name, object) in [
+            ("s3", ObjectStorage::in_memory()),
+            (
+                "gcs",
+                ObjectStorage::over_named(Box::new(object_store::memory::InMemory::new()), "gcs"),
+            ),
+        ] {
+            let put_raw = |path: &str, data: &'static [u8]| {
+                let path = Path::from(path);
+                let store = object.store();
+                async move {
+                    store
+                        .put(&path, object_store::PutPayload::from_static(data))
+                        .await
+                        .unwrap();
+                }
+            };
+            // As 0.9.2 wrote `go/example.com/m/@v/...`, and a file of the current form under
+            // another key that starts with the same old-form prefix.
+            put_raw("go/example.com/m/_at_v/v1.0.0.zip", b"legacy").await;
+            put_raw("go/example.com/m/_at_v/list", b"v1.0.0\n").await;
+            put_raw("go/example.com/m/_at_v/v~1.zip", b"tilde").await;
+            object
+                .put("go/example.com/m/@v/v1.1.0.zip", b"current", &sha)
                 .await
-                .expect("a read finds the listed name");
+                .unwrap();
+            object
+                .put("go/example.com/m/_at_v/@v/v9.zip", b"current", &sha)
+                .await
+                .unwrap();
+            // The current form under every character `object_store` encodes in a key part.
+            let mut written = vec!["go/example.com/m/@v/v1.1.0.zip".to_string()];
+            for c in "\\{^}%`]\"><[~#|*?".chars() {
+                let key = format!("go/example.com/m/@v/v{c}x.zip");
+                object.put(&key, b"current", &sha).await.unwrap();
+                written.push(key);
+            }
+            written.sort_unstable();
+
+            let listed = object
+                .list_with_meta_as_read("go/example.com/m/@v/")
+                .await
+                .unwrap();
+            let mut current: Vec<_> = listed.current.iter().map(|(k, _)| k.clone()).collect();
+            current.sort_unstable();
             assert_eq!(
-                (read.size, read.modified),
-                (meta.size, meta.modified),
-                "{name}"
+                current, written,
+                "{name}: current names are the keys written"
             );
+            let older: Option<Vec<_>> = listed.older.as_ref().map(|older| {
+                let mut names: Vec<_> = older.iter().map(|(k, m)| (k.as_str(), m.size)).collect();
+                names.sort_unstable();
+                names
+            });
+            let expected = (name == "s3").then(|| {
+                vec![
+                    ("go/example.com/m/@v/list", 7),
+                    ("go/example.com/m/@v/v1.0.0.zip", 6),
+                    ("go/example.com/m/@v/v~1.zip", 5),
+                ]
+            });
+            assert_eq!(older, expected, "{name}: the old form");
+            for (key, meta) in listed.current.iter().chain(listed.older.iter().flatten()) {
+                let read = object
+                    .stat(key)
+                    .await
+                    .unwrap_or_else(|| panic!("{name}: a read finds {key}"));
+                assert_eq!(
+                    (read.size, read.modified),
+                    (meta.size, meta.modified),
+                    "{name}: {key}"
+                );
+            }
+            assert!(object
+                .list_with_meta_as_read("go/example.com/plain/")
+                .await
+                .unwrap()
+                .older
+                .is_none());
         }
-        assert!(object
-            .list_legacy_with_meta("go/example.com/plain/")
-            .await
-            .unwrap()
-            .is_none());
         let dir = tempfile::tempdir().unwrap();
         let local = crate::storage::LocalStorage::new(dir.path().to_str().unwrap());
         assert!(local
-            .list_legacy_with_meta("go/example.com/m/@v/")
+            .list_with_meta_as_read("go/example.com/m/@v/")
             .await
             .unwrap()
+            .older
             .is_none());
     }
 

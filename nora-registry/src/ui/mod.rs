@@ -1885,6 +1885,128 @@ mod listing_cost_tests {
         );
     }
 
+    /// Characters `object_store` percent-encodes in a part of a key (its `INVALID` set, less
+    /// `/` and the control characters storage keys refuse).
+    const ENCODED_BY_OBJECT_STORE: &[char] = &[
+        '\\', '{', '^', '}', '%', '`', ']', '"', '>', '[', '~', '<', '#', '|', '*', '?',
+    ];
+
+    /// Write `data` at `path` of the raw store, as `object_store` names it.
+    async fn put_raw(raw: &object_store::memory::InMemory, path: &str, data: &[u8]) {
+        use object_store::ObjectStoreExt;
+        raw.put(
+            &object_store::path::Path::from(path),
+            object_store::PutPayload::from(data.to_vec()),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// #1172: on S3, a Go module whose path holds a character `object_store` encodes shows its
+    /// versions as a stat per version did: the current file wins over one under the old key
+    /// form, and with no old one the current file still shows as cached with its size.
+    #[tokio::test]
+    async fn go_versions_under_keys_object_store_encodes_show_as_a_read_finds_them() {
+        let mut taken = Vec::new();
+        let mut wrong = Vec::new();
+        for &c in ENCODED_BY_OBJECT_STORE {
+            let (storage, raw, _) = crate::test_helpers::list_counting_storage("s3");
+            let both = format!("example.com/m{c}x");
+            let current_only = format!("example.com/n{c}x");
+            // A key storage refuses is not one a page can show.
+            if storage
+                .put(&format!("go/{both}/@v/list"), b"v1.0.0\n")
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            taken.push(c);
+            storage
+                .put(&format!("go/{both}/@v/v1.0.0.zip"), &[b'x'; 11])
+                .await
+                .unwrap();
+            put_raw(&raw, &format!("go/{both}/_at_v/v1.0.0.zip"), &[b'o'; 99]).await;
+            storage
+                .put(&format!("go/{current_only}/@v/list"), b"v1.0.0\n")
+                .await
+                .unwrap();
+            storage
+                .put(&format!("go/{current_only}/@v/v1.0.0.zip"), &[b'x'; 11])
+                .await
+                .unwrap();
+            for module in [&both, &current_only] {
+                let shown = rows(&get_go_detail(&storage, module, true, true).await);
+                if shown != [row("v1.0.0", 11, "just now", true)] {
+                    wrong.push(format!("{module}: {shown:?}"));
+                }
+            }
+        }
+        assert!(taken.contains(&'~'), "keys taken: {taken:?}");
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// #1172: the same on the npm versions page, for a scoped package whose name holds `~`.
+    #[tokio::test]
+    async fn an_npm_tarball_under_a_key_object_store_encodes_shows_as_a_read_finds_it() {
+        let (storage, raw, _) = crate::test_helpers::list_counting_storage("s3");
+        storage
+            .put("npm/@sc~pe/pkg/metadata.json", &npm_packument())
+            .await
+            .unwrap();
+        storage
+            .put("npm/@sc~pe/pkg/tarballs/pkg-1.1.0.tgz", &[b'x'; 11])
+            .await
+            .unwrap();
+        put_raw(
+            &raw,
+            "npm/_at_sc~pe/pkg/tarballs/pkg-1.1.0.tgz",
+            &[b'o'; 99],
+        )
+        .await;
+        storage
+            .put("npm/@sc~pe/pkg/tarballs/pkg-1.0.0.tgz", &[b'x'; 10])
+            .await
+            .unwrap();
+
+        let detail = get_npm_detail(&storage, "@sc~pe/pkg", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("2.0.0", 77, "2026-03-04", false),
+                row("1.1.0", 11, "2026-01-02", true),
+                row("1.0.0", 10, "2026-01-02", true),
+            ]
+        );
+    }
+
+    /// #1172: only the S3 backend wrote keys in the old `_at_` form (NORA 0.9.2 and earlier;
+    /// the GCS backend came in 1.0.1): a versions page on GCS lists the current form alone, on
+    /// S3 the old form too.
+    #[tokio::test]
+    async fn the_go_versions_page_lists_the_old_key_form_on_s3_only() {
+        for (backend, expected) in [("gcs", (1, 0)), ("s3", (2, 1))] {
+            let (storage, _, listings) = crate::test_helpers::list_counting_storage(backend);
+            storage
+                .put("go/example.com/m/@v/list", b"v1.0.0\n")
+                .await
+                .unwrap();
+            storage
+                .put("go/example.com/m/@v/v1.0.0.zip", &[b'x'; 11])
+                .await
+                .unwrap();
+            listings.reset();
+
+            let shown = rows(&get_go_detail(&storage, "example.com/m", true, true).await);
+            assert_eq!(shown, [row("v1.0.0", 11, "just now", true)], "{backend}");
+            assert_eq!(
+                listings.counts(),
+                expected,
+                "{backend}: listings, of them in the old form"
+            );
+        }
+    }
+
     /// #1172: when only the listing of the older key form fails, the page asks per version,
     /// as before #1172 — a stat finds either form — rather than show what it could not list
     /// as not cached.

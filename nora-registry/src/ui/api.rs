@@ -674,38 +674,29 @@ pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
 /// The files under one prefix with their size and time, from listings rather than a stat
 /// per file — a HEAD per file on an object store (#1172).
 struct Listed {
-    /// Under the current encoding of their keys, as [`Storage::list_with_meta`] names them.
+    /// Under the current form of their keys, named as reads find them.
     current: Vec<(String, crate::storage::FileMeta)>,
-    /// Every file a read finds, by key: `current`, and the files stored under an older
-    /// encoding of their key (`_at_`, NORA 0.9.2 and earlier) that reads still fall back
-    /// to, the current form first as a read tries it first. `None` when the older form
-    /// could not be listed: the files are then asked one by one.
-    readable: Option<HashMap<String, crate::storage::FileMeta>>,
+    /// Every file a read finds, by key: `current`, and the files stored under an older form
+    /// of their key that reads still fall back to (`_at_`, NORA 0.9.2 and earlier, on S3), the
+    /// current form first as a read tries it first.
+    readable: HashMap<String, crate::storage::FileMeta>,
 }
 
 impl Listed {
-    /// The files under `prefix`; `None` when the listing fails. A failed listing is not an
+    /// The files under `prefix`; `None` when a listing fails. A failed listing is not an
     /// empty one: the caller then asks per file, as before #1172, instead of showing what
     /// is stored as missing.
     async fn of(storage: &Storage, prefix: &str) -> Option<Listed> {
-        let current = match storage.list_with_meta(prefix).await {
-            Ok(current) => current,
+        let listed = match storage.list_with_meta_as_read(prefix).await {
+            Ok(listed) => listed,
             Err(e) => {
                 tracing::warn!(prefix, error = %e, "listing failed; the page reads each file's metadata instead");
                 return None;
             }
         };
-        let readable = match storage.list_legacy_with_meta(prefix).await {
-            Ok(older) => {
-                let mut readable: HashMap<_, _> = older.unwrap_or_default().into_iter().collect();
-                readable.extend(current.iter().cloned());
-                Some(readable)
-            }
-            Err(e) => {
-                tracing::warn!(prefix, error = %e, "listing of older keys failed; the page reads each file's metadata instead");
-                None
-            }
-        };
+        let current = listed.current;
+        let mut readable: HashMap<_, _> = listed.older.unwrap_or_default().into_iter().collect();
+        readable.extend(current.iter().cloned());
         Some(Listed { current, readable })
     }
 }
@@ -716,8 +707,8 @@ async fn stored_meta(
     listed: Option<&Listed>,
     key: &str,
 ) -> Option<crate::storage::FileMeta> {
-    match listed.and_then(|l| l.readable.as_ref()) {
-        Some(files) => files.get(key).cloned(),
+    match listed {
+        Some(files) => files.readable.get(key).cloned(),
         None => storage.stat(key).await,
     }
 }
