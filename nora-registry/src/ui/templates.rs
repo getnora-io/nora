@@ -45,7 +45,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
         .collect();
 
     // Render mount points
-    let mount_data: Vec<(String, String, Vec<String>)> = data
+    let mount_data: Vec<(String, String, Vec<String>, bool)> = data
         .mount_points
         .iter()
         .map(|m| {
@@ -53,10 +53,11 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
                 m.registry.clone(),
                 m.mount_path.clone(),
                 m.proxy_upstreams.clone(),
+                m.proxy_hidden,
             )
         })
         .collect();
-    let mount_points = render_mount_points_table(&mount_data, t);
+    let mount_points = render_mount_points_table(&mount_data, t, auth_enabled);
 
     // Render activity log
     let activity_rows: String = if data.activity.is_empty() {

@@ -167,7 +167,10 @@ pub struct RegistryCardStats {
 pub struct MountPoint {
     pub registry: String,
     pub mount_path: String,
+    /// The upstream addresses, for a caller NORA knows; credentials an address carries are cut.
     pub proxy_upstreams: Vec<String>,
+    /// The registry has upstreams the caller is not shown: `proxy_upstreams` is empty for them.
+    pub proxy_hidden: bool,
 }
 
 // ============ API Handlers ============
@@ -210,10 +213,23 @@ pub async fn api_dashboard(
     Json(build_dashboard_response(&state, authenticated).await)
 }
 
+/// `url` without the `user:password@` its authority may carry; any other address unchanged.
+fn without_userinfo(url: &str) -> String {
+    let authority_start = url.find("://").map_or(0, |i| i + 3);
+    let rest = &url[authority_start..];
+    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    match rest[..authority_len].rfind('@') {
+        Some(at) => format!("{}{}", &url[..authority_start], &rest[at + 1..]),
+        None => url.to_string(),
+    }
+}
+
 /// Build the dashboard JSON payload.
 ///
 /// When `authenticated` is false, `proxy_upstreams` is redacted (empty vec)
-/// to avoid leaking upstream registry topology to anonymous callers.
+/// to avoid leaking upstream registry topology to anonymous callers, and
+/// `proxy_hidden` says a registry has upstreams. When it is true, each address
+/// shows without the credentials it may carry.
 pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> DashboardResponse {
     let mut total_storage: u64 = 0;
     let mut total_artifacts: usize = 0;
@@ -241,59 +257,59 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
             size_bytes: size,
         });
 
-        let proxy_upstreams: Vec<String> = if authenticated {
-            match reg {
-                RegistryType::Docker => state
-                    .config
-                    .docker
-                    .upstreams
-                    .iter()
-                    .map(|u| u.url.clone())
-                    .collect(),
-                RegistryType::Maven => state
-                    .config
-                    .maven
-                    .proxies
-                    .iter()
-                    .map(|p| p.url().to_string())
-                    .collect(),
-                RegistryType::Npm => state
-                    .config
-                    .npm
-                    .upstream_urls()
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
-                RegistryType::PyPI => state
-                    .config
-                    .pypi
-                    .upstreams()
-                    .iter()
-                    .map(|u| u.url().to_string())
-                    .collect(),
-                RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
-                RegistryType::Raw => vec![],
-                RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
-                RegistryType::Terraform => {
-                    state.config.terraform.proxy.clone().into_iter().collect()
-                }
-                RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
-                RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
-                RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
-                RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
-                RegistryType::Rpm => vec![],
-                RegistryType::Deb => vec![],
-                RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
-                RegistryType::Composer => state
-                    .config
-                    .composer
-                    .upstreams()
-                    .iter()
-                    .map(|u| u.url().to_string())
-                    .collect(),
-                RegistryType::HuggingFace => state.config.hf.proxy.clone().into_iter().collect(),
-            }
+        let configured: Vec<String> = match reg {
+            RegistryType::Docker => state
+                .config
+                .docker
+                .upstreams
+                .iter()
+                .map(|u| u.url.clone())
+                .collect(),
+            RegistryType::Maven => state
+                .config
+                .maven
+                .proxies
+                .iter()
+                .map(|p| p.url().to_string())
+                .collect(),
+            RegistryType::Npm => state
+                .config
+                .npm
+                .upstream_urls()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
+            RegistryType::PyPI => state
+                .config
+                .pypi
+                .upstreams()
+                .iter()
+                .map(|u| u.url().to_string())
+                .collect(),
+            RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
+            RegistryType::Raw => vec![],
+            RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
+            RegistryType::Terraform => state.config.terraform.proxy.clone().into_iter().collect(),
+            RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
+            RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
+            RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
+            RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
+            RegistryType::Rpm => vec![],
+            RegistryType::Deb => vec![],
+            RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
+            RegistryType::Composer => state
+                .config
+                .composer
+                .upstreams()
+                .iter()
+                .map(|u| u.url().to_string())
+                .collect(),
+            RegistryType::HuggingFace => state.config.hf.proxy.clone().into_iter().collect(),
+        };
+        let proxy_hidden = !authenticated && !configured.is_empty();
+        let proxy_upstreams = if authenticated {
+            configured.iter().map(|url| without_userinfo(url)).collect()
         } else {
             vec![]
         };
@@ -302,6 +318,7 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
             registry: reg.display_name().to_string(),
             mount_path: reg.mount_point().to_string(),
             proxy_upstreams,
+            proxy_hidden,
         });
     }
 
@@ -2476,5 +2493,40 @@ mod registry_stats_cover_every_registry {
             .map(|rt| rt.as_str().to_string())
             .collect();
         assert_eq!(keys, names);
+    }
+}
+
+#[cfg(test)]
+mod userinfo_tests {
+    use super::without_userinfo;
+
+    /// Only the authority's `user:password@` goes: an `@` in a path or query is part of the
+    /// address, and a password holding `@` goes whole.
+    #[test]
+    fn the_credentials_go_and_the_rest_of_the_address_stays() {
+        for (url, shown) in [
+            ("https://registry.npmjs.org", "https://registry.npmjs.org"),
+            (
+                "https://u:p@mirror.example/simple",
+                "https://mirror.example/simple",
+            ),
+            ("https://token@mirror.example", "https://mirror.example"),
+            (
+                "https://u:p@ss@mirror.example/x",
+                "https://mirror.example/x",
+            ),
+            (
+                "https://npm.example/@scope/pkg",
+                "https://npm.example/@scope/pkg",
+            ),
+            (
+                "https://host.example?ref=a@b",
+                "https://host.example?ref=a@b",
+            ),
+            ("https://host.example#a@b", "https://host.example#a@b"),
+            ("u:p@mirror.example/x", "mirror.example/x"),
+        ] {
+            assert_eq!(without_userinfo(url), shown, "{url}");
+        }
     }
 }

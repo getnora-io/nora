@@ -598,13 +598,23 @@ pub fn render_registry_card(
 
 /// Render mount points table
 pub fn render_mount_points_table(
-    mount_points: &[(String, String, Vec<String>)],
+    mount_points: &[(String, String, Vec<String>, bool)],
     t: &Translations,
+    auth_enabled: bool,
 ) -> String {
     let rows: String = mount_points
         .iter()
-        .map(|(registry, mount_path, upstreams)| {
-            let proxy_display = if upstreams.is_empty() {
+        .map(|(registry, mount_path, upstreams, hidden)| {
+            let proxy_display = if *hidden {
+                // The registry has upstreams this caller is not shown: say so, and how to see
+                // them where signing in is possible.
+                let label = if auth_enabled {
+                    t.proxy_hidden_sign_in
+                } else {
+                    t.proxy_hidden
+                };
+                format!(r#"<span class="italic text-slate-500">{label}</span>"#)
+            } else if upstreams.is_empty() {
                 "-".to_string()
             } else {
                 upstreams
