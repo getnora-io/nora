@@ -622,23 +622,19 @@ fn tarball_of(version_data: &serde_json::Value) -> Option<&str> {
     version_data.get("dist")?.get("tarball")?.as_str()
 }
 
-/// The part of `link` after NORA's `/npm`, `/<package>/-/<file>` as the link spells it, when `link`
-/// is NORA's own tarball link for `package`. NORA writes `{public_url}/npm/<package>/-/<file>`, and
-/// the public_url is the address of the instance that wrote the link, not of the one serving it
-/// (#1180): the host, port and any path before `/npm` do not decide. The form alone does not
+/// The tail after NORA's `/npm` of `link`, when `link` is NORA's own tarball link for `package` to a
+/// file NORA holds: `/<package>/-/<file>` (the file flat, or in a version directory that names its
+/// version) or `/download/<@scope/name>/<version>/<sha1>` (GitHub Packages). These are the forms the
+/// tarball route serves ([`TarballAsk::parse`]). NORA writes `{public_url}/npm<tail>`, and the
+/// public_url is the address of the instance that wrote the link, not of the one serving it
+/// (#1180): the host, port and any prefix before `/npm` do not decide. The form alone does not
 /// decide either — a link of another upstream can end the same way — so the file must be one NORA
-/// holds: `held(<file>)` says so. Only a link that leaves nothing to interpretation counts —
-/// absolute http or https, written as a URL parser writes it, without userinfo, query or fragment,
-/// its path ending in `/npm/<package>/-/<file>` with `<file>` one of the package's tarballs that
-/// NORA holds. `None` for any other link.
-pub fn own_link_tail<'a>(
-    link: &'a str,
-    package: &str,
-    held: &dyn Fn(&str) -> bool,
-) -> Option<&'a str> {
+/// holds: `held(<file>)` says so. The link is read as a URL parser reads it (dot segments resolved,
+/// default ports and the scheme's case not part of the path), and every `/npm/` in its path is a
+/// candidate, so a prefix that ends in `/npm` does not hide the route. `None` for any other link.
+pub fn own_link_tail(link: &str, package: &str, held: &dyn Fn(&str) -> bool) -> Option<String> {
     let target = Url::parse(link).ok()?;
-    if target.as_str() != link
-        || !matches!(target.scheme(), "http" | "https")
+    if !matches!(target.scheme(), "http" | "https")
         || target.host_str().is_none()
         || !target.username().is_empty()
         || target.password().is_some()
@@ -647,21 +643,39 @@ pub fn own_link_tail<'a>(
     {
         return None;
     }
-    // Without a query or a fragment the path is the end of the link as written.
-    let path_at = link.len().checked_sub(target.path().len())?;
-    let path = link.get(path_at..)?;
-    let want = format!("/npm/{package}/-/");
-    let (at, _) = path.match_indices("/npm/").find(|&(at, _)| {
-        decode(&path[at..]).is_some_and(|tail| {
-            tail.strip_prefix(want.as_str()).is_some_and(|file| {
-                !file.contains('/')
-                    && parse_npm_tarball_version(package, file).is_some()
-                    && held(file)
-            })
-        })
-    })?;
-    // The tail starts at the package's own segment: the `/npm` before it is NORA's base.
-    link.get(path_at + at + "/npm".len()..)
+    let path = target.path();
+    path.char_indices()
+        .filter(|&(at, c)| c == '/' && path[at..].starts_with("/npm/"))
+        .find(|&(at, _)| own_route_holds(&path[at + "/npm".len()..], package, held))
+        .map(|(at, _)| path[at + "/npm".len()..].to_string())
+}
+
+/// Whether `link` is NORA's own tarball link for `package` at `nora_npm_base` as it is written: the
+/// base as a prefix, then a route of a held file ([`own_route_holds`]). Nothing is parsed, so a
+/// stored copy of many versions is checked in a pass over its strings; a link this check does not
+/// take is placed again, which is safe whatever it is (#1180, round 2).
+pub fn is_own_link_at(link: &str, nora_npm_base: &str, package: &str) -> bool {
+    link.strip_prefix(nora_npm_base)
+        .is_some_and(|tail| own_route_holds(tail, package, &|_: &str| true))
+}
+
+/// Whether `tail`, the path after `/npm` (beginning `/`), is the route of a file of `package` NORA
+/// holds: the flat or version-directory `/<package>/-/<file>`, or GitHub Packages' `/download/…`
+/// (stored under the npmjs name of the version, `<name>-<version>.tgz`).
+fn own_route_holds(tail: &str, package: &str, held: &dyn Fn(&str) -> bool) -> bool {
+    let Some(rest) = tail.strip_prefix('/').and_then(decode) else {
+        return false;
+    };
+    if let Some(file) = rest.strip_prefix(&format!("{package}/-/")) {
+        return parse_npm_tarball_version(package, file).is_some() && held(file);
+    }
+    match github_packages_tarball(&rest) {
+        Some((name, version)) if name == package => {
+            let bare = name.rsplit('/').next().unwrap_or(name);
+            held(&format!("{bare}-{version}.tgz"))
+        }
+        _ => false,
+    }
 }
 
 /// Where the tarball link `link` of an upstream document leads once NORA serves it: the
@@ -1538,5 +1552,95 @@ mod tests {
             "https://nora.example/npm/pkg/-/pkg-1.0.0.tgz"
         );
         assert_eq!(retarget_own_links(b"not json", NORA, "pkg"), None);
+    }
+
+    /// One recognizer for NORA's own tarball links (#1180, round 2): every form NORA writes and
+    /// serves (flat, version directory, GitHub Packages' `download/`, scoped) at any address and
+    /// prefix, the address's default port written out or not. A form that does not name a held
+    /// file of the package is not NORA's.
+    #[test]
+    fn own_link_tail_recognizes_every_form_nora_writes_at_any_address() {
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let held = |file: &str| file == "pkg-1.0.0.tgz" || file == "1.0.0/pkg-1.0.0.tgz";
+        let rows: [(String, &str, Option<&str>); 14] = [
+            (
+                "http://old.example:4000/npm/pkg/-/pkg-1.0.0.tgz".into(),
+                "pkg",
+                Some("/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "http://old.example:80/npm/pkg/-/pkg-1.0.0.tgz".into(),
+                "pkg",
+                Some("/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "https://old.example:443/npm/pkg/-/1.0.0/pkg-1.0.0.tgz".into(),
+                "pkg",
+                Some("/pkg/-/1.0.0/pkg-1.0.0.tgz"),
+            ),
+            (
+                "https://old.example/repo/npm/npm/pkg/-/pkg-1.0.0.tgz".into(),
+                "pkg",
+                Some("/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "https://host/npm/archive/npm/pkg/-/pkg-1.0.0.tgz".into(),
+                "pkg",
+                Some("/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "https://old.example/npm/%40vendor%2Fpkg/-/pkg-1.0.0.tgz".into(),
+                "@vendor/pkg",
+                Some("/%40vendor%2Fpkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                format!("https://old.example/npm/download/@vendor/pkg/1.0.0/{SHA}"),
+                "@vendor/pkg",
+                Some(&format!("/download/@vendor/pkg/1.0.0/{SHA}")[..]),
+            ),
+            (
+                format!("https://old.example/npm/download/@vendor/other/1.0.0/{SHA}"),
+                "@vendor/pkg",
+                None,
+            ),
+            (
+                "https://old.example/npm/download/@vendor/pkg/1.0.0/not-hex".into(),
+                "@vendor/pkg",
+                None,
+            ),
+            (
+                "https://old.example/npm/pkg/-/1.0.1/pkg-1.0.1.tgz".into(),
+                "pkg",
+                None,
+            ),
+            (
+                "https://old.example/npm/pkg/-/2.0.0/pkg-1.0.0.tgz".into(),
+                "pkg",
+                None,
+            ),
+            (
+                "https://old.example/npm/pkg/-/pkg-1.0.0.tgz?token=x".into(),
+                "pkg",
+                None,
+            ),
+            (
+                "https://old.example/npm/pkg/-/../pkg-1.0.0.tgz".into(),
+                "pkg",
+                None,
+            ),
+            (
+                "https://old.example/pkg/-/pkg-1.0.0.tgz".into(),
+                "pkg",
+                None,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (link, package, want) in rows {
+            let got = own_link_tail(&link, package, &held);
+            if got.as_deref() != want {
+                wrong.push(format!("{link} for {package}: {got:?}, want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

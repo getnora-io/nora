@@ -1903,7 +1903,7 @@ fn place_for_nora(
 /// stored, so the rewrite costs nothing once the links are right.
 fn served_published(state: &AppState, package: &str, data: Bytes) -> Bytes {
     let nora_base = nora_base_url(state);
-    if links_on_nora(&data, &nora_base) {
+    if links_on_nora(&data, &nora_base, package) {
         return data;
     }
     let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
@@ -1917,7 +1917,7 @@ fn served_published(state: &AppState, package: &str, data: Bytes) -> Bytes {
 /// links are read (the rest is skipped unbuilt), so a cached document is placed again
 /// ([`served_copy`]) only when it holds a link of another form (a relative one) or one past NORA,
 /// cached by a release that kept it — or does not read as a packument or manifest at all.
-fn links_on_nora(data: &[u8], nora_base: &str) -> bool {
+fn links_on_nora(data: &[u8], nora_base: &str, package: &str) -> bool {
     #[derive(serde::Deserialize)]
     struct Dist {
         tarball: Option<String>,
@@ -1934,13 +1934,29 @@ fn links_on_nora(data: &[u8], nora_base: &str) -> bool {
     let Ok(doc) = serde_json::from_slice::<Document>(data) else {
         return false;
     };
-    let nora = format!("{}/npm/", nora_base.trim_end_matches('/'));
+    let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+    // On NORA is a link NORA writes at this address: its own form for the package, under this base
+    // and no other. A prefix that only starts like the base is another address's (#1180).
     let on_nora = |dist: &Option<Dist>| {
         dist.as_ref()
             .and_then(|d| d.tarball.as_deref())
-            .is_none_or(|link| link.starts_with(&nora))
+            .is_none_or(|link| npm_links::is_own_link_at(link, &nora_npm_base, package))
     };
     on_nora(&doc.dist) && doc.versions.iter().flatten().all(|(_, v)| on_nora(&v.dist))
+}
+
+/// The tarball files NORA holds for `package`, for a copy that must be placed again: a copy whose
+/// links are already NORA's is served as it is, so nothing is listed for it.
+async fn held_for(
+    state: &AppState,
+    package: &str,
+    data: &[u8],
+) -> std::collections::HashSet<String> {
+    if links_on_nora(data, &nora_base_url(state), package) {
+        std::collections::HashSet::new()
+    } else {
+        held_tarballs(state, package).await
+    }
 }
 
 /// The tarball files NORA holds for `package`, by file name. A link of NORA's own form to one of
@@ -1968,7 +1984,11 @@ fn served_copy(
     data: Bytes,
     held: &dyn Fn(&str) -> bool,
 ) -> (Option<Bytes>, bool) {
-    if links_on_nora(&data, &nora_base_url(state)) {
+    let package = match classify_metadata_path(path) {
+        MetadataPath::Packument { name } | MetadataPath::VersionManifest { name, .. } => name,
+        MetadataPath::Other => "",
+    };
+    if links_on_nora(&data, &nora_base_url(state), package) {
         return (Some(data), false);
     }
     let upstream = state
@@ -2130,11 +2150,7 @@ async fn upstream_metadata(
     if let Some((data, from_key)) = cached {
         // A copy holding a link past NORA (cached by a release that kept one) is served placed
         // again, and refetched in full whatever its age: a 304 would keep it as it is.
-        let held = if links_on_nora(&data, &nora_base_url(state)) {
-            std::collections::HashSet::new()
-        } else {
-            held_tarballs(state, name).await
-        };
+        let held = held_for(state, name, &data).await;
         let (served, past_nora) = served_copy(state, path, data, &|file: &str| held.contains(file));
         let fresh = !past_nora
             && state.storage.stat(&from_key).await.is_some_and(|meta| {
@@ -2177,7 +2193,12 @@ async fn upstream_metadata(
             refetch().await
         };
         if let Some(refreshed) = refreshed {
-            return served_metadata(state, headers, path, document, refreshed, &|_: &str| false);
+            // A 304 hands back the stored copy, which names the store's own tarballs: they are
+            // held, so the copy is placed with them (#1180, round 2).
+            let held = held_for(state, name, &refreshed).await;
+            return served_metadata(state, headers, path, document, refreshed, &|file: &str| {
+                held.contains(file)
+            });
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
@@ -10592,13 +10613,14 @@ mod unreadable_sidecar {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod own_links_follow_the_serving_instance {
+    use crate::registry::{write_validators, Validators};
     use crate::test_helpers::{
         body_bytes, create_test_context_with_config, create_test_context_with_storage_and_config,
         send,
     };
     use axum::http::{Method, StatusCode};
     use base64::Engine;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header_exists, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const WRITER: &str = "http://nora-a.example:4000";
@@ -10904,6 +10926,302 @@ mod own_links_follow_the_serving_instance {
                 format!("{SERVER}/npm/@two/pkg/-/pkg-1.0.0.tgz")
             )]
         );
+    }
+    /// The forms a tarball link takes as NORA writes and serves them (`TarballAsk::parse`): the
+    /// flat `<package>/-/<file>`, the version directory `<package>/-/<version>/<file>`, and GitHub
+    /// Packages' `download/<@scope/name>/<version>/<sha1>`.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Form {
+        Flat,
+        Scoped,
+        Dir,
+        Github,
+    }
+
+    /// The state of the copy the second instance reads, and of the upstream it would refetch from.
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Cache {
+        /// Within the TTL: served as stored, nothing asked.
+        Fresh,
+        /// Expired, the upstream answers 304 to the copy's validator.
+        Stale304,
+        /// Expired, the upstream is down: the stale copy is served.
+        StaleDown,
+    }
+
+    const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+
+    impl Form {
+        fn package(self) -> &'static str {
+            match self {
+                Form::Flat | Form::Dir => "pkg",
+                Form::Scoped | Form::Github => "@vendor/pkg",
+            }
+        }
+
+        /// The tarball's path at the upstream, which is also the tail of the link NORA serves.
+        fn tail(self) -> String {
+            match self {
+                Form::Flat => "/pkg/-/pkg-1.0.0.tgz".to_string(),
+                Form::Scoped => "/@vendor/pkg/-/pkg-1.0.0.tgz".to_string(),
+                Form::Dir => "/pkg/-/1.0.0/pkg-1.0.0.tgz".to_string(),
+                Form::Github => format!("/download/@vendor/pkg/1.0.0/{SHA1}"),
+            }
+        }
+
+        /// The key the tarball is stored under.
+        fn storage_key(self) -> &'static str {
+            match self {
+                Form::Flat => "npm/pkg/tarballs/pkg-1.0.0.tgz",
+                Form::Scoped => "npm/@vendor/pkg/tarballs/pkg-1.0.0.tgz",
+                Form::Dir => "npm/pkg/tarballs/1.0.0/pkg-1.0.0.tgz",
+                Form::Github => "npm/@vendor/pkg/tarballs/pkg-1.0.0.tgz",
+            }
+        }
+    }
+
+    fn form_packument(form: Form, base: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "name": form.package(),
+            "versions": { "1.0.0": { "name": form.package(), "version": "1.0.0",
+                "dist": { "tarball": format!("{base}{}", form.tail()) } } },
+            "dist-tags": { "latest": "1.0.0" },
+        }))
+        .unwrap()
+    }
+
+    /// One cell of the table: the store written at address `a` (the copy and the tarball, the
+    /// upstream answering with an ETag), read at address `b` in the state `cache`. Returns what
+    /// is wrong with the reader's answer: the version must be served with the link at `b`, and
+    /// that link must download with 200 and the stored bytes, from the store.
+    async fn moved_cell(form: Form, a: &str, b: &str, cache: Cache) -> Vec<String> {
+        let mut wrong = Vec::new();
+        let up = MockServer::start().await;
+        let base = up.uri();
+        let (package, tail) = (form.package(), form.tail());
+        let packument = format!("/{package}");
+        Mock::given(method("GET"))
+            .and(path(packument.as_str()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"v1\"")
+                    .set_body_bytes(form_packument(form, &base)),
+            )
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(tail.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tarball-bytes".to_vec()))
+            .mount(&up)
+            .await;
+        let writer = create_test_context_with_config(|cfg| {
+            cfg.server.public_url = Some(a.to_string());
+            cfg.npm.proxy = Some(base.clone());
+        });
+        let got = send(&writer.app, Method::GET, &format!("/npm/{package}"), "").await;
+        if got.status() != StatusCode::OK {
+            wrong.push(format!("the writer's packument: {}", got.status()));
+            return wrong;
+        }
+        wait_until_stored(
+            &writer.state.storage,
+            &super::origin_key(&super::upstream_packument_key(package)),
+        )
+        .await;
+        let got = send(&writer.app, Method::GET, &format!("/npm{tail}"), "").await;
+        if got.status() != StatusCode::OK {
+            wrong.push(format!("the writer's tarball: {}", got.status()));
+            return wrong;
+        }
+        wait_until_stored(&writer.state.storage, form.storage_key()).await;
+
+        // The store moves; the upstream is reset and answers the reader as the cache state says.
+        up.reset().await;
+        match cache {
+            Cache::Fresh | Cache::StaleDown => {
+                Mock::given(method("GET"))
+                    .and(path(packument.as_str()))
+                    .respond_with(ResponseTemplate::new(503))
+                    .mount(&up)
+                    .await;
+            }
+            Cache::Stale304 => {
+                Mock::given(method("GET"))
+                    .and(path(packument.as_str()))
+                    .and(header_exists("if-none-match"))
+                    .respond_with(ResponseTemplate::new(304))
+                    .mount(&up)
+                    .await;
+                // The copy's validator, as the refetch that wrote it would have kept it.
+                write_validators(
+                    &writer.state.storage,
+                    &super::upstream_packument_key(package),
+                    &Validators {
+                        etag: Some("\"v1\"".to_string()),
+                        last_modified: None,
+                    },
+                )
+                .await;
+            }
+        }
+        let ttl = if cache == Cache::Fresh { 3600 } else { 0 };
+        let reader =
+            create_test_context_with_storage_and_config(writer.state.storage.clone(), |cfg| {
+                cfg.server.public_url = Some(b.to_string());
+                cfg.npm.proxy = Some(base.clone());
+                cfg.npm.metadata_ttl = ttl;
+            });
+        let want = format!("{}/npm{tail}", b.trim_end_matches('/'));
+        let got = send(&reader.app, Method::GET, &format!("/npm/{package}"), "").await;
+        if got.status() != StatusCode::OK {
+            wrong.push(format!("the reader's packument: {}", got.status()));
+            return wrong;
+        }
+        let doc: serde_json::Value = serde_json::from_slice(&body_bytes(got).await).unwrap();
+        let served = doc["versions"]["1.0.0"]["dist"]["tarball"]
+            .as_str()
+            .map(str::to_string);
+        if served.as_deref() != Some(want.as_str()) {
+            wrong.push(format!("served link {served:?}, want {want}"));
+        }
+        let download = want
+            .strip_prefix(b.trim_end_matches('/'))
+            .unwrap_or(&want)
+            .to_string();
+        let got = send(&reader.app, Method::GET, &download, "").await;
+        if got.status() != StatusCode::OK {
+            wrong.push(format!("download of {download}: {}", got.status()));
+        } else if &body_bytes(got).await[..] != b"tarball-bytes" {
+            wrong.push(format!("download of {download}: other bytes"));
+        }
+        if cache == Cache::Stale304 {
+            let asked = up.received_requests().await.unwrap_or_default();
+            let conditional = asked.iter().any(|r| {
+                r.url.path() == packument.as_str() && r.headers.contains_key("if-none-match")
+            });
+            if !conditional {
+                wrong.push(
+                    "the refetch did not ask conditionally: the 304 path was not taken".to_string(),
+                );
+            }
+        }
+        wrong
+    }
+
+    /// The table (#1180, round 2): a version whose tarball the store holds is served at the address
+    /// that serves it, with a link that downloads, whatever the form of the link, the address that
+    /// wrote it, and the state of the copy and of the upstream.
+    #[tokio::test]
+    async fn a_held_version_is_served_at_the_serving_address_in_every_form_and_cache_state() {
+        const A: &str = "http://nora-a.example:4000";
+        const B: &str = "https://nora-b.example";
+        let cells: [(Form, &str, &str, Cache); 15] = [
+            (Form::Flat, A, B, Cache::Fresh),
+            (Form::Flat, A, B, Cache::Stale304),
+            (Form::Flat, A, B, Cache::StaleDown),
+            (Form::Scoped, A, B, Cache::Stale304),
+            (Form::Dir, A, B, Cache::StaleDown),
+            (Form::Dir, A, B, Cache::Fresh),
+            (Form::Github, A, B, Cache::Fresh),
+            (Form::Github, A, B, Cache::StaleDown),
+            (Form::Flat, "http://nora-a.example:80", B, Cache::Fresh),
+            (Form::Flat, A, "https://nora-b.example:443", Cache::Fresh),
+            (
+                Form::Flat,
+                "https://old.example/repo/npm",
+                B,
+                Cache::StaleDown,
+            ),
+            (
+                Form::Dir,
+                "https://old.example/repo/npm",
+                B,
+                Cache::Stale304,
+            ),
+            (
+                Form::Github,
+                "https://old.example/repo/npm",
+                B,
+                Cache::Stale304,
+            ),
+            (
+                Form::Flat,
+                "https://host/npm/archive",
+                "https://host",
+                Cache::Fresh,
+            ),
+            (
+                Form::Flat,
+                "https://host/npm/archive",
+                "https://host",
+                Cache::StaleDown,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (form, a, b, cache) in cells {
+            for line in moved_cell(form, a, b, cache).await {
+                wrong.push(format!("{form:?} {a} -> {b} {cache:?}: {line}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Published versions (#1180, round 2): written at one address and prefix, served at another,
+    /// including a prefix dropped on the same host. Each link downloads from the serving instance.
+    #[tokio::test]
+    async fn a_published_version_is_served_at_the_serving_address_under_any_prefix() {
+        let mut wrong = Vec::new();
+        for (a, b) in [
+            ("http://nora-a.example:4000", "https://nora-b.example"),
+            ("https://host/npm/archive", "https://host"),
+            ("http://nora-a.example:80", "https://nora-b.example"),
+        ] {
+            let writer = create_test_context_with_config(|cfg| {
+                cfg.server.public_url = Some(a.to_string());
+            });
+            let payload = serde_json::json!({
+                "name": "pkg",
+                "versions": { "1.0.0": { "dist": {} } },
+                "_attachments": {
+                    "pkg-1.0.0.tgz": {
+                        "data": base64::engine::general_purpose::STANDARD.encode(b"fake-tarball")
+                    }
+                },
+                "dist-tags": { "latest": "1.0.0" },
+            });
+            let put = send(
+                &writer.app,
+                Method::PUT,
+                "/npm/pkg",
+                axum::body::Body::from(serde_json::to_vec(&payload).unwrap()),
+            )
+            .await;
+            if put.status() != StatusCode::CREATED {
+                wrong.push(format!("{a}: publish {}", put.status()));
+                continue;
+            }
+            let reader =
+                create_test_context_with_storage_and_config(writer.state.storage.clone(), |cfg| {
+                    cfg.server.public_url = Some(b.to_string())
+                });
+            let want = format!("{}/npm/pkg/-/pkg-1.0.0.tgz", b.trim_end_matches('/'));
+            let got = served_links_at(&reader.app, "/npm/pkg").await;
+            if got != vec![("1.0.0".to_string(), want.clone())] {
+                wrong.push(format!("{a} -> {b}: served {got:?}, want {want}"));
+                continue;
+            }
+            let download = want
+                .strip_prefix(b.trim_end_matches('/'))
+                .unwrap()
+                .to_string();
+            let got = send(&reader.app, Method::GET, &download, "").await;
+            if got.status() != StatusCode::OK || &body_bytes(got).await[..] != b"fake-tarball" {
+                wrong.push(format!(
+                    "{a} -> {b}: download of {download} is not the stored tarball"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }
 
