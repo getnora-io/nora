@@ -290,6 +290,14 @@ pub fn sidebar_dark_with_registries(
             icons::COMPOSER,
             false,
         ),
+        (
+            Some(RegistryType::HuggingFace),
+            "hf",
+            "/ui/hf",
+            "Hugging Face",
+            icons::HF,
+            false,
+        ),
     ];
 
     // Filter to enabled registries (dashboard always shown)
@@ -1142,6 +1150,32 @@ mod tests {
         assert!(!html.contains("/ui/deb"), "disabled deb absent");
         assert!(!html.contains("/ui/composer"), "disabled composer absent");
         assert!(html.contains("\"/ui/\""), "dashboard nav always present");
+    }
+
+    /// The sidebar lists exactly the enabled registries, each format alike: every one when all
+    /// are on, the opt-in Hugging Face included, and a registry alone shows only itself.
+    #[test]
+    fn sidebar_lists_exactly_the_enabled_registries_for_every_format() {
+        let t = get_translations(Lang::En);
+        let listed = |set: &HashSet<RegistryType>| -> HashSet<String> {
+            let html = sidebar_dark_with_registries(Some("dashboard"), t, false, Some(set));
+            html.split("href=\"/ui/")
+                .skip(1)
+                .filter_map(|rest| rest.split_once('"').map(|(name, _)| name))
+                .filter(|name| RegistryType::from_str_opt(name).is_some())
+                .map(str::to_string)
+                .collect()
+        };
+        let names = |set: &HashSet<RegistryType>| -> HashSet<String> {
+            set.iter().map(|r| r.as_str().to_string()).collect()
+        };
+
+        let all = enabled_set(RegistryType::all());
+        assert_eq!(listed(&all), names(&all), "every registry when all are on");
+        for reg in RegistryType::all() {
+            let one = enabled_set(&[*reg]);
+            assert_eq!(listed(&one), names(&one), "{} alone", reg.as_str());
+        }
     }
 
     #[test]
