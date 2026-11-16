@@ -671,6 +671,48 @@ pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
     MavenDetail { artifacts }
 }
 
+/// The files under one prefix with their size and time, from listings rather than a stat
+/// per file — a HEAD per file on an object store (#1172).
+struct Listed {
+    /// Under the current form of their keys, named as reads find them.
+    current: Vec<(String, crate::storage::FileMeta)>,
+    /// Every file a read finds, by key: `current`, and the files stored under an older form
+    /// of their key that reads still fall back to (`_at_`, NORA 0.9.2 and earlier, on S3), the
+    /// current form first as a read tries it first.
+    readable: HashMap<String, crate::storage::FileMeta>,
+}
+
+impl Listed {
+    /// The files under `prefix`; `None` when a listing fails. A failed listing is not an
+    /// empty one: the caller then asks per file, as before #1172, instead of showing what
+    /// is stored as missing.
+    async fn of(storage: &Storage, prefix: &str) -> Option<Listed> {
+        let listed = match storage.list_with_meta_as_read(prefix).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                tracing::warn!(prefix, error = %e, "listing failed; the page reads each file's metadata instead");
+                return None;
+            }
+        };
+        let current = listed.current;
+        let mut readable: HashMap<_, _> = listed.older.unwrap_or_default().into_iter().collect();
+        readable.extend(current.iter().cloned());
+        Some(Listed { current, readable })
+    }
+}
+
+/// What a read finds of `key`: from `listed` when its listings answered, else a stat.
+async fn stored_meta(
+    storage: &Storage,
+    listed: Option<&Listed>,
+    key: &str,
+) -> Option<crate::storage::FileMeta> {
+    match listed {
+        Some(files) => files.readable.get(key).cloned(),
+        None => storage.stat(key).await,
+    }
+}
+
 /// The versions a package's stored tarballs add to the ones its packument names (`listed`,
 /// shown or not): each stored file curation's parser reads as a tarball of `name` — any
 /// layout it reads — once, so one version stored in two layouts is one version, and none
@@ -702,6 +744,11 @@ pub async fn get_npm_detail(
     let mut prerelease_count: usize = 0;
     // Every version the packument names, shown or not, so a stored tarball adds only the rest.
     let mut listed = std::collections::HashSet::new();
+
+    // The package's stored tarballs with their sizes, from listings: whether a version the
+    // packument names is cached is looked up there, not stat'ed per version (#1172).
+    let tarballs = format!("npm/{}/tarballs/", name);
+    let stored = Listed::of(storage, &tarballs).await;
 
     // Parse metadata.json for version info
     if let Ok(data) = storage.get(&metadata_key).await {
@@ -742,11 +789,11 @@ pub async fn get_npm_detail(
                     };
                     let tarball_key =
                         format!("npm/{}/tarballs/{}-{}.tgz", name, name_part, version);
-                    let (size, cached) = if let Some(meta) = storage.stat(&tarball_key).await {
-                        (meta.size, true)
-                    } else {
-                        (meta_size, false)
-                    };
+                    let (size, cached) =
+                        match stored_meta(storage, stored.as_ref(), &tarball_key).await {
+                            Some(meta) => (meta.size, true),
+                            None => (meta_size, false),
+                        };
 
                     stable_versions.push(VersionInfo {
                         version: version.clone(),
@@ -762,9 +809,9 @@ pub async fn get_npm_detail(
     // A tarball stored without its packument is a stored version too: a lockfile install
     // fetches tarballs only, and with release dates off no packument is cached. List every
     // stored tarball of this package the packument does not name.
-    let tarballs = format!("npm/{}/tarballs/", name);
-    if let Ok(stored) = storage.list_with_meta(&tarballs).await {
+    if let Some(stored) = stored {
         let files = stored
+            .current
             .into_iter()
             .filter_map(|(key, meta)| Some((key.strip_prefix(&tarballs)?.to_string(), meta)));
         for (version, meta) in stored_only_versions(name, &listed, files) {
@@ -875,22 +922,18 @@ pub async fn get_cargo_detail(
     show_all: bool,
 ) -> PackageDetail {
     let prefix = format!("cargo/{}/", name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    // Size and time come with the listing, not a stat (a HEAD) per crate file (#1172).
+    let entries = storage.list_with_meta(&prefix).await.unwrap_or_default();
 
     let mut versions = Vec::new();
-    for key in keys.iter().filter(|k| ends_with_ci(k, ".crate")) {
+    for (key, meta) in entries.iter().filter(|(k, _)| ends_with_ci(k, ".crate")) {
         if let Some(rest) = key.strip_prefix(&prefix) {
             let parts: Vec<_> = rest.split('/').collect();
             if !parts.is_empty() {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
-                    (meta.size, format_timestamp(meta.modified))
-                } else {
-                    (0, "N/A".to_string())
-                };
                 versions.push(VersionInfo {
                     version: parts[0].to_string(),
-                    size,
-                    published,
+                    size: meta.size,
+                    published: format_timestamp(meta.modified),
                     cached: true,
                 });
             }
@@ -969,21 +1012,17 @@ pub async fn get_pypi_detail(
     show_all: bool,
 ) -> PackageDetail {
     let prefix = format!("pypi/{}/", name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    // Size and time come with the listing, not a stat (a HEAD) per file (#1172).
+    let entries = storage.list_with_meta(&prefix).await.unwrap_or_default();
 
     let mut versions = Vec::new();
-    for key in &keys {
+    for (key, meta) in &entries {
         if let Some(filename) = key.strip_prefix(&prefix) {
             if let Some(version) = extract_pypi_version(name, filename) {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
-                    (meta.size, format_timestamp(meta.modified))
-                } else {
-                    (0, "N/A".to_string())
-                };
                 versions.push(VersionInfo {
                     version,
-                    size,
-                    published,
+                    size: meta.size,
+                    published: format_timestamp(meta.modified),
                     cached: true,
                 });
             }
@@ -1009,14 +1048,16 @@ pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>
     } else {
         format!("go/{}/", path)
     };
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    // Size and time come with the listing: a stat per file is a HEAD per file on an
+    // object store (#1172).
+    let entries = storage.list_with_meta(&prefix).await.unwrap_or_default();
 
-    if keys.is_empty() {
+    if entries.is_empty() {
         return (vec![], false);
     }
 
     // Leaf detection: if any key under this prefix contains /@v/ → this is a module
-    let is_module = keys.iter().any(|k| {
+    let is_module = entries.iter().any(|(k, _)| {
         k.strip_prefix(&prefix)
             .is_some_and(|r| r.starts_with("@v/"))
     });
@@ -1026,7 +1067,7 @@ pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>
 
     // Group by immediate child segment (skip @latest and other direct files)
     let mut groups: HashMap<String, (usize, u64, u64)> = HashMap::new();
-    for key in &keys {
+    for (key, meta) in &entries {
         if let Some(rest) = key.strip_prefix(&prefix) {
             if rest.is_empty() || !rest.contains('/') {
                 continue;
@@ -1038,12 +1079,8 @@ pub async fn get_go_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>
             }
             let entry = groups.entry(child_name).or_insert((0, 0, 0));
             entry.0 += 1;
-            if let Some(meta) = storage.stat(key).await {
-                entry.1 += meta.size;
-                if meta.modified > entry.2 {
-                    entry.2 = meta.modified;
-                }
-            }
+            entry.1 += meta.size;
+            entry.2 = entry.2.max(meta.modified);
         }
     }
 
@@ -1163,9 +1200,14 @@ pub async fn get_go_detail(
         }
     }
 
-    // Also scan for .zip files that might exist without being in the list
-    let keys = storage.list(&prefix).await.unwrap_or_default();
-    for key in keys.iter().filter(|k| ends_with_ci(k, ".zip")) {
+    // Also scan for .zip files that might exist without being in the list. The listings
+    // carry each file's size and time, so no version costs a stat (#1172).
+    let stored = Listed::of(storage, &prefix).await;
+    let current = stored
+        .as_ref()
+        .map(|l| l.current.as_slice())
+        .unwrap_or_default();
+    for (key, _) in current.iter().filter(|(k, _)| ends_with_ci(k, ".zip")) {
         if let Some(rest) = key.strip_prefix(&prefix) {
             if let Some(version) = rest.strip_suffix(".zip") {
                 if !known_versions.iter().any(|v| v == version) {
@@ -1175,8 +1217,7 @@ pub async fn get_go_detail(
         }
     }
 
-    let list_ts = storage
-        .stat(&list_key)
+    let list_ts = stored_meta(storage, stored.as_ref(), &list_key)
         .await
         .map(|m| format_timestamp(m.modified))
         .unwrap_or_else(|| "N/A".to_string());
@@ -1184,11 +1225,12 @@ pub async fn get_go_detail(
     let mut versions = Vec::new();
     for v in &known_versions {
         let zip_key = format!("{}{}.zip", prefix, v);
-        let (size, published, cached) = if let Some(meta) = storage.stat(&zip_key).await {
-            (meta.size, format_timestamp(meta.modified), true)
-        } else {
-            (0, list_ts.clone(), false)
-        };
+        let (size, published, cached) =
+            if let Some(meta) = stored_meta(storage, stored.as_ref(), &zip_key).await {
+                (meta.size, format_timestamp(meta.modified), true)
+            } else {
+                (0, list_ts.clone(), false)
+            };
         versions.push(VersionInfo {
             version: v.clone(),
             size,
@@ -1447,25 +1489,21 @@ async fn get_conan_detail(
     // Conan: conan/{name}/{version}/_/_/revisions.json (metadata)
     // Actual files: conan/{name}/{version}/_/_/{rrev}/export/* or /packages/*/
     let prefix = format!("conan/{}/", name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    // Size and time come with the listing, not a stat (a HEAD) per file (#1172).
+    let entries = storage.list_with_meta(&prefix).await.unwrap_or_default();
     let mut version_data: HashMap<String, (u64, u64, bool)> = HashMap::new(); // (size, mtime, has_content)
 
-    for key in &keys {
+    for (key, meta) in &entries {
         if let Some(rest) = key.strip_prefix(&prefix) {
             if let Some(version) = rest.split('/').next() {
                 let entry = version_data
                     .entry(version.to_string())
                     .or_insert((0, 0, false));
-                let is_content = !ends_with_ci(key, "/revisions.json");
-                if let Some(meta) = storage.stat(key).await {
-                    if is_content {
-                        entry.0 += meta.size;
-                        entry.2 = true;
-                    }
-                    if meta.modified > entry.1 {
-                        entry.1 = meta.modified;
-                    }
+                if !ends_with_ci(key, "/revisions.json") {
+                    entry.0 += meta.size;
+                    entry.2 = true;
                 }
+                entry.1 = entry.1.max(meta.modified);
             }
         }
     }
@@ -1657,25 +1695,21 @@ async fn get_pub_detail(
 ) -> PackageDetail {
     // Pub: pub/packages/{name}/versions/{version}.tar.gz
     let prefix = format!("pub/packages/{}/versions/", name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    // Size and time come with the listing, not a stat (a HEAD) per archive (#1172).
+    let entries = storage.list_with_meta(&prefix).await.unwrap_or_default();
     let mut versions = Vec::new();
 
-    for key in &keys {
+    for (key, meta) in &entries {
         if ends_with_ci(key, ".sha256") {
             continue;
         }
         if let Some(rest) = key.strip_prefix(&prefix) {
             let version = rest.trim_end_matches(".tar.gz").to_string();
             if !version.is_empty() {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
-                    (meta.size, format_timestamp(meta.modified))
-                } else {
-                    (0, "N/A".to_string())
-                };
                 versions.push(VersionInfo {
                     version,
-                    size,
-                    published,
+                    size: meta.size,
+                    published: format_timestamp(meta.modified),
                     cached: true,
                 });
             }
@@ -1713,26 +1747,25 @@ async fn get_ansible_detail(
         }
     };
 
-    let keys = storage.list("ansible/download/").await.unwrap_or_default();
+    // Size and time come with the listing, not a stat (a HEAD) per archive (#1172).
+    let entries = storage
+        .list_with_meta("ansible/download/")
+        .await
+        .unwrap_or_default();
     let prefix = format!("{}-{}-", ns, col);
     let mut versions = Vec::new();
 
-    for key in &keys {
+    for (key, meta) in &entries {
         if let Some(filename) = key
             .strip_prefix("ansible/download/")
             .and_then(|f| f.strip_suffix(".tar.gz"))
         {
             if let Some(version) = filename.strip_prefix(&prefix) {
                 if !version.is_empty() {
-                    let (size, published) = if let Some(meta) = storage.stat(key).await {
-                        (meta.size, format_timestamp(meta.modified))
-                    } else {
-                        (0, "N/A".to_string())
-                    };
                     versions.push(VersionInfo {
                         version: version.to_string(),
-                        size,
-                        published,
+                        size: meta.size,
+                        published: format_timestamp(meta.modified),
                         cached: true,
                     });
                 }
@@ -1919,9 +1952,10 @@ async fn get_storage_scan_detail(
     show_all: bool,
 ) -> PackageDetail {
     let prefix = format!("{}/{}/", registry, name);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    // Size and time come with the listing, not a stat (a HEAD) per file (#1172).
+    let entries = storage.list_with_meta(&prefix).await.unwrap_or_default();
     let mut versions = Vec::new();
-    for key in &keys {
+    for (key, meta) in &entries {
         if let Some(rest) = key.strip_prefix(&prefix) {
             let version = rest
                 .trim_end_matches(".tar.gz")
@@ -1930,15 +1964,10 @@ async fn get_storage_scan_detail(
                 .trim_end_matches(".tgz")
                 .to_string();
             if !version.is_empty() && !version.contains('/') {
-                let (size, published) = if let Some(meta) = storage.stat(key).await {
-                    (meta.size, format_timestamp(meta.modified))
-                } else {
-                    (0, "N/A".to_string())
-                };
                 versions.push(VersionInfo {
                     version,
-                    size,
-                    published,
+                    size: meta.size,
+                    published: format_timestamp(meta.modified),
                     cached: true,
                 });
             }
@@ -2113,11 +2142,12 @@ fn extract_pypi_version(name: &str, filename: &str) -> Option<String> {
 
 pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
     let prefix = format!("raw/{}/", group);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    // Size and time come with the listing, not a stat (a HEAD) per file (#1172).
+    let entries = storage.list_with_meta(&prefix).await.unwrap_or_default();
 
     let mut versions = Vec::new();
 
-    if keys.is_empty() {
+    if entries.is_empty() {
         // Root-level file: "raw/myfile.txt" (no subdirectory)
         let direct_key = format!("raw/{}", group);
         if let Some(meta) = storage.stat(&direct_key).await {
@@ -2136,17 +2166,12 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
         }
     }
 
-    for key in &keys {
+    for (key, meta) in &entries {
         if let Some(filename) = key.strip_prefix(&prefix) {
-            let (size, published) = if let Some(meta) = storage.stat(key).await {
-                (meta.size, format_timestamp(meta.modified))
-            } else {
-                (0, "N/A".to_string())
-            };
             versions.push(VersionInfo {
                 version: filename.to_string(),
-                size,
-                published,
+                size: meta.size,
+                published: format_timestamp(meta.modified),
                 cached: true,
             });
         }
@@ -2164,9 +2189,10 @@ pub async fn get_raw_detail(storage: &Storage, group: &str) -> PackageDetail {
 /// Returns (entries, is_directory). If the path is a single file, returns empty vec + false.
 pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo>, bool) {
     let prefix = format!("raw/{}/", path);
-    let keys = storage.list(&prefix).await.unwrap_or_default();
+    // Size and time come with the listing, not a stat (a HEAD) per file (#1172).
+    let entries = storage.list_with_meta(&prefix).await.unwrap_or_default();
 
-    if keys.is_empty() {
+    if entries.is_empty() {
         // Check if it's a direct file
         let direct_key = format!("raw/{}", path);
         if storage.stat(&direct_key).await.is_some() {
@@ -2178,7 +2204,7 @@ pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo
     // Group by immediate child segment
     let mut groups: HashMap<String, (usize, u64, u64, bool)> = HashMap::new();
 
-    for key in &keys {
+    for (key, meta) in &entries {
         if let Some(rest) = key.strip_prefix(&prefix) {
             if rest.is_empty() {
                 continue;
@@ -2190,12 +2216,8 @@ pub async fn get_raw_dir_listing(storage: &Storage, path: &str) -> (Vec<RepoInfo
                 .entry(child_name)
                 .or_insert((0, 0, 0, is_direct_file));
             entry.0 += 1;
-            if let Some(meta) = storage.stat(key).await {
-                entry.1 += meta.size;
-                if meta.modified > entry.2 {
-                    entry.2 = meta.modified;
-                }
-            }
+            entry.1 += meta.size;
+            entry.2 = entry.2.max(meta.modified);
         }
     }
 

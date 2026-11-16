@@ -1,0 +1,329 @@
+---
+source: nora-registry/src/ui/mod.rs
+expression: shown
+---
+{
+  "ansible": {
+    "prerelease": 0,
+    "stable": 3,
+    "versions": [
+      [
+        "1.0.2",
+        3502,
+        "3 hours ago",
+        true
+      ],
+      [
+        "1.0.1",
+        3501,
+        "2 hours ago",
+        true
+      ],
+      [
+        "1.0.0",
+        3500,
+        "1 hour ago",
+        true
+      ]
+    ]
+  },
+  "cargo": {
+    "prerelease": 0,
+    "stable": 3,
+    "versions": [
+      [
+        "1.0.2",
+        3102,
+        "3 hours ago",
+        true
+      ],
+      [
+        "1.0.1",
+        3101,
+        "2 hours ago",
+        true
+      ],
+      [
+        "1.0.0",
+        3100,
+        "1 hour ago",
+        true
+      ]
+    ]
+  },
+  "conan": {
+    "prerelease": 0,
+    "stable": 3,
+    "versions": [
+      [
+        "1.2.0",
+        3302,
+        "5 hours ago",
+        true
+      ],
+      [
+        "1.1.0",
+        3301,
+        "3 hours ago",
+        true
+      ],
+      [
+        "1.0.0",
+        3300,
+        "1 hour ago",
+        true
+      ]
+    ]
+  },
+  "go dir /": [
+    [
+      "github.com",
+      8,
+      2264,
+      "1 hour ago",
+      false
+    ],
+    [
+      "golang.org",
+      1,
+      900,
+      "9 hours ago",
+      false
+    ]
+  ],
+  "go dir github.com": [
+    [
+      "acme",
+      8,
+      2264,
+      "1 hour ago",
+      false
+    ]
+  ],
+  "go dir github.com/acme": [
+    [
+      "lib",
+      1,
+      700,
+      "8 hours ago",
+      false
+    ],
+    [
+      "mod",
+      7,
+      1564,
+      "1 hour ago",
+      false
+    ]
+  ],
+  "go module": {
+    "prerelease": 0,
+    "stable": 4,
+    "versions": [
+      [
+        "v2.0.0",
+        0,
+        "7 hours ago",
+        false
+      ],
+      [
+        "v1.2.0",
+        502,
+        "5 hours ago",
+        true
+      ],
+      [
+        "v1.1.0",
+        501,
+        "3 hours ago",
+        true
+      ],
+      [
+        "v1.0.0",
+        500,
+        "1 hour ago",
+        true
+      ]
+    ]
+  },
+  "npm": {
+    "prerelease": 0,
+    "stable": 5,
+    "versions": [
+      [
+        "3.0.0",
+        3000,
+        "4 hours ago",
+        true
+      ],
+      [
+        "2.0.0",
+        77,
+        "2026-03-04",
+        false
+      ],
+      [
+        "1.0.2",
+        2002,
+        "2026-01-02",
+        true
+      ],
+      [
+        "1.0.1",
+        2001,
+        "2026-01-02",
+        true
+      ],
+      [
+        "1.0.0",
+        2000,
+        "2026-01-02",
+        true
+      ]
+    ]
+  },
+  "pub": {
+    "prerelease": 0,
+    "stable": 3,
+    "versions": [
+      [
+        "1.0.2",
+        3402,
+        "5 hours ago",
+        true
+      ],
+      [
+        "1.0.1",
+        3401,
+        "3 hours ago",
+        true
+      ],
+      [
+        "1.0.0",
+        3400,
+        "1 hour ago",
+        true
+      ]
+    ]
+  },
+  "pypi": {
+    "prerelease": 0,
+    "stable": 3,
+    "versions": [
+      [
+        "2.0.2",
+        3202,
+        "3 hours ago",
+        true
+      ],
+      [
+        "2.0.1",
+        3201,
+        "2 hours ago",
+        true
+      ],
+      [
+        "2.0.0",
+        3200,
+        "1 hour ago",
+        true
+      ]
+    ]
+  },
+  "raw detail": {
+    "prerelease": 0,
+    "stable": 0,
+    "versions": [
+      [
+        "file-0.bin",
+        3700,
+        "1 hour ago",
+        true
+      ],
+      [
+        "file-1.bin",
+        3701,
+        "3 hours ago",
+        true
+      ],
+      [
+        "file-2.bin",
+        3702,
+        "5 hours ago",
+        true
+      ],
+      [
+        "sub/part-0.bin",
+        3800,
+        "2 hours ago",
+        true
+      ],
+      [
+        "sub/part-1.bin",
+        3801,
+        "4 hours ago",
+        true
+      ],
+      [
+        "sub/part-2.bin",
+        3802,
+        "6 hours ago",
+        true
+      ]
+    ]
+  },
+  "raw dir": [
+    [
+      "sub",
+      3,
+      11403,
+      "2 hours ago",
+      false
+    ],
+    [
+      "file-0.bin",
+      1,
+      3700,
+      "1 hour ago",
+      true
+    ],
+    [
+      "file-1.bin",
+      1,
+      3701,
+      "3 hours ago",
+      true
+    ],
+    [
+      "file-2.bin",
+      1,
+      3702,
+      "5 hours ago",
+      true
+    ]
+  ],
+  "terraform (storage scan)": {
+    "prerelease": 0,
+    "stable": 3,
+    "versions": [
+      [
+        "5.0.2",
+        3602,
+        "3 hours ago",
+        true
+      ],
+      [
+        "5.0.1",
+        3601,
+        "2 hours ago",
+        true
+      ],
+      [
+        "5.0.0",
+        3600,
+        "1 hour ago",
+        true
+      ]
+    ]
+  }
+}

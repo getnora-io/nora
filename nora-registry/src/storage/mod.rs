@@ -49,6 +49,17 @@ pub struct FileMeta {
     pub modified: u64, // Unix timestamp
 }
 
+/// The objects under one prefix, each named by the key a read finds it under (#1172).
+#[derive(Debug, Default)]
+pub struct ListedAsRead {
+    /// Stored under the current encoding of their keys.
+    pub current: Vec<(String, FileMeta)>,
+    /// Stored under an older encoding that reads still fall back to — on S3, `@` spelled
+    /// `_at_` by NORA 0.9.2 and earlier (#534). `None` when the store holds no such form for
+    /// the prefix and was not asked.
+    pub older: Option<Vec<(String, FileMeta)>>,
+}
+
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("Network error: {0}")]
@@ -143,6 +154,15 @@ pub trait StorageBackend: Send + Sync {
             }
         }
         Ok(out)
+    }
+    /// Every object under `prefix` with its size/mtime, each named by the key a read finds it
+    /// under — for a caller that looks keys up in the listing rather than stat each one (#1172).
+    /// Backends whose listing names are those keys use [`list_with_meta`](Self::list_with_meta).
+    async fn list_with_meta_as_read(&self, prefix: &str) -> Result<ListedAsRead> {
+        Ok(ListedAsRead {
+            current: self.list_with_meta(prefix).await?,
+            older: None,
+        })
     }
     async fn health_check(&self) -> bool;
     /// Total size of all stored artifacts in bytes
@@ -533,6 +553,38 @@ impl Storage {
             .into_iter()
             .filter(|(k, _)| !k.starts_with(".nora-"))
             .collect())
+    }
+
+    /// Every object under `prefix`, named by the key a read finds it under, see
+    /// [`StorageBackend::list_with_meta_as_read`], with the `.nora-` filter of
+    /// [`list`](Self::list). Each listing the store does counts as one `list_with_meta`.
+    pub async fn list_with_meta_as_read(&self, prefix: &str) -> Result<ListedAsRead> {
+        if !prefix.is_empty() {
+            validate_storage_key(listing_key(prefix))?;
+        }
+        let listed = match self.inner.list_with_meta_as_read(prefix).await {
+            Ok(listed) => listed,
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["list_with_meta", "error"])
+                    .inc();
+                return Err(e);
+            }
+        };
+        let listings = if listed.older.is_some() { 2 } else { 1 };
+        STORAGE_OPERATIONS
+            .with_label_values(&["list_with_meta", "ok"])
+            .inc_by(listings);
+        let visible = |entries: Vec<(String, FileMeta)>| -> Vec<(String, FileMeta)> {
+            entries
+                .into_iter()
+                .filter(|(k, _)| !k.starts_with(".nora-"))
+                .collect()
+        };
+        Ok(ListedAsRead {
+            current: visible(listed.current),
+            older: listed.older.map(visible),
+        })
     }
 
     pub async fn stat(&self, key: &str) -> Option<FileMeta> {
@@ -1184,6 +1236,43 @@ mod tests {
         );
     }
 
+    /// #1172: each listing an as-read listing makes is a round-trip, counted as a
+    /// `list_with_meta` — one where the store keeps no older key form for the prefix, two where
+    /// it does — and a refused one is an error.
+    #[tokio::test]
+    async fn as_read_listings_are_counted() {
+        let count =
+            |op: &str, status: &str| STORAGE_OPERATIONS.with_label_values(&[op, status]).get();
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ok = count("list_with_meta", "ok");
+        let listed = storage
+            .list_with_meta_as_read("npm/@scope/pkg/tarballs/")
+            .await
+            .unwrap();
+        assert!(listed.older.is_some(), "an S3 store keeps the older form");
+        assert!(
+            count("list_with_meta", "ok") >= ok + 2,
+            "both listings counted"
+        );
+
+        let listed = storage
+            .list_with_meta_as_read("npm/pkg/tarballs/")
+            .await
+            .unwrap();
+        assert!(listed.older.is_none(), "no `@`: no older form, not asked");
+
+        outage.fail_older_listings_of("npm/@scope/pkg/tarballs/");
+        let error = count("list_with_meta", "error");
+        assert!(storage
+            .list_with_meta_as_read("npm/@scope/pkg/tarballs/")
+            .await
+            .is_err());
+        assert!(
+            count("list_with_meta", "error") > error,
+            "refused: an error"
+        );
+    }
+
     /// The failing half of the same contract: a listing that the backend refuses must
     /// land on `list`/`error`, so an operator can tell "the store is answering with
     /// nothing" from "the store is not answering".
@@ -1692,6 +1781,7 @@ mod tests {
         "list",
         "list_internal",
         "list_with_meta",
+        "list_with_meta_as_read",
         "pin",
         "put",
         "put_from_path",
@@ -1749,6 +1839,10 @@ mod tests {
                     ("list", s.list(prefix).await.is_err()),
                     ("list_internal", s.list_internal(prefix).await.is_err()),
                     ("list_with_meta", s.list_with_meta(prefix).await.is_err()),
+                    (
+                        "list_with_meta_as_read",
+                        s.list_with_meta_as_read(prefix).await.is_err(),
+                    ),
                 ];
                 for (method, ok) in checks {
                     assert!(ok, "{b} {method} {prefix}");
