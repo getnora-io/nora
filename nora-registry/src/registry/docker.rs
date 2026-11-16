@@ -2518,6 +2518,106 @@ fn docker_metadata_ttl(config: &crate::config::DockerConfig, namespace: Option<&
         .unwrap_or(config.metadata_ttl)
 }
 
+/// Tags that no upstream has, remembered for `miss_ttl` seconds (#1192), keyed by the proxied
+/// name, its storage namespace and the reference. In memory only: a restart forgets them, which
+/// costs one more upstream request per name, as the in-flight map of the proxy path does.
+#[derive(Default)]
+pub(crate) struct MissCache {
+    until: parking_lot::RwLock<HashMap<String, std::time::Instant>>,
+}
+
+/// Past this many entries, the expired ones are dropped; past it again, the map is emptied. Only
+/// the upstream requests the entries saved are lost.
+const MISS_CACHE_MAX: usize = 10_000;
+
+impl MissCache {
+    /// Whether `key` was recorded as missing and its window has not ended at `now`.
+    pub(crate) fn is_fresh(&self, key: &str, now: std::time::Instant) -> bool {
+        self.until.read().get(key).is_some_and(|until| *until > now)
+    }
+
+    /// Record `key` as missing from `now` for `ttl`. A window that does not fit in time is not
+    /// recorded.
+    pub(crate) fn record(&self, key: &str, ttl: Duration, now: std::time::Instant) {
+        let Some(until) = now.checked_add(ttl) else {
+            return;
+        };
+        let mut map = self.until.write();
+        if map.len() >= MISS_CACHE_MAX {
+            map.retain(|_, u| *u > now);
+            if map.len() >= MISS_CACHE_MAX {
+                map.clear();
+            }
+        }
+        map.insert(key.to_string(), until);
+    }
+
+    /// Forget `key`: its tag was pushed, so it exists here now.
+    pub(crate) fn forget(&self, key: &str) {
+        self.until.write().remove(key);
+    }
+}
+
+/// The key a proxied tag's miss is remembered and shared under: its storage namespace, the
+/// proxied name and the reference (#1192).
+fn miss_key(namespace: Option<&str>, name: &str, reference: &str) -> String {
+    format!("{}\n{name}\n{reference}", namespace.unwrap_or(""))
+}
+
+/// What the requests that ask for one missing tag share (#1192): a waiter takes the leader's
+/// `NotFound` as the answer, and asks the upstreams itself after any other share.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ManifestShare {
+    Found,
+    NotFound,
+    Unanswered,
+}
+
+/// The upstream attempt for a Docker manifest that is not held: `Found` carries the response,
+/// `Missed` the answer folded over every upstream asked, under the name and its `library/` name.
+pub(crate) enum ManifestAttempt {
+    Found(Response),
+    Missed(UpstreamMiss),
+}
+
+async fn ask_manifest_upstreams(
+    state: &AppState,
+    upstreams: &[&crate::config::DockerUpstream],
+    name: &str,
+    reference: &str,
+    key: &str,
+) -> ManifestAttempt {
+    let mut misses: Vec<UpstreamMiss> = upstreams.iter().map(|_| UpstreamMiss::default()).collect();
+    if let Some(response) =
+        try_fetch_and_cache(state, upstreams, &mut misses, name, name, reference, key).await
+    {
+        return ManifestAttempt::Found(response);
+    }
+    // Auto-prepend library/ for single-segment names (Docker Hub official images)
+    // e.g., "nginx" -> "library/nginx", "alpine" -> "library/alpine"
+    if !name.contains('/') {
+        let library_name = format!("library/{}", name);
+        if let Some(response) = try_fetch_and_cache(
+            state,
+            upstreams,
+            &mut misses,
+            &library_name,
+            name,
+            reference,
+            key,
+        )
+        .await
+        {
+            return ManifestAttempt::Found(response);
+        }
+    }
+    let mut miss = UpstreamMiss::default();
+    for asked in &misses {
+        miss.record_upstream(asked);
+    }
+    ManifestAttempt::Missed(miss)
+}
+
 async fn get_manifest(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -2684,47 +2784,87 @@ async fn get_manifest(
         return manifest_unknown_response(&name, &reference);
     }
 
-    // Try upstream proxies (always if no cache, or if cache is stale)
+    // A tag that no upstream has is remembered for `miss_ttl` seconds (#1192), so a repeat is
+    // answered without asking again. Only a tag with no stored copy takes that shortcut: a copy
+    // goes through the upstreams as before and, failing them, through the stale path below.
+    let miss_key = miss_key(ns.as_deref(), &name, &reference);
+    if cached.is_none()
+        && state
+            .manifest_misses
+            .is_fresh(&miss_key, std::time::Instant::now())
+    {
+        return manifest_unknown_response(&name, &reference);
+    }
+
+    // Try upstream proxies (always if no cache, or if cache is stale). Concurrent requests for the
+    // same tag share one round of upstream requests: the leader asks, and a waiter takes the
+    // leader's answer when it was "not found". Any other answer makes the waiter ask on its own.
     tracing::debug!(
         upstreams_count = upstreams_to_try.len(),
         "Trying upstream proxies"
     );
-    // One record per upstream, across both names it may be asked under (library/ below).
-    let mut misses: Vec<UpstreamMiss> = upstreams_to_try
-        .iter()
-        .map(|_| UpstreamMiss::default())
-        .collect();
-    if let Some(response) = try_fetch_and_cache(
-        &state,
-        &upstreams_to_try,
-        &mut misses,
-        &name,
-        &name,
-        &reference,
-        &key,
-    )
-    .await
-    {
-        return response;
-    }
-
-    // Auto-prepend library/ for single-segment names (Docker Hub official images)
-    // e.g., "nginx" -> "library/nginx", "alpine" -> "library/alpine"
-    if !name.contains('/') {
-        let library_name = format!("library/{}", name);
-        if let Some(response) = try_fetch_and_cache(
-            &state,
-            &upstreams_to_try,
-            &mut misses,
-            &library_name,
-            &name,
-            &reference,
-            &key,
+    let miss_ttl = Duration::from_secs(state.config.docker.miss_ttl);
+    let flight_state = state.clone();
+    let flight_upstreams = upstreams_to_try.clone();
+    let (flight_name, flight_reference, flight_key) =
+        (name.clone(), reference.clone(), key.clone());
+    let flight_miss_key = miss_key.clone();
+    let (attempt, _lease) = match state
+        .manifest_flights
+        .leased(
+            &miss_key,
+            "docker",
+            crate::proxy_coalesce::follower_budget(state.config.docker.proxy_timeout),
+            move || async move {
+                let attempt = ask_manifest_upstreams(
+                    &flight_state,
+                    &flight_upstreams,
+                    &flight_name,
+                    &flight_reference,
+                    &flight_key,
+                )
+                .await;
+                let share = match &attempt {
+                    ManifestAttempt::Found(_) => ManifestShare::Found,
+                    ManifestAttempt::Missed(miss) if miss.all_not_found() => {
+                        ManifestShare::NotFound
+                    }
+                    ManifestAttempt::Missed(_) => ManifestShare::Unanswered,
+                };
+                // A referrers tag is never remembered: its 404 holds only while the upstream is
+                // silent, and a kept one would answer an outage without its stale mark and
+                // `no-store` (see the referrers answer below).
+                if share == ManifestShare::NotFound
+                    && !miss_ttl.is_zero()
+                    && !is_referrers_tag(&flight_reference)
+                {
+                    flight_state.manifest_misses.record(
+                        &flight_miss_key,
+                        miss_ttl,
+                        std::time::Instant::now(),
+                    );
+                }
+                Some((share, attempt))
+            },
         )
         .await
-        {
-            return response;
+    {
+        Some(Flight::Leader { own, lease, .. }) => (own, Some(lease)),
+        Some(Flight::Alone { own, .. }) => (own, None),
+        Some(Flight::Follower(ManifestShare::NotFound)) if cached.is_none() => {
+            return manifest_unknown_response(&name, &reference);
         }
+        Some(Flight::Follower(_)) | None => (
+            ask_manifest_upstreams(&state, &upstreams_to_try, &name, &reference, &key).await,
+            None,
+        ),
+    };
+    let miss = match attempt {
+        ManifestAttempt::Found(response) => return response,
+        ManifestAttempt::Missed(miss) => miss,
+    };
+    if cached.is_none() && miss.all_not_found() {
+        return manifest_unknown_response(&name, &reference);
     }
 
     // Stale-while-error: serve stale cached manifest when upstream is unreachable
@@ -2750,10 +2890,6 @@ async fn get_manifest(
         }
     }
 
-    let mut miss = UpstreamMiss::default();
-    for asked in &misses {
-        miss.record_upstream(asked);
-    }
     // A referrers tag (`sha256-<hex>`, OCI referrers tag schema) is how a client looks for an
     // image's signatures and attestations, and Docker ends the pull on a 5xx for it. With
     // serve_stale on, no upstream answering at all (failed or skipped for its open breaker) and
@@ -3044,6 +3180,10 @@ async fn put_manifest(
         "manifest",
     ));
     state.repo_index.invalidate("docker");
+    // The tag exists here now, so a miss remembered for it no longer applies (#1192).
+    state
+        .manifest_misses
+        .forget(&miss_key(ns.as_deref(), &name, &reference));
 
     let location = format!("/v2/{}/manifests/{}", repository, reference);
     (
@@ -13964,6 +14104,256 @@ mod integration_tests {
         .unwrap();
         assert_eq!(parsed.upstreams[0].metadata_ttl, Some(60));
         assert_eq!(parsed.upstreams[1].metadata_ttl, None);
+    }
+
+    /// A proxied copy's upstream: a fallback-chain entry under `namespace`, with no window of its
+    /// own.
+    fn miss_upstream(url: String, namespace: &str) -> crate::config::DockerUpstream {
+        crate::config::DockerUpstream {
+            url,
+            auth: None,
+            namespace: Some(namespace.to_string()),
+            prefix: None,
+            namespaces: Vec::new(),
+            metadata_ttl: None,
+        }
+    }
+
+    /// An upstream that has no manifest of any name, answering after `delay`.
+    async fn missing_hub(delay: std::time::Duration) -> wiremock::MockServer {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(404).set_delay(delay))
+            .mount(&hub)
+            .await;
+        hub
+    }
+
+    /// Two upstreams that have nothing, in the fallback chain of a name, with `miss_ttl` seconds
+    /// of remembering.
+    async fn two_missing_hubs(
+        delay: std::time::Duration,
+        miss_ttl: u64,
+    ) -> (
+        wiremock::MockServer,
+        wiremock::MockServer,
+        crate::test_helpers::TestContext,
+    ) {
+        let a = missing_hub(delay).await;
+        let b = missing_hub(delay).await;
+        let (url_a, url_b) = (a.uri(), b.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.miss_ttl = miss_ttl;
+            cfg.docker.upstreams = vec![miss_upstream(url_a, "ns-a"), miss_upstream(url_b, "ns-b")];
+        });
+        (a, b, ctx)
+    }
+
+    /// Twenty concurrent requests for a tag that no upstream has ask each upstream at most once:
+    /// they share one round of upstream requests (#1192).
+    #[tokio::test]
+    async fn docker_manifest_miss_concurrent_requests_ask_each_upstream_once() {
+        let (a, b, ctx) = two_missing_hubs(std::time::Duration::from_millis(300), 30).await;
+        let mut requests = Vec::new();
+        for _ in 0..20 {
+            let app = ctx.app.clone();
+            let request = tokio::spawn(async move {
+                send(
+                    &app,
+                    Method::GET,
+                    "/v2/team/app/manifests/v9",
+                    Body::empty(),
+                )
+                .await
+                .status()
+            });
+            requests.push(request);
+        }
+        for request in requests {
+            assert_eq!(request.await.unwrap(), StatusCode::NOT_FOUND);
+        }
+        let asked_a = a.received_requests().await.unwrap().len();
+        let asked_b = b.received_requests().await.unwrap().len();
+        assert!(
+            asked_a <= 1,
+            "upstream a was asked {asked_a} times for one tag"
+        );
+        assert!(
+            asked_b <= 1,
+            "upstream b was asked {asked_b} times for one tag"
+        );
+    }
+
+    /// Repeats of a tag that no upstream has, within `miss_ttl`, are answered without asking the
+    /// upstreams again (#1192).
+    #[tokio::test]
+    async fn docker_manifest_miss_repeats_within_its_ttl_ask_nothing() {
+        let (a, b, ctx) = two_missing_hubs(std::time::Duration::ZERO, 60).await;
+        for _ in 0..5 {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                "/v2/team/app/manifests/v9",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+        assert_eq!(a.received_requests().await.unwrap().len(), 1);
+        assert_eq!(b.received_requests().await.unwrap().len(), 1);
+    }
+
+    /// A repeat after `miss_ttl` asks the upstreams again (#1192).
+    #[tokio::test]
+    async fn docker_manifest_miss_is_asked_again_after_its_ttl() {
+        let (a, _b, ctx) = two_missing_hubs(std::time::Duration::ZERO, 1).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/app/manifests/v9",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(a.received_requests().await.unwrap().len(), 1);
+        tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/app/manifests/v9",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(a.received_requests().await.unwrap().len(), 2);
+    }
+
+    /// A miss in which an upstream failed is not remembered: that upstream may have the tag, so
+    /// the next request asks again (#1192).
+    #[tokio::test]
+    async fn docker_manifest_miss_with_a_failed_upstream_is_not_remembered() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let failing = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&failing)
+            .await;
+        let answering = missing_hub(std::time::Duration::ZERO).await;
+        let (url_a, url_b) = (failing.uri(), answering.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.miss_ttl = 60;
+            cfg.docker.upstreams = vec![miss_upstream(url_a, "ns-a"), miss_upstream(url_b, "ns-b")];
+        });
+        let _ = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/app/manifests/v9",
+            Body::empty(),
+        )
+        .await;
+        let first = failing.received_requests().await.unwrap().len();
+        let _ = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/app/manifests/v9",
+            Body::empty(),
+        )
+        .await;
+        let second = failing.received_requests().await.unwrap().len();
+        assert!(
+            second > first,
+            "a miss with a failed upstream was remembered: the upstream was not asked again"
+        );
+    }
+
+    /// A tag pushed after it was remembered as missing is served at once, from this registry, and
+    /// the upstreams are not asked for it (#1192).
+    #[tokio::test]
+    async fn docker_manifest_pushed_after_a_miss_is_served_at_once() {
+        let (a, _b, ctx) = two_missing_hubs(std::time::Duration::ZERO, 60).await;
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/app/manifests/v9",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let zero = format!("sha256:{}", "0".repeat(64));
+        ctx.state
+            .storage
+            .put(&format!("docker/team/app/blobs/{zero}"), b"x")
+            .await
+            .unwrap();
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": 1,
+                "digest": zero,
+            },
+            "layers": [],
+        }))
+        .unwrap();
+        let put = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/team/app/manifests/v9",
+            Body::from(manifest),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/app/manifests/v9",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            a.received_requests().await.unwrap().len(),
+            1,
+            "a pushed tag was asked of the upstream again"
+        );
+        assert!(
+            !ctx.state.manifest_misses.is_fresh(
+                &super::miss_key(Some("ns-a"), "team/app", "v9"),
+                std::time::Instant::now()
+            ),
+            "the push did not forget the miss it answers"
+        );
+    }
+
+    /// `miss_ttl = 0` turns the remembering off: every repeat asks the upstreams (#1192).
+    #[tokio::test]
+    async fn docker_manifest_miss_ttl_zero_remembers_nothing() {
+        let (a, _b, ctx) = two_missing_hubs(std::time::Duration::ZERO, 0).await;
+        for _ in 0..3 {
+            let resp = send(
+                &ctx.app,
+                Method::GET,
+                "/v2/team/app/manifests/v9",
+                Body::empty(),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        }
+        assert_eq!(a.received_requests().await.unwrap().len(), 3);
+    }
+
+    /// `miss_ttl` is read from `[docker]`, and defaults to 30 seconds (#1192).
+    #[test]
+    fn docker_miss_ttl_is_read_and_defaults_to_thirty_seconds() {
+        let parsed: crate::config::DockerConfig = toml::from_str("miss_ttl = 60\n").unwrap();
+        assert_eq!(parsed.miss_ttl, 60);
+        assert_eq!(crate::config::DockerConfig::default().miss_ttl, 30);
     }
 }
 

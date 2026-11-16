@@ -3803,6 +3803,8 @@ Jd74nq6dNCjpWG4drIsyhqX+
             )),
             proxy_coalesce: crate::proxy_coalesce::InflightMap::new(),
             blob_flights: crate::proxy_coalesce::InflightMap::new(),
+            manifest_flights: crate::proxy_coalesce::InflightMap::new(),
+            manifest_misses: std::sync::Arc::new(crate::registry::docker::MissCache::default()),
             digest_store: ctx.state.digest_store.clone(),
             signer: ctx.state.signer.clone(),
             leak_finders: ctx.state.leak_finders.clone(),
