@@ -1338,6 +1338,7 @@ pub fn render_package_detail(
             let package_name = distribution.replace('-', "::");
             format!("cpanm --from {}/cpan {}", base_url, package_name)
         }
+        Some(RegistryType::HuggingFace) => format!("HF_ENDPOINT={}/hf hf download {}", base_url, name),
         _ => String::new(),
     };
 
