@@ -600,28 +600,28 @@ pub fn render_registry_card(
 pub fn render_mount_points_table(
     mount_points: &[(String, String, Vec<String>, bool)],
     t: &Translations,
-    auth_enabled: bool,
+    can_sign_in: bool,
 ) -> String {
     let rows: String = mount_points
         .iter()
         .map(|(registry, mount_path, upstreams, hidden)| {
-            let proxy_display = if *hidden {
+            let mut shown: Vec<String> = upstreams.iter().map(|u| html_escape(u)).collect();
+            if *hidden {
                 // The registry has upstreams this caller is not shown: say so, and how to see
                 // them where signing in is possible.
-                let label = if auth_enabled {
+                let label = if can_sign_in {
                     t.proxy_hidden_sign_in
                 } else {
                     t.proxy_hidden
                 };
-                format!(r#"<span class="italic text-slate-500">{label}</span>"#)
-            } else if upstreams.is_empty() {
+                shown.push(format!(
+                    r#"<span class="italic text-slate-500">{label}</span>"#
+                ));
+            }
+            let proxy_display = if shown.is_empty() {
                 "-".to_string()
             } else {
-                upstreams
-                    .iter()
-                    .map(|u| html_escape(u))
-                    .collect::<Vec<_>>()
-                    .join("<br>")
+                shown.join("<br>")
             };
             format!(
                 r##"

@@ -213,15 +213,19 @@ pub async fn api_dashboard(
     Json(build_dashboard_response(&state, authenticated).await)
 }
 
-/// `url` without the `user:password@` its authority may carry; any other address unchanged.
-fn without_userinfo(url: &str) -> String {
-    let authority_start = url.find("://").map_or(0, |i| i + 3);
-    let rest = &url[authority_start..];
-    let authority_len = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    match rest[..authority_len].rfind('@') {
-        Some(at) => format!("{}{}", &url[..authority_start], &rest[at + 1..]),
-        None => url.to_string(),
+/// The upstream address `url` as the dashboard shows it: read by the parser the proxy client
+/// sends with (`reqwest::Url`), so every spelling it accepts (`https:///u:p@host`, a
+/// backslash for a slash) is judged as it is sent, then shown without its credentials. `None`
+/// for an address that is not an `http(s)` URL with a host: it is not shown at all, since
+/// whatever it carries cannot be told apart.
+fn shown_address(url: &str) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
     }
+    parsed.set_username("").ok()?;
+    parsed.set_password(None).ok()?;
+    Some(parsed.to_string())
 }
 
 /// Build the dashboard JSON payload.
@@ -295,8 +299,20 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
             RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
             RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
             RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
-            RegistryType::Rpm => vec![],
-            RegistryType::Deb => vec![],
+            RegistryType::Rpm => state
+                .config
+                .rpm
+                .proxies
+                .values()
+                .map(|p| p.url().to_string())
+                .collect(),
+            RegistryType::Deb => state
+                .config
+                .deb
+                .proxies
+                .values()
+                .map(|p| p.url().to_string())
+                .collect(),
             RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
             RegistryType::Composer => state
                 .config
@@ -307,12 +323,17 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
                 .collect(),
             RegistryType::HuggingFace => state.config.hf.proxy.clone().into_iter().collect(),
         };
-        let proxy_hidden = !authenticated && !configured.is_empty();
-        let proxy_upstreams = if authenticated {
-            configured.iter().map(|url| without_userinfo(url)).collect()
+        // A caller NORA does not know sees no address; a known one sees each address the
+        // client parser reads, and an address it cannot read stays hidden.
+        let proxy_upstreams: Vec<String> = if authenticated {
+            configured
+                .iter()
+                .filter_map(|url| shown_address(url))
+                .collect()
         } else {
             vec![]
         };
+        let proxy_hidden = proxy_upstreams.len() < configured.len();
 
         mount_points.push(MountPoint {
             registry: reg.display_name().to_string(),
@@ -2497,36 +2518,69 @@ mod registry_stats_cover_every_registry {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod userinfo_tests {
-    use super::without_userinfo;
+    use super::shown_address;
 
-    /// Only the authority's `user:password@` goes: an `@` in a path or query is part of the
-    /// address, and a password holding `@` goes whole.
+    /// Every spelling of an address is judged by the parser the proxy client sends with: what
+    /// the dashboard shows has the host, port, path and query of the request reqwest builds
+    /// from the configured address, and none of the credentials that request carries.
     #[test]
-    fn the_credentials_go_and_the_rest_of_the_address_stays() {
-        for (url, shown) in [
-            ("https://registry.npmjs.org", "https://registry.npmjs.org"),
-            (
-                "https://u:p@mirror.example/simple",
-                "https://mirror.example/simple",
-            ),
-            ("https://token@mirror.example", "https://mirror.example"),
-            (
-                "https://u:p@ss@mirror.example/x",
-                "https://mirror.example/x",
-            ),
-            (
-                "https://npm.example/@scope/pkg",
-                "https://npm.example/@scope/pkg",
-            ),
-            (
-                "https://host.example?ref=a@b",
-                "https://host.example?ref=a@b",
-            ),
-            ("https://host.example#a@b", "https://host.example#a@b"),
-            ("u:p@mirror.example/x", "mirror.example/x"),
+    fn an_address_shows_as_the_client_reads_it_without_its_credentials() {
+        let forms = [
+            "https://ci-bot:s3cr3t@mirror.example/simple",
+            "https:///ci-bot:s3cr3t@mirror.example/simple",
+            "https:/ci-bot:s3cr3t@mirror.example/simple",
+            "https://ci-bot@mirror.example/simple",
+            "https://ci%40bot:s3%40cr3t@mirror.example/simple",
+            "https://ci-bot:s3@cr3t@mirror.example/x",
+            "https://ci-bot:s3cr3t@[2001:db8::1]:8443/simple",
+            "https://ci-bot:s3cr3t@mirror.example:8443/simple",
+            "https://mirror.example\\@scope/pkg",
+            "https://mirror.example/@scope/pkg",
+            "https://mirror.example/simple?ref=a@b",
+            "https://mirror.example/simple#a@b",
+            "https://registry.npmjs.org",
+        ];
+        let client = reqwest::Client::new();
+        for form in forms {
+            let sent = client.get(form).build().unwrap();
+            let shown = shown_address(form).unwrap_or_else(|| panic!("{form} parses"));
+            let shown_url = reqwest::Url::parse(&shown).unwrap();
+            let sent_url = sent.url();
+            assert_eq!(shown_url.host_str(), sent_url.host_str(), "{form}: host");
+            assert_eq!(
+                shown_url.port_or_known_default(),
+                sent_url.port_or_known_default(),
+                "{form}"
+            );
+            assert_eq!(shown_url.path(), sent_url.path(), "{form}: path");
+            assert_eq!(shown_url.query(), sent_url.query(), "{form}: query");
+            assert_eq!(shown_url.username(), "", "{form}: no user");
+            assert_eq!(shown_url.password(), None, "{form}: no password");
+            for secret in [
+                "ci-bot",
+                "ci%40bot",
+                "ci@bot",
+                "s3cr3t",
+                "s3%40cr3t",
+                "cr3t",
+            ] {
+                assert!(!shown.contains(secret), "{form} shows {secret}: {shown}");
+            }
+        }
+    }
+
+    /// An address the client cannot parse is not shown at all, rather than as written.
+    #[test]
+    fn an_address_that_does_not_parse_is_not_shown() {
+        for form in [
+            "ci-bot:s3cr3t@mirror.example/simple",
+            "ftp://ci-bot:s3cr3t@mirror.example/simple",
+            "not an address",
+            "",
         ] {
-            assert_eq!(without_userinfo(url), shown, "{url}");
+            assert_eq!(shown_address(form), None, "{form}");
         }
     }
 }

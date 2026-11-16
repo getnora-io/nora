@@ -12,7 +12,14 @@ use crate::tokens::TokenListEntry;
 use std::fmt::Write;
 
 /// Renders the main dashboard page with dark theme
-pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool) -> String {
+/// `can_sign_in`: the caller is not signed in on an instance with authentication, so the
+/// upstreams hidden from them would show after signing in.
+pub fn render_dashboard(
+    data: &DashboardResponse,
+    lang: Lang,
+    auth_enabled: bool,
+    can_sign_in: bool,
+) -> String {
     let t = get_translations(lang);
     // Render global stats
     let global_stats = render_global_stats(
@@ -57,7 +64,7 @@ pub fn render_dashboard(data: &DashboardResponse, lang: Lang, auth_enabled: bool
             )
         })
         .collect();
-    let mount_points = render_mount_points_table(&mount_data, t, auth_enabled);
+    let mount_points = render_mount_points_table(&mount_data, t, can_sign_in);
 
     // Render activity log
     let activity_rows: String = if data.activity.is_empty() {
