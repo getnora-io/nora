@@ -115,31 +115,120 @@ pub(crate) fn written_host(url: &str) -> Option<String> {
     rest.split(['/', ':']).next().map(str::to_string)
 }
 
+/// Every spelling `text` takes in an output: as it is (a `%` field, a message, stderr), as
+/// `{:?}` writes it (a `?` field, an error's `Debug`, serde's "invalid type: string …"), as a
+/// JSON string holds it (a field of a JSON log line), and as a JSON string holds its `{:?}`
+/// (a `?` field of a JSON log line). The one place the spellings of a secret are made.
+pub(crate) fn spellings(text: &str) -> [String; 4] {
+    let debug = format!("{text:?}");
+    let debug = unquoted(&debug).to_string();
+    [text.to_string(), debug.clone(), json(text), json(&debug)]
+}
+
+/// `text` as a JSON string holds it, without the quotes.
+fn json(text: &str) -> String {
+    // A `str` is always a JSON string; the fallback is never taken.
+    let quoted = serde_json::to_string(text).unwrap_or_default();
+    unquoted(&quoted).to_string()
+}
+
+fn unquoted(text: &str) -> &str {
+    text.strip_prefix('"')
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or(text)
+}
+
 /// The texts of `url`'s userinfo that the log filter cannot find by reading a URL, for it to
-/// mask wherever they appear: the whole text of an address the parser cannot read but that
-/// has an `@`; a user or password holding a space, `"`, `<` or `>` (the parser takes them
-/// and encodes them, the filter stops at them), as written and as a JSON string holds it.
+/// mask wherever they appear; empty when it finds them all.
+///
+/// The filter is asked, not second-guessed: each spelling of the address ([`spellings`]) goes
+/// through it, and a user or password it leaves is masked by its text, in every spelling of
+/// every form it takes: as written in the configuration, as the parser writes it, and decoded
+/// (`pa %73s`, `pa%20%73s`, `pa ss`). An address the parser cannot read but that has an `@`
+/// is masked whole, in every spelling.
 pub(crate) fn texts_the_filter_misses(url: &str) -> Vec<String> {
-    match read(url) {
-        Reading::Unreadable if url.contains('@') => vec![url.to_string()],
-        Reading::WithUserinfo(parsed) => [parsed.username(), parsed.password().unwrap_or("")]
-            .into_iter()
-            .map(|part| {
-                percent_encoding::percent_decode_str(part)
-                    .decode_utf8_lossy()
-                    .into_owned()
-            })
-            .filter(|part| {
-                part.bytes()
-                    .any(|b| matches!(b, b'"' | b'<' | b'>') || b.is_ascii_whitespace())
-            })
-            .flat_map(|part| {
-                let json = part.replace('\\', "\\\\").replace('"', "\\\"");
-                [part, json]
-            })
-            .collect(),
-        _ => Vec::new(),
+    let parsed = match read(url) {
+        Reading::Clean => return Vec::new(),
+        Reading::Unreadable if url.contains('@') => return spellings(url).into(),
+        Reading::Unreadable => return Vec::new(),
+        Reading::WithUserinfo(parsed) => parsed,
+    };
+    let Some((start, end)) = written_userinfo(url, &parsed) else {
+        // The parser read userinfo that cannot be found in the text: mask the address whole.
+        return spellings(url).into();
+    };
+    let written = &url[start..end];
+    let (user, password) = match written.split_once(':') {
+        Some((user, password)) => (user, Some(password)),
+        None => (written, None),
+    };
+    let forms = |as_written: &str, as_parsed: &str| -> Vec<String> {
+        let decoded = percent_encoding::percent_decode_str(as_parsed)
+            .decode_utf8_lossy()
+            .into_owned();
+        [as_written.to_string(), as_parsed.to_string(), decoded]
+            .iter()
+            .flat_map(|form| spellings(form))
+            .filter(|form| !form.is_empty())
+            .collect()
+    };
+    let mut parts = vec![forms(user, parsed.username())];
+    if let (Some(written), Some(as_parsed)) = (password, parsed.password()) {
+        parts.push(forms(written, as_parsed));
     }
+    // What the filter should leave: the address with [`MASK`] for its userinfo.
+    let ideal = format!("{}{MASK}{}", &url[..start], &url[end..]);
+    let ideal = spellings(&ideal);
+    let missed: Vec<&Vec<String>> = parts
+        .iter()
+        .filter(|forms| {
+            spellings(url).iter().zip(&ideal).any(|(spelled, ideal)| {
+                let out = crate::log_redact::redact_userinfo(spelled.as_bytes());
+                let out = String::from_utf8_lossy(&out);
+                // More often than in the masked address: a user named like its host is not a
+                // leak where the host shows it.
+                forms.iter().any(|form| {
+                    out.matches(form.as_str()).count() > ideal.matches(form.as_str()).count()
+                })
+            })
+        })
+        .collect();
+    missed.into_iter().flatten().cloned().collect()
+}
+
+/// Where in `url` the userinfo the parser read in `parsed` is written: the narrowest range
+/// ending at an `@` that, replaced by one user, reads as the same address with that user and no
+/// password. The text proposes the ranges; the parser judges them.
+fn written_userinfo(url: &str, parsed: &reqwest::Url) -> Option<(usize, usize)> {
+    let ats: Vec<usize> = url.match_indices('@').map(|(at, _)| at).collect();
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(
+            url.char_indices()
+                .filter(|(_, c)| matches!(c, ':' | '/' | '\\'))
+                .map(|(at, c)| at + c.len_utf8()),
+        )
+        .collect();
+    ats.iter().rev().find_map(|&end| {
+        starts
+            .iter()
+            .rev()
+            .filter(|&&start| start < end)
+            .find_map(|&start| {
+                let probe = format!("{}x{}", &url[..start], &url[end..]);
+                reqwest::Url::parse(&probe)
+                    .is_ok_and(|p| {
+                        p.username() == "x"
+                            && p.password().is_none()
+                            && p.scheme() == parsed.scheme()
+                            && p.host() == parsed.host()
+                            && p.port() == parsed.port()
+                            && p.path() == parsed.path()
+                            && p.query() == parsed.query()
+                            && p.fragment() == parsed.fragment()
+                    })
+                    .then_some((start, end))
+            })
+    })
 }
 
 /// `url` as the dashboard shows it to a caller allowed to see addresses: an `http(s)` address
@@ -225,6 +314,26 @@ pub(crate) const FORMS: &[(&str, &[&str])] = &[
         "https://ci bot:s3cr3t@mirror.example/x",
         &["ci bot", "ci%20bot", "s3cr3t"],
     ),
+    // A control character: `{:?}` writes it `\u{1}`, JSON `\u0001`; each `\` stops the filter.
+    (
+        "https://ci-bot:pa\u{1}ss@mirror.example/x",
+        &["ci-bot", "pa\u{1}ss", "pa%01ss"],
+    ),
+    // Encoded and raw in one password: neither the decoded text nor the filter finds it.
+    (
+        "http://ci-bot:pa %73s@127.0.0.1:9/repo",
+        &["ci-bot", "pa %73s", "pa ss", "pa%20%73s"],
+    ),
+];
+
+/// Addresses the parser cannot read but with an `@`, each with the text of what may be
+/// userinfo: masked whole wherever they appear.
+#[cfg(test)]
+pub(crate) const UNREADABLE_FORMS: &[(&str, &[&str])] = &[
+    ("robot:pa\"ss@mirror.example/repo", &["robot", "pa\"ss"]),
+    ("robot:pa ss@mirror.example/repo", &["robot", "pa ss"]),
+    ("ci-bot:s3cr3t@mirror.example/repo", &["ci-bot", "s3cr3t"]),
+    ("https://ci-bot:pa/ss@mirror.example", &["ci-bot", "pa/ss"]),
 ];
 
 /// Checks shared by the tests of every output.
@@ -255,6 +364,28 @@ pub(crate) mod check {
             );
         }
     }
+
+    /// `out` holds no secret in any spelling an output takes it in: as it is, `{:?}`, a JSON
+    /// string, a JSON string of its `{:?}`. Made here, not by [`super::spellings`], so a
+    /// spelling that function loses is still looked for.
+    pub(crate) fn holds_no_spelling(out: &str, form: &str, secrets: &[&str]) {
+        let unquote = |t: String| t[1..t.len() - 1].to_string();
+        for secret in secrets {
+            let debug = unquote(format!("{secret:?}"));
+            let json = |t: &str| unquote(serde_json::to_string(t).unwrap());
+            for spelled in [
+                secret.to_string(),
+                json(secret),
+                json(&debug),
+                debug.clone(),
+            ] {
+                assert!(
+                    !out.contains(&spelled),
+                    "{form}: output shows {spelled}: {out}"
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -262,6 +393,22 @@ pub(crate) mod check {
 mod tests {
     use super::check::{holds_no_secret, same_target};
     use super::*;
+
+    /// An address the filter reads by itself adds no text to mask: the filter leaves its
+    /// host, so a user named like the host (`mirror` of `mirror.example`) is not masked in
+    /// every line that names that host.
+    #[test]
+    fn an_address_the_filter_reads_adds_no_text() {
+        for url in [
+            "https://ci-bot:s3cr3t@mirror.example/simple",
+            "https:///ci-bot:s3cr3t@mirror.example/simple",
+            "HTTPS:/ci-bot:s3cr3t@mirror.example/simple",
+            "https://mirror:s3cr3t@mirror.example/simple",
+            "https://mirror.example/simple",
+        ] {
+            assert_eq!(texts_the_filter_misses(url), Vec::<String>::new(), "{url}");
+        }
+    }
 
     /// The client sends each form with its userinfo (moved into an `Authorization` header);
     /// the address shown names the same target and none of the userinfo.
@@ -381,6 +528,11 @@ mod one_judge_tests {
             "url_userinfo.rs",
             "read",
             "the one judge: the client parser",
+        ),
+        (
+            "url_userinfo.rs",
+            "written_userinfo",
+            "proposes where the written userinfo is; the parser accepts each range or not",
         ),
         (
             "url_userinfo.rs",

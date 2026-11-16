@@ -2109,12 +2109,7 @@ async fn main() {
     // The userinfo of a configured upstream that the log filter cannot find by reading a URL
     // (a password with a space, an address the parser cannot read) is masked wherever it
     // appears from here on. SIGHUP reloads curation only, so the upstreams do not change.
-    log_known.mask_also(
-        config
-            .every_upstream_url()
-            .iter()
-            .flat_map(|url| url_userinfo::texts_the_filter_misses(url)),
-    );
+    log_known.mask_also(config.userinfo_the_filter_misses());
 
     // Initialize storage based on mode
     let storage = match config.storage.mode {

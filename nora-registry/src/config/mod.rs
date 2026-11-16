@@ -70,12 +70,8 @@ pub enum ConfigLoadError {
         source: std::io::Error,
     },
     /// `NORA_CONFIG_PATH` names a file that is not valid TOML.
-    #[error("NORA_CONFIG_PATH={path} contains invalid TOML: {source}")]
-    InvalidToml {
-        path: String,
-        #[source]
-        source: toml::de::Error,
-    },
+    #[error("NORA_CONFIG_PATH={path} contains invalid TOML: {problem}")]
+    InvalidToml { path: String, problem: TomlProblem },
     /// An environment override has a value that cannot be applied.
     #[error("fatal env override error: {0}")]
     EnvOverride(String),
@@ -88,6 +84,66 @@ pub enum ConfigLoadError {
         .keys.join(", ")
     )]
     UnknownKeys { path: String, keys: Vec<String> },
+}
+
+/// Why a file is not a configuration, as it is reported: the line and column the parser
+/// stopped at and its message, never the line itself, which can hold a secret (the password of
+/// an upstream address). The message can quote a value (serde's `invalid type: string "…"`):
+/// the userinfo of every string of the file that the log filter would miss is masked in it.
+#[derive(Debug)]
+pub struct TomlProblem {
+    at: Option<(usize, usize)>,
+    message: String,
+}
+
+impl TomlProblem {
+    fn new(content: &str, error: &toml::de::Error) -> Self {
+        let at = error
+            .span()
+            .and_then(|span| content.get(..span.start))
+            .map(|before| {
+                let line = before.matches('\n').count() + 1;
+                let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+                (line, column)
+            });
+        let mask = crate::log_redact::KnownTexts::default();
+        mask.mask_also(
+            strings_of(content)
+                .iter()
+                .flat_map(|text| crate::url_userinfo::texts_the_filter_misses(text)),
+        );
+        Self {
+            at,
+            message: mask.redact_text(error.message()).into_owned(),
+        }
+    }
+}
+
+impl std::fmt::Display for TomlProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.at {
+            Some((line, column)) => write!(f, "line {line}, column {column}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+/// Every string value of `content` read as TOML without the settings' types; none when it is
+/// not TOML (the parser's messages then quote no value).
+fn strings_of(content: &str) -> Vec<String> {
+    fn walk(value: &toml::Value, out: &mut Vec<String>) {
+        match value {
+            toml::Value::String(text) => out.push(text.clone()),
+            toml::Value::Array(values) => values.iter().for_each(|v| walk(v, out)),
+            toml::Value::Table(table) => table.values().for_each(|v| walk(v, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(table) = content.parse::<toml::Table>() {
+        table.values().for_each(|v| walk(v, &mut out));
+    }
+    out
 }
 
 /// The config file read from the working directory when `NORA_CONFIG_PATH` is unset.
@@ -1670,7 +1726,7 @@ impl Config {
             let (cfg, unknown) =
                 parse_config(&content).map_err(|source| ConfigLoadError::InvalidToml {
                     path: config_path.clone(),
-                    source,
+                    problem: TomlProblem::new(&content, &source),
                 })?;
             refuse_hf_curation_keys(&config_path, &unknown)?;
             unknown_keys = surface_unknown_keys(&config_path, unknown, strict)?;
@@ -1686,7 +1742,8 @@ impl Config {
                         cfg
                     }
                     Err(e) => {
-                        tracing::warn!(path = %fallback, error = %e, "config exists but contains invalid TOML, using defaults");
+                        let problem = TomlProblem::new(&content, &e);
+                        tracing::warn!(path = %fallback, error = %problem, "config exists but contains invalid TOML, using defaults");
                         Config::default()
                     }
                 },
@@ -1711,18 +1768,42 @@ impl Config {
     }
 
     /// Validate: warnings are logged, errors reject the configuration.
+    ///
+    /// Each text is written with the userinfo of this configuration's upstreams masked: the
+    /// process's log filter learns it only once the configuration is accepted.
     fn checked(self) -> Result<Self, ConfigLoadError> {
         let (warnings, errors) = self.validate();
-        for w in &warnings {
+        let mask = self.userinfo_mask();
+        let masked = |text: String| mask.redact_text(&text).into_owned();
+        for w in warnings.into_iter().map(masked) {
             tracing::warn!("Config validation: {}", w);
         }
         if !errors.is_empty() {
+            let errors: Vec<String> = errors.into_iter().map(masked).collect();
             for e in &errors {
                 tracing::error!("Config validation: {}", e);
             }
             return Err(ConfigLoadError::Invalid(errors));
         }
         Ok(self)
+    }
+
+    /// The userinfo of the configured upstreams that the log filter cannot find by reading a
+    /// URL ([`crate::url_userinfo::texts_the_filter_misses`]): what the process masks in every
+    /// output once this configuration is read.
+    pub fn userinfo_the_filter_misses(&self) -> Vec<String> {
+        self.every_upstream_url()
+            .iter()
+            .flat_map(|url| crate::url_userinfo::texts_the_filter_misses(url))
+            .collect()
+    }
+
+    /// A mask of [`Self::userinfo_the_filter_misses`], for what is written before the process
+    /// learns it.
+    fn userinfo_mask(&self) -> crate::log_redact::KnownTexts {
+        let mask = crate::log_redact::KnownTexts::default();
+        mask.mask_also(self.userinfo_the_filter_misses());
+        mask
     }
 
     /// The configuration file `NORA_CONFIG_PATH` names; `None` reads `config.toml` of the
@@ -1749,8 +1830,13 @@ impl Config {
         // one path for both sources, so neither can skip the unknown-key check
         let mut config: Config = match file {
             Some((path, content)) => {
-                let (config, unknown) = parse_config(&content)
-                    .map_err(|e| format!("Invalid TOML in {}: {}", path, e))?;
+                let (config, unknown) = parse_config(&content).map_err(|e| {
+                    format!(
+                        "Invalid TOML in {}: {}",
+                        path,
+                        TomlProblem::new(&content, &e)
+                    )
+                })?;
                 surface_unknown_keys(&path, unknown, config_strict_from_env())
                     .map_err(|e| format!("Reload refused: {}", e))?;
                 config
@@ -1763,7 +1849,8 @@ impl Config {
         config.apply_enabled_registries(&set);
         let (_, errors) = config.validate();
         if !errors.is_empty() {
-            return Err(format!("Validation errors: {}", errors.join("; ")));
+            let text = format!("Validation errors: {}", errors.join("; "));
+            return Err(config.userinfo_mask().redact_text(&text).into_owned());
         }
         Ok(config)
     }
@@ -6743,6 +6830,36 @@ proxies = [
                 prop_assert_eq!(actual, expected,
                     "CIDR {} vs addr {}: expected={}, actual={}",
                     cidr, addr, expected, actual);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::unwrap_used)]
+    mod reload_userinfo_tests {
+        use super::Config;
+
+        /// A reload (SIGHUP) of a file that is not TOML, or that the settings cannot be read from,
+        /// says where without the line, and no value it quotes shows its userinfo.
+        #[test]
+        fn a_reload_of_a_broken_file_shows_no_userinfo() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            for password in ["s3cr3t", "pa ss", "pa %73s"] {
+                for text in [
+                    format!(
+                        "[npm]\nproxy = \"https://ci-bot:{password}@mirror.example/npm\" oops\n"
+                    ),
+                    format!("[server]\nport = \"https://ci-bot:{password}@mirror.example/npm\"\n"),
+                ] {
+                    std::fs::write(&path, &text).unwrap();
+                    let error = Config::try_load_from(Some(path.to_str().unwrap().to_string()))
+                        .expect_err("broken file");
+                    assert!(error.contains("line 2, column"), "{text}: {error}");
+                    for secret in ["ci-bot", password, "pa%20ss", "pa%20%73s"] {
+                        assert!(!error.contains(secret), "{text}: shows {secret}: {error}");
+                    }
+                }
             }
         }
     }

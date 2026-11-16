@@ -416,6 +416,39 @@ mod tests {
         assert!(!out.contains("user:"), "{out}");
     }
 
+    /// Every form an upstream may be configured in, readable or not, in every spelling an
+    /// output takes it in (`%` and `?` fields, a message with `{}` and `{:?}`), through every
+    /// output (the log as text, the log as JSON, stderr), as the server masks once its
+    /// configuration is read: no user or password, in any spelling, reaches the output. The
+    /// address is logged as a request URL built on it, as a handler logs the URL it asked.
+    #[test]
+    fn every_form_in_every_spelling_is_masked_in_every_output() {
+        use crate::url_userinfo::{check::holds_no_spelling, FORMS, UNREADABLE_FORMS};
+        use tracing_subscriber::prelude::*;
+        for (form, secrets) in FORMS.iter().chain(UNREADABLE_FORMS) {
+            let known = KnownTexts::default();
+            known.mask_also(crate::url_userinfo::texts_the_filter_misses(form));
+            let url = format!("{form}/pkg/-/pkg-1.0.0.tgz");
+            for json in [false, true] {
+                let sink = Captured::default();
+                let subscriber =
+                    tracing_subscriber::registry().with(layer(json, sink.clone(), known.clone()));
+                tracing::subscriber::with_default(subscriber, || {
+                    tracing::warn!(url = %url, "upstream failed");
+                    tracing::warn!(url = ?url, "upstream failed");
+                    tracing::warn!("upstream {url} failed");
+                    tracing::warn!("upstream {url:?} failed");
+                });
+                let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
+                assert_eq!(out.lines().count(), 4, "{out}");
+                holds_no_spelling(&out, form, secrets);
+            }
+            for stderr in [format!("nora: {url}"), format!("nora: {url:?}")] {
+                holds_no_spelling(&known.redact_text(&stderr), form, secrets);
+            }
+        }
+    }
+
     /// End to end through the layer the server builds, JSON and text: the secret of a
     /// `Display` field, a `Debug` field and the message never reaches the writer.
     #[test]
