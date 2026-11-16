@@ -2242,7 +2242,7 @@ async fn try_fetch_and_cache(
                         let storage = state.storage.clone();
                         let key_clone = cache_key.to_string();
                         let repo_index = Arc::clone(&state.repo_index);
-                        tokio::spawn(async move {
+                        state.cache_writes.spawn("docker", async move {
                             if let Err(e) = storage.put(&key_clone, &data).await {
                                 tracing::warn!(key = %key_clone, error = %e, "cache write failed (quarantine pre-cache)");
                                 crate::metrics::CACHE_WRITE_ERRORS
@@ -2265,7 +2265,7 @@ async fn try_fetch_and_cache(
                 let digest_clone = digest.clone();
                 let repo_index = Arc::clone(&state.repo_index);
                 let state_clone = state.clone();
-                tokio::spawn(async move {
+                state.cache_writes.spawn("docker", async move {
                     // Store manifest by tag and digest (namespaced)
                     if let Err(e) = storage.put(&key_clone, &data_clone).await {
                         tracing::warn!(key = %key_clone, error = %e, "cache write failed (manifest by tag)");
@@ -3857,6 +3857,7 @@ fn spawn_blob_spool(
     let progress = Arc::new(progress);
     let on_panic = Arc::clone(&progress);
     let panic_key = key.clone();
+    let writes = state.cache_writes.clone();
     let task = async move {
         let outcome = spool_upstream_blob(
             blob,
@@ -3920,7 +3921,9 @@ fn spawn_blob_spool(
         // so a request arriving in between still joins instead of refetching.
         drop(lease);
     };
-    tokio::spawn(AssertUnwindSafe(task).catch_unwind().map(move |done| {
+    // Counted as a cache write: the blob reaches storage at the end of the spool, and a stop
+    // waits for it like for every other write after a response.
+    writes.spawn("docker", AssertUnwindSafe(task).catch_unwind().map(move |done| {
         if let Err(panic) = done {
             crate::metrics::CACHE_WRITE_ERRORS
                 .with_label_values(&["docker", "proxy_blob_spool_panic"])

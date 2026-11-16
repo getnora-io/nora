@@ -3812,6 +3812,7 @@ Jd74nq6dNCjpWG4drIsyhqX+
             ),
             tasks: ctx.state.tasks.clone(),
             maintenance: ctx.state.maintenance.clone(),
+            cache_writes: ctx.state.cache_writes.clone(),
         };
 
         // Rebuild router with new state

@@ -37,6 +37,7 @@ mod audit;
 mod auth;
 mod backup;
 mod cache_ttl;
+mod cache_writes;
 mod circuit_breaker;
 mod cleanup;
 mod config;
@@ -438,6 +439,8 @@ pub struct AppState {
     pub(crate) tasks: Arc<supervise::Supervisor>,
     /// The maintenance loop's heartbeat, which `tasks` reads.
     pub(crate) maintenance: Arc<supervise::Heartbeat>,
+    /// Cache writes running after their response; a graceful stop waits for them.
+    pub(crate) cache_writes: cache_writes::CacheWrites,
 }
 
 impl AppState {
@@ -468,37 +471,59 @@ impl AppState {
     pub fn spawn_cache(&self, registry: &'static str, key: String, data: Bytes) {
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
-        tokio::spawn(
-            std::panic::AssertUnwindSafe(async move {
-                if storage.put(&key, &data).await.is_ok() {
-                    repo_index.invalidate(registry);
-                }
-            })
-            .catch_unwind()
-            .map(|r| {
-                if let Err(e) = r {
-                    tracing::error!(panic = ?e, "background cache task panicked");
-                }
-            }),
-        );
+        self.cache_writes.spawn(registry, async move {
+            if storage.put(&key, &data).await.is_ok() {
+                repo_index.invalidate(registry);
+            }
+        });
     }
 
     /// Like [`spawn_cache`], but skips the write if the key already exists (immutable artifacts).
     pub fn spawn_cache_immutable(&self, registry: &'static str, key: String, data: Bytes) {
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
-        tokio::spawn(
-            std::panic::AssertUnwindSafe(async move {
-                if storage.stat(&key).await.is_none() && storage.put(&key, &data).await.is_ok() {
-                    repo_index.invalidate(registry);
-                }
-            })
-            .catch_unwind()
-            .map(|r| {
-                if let Err(e) = r {
-                    tracing::error!(panic = ?e, "background cache task panicked");
-                }
-            }),
+        self.cache_writes.spawn(registry, async move {
+            if storage.stat(&key).await.is_none() && storage.put(&key, &data).await.is_ok() {
+                repo_index.invalidate(registry);
+            }
+        });
+    }
+}
+
+/// Wait for the stopped schedulers and for the cache writes in flight, together, for at most
+/// `within`; warn of what is still running when it passes. A cache write left running is
+/// dropped with the process; storage writes are atomic, so it leaves no partial file.
+async fn finish_background_work(
+    schedulers: Vec<tokio::task::JoinHandle<()>>,
+    cache_writes: &cache_writes::CacheWrites,
+    within: std::time::Duration,
+) {
+    info!(
+        schedulers = schedulers.len(),
+        "Waiting for background schedulers and cache writes to finish ({}s timeout)...",
+        within.as_secs()
+    );
+    let schedulers_done = async {
+        // CANCEL-SAFETY: timeout wraps join_all of scheduler handles. On timeout, the
+        // JoinHandles are dropped which cancels the spawned tasks — this is intentional
+        // since we're shutting down and don't need their results.
+        tokio::time::timeout(within, futures::future::join_all(schedulers))
+            .await
+            .is_ok()
+    };
+    let (schedulers_done, writes_left) = tokio::join!(schedulers_done, cache_writes.finish(within));
+    if !schedulers_done {
+        warn!(
+            "Background schedulers did not finish within {}s, proceeding with shutdown",
+            within.as_secs()
+        );
+    }
+    if writes_left > 0 {
+        warn!(
+            cache_writes = writes_left,
+            "Cache writes still running after {}s are dropped; those artifacts are fetched \
+             from the upstream again",
+            within.as_secs()
         );
     }
 }
@@ -3601,6 +3626,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
         tasks,
         maintenance,
+        cache_writes: cache_writes::CacheWrites::default(),
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
@@ -3886,23 +3912,19 @@ async fn run_server(mut config: Config, storage: Storage) {
         ),
     }
 
-    // Signal background schedulers to stop and wait for them (#306)
+    // Signal background schedulers to stop, and wait for them and for the cache writes still
+    // running after their response, together and within the same 10 s the schedulers always
+    // had (#306): the documented stop budget (drain + 10 s) does not grow.
     cancel_token.cancel();
-    if !scheduler_handles.is_empty() {
-        info!("Waiting for background schedulers to finish (10s timeout)...");
-        let join_all = futures::future::join_all(scheduler_handles);
-        // CANCEL-SAFETY: timeout wraps join_all of scheduler handles. On timeout,
-        // the JoinHandles are dropped which cancels the spawned tasks — this is
-        // intentional since we're shutting down and don't need their results.
-        if tokio::time::timeout(std::time::Duration::from_secs(10), join_all)
-            .await
-            .is_err()
-        {
-            warn!("Background schedulers did not finish within 10s, proceeding with shutdown");
-        }
-    }
+    finish_background_work(
+        scheduler_handles,
+        &state.cache_writes,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
 
-    // Drain audit log — AFTER schedulers finish so their final entries are captured (#543)
+    // Drain audit log — AFTER schedulers and cache writes finish so their final entries are
+    // captured (#543)
     state.audit.shutdown().await;
 
     // Flush token last_used timestamps to disk
@@ -4088,6 +4110,122 @@ async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceW
             registry::docker::cleanup_upload_temp_dir(&storage_path);
             registry::raw::cleanup_upload_temp_dir(&storage_path);
         });
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cache_write_stop_tests {
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_storage_and_config, send, slow_write_storage,
+    };
+    use axum::http::{Method, StatusCode};
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The first write takes this long, each later one this much longer: far longer than
+    /// answering, all of them together far shorter than the stop's ceiling.
+    const WRITE: Duration = Duration::from_millis(300);
+
+    /// The stop as `main` runs it after the connections drained: no schedulers here.
+    async fn stop(state: &crate::AppState) {
+        super::finish_background_work(Vec::new(), &state.cache_writes, Duration::from_secs(10))
+            .await;
+    }
+
+    /// An npm tarball answered right before a graceful stop is in storage after it: the stop
+    /// waits for the write that runs after the response, so a restart without the upstream
+    /// still serves it.
+    #[tokio::test]
+    async fn an_npm_tarball_answered_before_a_stop_is_kept() {
+        let upstream = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": "testpkg",
+            "versions": { "1.0.0": { "dist": {
+                "tarball": format!("{}/testpkg/-/testpkg-1.0.0.tgz", upstream.uri())
+            } } },
+            "time": { "1.0.0": "2020-01-15T10:30:00.000Z" }
+        });
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument.to_string()))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg/-/testpkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TGZ-BYTES".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_storage_and_config(slow_write_storage(WRITE), |c| {
+            c.npm.proxy = Some(uri)
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/testpkg/-/testpkg-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"TGZ-BYTES");
+        stop(&ctx.state).await;
+
+        let kept = ctx
+            .state
+            .storage
+            .get("npm/testpkg/tarballs/testpkg-1.0.0.tgz")
+            .await;
+        assert_eq!(kept.unwrap().as_ref(), b"TGZ-BYTES");
+    }
+
+    /// Both ways a handler caches through the state are waited for: `spawn_cache` and its
+    /// immutable form, which most formats use for their artifacts.
+    #[tokio::test]
+    async fn both_cache_helpers_are_waited_for() {
+        let ctx = create_test_context_with_storage_and_config(slow_write_storage(WRITE), |_| {});
+        ctx.state
+            .spawn_cache("raw", "raw/a".into(), super::Bytes::from_static(b"a"));
+        ctx.state
+            .spawn_cache_immutable("raw", "raw/b".into(), super::Bytes::from_static(b"b"));
+        stop(&ctx.state).await;
+        assert_eq!(ctx.state.storage.get("raw/a").await.unwrap().as_ref(), b"a");
+        assert_eq!(ctx.state.storage.get("raw/b").await.unwrap().as_ref(), b"b");
+    }
+
+    /// The same for an artifact cached through `spawn_cache` (Maven).
+    #[tokio::test]
+    async fn a_maven_artifact_answered_before_a_stop_is_kept() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/com/example/lib/1.0/lib-1.0.jar"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"JAR-BYTES".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_storage_and_config(slow_write_storage(WRITE), |c| {
+            c.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri)]
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/example/lib/1.0/lib-1.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"JAR-BYTES");
+        stop(&ctx.state).await;
+
+        let kept = ctx
+            .state
+            .storage
+            .get("maven/com/example/lib/1.0/lib-1.0.jar")
+            .await;
+        assert_eq!(kept.unwrap().as_ref(), b"JAR-BYTES");
     }
 }
 

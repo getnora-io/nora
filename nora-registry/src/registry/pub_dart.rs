@@ -282,7 +282,7 @@ async fn package_listing(
             let storage = state.storage.clone();
             let key_clone = key.clone();
             let bump = body.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("pub", async move {
                 let _ = storage.put(&key_clone, &bump).await;
             });
             pub_json_response(body.to_vec())
