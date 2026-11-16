@@ -375,16 +375,26 @@ async fn strip_published_bulk(state: &AppState, body: Vec<u8>) -> Result<Vec<u8>
     })
 }
 
-/// [`npm_links::place_document`] with the server's storage-key check.
+/// [`npm_links::place_document`] with the server's storage-key check. `held` says which of the
+/// package's tarballs NORA holds: only a link of NORA's own form to one of them is NORA's (#1180).
 fn place_document(
     data: &[u8],
     nora_base: &str,
     upstream_url: &str,
     package_asked: Option<&str>,
     links: Links,
+    held: &dyn Fn(&str) -> bool,
 ) -> Result<Placed, Unrewritable> {
     let key_ok = |key: &str| crate::validation::validate_storage_key(key).is_ok();
-    npm_links::place_document(data, nora_base, upstream_url, package_asked, links, &key_ok)
+    npm_links::place_document(
+        data,
+        nora_base,
+        upstream_url,
+        package_asked,
+        links,
+        &key_ok,
+        held,
+    )
 }
 
 /// npm whoami handler: returns `{"username": "..."}`
@@ -1696,7 +1706,11 @@ async fn serve_metadata(
             let key = published_packument_key(name);
             match state.storage.get(&key).await {
                 Ok(data) if is_assembled_by_nora(&state.storage, &key, &data).await => match spec {
-                    None => metadata_response(headers, Document::Packument, data),
+                    None => metadata_response(
+                        headers,
+                        Document::Packument,
+                        served_published(state, name, data),
+                    ),
                     Some(spec) => published_version_manifest(state, name, spec).await,
                 },
                 // Without one NORA cannot tell whether the package is its own: unavailable (503), as
@@ -1724,7 +1738,11 @@ async fn published_packument_response(
     if let Ok(data) = state.storage.get(&key).await {
         if current(&data) && is_assembled_by_nora(&state.storage, &key, &data).await {
             state.metrics.record_cache_hit("npm");
-            return metadata_response(headers, Document::Packument, data);
+            return metadata_response(
+                headers,
+                Document::Packument,
+                served_published(state, name, data),
+            );
         }
     }
     // LOCK-SAFE: tokio mutex, the one publish holds while it writes this package; a CI fleet
@@ -1741,7 +1759,11 @@ async fn published_packument_response(
     if let Ok(data) = state.storage.get(&key).await {
         if current(&data) && is_assembled_by_nora(&state.storage, &key, &data).await {
             state.metrics.record_cache_hit("npm");
-            return metadata_response(headers, Document::Packument, data);
+            return metadata_response(
+                headers,
+                Document::Packument,
+                served_published(state, name, data),
+            );
         }
     }
     match assemble_packument(&state.storage, name).await {
@@ -1758,7 +1780,11 @@ async fn published_packument_response(
                 tracing::warn!(registry = "npm", package = %name, error = %e, "rebuilt packument not stored; served anyway");
             }
             state.metrics.record_cache_hit("npm");
-            metadata_response(headers, Document::Packument, Bytes::from(bytes))
+            metadata_response(
+                headers,
+                Document::Packument,
+                served_published(state, name, Bytes::from(bytes)),
+            )
         }
         Err(unassembled) => unassembled.response(name),
     }
@@ -1819,7 +1845,7 @@ async fn published_version_manifest(state: &AppState, name: &str, spec: &str) ->
                 header::CONTENT_TYPE,
                 HeaderValue::from_static("application/json"),
             )],
-            doc,
+            served_published(state, name, doc),
         )
             .into_response(),
         Err(StorageError::NotFound | StorageError::Validation(_)) => {
@@ -1839,7 +1865,7 @@ fn rewrite_for_nora(
     path: &str,
     links: Links,
 ) -> Option<Vec<u8>> {
-    place_for_nora(state, data, proxy_url, path, links).map(|placed| placed.body)
+    place_for_nora(state, data, proxy_url, path, links, &|_: &str| false).map(|placed| placed.body)
 }
 
 /// [`rewrite_for_nora`], saying whether a version was left out.
@@ -1849,13 +1875,14 @@ fn place_for_nora(
     proxy_url: &str,
     path: &str,
     links: Links,
+    held: &dyn Fn(&str) -> bool,
 ) -> Option<Placed> {
     let nora_base = nora_base_url(state);
     let package = match classify_metadata_path(path) {
         MetadataPath::Packument { name } | MetadataPath::VersionManifest { name, .. } => Some(name),
         MetadataPath::Other => None,
     };
-    match place_document(data, &nora_base, proxy_url, package, links) {
+    match place_document(data, &nora_base, proxy_url, package, links, held) {
         Ok(placed) => Some(placed),
         Err(Unrewritable::OffUpstream) => None,
         Err(Unrewritable::NotJson) => {
@@ -1867,6 +1894,22 @@ fn place_for_nora(
                 left_out: false,
             })
         }
+    }
+}
+
+/// What NORA serves of a published package's document: the tarball links NORA wrote, at the address
+/// of the instance that wrote them, move to this instance's `public_url`
+/// ([`npm_links::retarget_own_links`], #1180). A document already on this address is served as
+/// stored, so the rewrite costs nothing once the links are right.
+fn served_published(state: &AppState, package: &str, data: Bytes) -> Bytes {
+    let nora_base = nora_base_url(state);
+    if links_on_nora(&data, &nora_base) {
+        return data;
+    }
+    let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+    match npm_links::retarget_own_links(&data, &nora_npm_base, package) {
+        Some(body) => Bytes::from(body),
+        None => data,
     }
 }
 
@@ -1900,11 +1943,31 @@ fn links_on_nora(data: &[u8], nora_base: &str) -> bool {
     on_nora(&doc.dist) && doc.versions.iter().flatten().all(|(_, v)| on_nora(&v.dist))
 }
 
+/// The tarball files NORA holds for `package`, by file name. A link of NORA's own form to one of
+/// them is NORA's, whatever address wrote it (#1180); a failed listing holds none, so nothing is
+/// taken on trust.
+async fn held_tarballs(state: &AppState, package: &str) -> std::collections::HashSet<String> {
+    let prefix = format!("npm/{package}/tarballs/");
+    state
+        .storage
+        .list(&prefix)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|key| key.strip_prefix(&prefix).map(str::to_string))
+        .collect()
+}
+
 /// What NORA serves of an upstream document it cached: the document itself when every tarball
 /// link in it is NORA's, else the document placed again, as a fresh one is — the versions whose
 /// tarball lies outside the upstream left out. `None` for a version manifest whose tarball does.
 /// The flag says whether the copy held such a link (cached by a release that kept one).
-fn served_copy(state: &AppState, path: &str, data: Bytes) -> (Option<Bytes>, bool) {
+fn served_copy(
+    state: &AppState,
+    path: &str,
+    data: Bytes,
+    held: &dyn Fn(&str) -> bool,
+) -> (Option<Bytes>, bool) {
     if links_on_nora(&data, &nora_base_url(state)) {
         return (Some(data), false);
     }
@@ -1914,7 +1977,7 @@ fn served_copy(state: &AppState, path: &str, data: Bytes) -> (Option<Bytes>, boo
         .route(path)
         .map(|u| u.url)
         .unwrap_or_default();
-    match place_for_nora(state, &data, upstream, path, Links::Served) {
+    match place_for_nora(state, &data, upstream, path, Links::Served, held) {
         Some(placed) => (Some(Bytes::from(placed.body)), placed.left_out),
         None => (None, true),
     }
@@ -2021,8 +2084,9 @@ fn served_metadata(
     path: &str,
     document: Document,
     data: Bytes,
+    held: &dyn Fn(&str) -> bool,
 ) -> Response {
-    match served_copy(state, path, data) {
+    match served_copy(state, path, data, held) {
         (Some(data), _) => metadata_response(headers, document, data),
         (None, _) => StatusCode::NOT_FOUND.into_response(),
     }
@@ -2066,7 +2130,12 @@ async fn upstream_metadata(
     if let Some((data, from_key)) = cached {
         // A copy holding a link past NORA (cached by a release that kept one) is served placed
         // again, and refetched in full whatever its age: a 304 would keep it as it is.
-        let (served, past_nora) = served_copy(state, path, data);
+        let held = if links_on_nora(&data, &nora_base_url(state)) {
+            std::collections::HashSet::new()
+        } else {
+            held_tarballs(state, name).await
+        };
+        let (served, past_nora) = served_copy(state, path, data, &|file: &str| held.contains(file));
         let fresh = !past_nora
             && state.storage.stat(&from_key).await.is_some_and(|meta| {
                 crate::cache_ttl::is_within_ttl(meta.modified, state.config.npm.metadata_ttl)
@@ -2108,7 +2177,7 @@ async fn upstream_metadata(
             refetch().await
         };
         if let Some(refreshed) = refreshed {
-            return served_metadata(state, headers, path, document, refreshed);
+            return served_metadata(state, headers, path, document, refreshed, &|_: &str| false);
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
@@ -2186,7 +2255,14 @@ async fn upstream_metadata(
                     tracing::error!(panic = ?panic, "npm metadata cache task panicked");
                 }
             }));
-            served_metadata(state, headers, path, document, Bytes::from(rewritten))
+            served_metadata(
+                state,
+                headers,
+                path,
+                document,
+                Bytes::from(rewritten),
+                &|_: &str| false,
+            )
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
@@ -3214,6 +3290,7 @@ fn rewrite_tarball_urls(
         upstream_url,
         package.as_deref(),
         Links::Served,
+        &|_: &str| false,
     )
     .map(|placed| placed.body)
 }
@@ -10507,6 +10584,211 @@ mod unreadable_sidecar {
                 "upstream {status}"
             );
         }
+    }
+}
+
+/// The store moved to an instance at another address (#1180): what the second instance serves is
+/// the first one's packuments and tarballs, with links at the address that serves them.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod own_links_follow_the_serving_instance {
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, create_test_context_with_storage_and_config,
+        send,
+    };
+    use axum::http::{Method, StatusCode};
+    use base64::Engine;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const WRITER: &str = "http://nora-a.example:4000";
+    const SERVER: &str = "https://nora-b.example";
+
+    fn upstream_packument(base: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "name": "pkg",
+            "versions": {
+                "1.0.0": { "name": "pkg", "version": "1.0.0",
+                    "dist": { "tarball": format!("{base}/pkg/-/pkg-1.0.0.tgz") } },
+                "1.0.1": { "name": "pkg", "version": "1.0.1",
+                    "dist": { "tarball": format!("{base}/pkg/-/pkg-1.0.1.tgz") } },
+            },
+            "dist-tags": { "latest": "1.0.1" },
+        }))
+        .unwrap()
+    }
+
+    /// The proxy writes what it caches in a task of its own, after the response: waits until
+    /// `key` is stored, so the other instance reads what the writer left.
+    async fn wait_until_stored(storage: &crate::Storage, key: &str) {
+        for _ in 0..500 {
+            if storage.stat(key).await.is_some() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("{key} was not written");
+    }
+
+    /// Packument of `pkg` as the server serves it: its versions, and each tarball link.
+    async fn served_links(app: &axum::Router) -> Vec<(String, String)> {
+        let got = send(app, Method::GET, "/npm/pkg", "").await;
+        assert_eq!(got.status(), StatusCode::OK);
+        let doc: serde_json::Value = serde_json::from_slice(&body_bytes(got).await).unwrap();
+        let mut out: Vec<(String, String)> = doc["versions"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(v, m)| {
+                (
+                    v.clone(),
+                    m["dist"]["tarball"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    #[tokio::test]
+    async fn a_published_packument_written_at_another_address_is_served_at_this_one() {
+        let writer = create_test_context_with_config(|cfg| {
+            cfg.server.public_url = Some(WRITER.to_string());
+        });
+        let payload = serde_json::json!({
+            "name": "pkg",
+            "versions": { "1.0.0": { "dist": {} } },
+            "_attachments": {
+                "pkg-1.0.0.tgz": {
+                    "data": base64::engine::general_purpose::STANDARD.encode(b"fake-tarball")
+                }
+            },
+            "dist-tags": { "latest": "1.0.0" },
+        });
+        let put = send(
+            &writer.app,
+            Method::PUT,
+            "/npm/pkg",
+            axum::body::Body::from(serde_json::to_vec(&payload).unwrap()),
+        )
+        .await;
+        assert_eq!(put.status(), StatusCode::CREATED);
+
+        let server =
+            create_test_context_with_storage_and_config(writer.state.storage.clone(), |cfg| {
+                cfg.server.public_url = Some(SERVER.to_string())
+            });
+        assert_eq!(
+            served_links(&server.app).await,
+            vec![(
+                "1.0.0".to_string(),
+                format!("{SERVER}/npm/pkg/-/pkg-1.0.0.tgz")
+            )]
+        );
+    }
+
+    /// The store moved to an isolated network: the upstream is gone, so the second instance cannot
+    /// refetch and serves its copy. The copy names the writer's address; the version whose tarball
+    /// NORA holds is served at this one, and the version it never stored is left out, as before
+    /// (#1180).
+    #[tokio::test]
+    async fn a_cached_packument_written_at_another_address_is_served_at_this_one() {
+        let up = MockServer::start().await;
+        let base = up.uri();
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream_packument(&base)))
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/-/pkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tarball-bytes".to_vec()))
+            .mount(&up)
+            .await;
+        let writer = create_test_context_with_config(|cfg| {
+            cfg.server.public_url = Some(WRITER.to_string());
+            cfg.npm.proxy = Some(base.clone());
+        });
+        assert_eq!(
+            send(&writer.app, Method::GET, "/npm/pkg", "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        wait_until_stored(
+            &writer.state.storage,
+            &super::origin_key(&super::upstream_packument_key("pkg")),
+        )
+        .await;
+        assert_eq!(
+            send(&writer.app, Method::GET, "/npm/pkg/-/pkg-1.0.0.tgz", "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        wait_until_stored(&writer.state.storage, "npm/pkg/tarballs/pkg-1.0.0.tgz").await;
+
+        // The upstream is down from here on: every refetch fails, and the stale copy is served.
+        up.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&up)
+            .await;
+
+        let server =
+            create_test_context_with_storage_and_config(writer.state.storage.clone(), |cfg| {
+                cfg.server.public_url = Some(SERVER.to_string());
+                cfg.npm.proxy = Some(base.clone());
+            });
+        assert_eq!(
+            served_links(&server.app).await,
+            vec![(
+                "1.0.0".to_string(),
+                format!("{SERVER}/npm/pkg/-/pkg-1.0.0.tgz")
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_tarball_link_written_at_another_address_is_fetched_at_the_upstream() {
+        let up = MockServer::start().await;
+        let base = up.uri();
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream_packument(&base)))
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/pkg/-/pkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tarball-bytes".to_vec()))
+            .expect(1)
+            .mount(&up)
+            .await;
+        let writer = create_test_context_with_config(|cfg| {
+            cfg.server.public_url = Some(WRITER.to_string());
+            cfg.npm.proxy = Some(base.clone());
+        });
+        assert_eq!(
+            send(&writer.app, Method::GET, "/npm/pkg", "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        wait_until_stored(
+            &writer.state.storage,
+            &super::origin_key(&super::upstream_packument_key("pkg")),
+        )
+        .await;
+
+        let server =
+            create_test_context_with_storage_and_config(writer.state.storage.clone(), |cfg| {
+                cfg.server.public_url = Some(SERVER.to_string());
+                cfg.npm.proxy = Some(base.clone());
+            });
+        let got = send(&server.app, Method::GET, "/npm/pkg/-/pkg-1.0.0.tgz", "").await;
+        assert_eq!(got.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(got).await[..], b"tarball-bytes");
     }
 }
 
