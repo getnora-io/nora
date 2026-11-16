@@ -62,6 +62,10 @@ jobs:
         run: ./scripts/coherence-check.sh
       - name: Verify changelog claims
         run: ./scripts/verify-changelog.sh
+      - name: Changelog fragments are well-formed
+        run: ./scripts/changelog-fragments.sh --check
+      - name: Changelog fragment assembler self-test
+        run: bash scripts/test-changelog-fragments.sh
       - name: Reland FileChanges builder — large-PR regression
         run: ./scripts/test-reland-filechanges.sh
       - name: Diff-coverage helper self-test
