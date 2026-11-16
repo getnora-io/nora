@@ -6234,7 +6234,7 @@ mod stale_copy_within_one_timeout {
     /// included, still lets the stored copy come within 6 s at default settings. The date is still
     /// asked for, once per request.
     #[tokio::test]
-    async fn with_trusted_dates_the_date_query_shares_the_copys_budget() {
+    async fn with_trusted_dates_the_date_query_shares_the_budget_of_the_copy() {
         let (dates, dates_opened) = blackhole().await;
         super::DATES_API_FOR_TEST.with(|api| *api.borrow_mut() = Some(dates));
         let answers =
