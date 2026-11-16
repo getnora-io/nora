@@ -7274,6 +7274,69 @@ mod integration_tests {
         assert!(listed_tags(resp).await.is_empty());
     }
 
+    /// The legacy keys of a routed name are listed too, since they hold this registry's own
+    /// pushes. A failure to list them is a failure to know whether the name is hosted, so the
+    /// listing answers 503 and asks no upstream, as the namespaced listing does (#1218). The
+    /// healthy request first shows that the same name is listed from the upstream.
+    #[tokio::test]
+    async fn tags_list_of_a_routed_name_is_503_when_its_legacy_keys_cannot_be_read() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "library/alpine",
+                "tags": ["3.19"]
+            })))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+
+        let healthy = create_test_context_with_config({
+            let url = url.clone();
+            move |cfg| {
+                cfg.docker.upstreams = vec![routed_to(url)];
+            }
+        });
+        let resp = send(
+            &healthy.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["3.19"]);
+        let asked = hub.received_requests().await.unwrap().len();
+
+        // The legacy prefix of `library/alpine` fails to list; the namespaced one lists fine.
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage =
+            crate::storage::Storage::from_backend(std::sync::Arc::new(FailingPrefixBackend {
+                inner: crate::storage::LocalStorage::new(dir.path().to_str().unwrap()),
+                fail_prefix: "docker/library/alpine/manifests/".to_string(),
+            }));
+        let broken =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
+                cfg.docker.upstreams = vec![routed_to(url)];
+            });
+        let resp = send(
+            &broken.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            hub.received_requests().await.unwrap().len(),
+            asked,
+            "a name whose legacy keys could not be read was asked of the upstream"
+        );
+    }
+
     #[test]
     fn next_link_target_reads_a_rel_list_and_skips_other_relations() {
         assert_eq!(
