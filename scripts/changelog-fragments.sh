@@ -4,7 +4,7 @@
 # One file per change means parallel pull requests never edit the same lines, so they
 # cannot conflict on the changelog. See changelog.d/README.md.
 #
-#   --check              fragments are well-formed (names, categories, non-empty)
+#   --check              fragments are well-formed (names, categories, non-empty, no #NNNN)
 #   --render             print the assembled section to stdout
 #   --apply              write it into ## [Unreleased]
 #   --release <version>  promote it to a dated version section and delete the fragments
@@ -23,6 +23,8 @@ root, frag_dir, changelog, mode, version = sys.argv[1:6]
 # Keep a Changelog order; anything else is a naming mistake, not a new section.
 ORDER = ["added", "changed", "deprecated", "removed", "fixed", "security"]
 NAME = re.compile(r"^(\d+)\.(" + "|".join(ORDER) + r")\.md$")
+# A number left for later (#NNNN, #XXX, #TBD, #?) reaches the release notes as written.
+PLACEHOLDER = re.compile(r"#(?:N{2,}|X{2,}|TBD|\?+)(?![\w-])", re.IGNORECASE)
 
 problems, entries = [], {c: [] for c in ORDER}
 if os.path.isdir(frag_dir):
@@ -41,6 +43,10 @@ if os.path.isdir(frag_dir):
             continue
         if text.startswith("- "):
             problems.append(f"{fn}: drop the leading '- ', the assembler adds it")
+            continue
+        hole = PLACEHOLDER.search(text)
+        if hole:
+            problems.append(f"{fn}: '{hole.group(0)}' is a placeholder, write the issue or PR number")
             continue
         entries[m.group(2)].append((int(m.group(1)), " ".join(text.split("\n"))))
 

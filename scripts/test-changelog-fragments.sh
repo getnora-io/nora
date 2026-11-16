@@ -58,6 +58,16 @@ rm "$TMP/changelog.d/3.fixed.md"
 check --check 1 "an empty fragment is rejected"
 rm "$TMP/changelog.d/4.fixed.md"
 
+for hole in '#NNNN' '#XXX' '#TBD' '#?'; do
+    printf '**Left for later (%s)** — e\n' "$hole" > "$TMP/changelog.d/5.fixed.md"
+    check --check 1 "a fragment with the placeholder $hole for its number is rejected"
+done
+rm "$TMP/changelog.d/5.fixed.md"
+printf '**Not a placeholder (#1253)** — f, with `#NNNN-style` text in code (#7)\n' > "$TMP/changelog.d/6.fixed.md"
+printf '**Nor these (#12)** — the anchor `#nodes` and issue #1234 pass\n' > "$TMP/changelog.d/8.fixed.md"
+check --check 0 "real numbers and words that start like a placeholder pass"
+rm "$TMP/changelog.d/6.fixed.md" "$TMP/changelog.d/8.fixed.md"
+
 "$TMP/scripts/changelog-fragments.sh" --apply >/dev/null 2>&1
 if grep -q "A change (#9)" "$TMP/CHANGELOG.md" && grep -q "^## \[Unreleased\]" "$TMP/CHANGELOG.md"; then
     echo "  OK: --apply writes the section under [Unreleased]"

@@ -33,6 +33,7 @@ lock-audit:
 
 verify-changelog:
 	@if [ -x scripts/verify-changelog.sh ]; then scripts/verify-changelog.sh; fi
+	@scripts/changelog-fragments.sh --check
 
 # Kani proofs are NOT part of `check`: they need the Kani toolchain (`cargo kani`)
 # and run CBMC, which is far heavier than the unit suite. Run on demand / in the
