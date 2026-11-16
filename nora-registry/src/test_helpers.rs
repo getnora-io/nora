@@ -410,7 +410,11 @@ fn build_context_full(
         tokens,
         metrics: Arc::new(DashboardMetrics::new()),
         activity: Arc::new(ActivityLog::new(50)),
-        audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
+        audit: Arc::new(AuditLog::new(
+            &storage_path,
+            audit_mode,
+            crate::supervise::recorded_exit(),
+        )),
         docker_auth: Arc::new(docker_auth),
         docker_tokens,
         repo_index: Arc::new(RepoIndex::new()),

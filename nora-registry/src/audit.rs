@@ -120,7 +120,10 @@ pub struct AuditLog {
 }
 
 impl AuditLog {
-    pub fn new(storage_path: &str, mode: AuditMode) -> Self {
+    /// The audit log of `mode` under `storage_path`. `exit` ends the process if the writer
+    /// panics: in the server and the commands, the log file's hook (`LogFile::exit_hook`), so
+    /// the exit drains `NORA_LOG_FILE` first.
+    pub fn new(storage_path: &str, mode: AuditMode, exit: crate::supervise::ExitHook) -> Self {
         let path = PathBuf::from(storage_path).join("audit.jsonl");
 
         if mode == AuditMode::Off {
@@ -164,7 +167,6 @@ impl AuditLog {
         // Without its writer the audit log would take entries and record none, so a panic
         // there ends the process with `EXIT_TASK_PANICKED` (`supervise::blocking`).
         let handle = tokio::task::spawn_blocking(move || {
-            let exit = crate::supervise::process_exit();
             crate::supervise::blocking("audit", &exit, move || {
                 Self::writer_loop(rx, file, writer_mode)
             });
@@ -324,6 +326,7 @@ pub async fn curation_refusal_middleware(
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::supervise::recorded_exit;
     use tempfile::TempDir;
 
     /// An entry whose action this is makes the writer panic.
@@ -341,7 +344,11 @@ mod tests {
         };
         let before = exits();
         let tmp = TempDir::new().unwrap();
-        let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::File);
+        let log = AuditLog::new(
+            tmp.path().to_str().unwrap(),
+            AuditMode::File,
+            recorded_exit(),
+        );
         log.log(AuditEntry::new("pull", "user1", "lodash", "npm", ""));
         log.log(AuditEntry::new(WRITER_PANIC, "user1", "lodash", "npm", ""));
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -376,15 +383,24 @@ mod tests {
         // AuditLog::new() spawns a tokio task, so we need a runtime
         let rt = tokio::runtime::Runtime::new().unwrap();
         let tmp = TempDir::new().unwrap();
-        let log =
-            rt.block_on(async { AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::File) });
+        let log = rt.block_on(async {
+            AuditLog::new(
+                tmp.path().to_str().unwrap(),
+                AuditMode::File,
+                recorded_exit(),
+            )
+        });
         assert!(log.path().ends_with("audit.jsonl"));
     }
 
     #[tokio::test]
     async fn test_audit_log_write_entry() {
         let tmp = TempDir::new().unwrap();
-        let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::File);
+        let log = AuditLog::new(
+            tmp.path().to_str().unwrap(),
+            AuditMode::File,
+            recorded_exit(),
+        );
 
         let entry = AuditEntry::new("pull", "user1", "lodash", "npm", "downloaded");
         log.log(entry);
@@ -402,7 +418,11 @@ mod tests {
     #[tokio::test]
     async fn test_audit_log_multiple_entries() {
         let tmp = TempDir::new().unwrap();
-        let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::File);
+        let log = AuditLog::new(
+            tmp.path().to_str().unwrap(),
+            AuditMode::File,
+            recorded_exit(),
+        );
 
         log.log(AuditEntry::new("push", "admin", "a", "docker", ""));
         log.log(AuditEntry::new("pull", "user", "b", "npm", ""));
@@ -464,7 +484,11 @@ mod tests {
     #[tokio::test]
     async fn test_audit_log_off_mode() {
         let tmp = TempDir::new().unwrap();
-        let log = AuditLog::new(tmp.path().to_str().unwrap(), AuditMode::Off);
+        let log = AuditLog::new(
+            tmp.path().to_str().unwrap(),
+            AuditMode::Off,
+            recorded_exit(),
+        );
         assert_eq!(log.mode(), &AuditMode::Off);
         // Should not panic even when logging to Off mode
         log.log(AuditEntry::new("test", "test", "test", "test", "test"));
