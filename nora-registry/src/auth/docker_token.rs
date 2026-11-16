@@ -810,10 +810,12 @@ mod tests {
     async fn an_expired_api_token_does_not_keep_writing_through_its_docker_token() {
         let ctx = ctx();
         let (token, _) =
-            docker_token_for_api_token(&ctx, "bob", crate::tokens::MintLifetime::days(1, Some(1)))
+            docker_token_for_api_token(&ctx, "bob", crate::tokens::MintLifetime::days(1, Some(5)))
                 .await;
-        // The store refuses a token once a whole second is past its expiry.
-        tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+        // Five seconds of lifetime leave the setup room on a loaded machine: the helper has
+        // to see the token write before it expires. The store refuses a token once a whole
+        // second is past its expiry, so 6.1 s after the setup it is refused.
+        tokio::time::sleep(std::time::Duration::from_millis(6100)).await;
         assert_eq!(
             with_bearer(&ctx, Method::POST, UPLOAD, &token)
                 .await
