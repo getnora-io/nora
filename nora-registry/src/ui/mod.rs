@@ -893,7 +893,12 @@ async fn hf_detail(
     Query(query): Query<LangQuery>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    let Some(detail) = api::get_hf_detail(&state.storage, &name).await else {
+    // An id NORA holds no file of has nothing to show or download: no page, as for an id
+    // that is not one.
+    let Some(detail) = api::get_hf_detail(&state.storage, &name)
+        .await
+        .filter(|detail| !detail.versions.is_empty())
+    else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let lang = extract_lang(
@@ -3018,8 +3023,12 @@ mod registry_pages {
         );
 
         // A repository id is not a path: three segments, a segment that does not start with a
-        // letter or digit, or one holding `..`, have no page.
+        // letter or digit, or one holding `..`, have no page. Nor has an id NORA holds no file
+        // of, the owner of a cached one included: there is nothing to show or download.
         for uri in [
+            "/ui/hf/org",
+            "/ui/hf/org/other",
+            "/ui/hf/gpt2",
             "/ui/hf/org/model/blobs",
             "/ui/hf/org/.model",
             "/ui/hf/org/model..x",
@@ -3035,6 +3044,11 @@ mod registry_pages {
             assert_eq!(status, StatusCode::OK, "{uri}");
             assert!(detail.contains(&digest), "{uri} names the cached file");
             assert!(!detail.contains("stray"), "{uri} lists cached files only");
+            // The owner in the breadcrumbs is not a repository: no link leads there.
+            assert!(
+                !detail.contains("href=\"/ui/hf/org\""),
+                "{uri} links no owner page"
+            );
             // The rows are cached files named by digest, not versions.
             assert!(
                 detail.contains(">Digest</th>"),

@@ -1377,10 +1377,17 @@ pub fn render_package_detail(
                 .map(encode_uri_component)
                 .collect::<Vec<_>>()
                 .join("/");
-            if i == segments.len() - 1 {
+            // A Hugging Face owner is not a repository and has no page: the segment is text.
+            if i == segments.len() - 1 || rt == Some(RegistryType::HuggingFace) {
+                let class = if i == segments.len() - 1 {
+                    "text-slate-200 font-medium"
+                } else {
+                    "text-slate-400"
+                };
                 let _ = write!(
                     crumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                    r#"<span class="mx-2 text-slate-500">/</span><span class="{}">{}</span>"#,
+                    class,
                     html_escape(seg)
                 );
             } else {
