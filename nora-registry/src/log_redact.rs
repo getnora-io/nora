@@ -438,9 +438,13 @@ mod tests {
                     tracing::warn!(url = ?url, "upstream failed");
                     tracing::warn!("upstream {url} failed");
                     tracing::warn!("upstream {url:?} failed");
+                    // As a client error names it: the client's own spelling of the address.
+                    if let Ok(asked) = reqwest::Url::parse(&url) {
+                        tracing::warn!("builder error for url ({asked})");
+                    }
                 });
                 let out = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-                assert_eq!(out.lines().count(), 4, "{out}");
+                assert!(out.lines().count() >= 4, "{out}");
                 holds_no_spelling(&out, form, secrets);
             }
             for stderr in [format!("nora: {url}"), format!("nora: {url:?}")] {

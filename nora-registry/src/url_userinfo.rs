@@ -149,7 +149,7 @@ fn unquoted(text: &str) -> &str {
 pub(crate) fn texts_the_filter_misses(url: &str) -> Vec<String> {
     let parsed = match read(url) {
         Reading::Clean => return Vec::new(),
-        Reading::Unreadable if url.contains('@') => return spellings(url).into(),
+        Reading::Unreadable if url.contains('@') => return unreadable_spellings(url),
         Reading::Unreadable => return Vec::new(),
         Reading::WithUserinfo(parsed) => parsed,
     };
@@ -194,6 +194,19 @@ pub(crate) fn texts_the_filter_misses(url: &str) -> Vec<String> {
         })
         .collect();
     missed.into_iter().flatten().cloned().collect()
+}
+
+/// Every spelling of an address the parser cannot read as one with a host but that has an `@`:
+/// as written, and as the client writes it when it takes it as something else (`ciLeakBot:pw@h`
+/// is the scheme `cileakbot` with a path, and a client error names it so).
+fn unreadable_spellings(url: &str) -> Vec<String> {
+    let mut texts: Vec<String> = spellings(url).into();
+    if let Ok(parsed) = reqwest::Url::parse(url) {
+        if parsed.as_str() != url {
+            texts.extend(spellings(parsed.as_str()));
+        }
+    }
+    texts
 }
 
 /// Where in `url` the userinfo the parser read in `parsed` is written: the narrowest range
@@ -334,6 +347,11 @@ pub(crate) const UNREADABLE_FORMS: &[(&str, &[&str])] = &[
     ("robot:pa ss@mirror.example/repo", &["robot", "pa ss"]),
     ("ci-bot:s3cr3t@mirror.example/repo", &["ci-bot", "s3cr3t"]),
     ("https://ci-bot:pa/ss@mirror.example", &["ci-bot", "pa/ss"]),
+    // The client reads a scheme `cirobot` in it and writes it in lower case.
+    (
+        "CiRobot:s3cr3t@mirror.example/repo",
+        &["CiRobot", "cirobot", "s3cr3t"],
+    ),
 ];
 
 /// Checks shared by the tests of every output.
