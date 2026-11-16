@@ -383,7 +383,7 @@ fn place_document(
     upstream_url: &str,
     package_asked: Option<&str>,
     links: Links,
-    held: &dyn Fn(&str, bool, Option<&str>) -> bool,
+    held: &dyn Fn(&str) -> bool,
 ) -> Result<Placed, Unrewritable> {
     let key_ok = |key: &str| crate::validation::validate_storage_key(key).is_ok();
     npm_links::place_document(
@@ -1865,15 +1865,7 @@ fn rewrite_for_nora(
     path: &str,
     links: Links,
 ) -> Option<Vec<u8>> {
-    place_for_nora(
-        state,
-        data,
-        proxy_url,
-        path,
-        links,
-        &|_: &str, _: bool, _: Option<&str>| false,
-    )
-    .map(|placed| placed.body)
+    place_for_nora(state, data, proxy_url, path, links, &|_: &str| false).map(|placed| placed.body)
 }
 
 /// [`rewrite_for_nora`], saying whether a version was left out.
@@ -1883,7 +1875,7 @@ fn place_for_nora(
     proxy_url: &str,
     path: &str,
     links: Links,
-    held: &dyn Fn(&str, bool, Option<&str>) -> bool,
+    held: &dyn Fn(&str) -> bool,
 ) -> Option<Placed> {
     let nora_base = nora_base_url(state);
     let package = match classify_metadata_path(path) {
@@ -1953,27 +1945,23 @@ fn links_on_nora(data: &[u8], nora_base: &str, package: &str) -> bool {
     on_nora(&doc.dist) && doc.versions.iter().flatten().all(|(_, v)| on_nora(&v.dist))
 }
 
-/// What the store shows for the links of a copy that asks it (#1180, round 3): the files it holds,
-/// and the files whose bytes the packument's declared digest proves. Nothing is listed for a copy
-/// no link of which asks the store, as a link of the upstream's own origin never does.
+/// What the store holds for the links of a copy that asks it (#1180): the files of the package
+/// NORA holds. Nothing is listed for a copy no link of which asks the store (a link of the upstream's
+/// own origin never does, nor a link of another origin).
 #[derive(Default)]
 struct StoreClaims {
     held: std::collections::HashSet<String>,
-    proven: std::collections::HashSet<(String, String)>,
 }
 
 impl StoreClaims {
-    /// Whether the store holds `file` for a link that is NORA's own (`own`: of this instance's
-    /// origin), or for a link of another origin whose declared digest the file's bytes match.
-    fn holds(&self, file: &str, own: bool, declared: Option<&str>) -> bool {
+    /// Whether the store holds `file`.
+    fn holds(&self, file: &str) -> bool {
         self.held.contains(file)
-            && (own
-                || declared
-                    .is_some_and(|d| self.proven.contains(&(file.to_string(), d.to_string()))))
     }
 }
 
-/// The store's claims for the copy `data` of `path` (see [`StoreClaims`]).
+/// The store's claims for the copy `data` of `path` (see [`StoreClaims`]). The copy is placed once
+/// with nothing held, to see which of its links ask the store, and only those files are listed.
 async fn store_claims(state: &AppState, path: &str, package: &str, data: &[u8]) -> StoreClaims {
     if links_on_nora(data, &nora_base_url(state), package) {
         return StoreClaims::default();
@@ -1984,70 +1972,20 @@ async fn store_claims(state: &AppState, path: &str, package: &str, data: &[u8]) 
         .route(path)
         .map(|u| u.url)
         .unwrap_or_default();
-    let asked = std::cell::RefCell::new(Vec::new());
+    let asked = std::cell::Cell::new(false);
     {
-        let record = |file: &str, own: bool, declared: Option<&str>| {
-            asked
-                .borrow_mut()
-                .push((file.to_string(), own, declared.map(str::to_string)));
+        let record = |_file: &str| {
+            asked.set(true);
             false
         };
         let _ = place_for_nora(state, data, upstream, path, Links::Served, &record);
     }
-    let asked = asked.into_inner();
-    if asked.is_empty() {
+    if !asked.get() {
         return StoreClaims::default();
     }
-    let held = held_tarballs(state, package).await;
-    let mut proven = std::collections::HashSet::new();
-    for (file, own, declared) in &asked {
-        if *own || !held.contains(file) {
-            continue;
-        }
-        if let Some(declared) = declared {
-            if stored_digest_matches(state, package, file, declared).await {
-                proven.insert((file.clone(), declared.clone()));
-            }
-        }
+    StoreClaims {
+        held: held_tarballs(state, package).await,
     }
-    StoreClaims { held, proven }
-}
-
-/// Whether the stored tarball `file` of `package` has the digest `declared` names (sha512 as
-/// `sha512-<base64>`, or a sha1 hex), so its bytes are the version's tarball whatever source wrote
-/// them (#1180, round 3). The digest of a stored file is computed once and kept under
-/// `.nora-digests/`, beside the other sidecars of the store.
-async fn stored_digest_matches(
-    state: &AppState,
-    package: &str,
-    file: &str,
-    declared: &str,
-) -> bool {
-    let (algo, expected) = if let Some(encoded) = declared.strip_prefix("sha512-") {
-        ("sha512", encoded.to_string())
-    } else if declared.len() == 40 && declared.bytes().all(|b| b.is_ascii_hexdigit()) {
-        ("sha1", declared.to_ascii_lowercase())
-    } else {
-        return false;
-    };
-    let key = format!("npm/{package}/tarballs/{file}");
-    let sidecar = format!(".nora-digests/{key}.{algo}");
-    let actual = match state.storage.get(&sidecar).await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(_) => {
-            let Ok(data) = state.storage.get(&key).await else {
-                return false;
-            };
-            let digest = if algo == "sha512" {
-                base64::engine::general_purpose::STANDARD.encode(sha2::Sha512::digest(&data))
-            } else {
-                hex::encode(sha1::Sha1::digest(&data))
-            };
-            let _ = state.storage.put(&sidecar, digest.as_bytes()).await;
-            digest
-        }
-    };
-    actual == expected
 }
 
 /// The tarball files NORA holds for `package`, by file name. A link of NORA's own form to one of
@@ -2073,14 +2011,15 @@ fn served_copy(
     state: &AppState,
     path: &str,
     data: Bytes,
-    held: &dyn Fn(&str, bool, Option<&str>) -> bool,
+    held: &dyn Fn(&str) -> bool,
 ) -> (Option<Bytes>, bool) {
     let package = match classify_metadata_path(path) {
         MetadataPath::Packument { name } | MetadataPath::VersionManifest { name, .. } => name,
         MetadataPath::Other => "",
     };
     if links_on_nora(&data, &nora_base_url(state), package) {
-        return (Some(data), false);
+        // The copy's record is kept by the copy, not served: taken out of the bytes (#1180).
+        return (Some(without_record_bytes(data)), false);
     }
     let upstream = state
         .config
@@ -2091,6 +2030,15 @@ fn served_copy(
     match place_for_nora(state, &data, upstream, path, Links::Served, held) {
         Some(placed) => (Some(Bytes::from(placed.body)), placed.left_out),
         None => (None, true),
+    }
+}
+
+/// A stored copy's bytes with its record taken out, for serving (#1180). A copy without a
+/// record is served as it is.
+fn without_record_bytes(data: Bytes) -> Bytes {
+    match npm_links::without_record(&data) {
+        Some(plain) => Bytes::from(plain),
+        None => data,
     }
 }
 
@@ -2195,7 +2143,7 @@ fn served_metadata(
     path: &str,
     document: Document,
     data: Bytes,
-    held: &dyn Fn(&str, bool, Option<&str>) -> bool,
+    held: &dyn Fn(&str) -> bool,
 ) -> Response {
     match served_copy(state, path, data, held) {
         (Some(data), _) => metadata_response(headers, document, data),
@@ -2242,12 +2190,7 @@ async fn upstream_metadata(
         // A copy holding a link past NORA (cached by a release that kept one) is served placed
         // again, and refetched in full whatever its age: a 304 would keep it as it is.
         let claims = store_claims(state, path, name, &data).await;
-        let (served, past_nora) = served_copy(
-            state,
-            path,
-            data,
-            &|file: &str, own: bool, declared: Option<&str>| claims.holds(file, own, declared),
-        );
+        let (served, past_nora) = served_copy(state, path, data, &|file: &str| claims.holds(file));
         let fresh = !past_nora
             && state.storage.stat(&from_key).await.is_some_and(|meta| {
                 crate::cache_ttl::is_within_ttl(meta.modified, state.config.npm.metadata_ttl)
@@ -2290,16 +2233,11 @@ async fn upstream_metadata(
         };
         if let Some(refreshed) = refreshed {
             // A 304 hands back the stored copy, which names the store's own tarballs: they are
-            // held, so the copy is placed with them (#1180, round 2).
+            // held, so the copy is placed with them (#1180).
             let claims = store_claims(state, path, name, &refreshed).await;
-            return served_metadata(
-                state,
-                headers,
-                path,
-                document,
-                refreshed,
-                &|file: &str, own: bool, declared: Option<&str>| claims.holds(file, own, declared),
-            );
+            return served_metadata(state, headers, path, document, refreshed, &|file: &str| {
+                claims.holds(file)
+            });
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
@@ -2383,7 +2321,7 @@ async fn upstream_metadata(
                 path,
                 document,
                 Bytes::from(rewritten),
-                &|_: &str, _: bool, _: Option<&str>| false,
+                &|_: &str| false,
             )
         }
         Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
@@ -3412,7 +3350,7 @@ fn rewrite_tarball_urls(
         upstream_url,
         package.as_deref(),
         Links::Served,
-        &|_: &str, _: bool, _: Option<&str>| false,
+        &|_: &str| false,
     )
     .map(|placed| placed.body)
 }
@@ -11209,7 +11147,7 @@ mod own_links_follow_the_serving_instance {
         wrong
     }
 
-    /// The table (#1180, round 2): a version whose tarball the store holds is served at the address
+    /// The table (#1180): a version whose tarball the store holds is served at the address
     /// that serves it, with a link that downloads, whatever the form of the link, the address that
     /// wrote it, and the state of the copy and of the upstream.
     #[tokio::test]
@@ -11267,7 +11205,7 @@ mod own_links_follow_the_serving_instance {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// Published versions (#1180, round 2): written at one address and prefix, served at another,
+    /// Published versions (#1180): written at one address and prefix, served at another,
     /// including a prefix dropped on the same host. Each link downloads from the serving instance.
     #[tokio::test]
     async fn a_published_version_is_served_at_the_serving_address_under_any_prefix() {
@@ -11348,10 +11286,11 @@ mod own_links_follow_the_serving_instance {
         .unwrap()
     }
 
-    /// The local backend, counting the listings of tarball prefixes (#1180, round 3).
+    /// The local backend, counting the listings of tarball prefixes (#1180).
     struct CountTarballLists {
         inner: crate::storage::LocalStorage,
         tarball_lists: std::sync::atomic::AtomicUsize,
+        gets: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -11363,6 +11302,7 @@ mod own_links_follow_the_serving_instance {
             &self,
             k: &str,
         ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.inner.get(k).await
         }
         async fn pin(&self, k: &str) -> Option<String> {
@@ -11424,7 +11364,7 @@ mod own_links_follow_the_serving_instance {
         }
     }
 
-    /// A copy names a tarball on another source (#1180, round 3). The store holds a file of the same
+    /// A copy names a tarball on another source (#1180). The store holds a file of the same
     /// name from a source whose bytes the packument does not declare: that is no proof that the
     /// link is NORA's, so the version is not offered with this instance's link.
     #[tokio::test]
@@ -11466,12 +11406,12 @@ mod own_links_follow_the_serving_instance {
         );
     }
 
-    /// The migration guard (#1180): a copy names the address of the instance that wrote it, and its
-    /// store holds exactly the bytes the packument declares. That is the same tarball, so it is
+    /// The migration (#1180): a copy names the address of the instance that wrote it, and the
+    /// record that instance kept says so. Its stored tarball is the file the link names, so the copy is
     /// served at this address and downloads.
     #[tokio::test]
-    async fn a_copy_naming_the_old_address_with_the_bytes_it_declares_is_served_here() {
-        const LOCAL: &[u8] = b"the declared bytes";
+    async fn a_copy_recorded_at_another_address_is_served_here() {
+        const LOCAL: &[u8] = b"the recorded bytes";
         let up = MockServer::start().await;
         Mock::given(wiremock::matchers::any())
             .respond_with(ResponseTemplate::new(503))
@@ -11482,10 +11422,13 @@ mod own_links_follow_the_serving_instance {
             cfg.npm.proxy = Some(up.uri());
             cfg.npm.metadata_ttl = 3600;
         });
-        let copy = copy_packument(
-            "pkg",
-            "http://old-nora.example:4000/npm/pkg/-/pkg-1.0.0.tgz",
-            LOCAL,
+        let copy = super::npm_links::with_record(
+            copy_packument(
+                "pkg",
+                "http://old-nora.example:4000/npm/pkg/-/pkg-1.0.0.tgz",
+                LOCAL,
+            ),
+            "http://old-nora.example:4000",
         );
         ctx.state
             .storage
@@ -11511,7 +11454,7 @@ mod own_links_follow_the_serving_instance {
     }
 
     /// A copy whose links are all the upstream's own origin links (GitLab's project endpoint) is
-    /// answered without listing the store's tarballs (#1180, round 3): those links are confirmed
+    /// answered without listing the store's tarballs (#1180): those links are confirmed
     /// through the upstream's origin, and the listing is for links that need the store.
     #[tokio::test]
     async fn a_copy_of_origin_links_lists_no_tarball() {
@@ -11519,6 +11462,7 @@ mod own_links_follow_the_serving_instance {
         let counting = std::sync::Arc::new(CountTarballLists {
             inner: crate::storage::LocalStorage::new(dir.path().to_str().unwrap()),
             tarball_lists: std::sync::atomic::AtomicUsize::new(0),
+            gets: std::sync::atomic::AtomicUsize::new(0),
         });
         let upstream = "http://127.0.0.1:1/api/v4/packages/npm";
         let ctx = create_test_context_with_storage_and_config(
@@ -11561,6 +11505,359 @@ mod own_links_follow_the_serving_instance {
             0,
             "a copy of origin links listed the store's tarballs"
         );
+    }
+    /// A copy with a `dist` the test declares: its tarball link and the digests it carries.
+    fn copy_with_dist(package: &str, dist: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "name": package,
+            "versions": { "1.0.0": { "name": package, "version": "1.0.0", "dist": dist } },
+            "dist-tags": { "latest": "1.0.0" },
+        }))
+        .unwrap()
+    }
+
+    /// A foreign copy whose bytes match the digest its packument declares is external, not NORA's:
+    /// offline it is left out, as 1.4.5 left it out (#1180). The digest proves nothing about
+    /// where the link points.
+    #[tokio::test]
+    async fn a_foreign_copy_is_external_even_when_its_bytes_match_the_declared_digest() {
+        const BYTES: &[u8] = b"the declared bytes";
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.server.public_url = Some(SERVER.to_string());
+            cfg.npm.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.npm.metadata_ttl = 3600;
+        });
+        ctx.state
+            .storage
+            .put(
+                &super::upstream_packument_key("pkg"),
+                &copy_packument(
+                    "pkg",
+                    "http://old-nora.example:4000/npm/pkg/-/pkg-1.0.0.tgz",
+                    BYTES,
+                ),
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("npm/pkg/tarballs/pkg-1.0.0.tgz", BYTES)
+            .await
+            .unwrap();
+        let served = served_links_at(&ctx.app, "/npm/pkg").await;
+        assert!(
+            !served
+                .iter()
+                .any(|(v, l)| v == "1.0.0" && l.starts_with(SERVER)),
+            "a foreign copy with matching bytes was offered at this address: {served:?}"
+        );
+        // Served as NORA 1.4.5 serves it: with the upstream down, the version is left out.
+        assert!(
+            served.iter().all(|(v, _)| v != "1.0.0"),
+            "a foreign copy without a record is external: its version is left out, as in 1.4.5: {served:?}"
+        );
+    }
+
+    /// A digest proven once is not proven for the bytes that replace them (#1180): the stored
+    /// file is replaced under the same key, and the link is still not NORA's.
+    #[tokio::test]
+    async fn a_replaced_file_is_not_proven_by_an_earlier_digest() {
+        const FIRST: &[u8] = b"the declared bytes";
+        const OTHER: &[u8] = b"other source's bytes";
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.server.public_url = Some(SERVER.to_string());
+            cfg.npm.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.npm.metadata_ttl = 3600;
+        });
+        ctx.state
+            .storage
+            .put(
+                &super::upstream_packument_key("pkg"),
+                &copy_packument(
+                    "pkg",
+                    "http://old-nora.example:4000/npm/pkg/-/pkg-1.0.0.tgz",
+                    FIRST,
+                ),
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("npm/pkg/tarballs/pkg-1.0.0.tgz", FIRST)
+            .await
+            .unwrap();
+        let _ = served_links_at(&ctx.app, "/npm/pkg").await;
+        ctx.state
+            .storage
+            .put("npm/pkg/tarballs/pkg-1.0.0.tgz", OTHER)
+            .await
+            .unwrap();
+        let served = served_links_at(&ctx.app, "/npm/pkg").await;
+        assert!(
+            !served
+                .iter()
+                .any(|(v, l)| v == "1.0.0" && l.starts_with(SERVER)),
+            "a replaced file was proven by the digest of the bytes it replaced: {served:?}"
+        );
+    }
+
+    /// The declared `integrity` decides: a `shasum` that matches the bytes does not stand in for an
+    /// integrity NORA cannot check (#1180).
+    #[tokio::test]
+    async fn a_declared_integrity_is_not_stood_in_for_by_a_matching_shasum() {
+        use sha2::Digest as _;
+        const BYTES: &[u8] = b"the bytes a shasum matches";
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.server.public_url = Some(SERVER.to_string());
+            cfg.npm.proxy = Some("http://127.0.0.1:1".to_string());
+            cfg.npm.metadata_ttl = 3600;
+        });
+        let dist = serde_json::json!({
+            "tarball": "http://old-nora.example:4000/npm/pkg/-/pkg-1.0.0.tgz",
+            "shasum": hex::encode(sha1::Sha1::digest(BYTES)),
+            "integrity": format!(
+                "sha256-{}",
+                base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(b"other"))
+            ),
+        });
+        ctx.state
+            .storage
+            .put(
+                &super::upstream_packument_key("pkg"),
+                &copy_with_dist("pkg", dist),
+            )
+            .await
+            .unwrap();
+        ctx.state
+            .storage
+            .put("npm/pkg/tarballs/pkg-1.0.0.tgz", BYTES)
+            .await
+            .unwrap();
+        let served = served_links_at(&ctx.app, "/npm/pkg").await;
+        assert!(
+            !served
+                .iter()
+                .any(|(v, l)| v == "1.0.0" && l.starts_with(SERVER)),
+            "a shasum stood in for an integrity it does not match: {served:?}"
+        );
+    }
+
+    /// A copy recorded at another address names a scoped version directory (#1180): the route
+    /// is recognized, the link moves here, and the file downloads from the store.
+    #[tokio::test]
+    async fn a_scoped_version_directory_moves_with_its_copy() {
+        let up = MockServer::start().await;
+        let base = up.uri();
+        let file = "1.0.0/@vendor/pkg-1.0.0.tgz";
+        let upstream_link = format!("{base}/@vendor/pkg/-/{file}");
+        Mock::given(method("GET"))
+            .and(path("/@vendor/pkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(
+                    serde_json::to_vec(&serde_json::json!({
+                        "name": "@vendor/pkg",
+                        "versions": { "1.0.0": { "name": "@vendor/pkg", "version": "1.0.0",
+                            "dist": dist_for(&upstream_link, b"tarball-bytes") } },
+                        "dist-tags": { "latest": "1.0.0" },
+                    }))
+                    .unwrap(),
+                ),
+            )
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/@vendor/pkg/-/{file}").as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tarball-bytes".to_vec()))
+            .mount(&up)
+            .await;
+        let writer = create_test_context_with_config(|cfg| {
+            cfg.server.public_url = Some(WRITER.to_string());
+            cfg.npm.proxy = Some(base.clone());
+        });
+        assert_eq!(
+            send(&writer.app, Method::GET, "/npm/@vendor/pkg", "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        wait_until_stored(
+            &writer.state.storage,
+            &super::origin_key(&super::upstream_packument_key("@vendor/pkg")),
+        )
+        .await;
+        assert_eq!(
+            send(
+                &writer.app,
+                Method::GET,
+                &format!("/npm/@vendor/pkg/-/{file}"),
+                ""
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        wait_until_stored(
+            &writer.state.storage,
+            &format!("npm/@vendor/pkg/tarballs/{file}"),
+        )
+        .await;
+        up.reset().await;
+        let reader =
+            create_test_context_with_storage_and_config(writer.state.storage.clone(), |cfg| {
+                cfg.server.public_url = Some(SERVER.to_string());
+                cfg.npm.proxy = Some("http://127.0.0.1:1".to_string());
+                cfg.npm.metadata_ttl = 3600;
+            });
+        assert_eq!(
+            served_links_at(&reader.app, "/npm/@vendor/pkg").await,
+            vec![(
+                "1.0.0".to_string(),
+                format!("{SERVER}/npm/@vendor/pkg/-/{file}")
+            )]
+        );
+        let got = send(
+            &reader.app,
+            Method::GET,
+            &format!("/npm/@vendor/pkg/-/{file}"),
+            "",
+        )
+        .await;
+        assert_eq!(got.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(got).await[..], b"tarball-bytes");
+    }
+
+    /// A warm copy that moved costs no reads per version (#1180): a request reads a constant
+    /// number of objects, whatever the number of versions the copy names.
+    #[tokio::test]
+    async fn a_warm_moved_copy_reads_no_object_per_version() {
+        const VERSIONS: usize = 100;
+        let up = MockServer::start().await;
+        let base = up.uri();
+        let mut versions = serde_json::Map::new();
+        for i in 0..VERSIONS {
+            let v = format!("1.0.{i}");
+            versions.insert(
+                v.clone(),
+                serde_json::json!({ "name": "pkg", "version": v,
+                    "dist": dist_for(&format!("{base}/pkg/-/pkg-{v}.tgz"), b"tarball-bytes") }),
+            );
+        }
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(
+                    serde_json::to_vec(&serde_json::json!({ "name": "pkg", "versions": versions,
+                    "dist-tags": { "latest": "1.0.0" } }))
+                    .unwrap(),
+                ),
+            )
+            .mount(&up)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let counting = std::sync::Arc::new(CountTarballLists {
+            inner: crate::storage::LocalStorage::new(dir.path().to_str().unwrap()),
+            tarball_lists: std::sync::atomic::AtomicUsize::new(0),
+            gets: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let writer = create_test_context_with_storage_and_config(
+            crate::storage::Storage::from_backend(counting.clone()),
+            |cfg| {
+                cfg.server.public_url = Some(WRITER.to_string());
+                cfg.npm.proxy = Some(base.clone());
+            },
+        );
+        assert_eq!(
+            send(&writer.app, Method::GET, "/npm/pkg", "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        wait_until_stored(
+            &writer.state.storage,
+            &super::origin_key(&super::upstream_packument_key("pkg")),
+        )
+        .await;
+        for i in 0..VERSIONS {
+            writer
+                .state
+                .storage
+                .put(
+                    &format!("npm/pkg/tarballs/pkg-1.0.{i}.tgz"),
+                    b"tarball-bytes",
+                )
+                .await
+                .unwrap();
+        }
+        up.reset().await;
+        let reader = create_test_context_with_storage_and_config(
+            crate::storage::Storage::from_backend(counting.clone()),
+            |cfg| {
+                cfg.server.public_url = Some(SERVER.to_string());
+                cfg.npm.proxy = Some(base.clone());
+                cfg.npm.metadata_ttl = 3600;
+            },
+        );
+        let _ = send(&reader.app, Method::GET, "/npm/pkg", "").await;
+        let before = counting.gets.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            send(&reader.app, Method::GET, "/npm/pkg", "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        let reads = counting.gets.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(
+            reads <= 10,
+            "a warm request of {VERSIONS} versions read {reads} objects"
+        );
+    }
+
+    /// A copy NORA wrote carries its record, and is served without it (#1180): the record is
+    /// the copy's, the document served is the upstream's, and the client never sees the address it was
+    /// written under.
+    #[tokio::test]
+    async fn a_copy_is_served_without_its_record() {
+        let up = MockServer::start().await;
+        let base = up.uri();
+        Mock::given(method("GET"))
+            .and(path("/pkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(upstream_packument(&base)))
+            .mount(&up)
+            .await;
+        let writer = create_test_context_with_config(|cfg| {
+            cfg.server.public_url = Some(WRITER.to_string());
+            cfg.npm.proxy = Some(base.clone());
+        });
+        assert_eq!(
+            send(&writer.app, Method::GET, "/npm/pkg", "")
+                .await
+                .status(),
+            StatusCode::OK
+        );
+        wait_until_stored(
+            &writer.state.storage,
+            &super::origin_key(&super::upstream_packument_key("pkg")),
+        )
+        .await;
+        let stored = writer
+            .state
+            .storage
+            .get(&super::upstream_packument_key("pkg"))
+            .await
+            .unwrap();
+        assert!(
+            stored.starts_with(b"{\"_nora_public_base\":"),
+            "the copy keeps its record first"
+        );
+        let got = send(&writer.app, Method::GET, "/npm/pkg", "").await;
+        assert_eq!(got.status(), StatusCode::OK);
+        let body = body_bytes(got).await;
+        assert!(
+            !String::from_utf8_lossy(&body).contains("_nora_public_base"),
+            "the record was served"
+        );
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(doc["versions"]["1.0.0"]["name"], "pkg");
     }
 }
 

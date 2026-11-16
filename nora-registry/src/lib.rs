@@ -74,7 +74,7 @@ pub mod npm_fuzz {
             package.as_deref(),
             crate::npm_links::Links::Served,
             &key_ok,
-            &|_: &str, _: bool, _: Option<&str>| false,
+            &|_: &str| false,
         )
         .map(|placed| placed.body)
         .map_err(|_| ())
