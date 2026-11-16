@@ -2122,20 +2122,26 @@ mod reindex_tests {
 #[allow(clippy::unwrap_used)]
 mod proxy_tests {
     use crate::config::registry::RepoProxyEntry;
-    use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_config, create_test_context_with_storage_and_config,
+        send,
+    };
     use axum::http::{Method, StatusCode};
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// Wait for the background `spawn_cache` write to land.
+    /// Wait for the background `spawn_cache` write to land, up to a deadline. The wait is for
+    /// the write, not for the disk: on a store in memory it lands at the first yield, while a
+    /// local store fsyncs it and took up to 0.9 s on a loaded runner (past the 1 s this waited).
     async fn await_cached(state: &crate::AppState, key: &str) {
-        for _ in 0..100 {
-            if state.storage.stat(key).await.is_some() {
-                return;
-            }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while state.storage.stat(key).await.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cache write for {key} never landed"
+            );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        panic!("cache write for {key} never landed");
     }
 
     #[tokio::test]
@@ -2149,7 +2155,11 @@ mod proxy_tests {
             .await;
 
         let uri = upstream.uri();
-        let ctx = create_test_context_with_config(move |cfg| {
+        // A store in memory: the test is of the cache, which a disk's fsync only slows.
+        let storage = crate::storage::Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        let ctx = create_test_context_with_storage_and_config(storage, move |cfg| {
             cfg.rpm.enabled = true;
             cfg.rpm
                 .proxies

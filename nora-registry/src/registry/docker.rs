@@ -8392,6 +8392,17 @@ mod integration_tests {
         crate::test_helpers::TestContext,
         String,
     ) {
+        table_context_over(None).await
+    }
+
+    /// [`table_context`] over `storage` when given, the local store otherwise.
+    async fn table_context_over(
+        storage: Option<crate::storage::Storage>,
+    ) -> (
+        wiremock::MockServer,
+        crate::test_helpers::TestContext,
+        String,
+    ) {
         use crate::config::DockerUpstream;
         use wiremock::matchers::any;
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -8415,9 +8426,15 @@ mod integration_tests {
             namespaces: Vec::new(),
         };
         let ns = upstream.resolved_namespace();
-        let ctx = crate::test_helpers::create_test_context_with_config(move |cfg| {
+        let customize = move |cfg: &mut crate::config::Config| {
             cfg.docker.upstreams = vec![upstream];
-        });
+        };
+        let ctx = match storage {
+            Some(storage) => {
+                crate::test_helpers::create_test_context_with_storage_and_config(storage, customize)
+            }
+            None => crate::test_helpers::create_test_context_with_config(customize),
+        };
         (server, ctx, ns)
     }
 
@@ -8450,7 +8467,12 @@ mod integration_tests {
     /// Row 7: a push removes the proxied copy of its tag and the copy's metadata.
     #[tokio::test]
     async fn row7_a_push_removes_the_proxied_copy_of_its_tag() {
-        let (_server, ctx, ns) = table_context().await;
+        // A store in memory: the wait below is for the cache task's writes, which a local store
+        // fsyncs, four of them, in up to 8.4 s on a loaded runner (of the 10 s it waits).
+        let storage = crate::storage::Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        let (_server, ctx, ns) = table_context_over(Some(storage)).await;
         assert_eq!(table_get(&ctx).await, table_manifest(UPSTREAM_CFG));
         let proxied = super::manifest_key(Some(&ns), "corp/app", "1.0");
         let proxied_meta = super::manifest_meta_key(Some(&ns), "corp/app", "1.0");
