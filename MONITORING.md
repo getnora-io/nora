@@ -29,6 +29,7 @@ Import `dist/grafana-dashboard.json` into Grafana (Dashboards > Import > Upload 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `nora_cache_requests_total` | counter | registry, result | Cache lookups (`result`: hit / miss) |
+| `nora_proxy_stale_served_total` | counter | registry | Answers served from a stored copy the upstream could not revalidate (failed, timed out, breaker open); each carries `X-Nora-Stale: true`. Counted by Terraform metadata (#1230) |
 
 ### Upstream Proxy
 

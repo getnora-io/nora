@@ -207,6 +207,23 @@ NORA serves both Terraform protocols against the same upstream: the **Registry P
 | **Network mirror — `{version}.json`** | Full | Mirror protocol; archives via NORA + `zh:` hash (#801) |
 | Provider publish | — | Proxy-only (read) |
 
+**When the upstream does not answer** (#1230): metadata whose stored copy is past `metadata_ttl`
+is asked of the upstream once, for at most `revalidate_timeout`. When the upstream has not answered
+by then, has failed, or its circuit breaker is open, the stored copy is served with
+`X-Nora-Stale: true` and `Cache-Control: public, max-age=0, must-revalidate`, logged as a warning
+and counted in `nora_proxy_stale_served_total`. Terraform waits 10 s for each network mirror request
+(measured with Terraform 1.9.8), so the 5 s default keeps `terraform init` working on a warm cache
+while the upstream is down. Metadata with no stored copy waits the full `proxy_timeout`, is asked
+twice, and then answers 502 (503 with `Retry-After` while the breaker is open). A stored provider
+archive is served without asking the upstream.
+
+| Setting | Env | Default | Meaning |
+|---------|-----|---------|---------|
+| `proxy_timeout` | `NORA_TF_PROXY_TIMEOUT` | `30` | Seconds per upstream metadata request with no stored copy |
+| `metadata_ttl` | `NORA_TF_METADATA_TTL` | `300` | Seconds a stored copy is served without asking the upstream |
+| `serve_stale` | `NORA_TF_SERVE_STALE` | `true` | Serve the stored copy when the upstream fails |
+| `revalidate_timeout` | `NORA_TF_REVALIDATE_TIMEOUT` | `5` | Seconds to wait for the upstream when a stored copy is there to serve (`proxy_timeout`, if lower); must not be 0 |
+
 Client (network mirror — Terraform requires an `https:` URL, trailing slash):
 `provider_installation { network_mirror { url = "https://nora.example.com/terraform/" } }`
 

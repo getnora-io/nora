@@ -1114,6 +1114,15 @@ impl Config {
             }
         }
 
+        // 1b. A zero revalidation ceiling would time out every request that has a stored copy:
+        // the copy would be served stale forever and never refreshed (#1230).
+        if self.terraform.revalidate_timeout == 0 {
+            errors.push(
+                "terraform.revalidate_timeout must not be 0: a stored copy would never be refreshed"
+                    .to_string(),
+            );
+        }
+
         let keep_alive = self.server.keep_alive_timeout;
         if (1..=server::PROXY_IDLE_SECS).contains(&keep_alive) {
             warnings.push(format!(
@@ -2504,6 +2513,32 @@ proxies = [
     fn test_s3_default_url() {
         let config = Config::default();
         assert_eq!(config.storage.s3_url, "http://127.0.0.1:9000");
+    }
+
+    /// The Terraform revalidation ceiling: 5 s by default, below the 10 s Terraform waits for a
+    /// mirror request (#1230); `NORA_TF_REVALIDATE_TIMEOUT` sets it; a zero is refused, since every
+    /// request with a stored copy would time out at once and the copy never be refreshed.
+    #[test]
+    fn terraform_revalidate_timeout_default_env_and_zero() {
+        let _lock = env_lock();
+        let config = Config::default();
+        assert_eq!(config.terraform.revalidate_timeout, 5);
+        let mut config = Config::default();
+        std::env::set_var("NORA_TF_REVALIDATE_TIMEOUT", "3");
+        let applied = config.apply_env_overrides();
+        std::env::remove_var("NORA_TF_REVALIDATE_TIMEOUT");
+        applied.unwrap();
+        assert_eq!(config.terraform.revalidate_timeout, 3);
+        let (_, errors) = config.validate();
+        assert!(errors.is_empty(), "{errors:?}");
+        config.terraform.revalidate_timeout = 0;
+        let (_, errors) = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("terraform.revalidate_timeout")),
+            "{errors:?}"
+        );
     }
 
     #[test]

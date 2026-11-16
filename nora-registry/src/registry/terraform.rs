@@ -244,14 +244,15 @@ async fn provider_versions(
         ptype
     );
 
+    let (timeout, retry) = metadata_attempt(&state, cached_data.is_some());
     match proxy_fetch_text_with_retry(
         &state.http_client,
         &url,
-        Duration::from_secs(state.config.terraform.proxy_timeout),
+        timeout,
         expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Terraform,
-        retry_unless_stale(&state, cached_data.is_some()),
+        retry,
     )
     .await
     {
@@ -272,10 +273,9 @@ async fn provider_versions(
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(provider = format!("{}/{}", ns, ptype), error = ?e, "Terraform upstream error");
-            serve_stale_or_bad_gateway(&state, cached_data, "provider_versions", &e)
+            serve_stale_or_fail(&state, cached_data, "provider_versions", &e)
         }
     }
 }
@@ -364,14 +364,15 @@ async fn provider_download_meta(
         arch
     );
 
+    let (timeout, retry) = metadata_attempt(&state, cached_data.is_some());
     match proxy_fetch_text_with_retry(
         &state.http_client,
         &url,
-        Duration::from_secs(state.config.terraform.proxy_timeout),
+        timeout,
         expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Terraform,
-        retry_unless_stale(&state, cached_data.is_some()),
+        retry,
     )
     .await
     {
@@ -395,10 +396,9 @@ async fn provider_download_meta(
             with_json(strip_nora_internal_fields(rewritten.as_bytes()))
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform download metadata error");
-            serve_stale_or_bad_gateway(&state, cached_data, "provider_download_meta", &e)
+            serve_stale_or_fail(&state, cached_data, "provider_download_meta", &e)
         }
     }
 }
@@ -658,14 +658,15 @@ async fn module_versions(
         provider
     );
 
+    let (timeout, retry) = metadata_attempt(&state, cached_data.is_some());
     match proxy_fetch_text_with_retry(
         &state.http_client,
         &url,
-        Duration::from_secs(state.config.terraform.proxy_timeout),
+        timeout,
         expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Terraform,
-        retry_unless_stale(&state, cached_data.is_some()),
+        retry,
     )
     .await
     {
@@ -686,10 +687,9 @@ async fn module_versions(
             with_json(text.into_bytes())
         }
         Err(ProxyError::NotFound) => StatusCode::NOT_FOUND.into_response(),
-        Err(ProxyError::CircuitOpen(reg)) => circuit_open_response(&reg),
         Err(e) => {
             tracing::debug!(error = ?e, "Terraform module versions error");
-            serve_stale_or_bad_gateway(&state, cached_data, "module_versions", &e)
+            serve_stale_or_fail(&state, cached_data, "module_versions", &e)
         }
     }
 }
@@ -1272,14 +1272,15 @@ async fn mirror_fetch_versions(
         ns,
         ptype
     );
+    let (timeout, retry) = metadata_attempt(state, cached_data.is_some());
     match proxy_fetch_text_with_retry(
         &state.http_client,
         &url,
-        Duration::from_secs(state.config.terraform.proxy_timeout),
+        timeout,
         expose_opt(&state.config.terraform.proxy_auth).map(UpstreamAuth::Basic),
         &state.circuit_breaker,
         RegistryType::Terraform,
-        retry_unless_stale(state, cached_data.is_some()),
+        retry,
     )
     .await
     {
@@ -1289,10 +1290,10 @@ async fn mirror_fetch_versions(
             parse_json(text.as_bytes()).map(VersionList::current)
         }
         Err(ProxyError::NotFound) => Err(Box::new(StatusCode::NOT_FOUND.into_response())),
-        Err(ProxyError::CircuitOpen(reg)) => Err(Box::new(circuit_open_response(&reg))),
         Err(e) => {
             tracing::debug!(provider = format!("{}/{}", ns, ptype), error = ?e, "Terraform mirror versions upstream error");
-            // Serve stale parsed metadata if allowed, else 502.
+            // Serve stale parsed metadata if allowed — an open breaker included — else the
+            // failure: 503 for an open breaker, 502 otherwise.
             if let Some(ref data) = cached_data {
                 if state.config.terraform.serve_stale {
                     if let Ok(json) = serde_json::from_slice::<serde_json::Value>(data) {
@@ -1301,7 +1302,7 @@ async fn mirror_fetch_versions(
                     }
                 }
             }
-            Err(Box::new(StatusCode::BAD_GATEWAY.into_response()))
+            Err(Box::new(upstream_failure(&e)))
         }
     }
 }
@@ -1783,11 +1784,28 @@ fn with_json(data: Vec<u8>) -> Response {
         .into_response()
 }
 
-/// How often a metadata request whose upstream fails is sent: once when a stored copy is there to
-/// serve stale, since a second attempt would only hold that copy back by another timeout; twice
-/// when there is nothing to fall back to (#1230).
-fn retry_unless_stale(state: &AppState, cached: bool) -> Retry {
-    Retry::unless_fallback(cached && state.config.terraform.serve_stale)
+/// How a metadata request asks the upstream (#1230). With a stored copy to serve stale when the
+/// upstream fails: once, within `revalidate_timeout` (or `proxy_timeout`, if lower) — a second
+/// attempt or the full timeout would hold the copy back past the 10 s Terraform waits for an
+/// answer. With nothing to fall back to: the full `proxy_timeout`, retried once.
+fn metadata_attempt(state: &AppState, cached: bool) -> (Duration, Retry) {
+    let tf = &state.config.terraform;
+    let fallback = cached && tf.serve_stale;
+    let secs = if fallback {
+        tf.revalidate_timeout.min(tf.proxy_timeout)
+    } else {
+        tf.proxy_timeout
+    };
+    (Duration::from_secs(secs), Retry::unless_fallback(fallback))
+}
+
+/// The answer to a metadata request whose upstream failed with no stored copy to serve: the 503
+/// with `Retry-After` of an open breaker, else 502.
+fn upstream_failure(error: &ProxyError) -> Response {
+    match error {
+        ProxyError::CircuitOpen(reg) => circuit_open_response(reg),
+        _ => StatusCode::BAD_GATEWAY.into_response(),
+    }
 }
 
 /// A stored copy served because the upstream could not revalidate it: logged and counted (#1230).
@@ -1827,8 +1845,9 @@ fn with_stale_json(data: Vec<u8>) -> Response {
         .into_response()
 }
 
-/// Serve stale cached metadata when upstream is unreachable, or 502 if no cache.
-fn serve_stale_or_bad_gateway(
+/// Serve stale cached metadata when the upstream failed or its breaker is open (#1230), else the
+/// failure: [`upstream_failure`].
+fn serve_stale_or_fail(
     state: &AppState,
     cached: Option<Bytes>,
     endpoint: &str,
@@ -1840,7 +1859,7 @@ fn serve_stale_or_bad_gateway(
             return with_stale_json(data.to_vec());
         }
     }
-    StatusCode::BAD_GATEWAY.into_response()
+    upstream_failure(error)
 }
 
 fn with_binary(data: Vec<u8>) -> Response {
@@ -5346,7 +5365,7 @@ mod terraform_decides_once {
         "mirror_fetch_versions(",
         "mirror_fetch_archive(",
         "range_binary(",
-        "serve_stale_or_bad_gateway(",
+        "serve_stale_or_fail(",
         ".send()",
         "storage.get_verified(",
     ];
@@ -5697,12 +5716,24 @@ mod stale_copy_within_one_timeout {
         ttl: i64,
         serve_stale: bool,
     ) -> crate::test_helpers::TestContext {
-        let ctx = create_test_context_with_config(move |cfg| {
-            cfg.terraform.enabled = true;
-            cfg.terraform.proxy = Some(upstream);
+        warm_with(upstream, move |cfg| {
             cfg.terraform.proxy_timeout = TIMEOUT;
             cfg.terraform.metadata_ttl = ttl;
             cfg.terraform.serve_stale = serve_stale;
+        })
+        .await
+    }
+
+    /// A NORA asking `upstream` with `customize` over the default settings, holding a copy of
+    /// every path.
+    async fn warm_with(
+        upstream: String,
+        customize: impl FnOnce(&mut crate::config::Config),
+    ) -> crate::test_helpers::TestContext {
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.terraform.enabled = true;
+            cfg.terraform.proxy = Some(upstream);
+            customize(cfg);
         });
         for (key, body) in [
             (
@@ -5950,5 +5981,161 @@ mod stale_copy_within_one_timeout {
             0,
             "a stored file waited for the upstream"
         );
+    }
+
+    /// The warning's callsite registered before a capture starts (see the first test).
+    async fn prime_the_warning() {
+        let primer = warm("http://127.0.0.1:1".to_string(), 0, true).await;
+        for uri in PATHS {
+            send(&primer.app, Method::GET, uri, "").await;
+        }
+    }
+
+    /// An open breaker says the upstream is down without asking it: a stored copy is served at
+    /// once, marked stale like any other, logged and counted; the upstream is not asked.
+    #[tokio::test]
+    async fn an_open_breaker_serves_the_copy_at_once() {
+        prime_the_warning().await;
+        let mut wrong = Vec::new();
+        for uri in PATHS {
+            let (upstream, opened) = blackhole().await;
+            let ctx = warm_with(upstream, |cfg| {
+                cfg.terraform.proxy_timeout = TIMEOUT;
+                cfg.terraform.metadata_ttl = 0;
+                cfg.circuit_breaker.enabled = true;
+                cfg.circuit_breaker.reset_timeout = 3600;
+            })
+            .await;
+            ctx.state.circuit_breaker.open_for_test("terraform");
+            let (log, _capture) = LogCapture::start();
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            let status = resp.status();
+            let stale = header(&resp, "x-nora-stale").map(str::to_string);
+            let cache = header(&resp, "cache-control").map(str::to_string);
+            let asked = opened.load(Ordering::SeqCst);
+            let warned = log
+                .text()
+                .lines()
+                .any(|l| l.contains("WARN") && l.contains("stale") && l.contains("terraform"));
+            if status != StatusCode::OK
+                || stale.as_deref() != Some("true")
+                || cache.as_deref() != Some("public, max-age=0, must-revalidate")
+                || asked != 0
+                || !warned
+            {
+                wrong.push(format!(
+                    "{uri}: {status}, x-nora-stale {stale:?}, cache-control {cache:?}, \
+                     upstream asked {asked}x, warned {warned}"
+                ));
+                continue;
+            }
+            holds_the_copy(uri, &body_bytes(resp).await);
+        }
+        assert!(
+            wrong.is_empty(),
+            "behind an open breaker the stored copy must be served at once, marked stale:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// With no stored copy an open breaker is still the 503 with `Retry-After` it was.
+    #[tokio::test]
+    async fn an_open_breaker_without_a_copy_is_still_503() {
+        for uri in PATHS {
+            let (upstream, opened) = blackhole().await;
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.terraform.enabled = true;
+                cfg.terraform.proxy = Some(upstream);
+                cfg.terraform.proxy_timeout = TIMEOUT;
+                cfg.circuit_breaker.enabled = true;
+                cfg.circuit_breaker.reset_timeout = 3600;
+            });
+            ctx.state.circuit_breaker.open_for_test("terraform");
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            assert_eq!(header(&resp, "retry-after"), Some("30"), "{uri}");
+            assert!(resp.headers().get("x-nora-stale").is_none(), "{uri}");
+            assert_eq!(opened.load(Ordering::SeqCst), 0, "{uri}");
+        }
+    }
+
+    /// How long Terraform waits for one network mirror request, in seconds: measured with
+    /// Terraform 1.9.8 — an `index.json` answered after 9 s is taken, after 12 s the request is
+    /// abandoned and retried once (#1230).
+    const TERRAFORM_WAITS: u64 = 10;
+
+    /// The reporter's setup with every timeout at its default: an upstream that never answers
+    /// and an expired copy. The copy comes well before Terraform gives up, on every path at once.
+    #[tokio::test]
+    async fn with_default_timeouts_a_copy_comes_before_terraform_gives_up() {
+        let defaults = crate::config::TerraformConfig::default();
+        assert_eq!(defaults.proxy_timeout, 30, "the default this test is about");
+        let answers = futures::future::join_all(PATHS.iter().map(|uri| async move {
+            let (upstream, opened) = blackhole().await;
+            let ctx = warm_with(upstream, |cfg| cfg.terraform.metadata_ttl = 0).await;
+            let started = Instant::now();
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            let took = started.elapsed();
+            let stale = header(&resp, "x-nora-stale").map(str::to_string);
+            (
+                *uri,
+                resp.status(),
+                stale,
+                took,
+                opened.load(Ordering::SeqCst),
+            )
+        }))
+        .await;
+        let wrong: Vec<String> = answers
+            .iter()
+            .filter(|(_, status, stale, took, asked)| {
+                *status != StatusCode::OK
+                    || stale.as_deref() != Some("true")
+                    || *took >= Duration::from_secs(6)
+                    || *asked != 1
+            })
+            .map(|(uri, status, stale, took, asked)| {
+                format!("{uri}: {status}, x-nora-stale {stale:?}, after {took:.1?}, asked {asked}x")
+            })
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "with default timeouts a stored copy must come within 6 s, Terraform waits \
+             {TERRAFORM_WAITS} s:\n{}",
+            wrong.join("\n")
+        );
+    }
+
+    /// With no stored copy the short revalidation ceiling does not apply: each of the two
+    /// attempts waits the full proxy timeout before the 502.
+    #[tokio::test]
+    async fn without_a_copy_the_full_proxy_timeout_is_waited() {
+        const PROXY: u64 = 2;
+        let answers = futures::future::join_all(PATHS.iter().map(|uri| async move {
+            let (upstream, opened) = blackhole().await;
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.terraform.enabled = true;
+                cfg.terraform.proxy = Some(upstream);
+                cfg.terraform.proxy_timeout = PROXY;
+                cfg.terraform.revalidate_timeout = 1;
+            });
+            let started = Instant::now();
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            (
+                *uri,
+                resp.status(),
+                started.elapsed(),
+                opened.load(Ordering::SeqCst),
+            )
+        }))
+        .await;
+        for (uri, status, took, asked) in answers {
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{uri}");
+            assert_eq!(asked, 2, "{uri}");
+            assert!(
+                took >= Duration::from_secs(2 * PROXY),
+                "{uri}: gave up after {took:?}, the proxy timeout is {PROXY} s per attempt"
+            );
+        }
     }
 }
