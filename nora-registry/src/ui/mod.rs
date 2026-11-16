@@ -1484,6 +1484,665 @@ mod composer_pages {
 }
 
 #[cfg(test)]
+/// #1172: a UI page that lists stored files takes their size and time from the listing
+/// that names them. On an object store every `stat` is one HEAD request, sent one after
+/// another, so a page that stats each listed file costs a request per stored version.
+mod listing_cost_tests {
+    use super::api::{
+        get_cargo_detail, get_generic_detail, get_go_detail, get_go_dir_listing, get_npm_detail,
+        get_pypi_detail, get_raw_detail, get_raw_dir_listing, PackageDetail,
+    };
+    use crate::repo_index::RepoInfo;
+    use crate::storage::Storage;
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_storage, op_counting_storage, send,
+    };
+    use axum::http::{Method, StatusCode};
+    use serde_json::{json, Value};
+    use std::collections::BTreeMap;
+
+    /// Stored files of every page under test, `n` versions of each package: key and length.
+    /// Lengths differ per file, so a page that shows one file's size for another shows it.
+    fn layout(n: usize) -> Vec<(String, Vec<u8>)> {
+        let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        let sized = |key: String, len: usize| (key, vec![b'x'; len]);
+
+        // Go: one module with `n` cached versions and one more its list names but not cached,
+        // and two more modules for the namespace pages.
+        let mut list = String::new();
+        for k in 0..n {
+            list.push_str(&format!("v1.{k}.0\n"));
+            files.push(sized(
+                format!("go/github.com/acme/mod/@v/v1.{k}.0.zip"),
+                500 + k,
+            ));
+            files.push(sized(
+                format!("go/github.com/acme/mod/@v/v1.{k}.0.mod"),
+                10 + k,
+            ));
+        }
+        list.push_str("v2.0.0\n");
+        files.push((
+            "go/github.com/acme/mod/@v/list".to_string(),
+            list.into_bytes(),
+        ));
+        files.push(sized(
+            "go/github.com/acme/lib/@v/v0.1.0.zip".to_string(),
+            700,
+        ));
+        files.push(sized(
+            "go/golang.org/x/text/@v/v0.20.0.zip".to_string(),
+            900,
+        ));
+
+        // npm: a packument naming `n` versions with stored tarballs and one without, and a
+        // stored tarball the packument does not name.
+        let mut versions = serde_json::Map::new();
+        let mut time = serde_json::Map::new();
+        for k in 0..n {
+            let v = format!("1.0.{k}");
+            versions.insert(v.clone(), json!({"dist": {"unpackedSize": 5}}));
+            time.insert(v.clone(), json!("2026-01-02T03:04:05.000Z"));
+            files.push(sized(format!("npm/pkg/tarballs/pkg-{v}.tgz"), 2000 + k));
+        }
+        versions.insert("2.0.0".to_string(), json!({"dist": {"unpackedSize": 77}}));
+        time.insert("2.0.0".to_string(), json!("2026-03-04T05:06:07.000Z"));
+        files.push(sized("npm/pkg/tarballs/pkg-3.0.0.tgz".to_string(), 3000));
+        files.push((
+            "npm/pkg/metadata.json".to_string(),
+            serde_json::to_vec(&json!({"versions": versions, "time": time})).unwrap(),
+        ));
+
+        for k in 0..n {
+            files.push(sized(
+                format!("cargo/serde/1.0.{k}/serde-1.0.{k}.crate"),
+                3100 + k,
+            ));
+            files.push(sized(
+                format!("pypi/requests/requests-2.0.{k}.tar.gz"),
+                3200 + k,
+            ));
+            files.push(sized(format!("conan/zlib/1.{k}.0/_/_/revisions.json"), 30));
+            files.push(sized(
+                format!("conan/zlib/1.{k}.0/_/_/rrev/export/conanfile.py"),
+                3300 + k,
+            ));
+            files.push(sized(
+                format!("pub/packages/http/versions/1.0.{k}.tar.gz"),
+                3400 + k,
+            ));
+            files.push(sized(
+                format!("pub/packages/http/versions/1.0.{k}.tar.gz.sha256"),
+                64,
+            ));
+            files.push(sized(
+                format!("ansible/download/community-general-1.0.{k}.tar.gz"),
+                3500 + k,
+            ));
+            files.push(sized(format!("terraform/aws/5.0.{k}.zip"), 3600 + k));
+            files.push(sized(format!("raw/tools/file-{k}.bin"), 3700 + k));
+            files.push(sized(format!("raw/tools/sub/part-{k}.bin"), 3800 + k));
+        }
+        files.push(sized(
+            "ansible/download/community-other-0.1.0.tar.gz".to_string(),
+            3550,
+        ));
+        files
+    }
+
+    /// What one page shows: every listed entry with the size and time it shows.
+    fn detail_view(d: &PackageDetail) -> Value {
+        let versions: Vec<Value> = d
+            .versions
+            .iter()
+            .map(|v| json!([v.version, v.size, v.published, v.cached]))
+            .collect();
+        json!({"versions": versions, "prerelease": d.prerelease_count, "stable": d.total_stable})
+    }
+
+    fn dir_view(entries: &[RepoInfo]) -> Value {
+        let rows: Vec<Value> = entries
+            .iter()
+            .map(|e| json!([e.name, e.versions, e.size, e.updated, e.is_file]))
+            .collect();
+        Value::Array(rows)
+    }
+
+    /// How many pages [`page`] shows.
+    const PAGES: usize = 13;
+
+    /// Page `i` under test, by name, as it shows the stored files.
+    async fn page(storage: &Storage, i: usize) -> (&'static str, Value) {
+        let detail = |name, d: PackageDetail| (name, detail_view(&d));
+        let dir = |name, entries: Vec<RepoInfo>| (name, dir_view(&entries));
+        match i {
+            0 => dir("go dir /", get_go_dir_listing(storage, "").await.0),
+            1 => dir(
+                "go dir github.com",
+                get_go_dir_listing(storage, "github.com").await.0,
+            ),
+            2 => dir(
+                "go dir github.com/acme",
+                get_go_dir_listing(storage, "github.com/acme").await.0,
+            ),
+            3 => detail(
+                "go module",
+                get_go_detail(storage, "github.com/acme/mod", true, true).await,
+            ),
+            4 => detail("npm", get_npm_detail(storage, "pkg", true, true).await),
+            5 => detail(
+                "cargo",
+                get_cargo_detail(storage, "serde", true, true).await,
+            ),
+            6 => detail(
+                "pypi",
+                get_pypi_detail(storage, "requests", true, true).await,
+            ),
+            7 => detail(
+                "conan",
+                get_generic_detail(storage, "conan", "zlib", true, true).await,
+            ),
+            8 => detail(
+                "pub",
+                get_generic_detail(storage, "pub", "http", true, true).await,
+            ),
+            9 => detail(
+                "ansible",
+                get_generic_detail(storage, "ansible", "community.general", true, true).await,
+            ),
+            10 => detail(
+                "terraform (storage scan)",
+                get_generic_detail(storage, "terraform", "aws", true, true).await,
+            ),
+            11 => detail("raw detail", get_raw_detail(storage, "tools").await),
+            12 => dir("raw dir", get_raw_dir_listing(storage, "tools").await.0),
+            _ => panic!("no page {i}"),
+        }
+    }
+
+    /// Every page under test, by name, as it shows the stored files.
+    async fn pages(storage: &Storage) -> BTreeMap<&'static str, Value> {
+        let mut out = BTreeMap::new();
+        for i in 0..PAGES {
+            let (name, shown) = page(storage, i).await;
+            out.insert(name, shown);
+        }
+        out
+    }
+
+    /// The round-trips each page costs against an object store, by page.
+    async fn costs(n: usize) -> BTreeMap<&'static str, BTreeMap<&'static str, usize>> {
+        let (storage, ops) = op_counting_storage();
+        for (key, data) in layout(n) {
+            storage.put(&key, &data).await.unwrap();
+        }
+        let mut out = BTreeMap::new();
+        for i in 0..PAGES {
+            // One page at a time, so each count is that page's own.
+            ops.reset();
+            let (name, shown) = page(&storage, i).await;
+            assert_ne!(
+                shown,
+                json!({"versions": [], "prerelease": 0, "stable": 0}),
+                "{name}"
+            );
+            assert_ne!(shown, json!([]), "{name}");
+            out.insert(name, ops.snapshot());
+        }
+        out
+    }
+
+    /// #1172: what a page costs against an object store does not grow with the number of
+    /// stored versions: 3 versions and 40 cost the same round-trips, method by method. A
+    /// page that stats each listed file costs 37 more HEADs at 40.
+    #[tokio::test]
+    async fn a_listing_page_costs_the_same_requests_for_3_versions_and_for_40() {
+        let few = costs(3).await;
+        let many = costs(40).await;
+        let mut grew = Vec::new();
+        for (page, cost) in &many {
+            if few[page] != *cost {
+                grew.push(format!(
+                    "{page}: 3 versions {:?}, 40 versions {cost:?}",
+                    few[page]
+                ));
+            }
+        }
+        assert!(
+            grew.is_empty(),
+            "requests grow with versions:\n{}",
+            grew.join("\n")
+        );
+    }
+
+    /// #1172, the reported pages: the Go root, a namespace and a module's versions, through
+    /// the router, send no `stat` at all — the listing already carries size and time.
+    #[tokio::test]
+    async fn the_go_pages_send_no_stat_per_stored_file() {
+        let (storage, ops) = op_counting_storage();
+        for (key, data) in layout(40) {
+            storage.put(&key, &data).await.unwrap();
+        }
+        let ctx = create_test_context_with_storage(storage);
+        for uri in ["/ui/go", "/ui/go/github.com", "/ui/go/github.com/acme/mod"] {
+            ops.reset();
+            let resp = send(&ctx.app, Method::GET, uri, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+            let page = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+            let cost = ops.snapshot();
+            assert_eq!(cost.get("stat"), None, "{uri}: {cost:?}");
+            if uri.ends_with("/mod") {
+                // The page does show the stored versions, with their own sizes.
+                assert!(
+                    page.contains("v1.39.0") && page.contains("v2.0.0"),
+                    "{page}"
+                );
+                assert!(page.contains("539 B"), "{page}");
+            }
+        }
+    }
+
+    /// #1172: what the pages show — each entry's size and time, cached or not — on the
+    /// local store, whose file times the test sets. Times are set back from now by a
+    /// different number of hours per file, so a page that shows one file's time for another
+    /// shows a different "N hours ago". Recorded before the change, unchanged by it.
+    #[tokio::test]
+    async fn the_listing_pages_show_each_files_own_size_and_time() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let now = std::time::SystemTime::now();
+        // Per top-level directory, the next file is one hour older: at most 23 per directory
+        // keep the "N hours ago" form.
+        let mut per_registry: BTreeMap<String, u64> = BTreeMap::new();
+        for (key, data) in layout(3) {
+            storage.put(&key, &data).await.unwrap();
+            let registry = key.split('/').next().unwrap().to_string();
+            let slot = per_registry.entry(registry).or_insert(0);
+            *slot += 1;
+            assert!(*slot < 23, "{key}: too many files to tell apart by hour");
+            let age = std::time::Duration::from_secs(*slot * 3600 + 1800);
+            std::fs::File::options()
+                .write(true)
+                .open(dir.path().join(&key))
+                .unwrap()
+                .set_modified(now - age)
+                .unwrap();
+        }
+        let shown = pages(&storage).await;
+        insta::assert_json_snapshot!("ui_listing_pages", shown);
+    }
+
+    /// #1172: a folded entry (a Go namespace, a raw directory, a Conan version) is as recent
+    /// as its newest file wherever that file comes in the listing, and as large as all of
+    /// them. The newest file is listed between two older ones here: the first one seen and
+    /// the last one seen are both older.
+    #[tokio::test]
+    async fn a_folded_entry_is_as_recent_as_its_newest_file_wherever_it_is_listed() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let now = std::time::SystemTime::now();
+        let hours = |h: u64| now - std::time::Duration::from_secs(h * 3600 + 1800);
+        let groups = [
+            "go/example.com/m/@v/v1.",
+            "raw/t/sub/",
+            "conan/z/1.0.0/_/_/rrev/export/",
+        ];
+        for prefix in groups {
+            // Listed in this order; the middle one is the newest.
+            for (file, age, len) in [("0.zip", 5, 100), ("1.zip", 1, 20), ("2.zip", 3, 3)] {
+                let key = format!("{prefix}{file}");
+                storage.put(&key, &vec![b'x'; len]).await.unwrap();
+                std::fs::File::options()
+                    .write(true)
+                    .open(dir.path().join(&key))
+                    .unwrap()
+                    .set_modified(hours(age))
+                    .unwrap();
+            }
+        }
+        let go = get_go_dir_listing(&storage, "").await.0;
+        let raw = get_raw_dir_listing(&storage, "t").await.0;
+        let conan = get_generic_detail(&storage, "conan", "z", true, true).await;
+        let shown = json!({
+            "go": dir_view(&go),
+            "raw": dir_view(&raw),
+            "conan": detail_view(&conan),
+        });
+        assert_eq!(
+            shown,
+            json!({
+                "go": [["example.com", 3, 123, "1 hour ago", false]],
+                "raw": [["sub", 3, 123, "1 hour ago", false]],
+                "conan": {"versions": [["1.0.0", 123, "1 hour ago", true]], "prerelease": 0, "stable": 1},
+            })
+        );
+    }
+
+    /// Each version as its page shows it: version, size, time, cached.
+    fn rows(detail: &PackageDetail) -> Vec<(String, u64, String, bool)> {
+        detail
+            .versions
+            .iter()
+            .map(|v| (v.version.clone(), v.size, v.published.clone(), v.cached))
+            .collect()
+    }
+
+    fn row(version: &str, size: u64, published: &str, cached: bool) -> (String, u64, String, bool) {
+        (version.to_string(), size, published.to_string(), cached)
+    }
+
+    /// An in-memory object store, and a writer of objects under the key a NORA of 0.9.2 or
+    /// earlier gave them: `@` spelled `_at_`, the encoding #534 replaced and reads still
+    /// fall back to.
+    fn object_store_with_old_keys() -> (
+        Storage,
+        impl Fn(&'static str, &'static [u8]) -> futures::future::BoxFuture<'static, ()>,
+    ) {
+        use crate::storage::{ObjectStorage, StorageBackend};
+        use object_store::{path::Path, ObjectStoreExt, PutPayload};
+        use std::sync::Arc;
+
+        let backend = Arc::new(ObjectStorage::in_memory());
+        let storage = Storage::from_backend(Arc::clone(&backend) as Arc<dyn StorageBackend>);
+        let put_old = move |key: &'static str, data: &'static [u8]| {
+            let backend = Arc::clone(&backend);
+            let old = key.replace('@', "_at_");
+            Box::pin(async move {
+                backend
+                    .store()
+                    .put(&Path::from(old.as_str()), PutPayload::from_static(data))
+                    .await
+                    .unwrap();
+            }) as futures::future::BoxFuture<'static, ()>
+        };
+        (storage, put_old)
+    }
+
+    /// #1172: on an object store, a Go version stored by NORA 0.9.2 or earlier — under the
+    /// `_at_` key encoding #534 replaced, which reads still fall back to — shows as it did
+    /// with a stat per version: cached, with its archive's size and time; a version list
+    /// stored that way gives the time of the versions not cached. Where both forms hold a
+    /// file, the current one is shown, as a read finds it first.
+    #[tokio::test]
+    async fn a_go_version_stored_under_the_pre_534_key_encoding_shows_as_cached() {
+        let (storage, put_old) = object_store_with_old_keys();
+        put_old("go/example.com/m/@v/list", b"v1.0.0\nv1.1.0\nv2.0.0\n").await;
+        put_old("go/example.com/m/@v/v1.0.0.zip", b"legacy").await;
+        put_old("go/example.com/m/@v/v1.1.0.zip", &[b'o'; 99]).await;
+        storage
+            .put("go/example.com/m/@v/v1.1.0.zip", &[b'x'; 11])
+            .await
+            .unwrap();
+
+        let detail = get_go_detail(&storage, "example.com/m", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("v2.0.0", 0, "just now", false),
+                row("v1.1.0", 11, "just now", true),
+                row("v1.0.0", 6, "just now", true),
+            ]
+        );
+    }
+
+    /// Characters `object_store` percent-encodes in a part of a key (its `INVALID` set, less
+    /// `/` and the control characters storage keys refuse).
+    const ENCODED_BY_OBJECT_STORE: &[char] = &[
+        '\\', '{', '^', '}', '%', '`', ']', '"', '>', '[', '~', '<', '#', '|', '*', '?',
+    ];
+
+    /// Write `data` at `path` of the raw store, as `object_store` names it.
+    async fn put_raw(raw: &object_store::memory::InMemory, path: &str, data: &[u8]) {
+        use object_store::ObjectStoreExt;
+        raw.put(
+            &object_store::path::Path::from(path),
+            object_store::PutPayload::from(data.to_vec()),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// #1172: on S3, a Go module whose path holds a character `object_store` encodes shows its
+    /// versions as a stat per version did: the current file wins over one under the old key
+    /// form, and with no old one the current file still shows as cached with its size.
+    #[tokio::test]
+    async fn go_versions_under_keys_object_store_encodes_show_as_a_read_finds_them() {
+        let mut taken = Vec::new();
+        let mut wrong = Vec::new();
+        for &c in ENCODED_BY_OBJECT_STORE {
+            let (storage, raw, _) = crate::test_helpers::list_counting_storage("s3");
+            let both = format!("example.com/m{c}x");
+            let current_only = format!("example.com/n{c}x");
+            // A key storage refuses is not one a page can show.
+            if storage
+                .put(&format!("go/{both}/@v/list"), b"v1.0.0\n")
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            taken.push(c);
+            storage
+                .put(&format!("go/{both}/@v/v1.0.0.zip"), &[b'x'; 11])
+                .await
+                .unwrap();
+            put_raw(&raw, &format!("go/{both}/_at_v/v1.0.0.zip"), &[b'o'; 99]).await;
+            storage
+                .put(&format!("go/{current_only}/@v/list"), b"v1.0.0\n")
+                .await
+                .unwrap();
+            storage
+                .put(&format!("go/{current_only}/@v/v1.0.0.zip"), &[b'x'; 11])
+                .await
+                .unwrap();
+            for module in [&both, &current_only] {
+                let shown = rows(&get_go_detail(&storage, module, true, true).await);
+                if shown != [row("v1.0.0", 11, "just now", true)] {
+                    wrong.push(format!("{module}: {shown:?}"));
+                }
+            }
+        }
+        assert!(taken.contains(&'~'), "keys taken: {taken:?}");
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// #1172: the same on the npm versions page, for a scoped package whose name holds `~`.
+    #[tokio::test]
+    async fn an_npm_tarball_under_a_key_object_store_encodes_shows_as_a_read_finds_it() {
+        let (storage, raw, _) = crate::test_helpers::list_counting_storage("s3");
+        storage
+            .put("npm/@sc~pe/pkg/metadata.json", &npm_packument())
+            .await
+            .unwrap();
+        storage
+            .put("npm/@sc~pe/pkg/tarballs/pkg-1.1.0.tgz", &[b'x'; 11])
+            .await
+            .unwrap();
+        put_raw(
+            &raw,
+            "npm/_at_sc~pe/pkg/tarballs/pkg-1.1.0.tgz",
+            &[b'o'; 99],
+        )
+        .await;
+        storage
+            .put("npm/@sc~pe/pkg/tarballs/pkg-1.0.0.tgz", &[b'x'; 10])
+            .await
+            .unwrap();
+
+        let detail = get_npm_detail(&storage, "@sc~pe/pkg", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("2.0.0", 77, "2026-03-04", false),
+                row("1.1.0", 11, "2026-01-02", true),
+                row("1.0.0", 10, "2026-01-02", true),
+            ]
+        );
+    }
+
+    /// #1172: only the S3 backend wrote keys in the old `_at_` form (NORA 0.9.2 and earlier;
+    /// the GCS backend came in 1.0.1): a versions page on GCS lists the current form alone, on
+    /// S3 the old form too.
+    #[tokio::test]
+    async fn the_go_versions_page_lists_the_old_key_form_on_s3_only() {
+        for (backend, expected) in [("gcs", (1, 0)), ("s3", (2, 1))] {
+            let (storage, _, listings) = crate::test_helpers::list_counting_storage(backend);
+            storage
+                .put("go/example.com/m/@v/list", b"v1.0.0\n")
+                .await
+                .unwrap();
+            storage
+                .put("go/example.com/m/@v/v1.0.0.zip", &[b'x'; 11])
+                .await
+                .unwrap();
+            listings.reset();
+
+            let shown = rows(&get_go_detail(&storage, "example.com/m", true, true).await);
+            assert_eq!(shown, [row("v1.0.0", 11, "just now", true)], "{backend}");
+            assert_eq!(
+                listings.counts(),
+                expected,
+                "{backend}: listings, of them in the old form"
+            );
+        }
+    }
+
+    /// #1172: when only the listing of the older key form fails, the page asks per version,
+    /// as before #1172 — a stat finds either form — rather than show what it could not list
+    /// as not cached.
+    #[tokio::test]
+    async fn a_failed_listing_of_older_keys_falls_back_to_reading_each_go_version() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        storage
+            .put("go/example.com/m/@v/list", b"v1.0.0\nv1.1.0\nv2.0.0\n")
+            .await
+            .unwrap();
+        storage
+            .put("go/example.com/m/@v/v1.0.0.zip", &[b'x'; 10])
+            .await
+            .unwrap();
+        storage
+            .put("go/example.com/m/@v/v1.1.0.zip", &[b'x'; 11])
+            .await
+            .unwrap();
+        outage.fail_older_listings_of("go/example.com/m/@v/");
+
+        let detail = get_go_detail(&storage, "example.com/m", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("v2.0.0", 0, "just now", false),
+                row("v1.1.0", 11, "just now", true),
+                row("v1.0.0", 10, "just now", true),
+            ]
+        );
+    }
+
+    /// #1172: the same for a scoped npm package's tarball stored by NORA 0.9.2 or earlier.
+    #[tokio::test]
+    async fn a_scoped_npm_tarball_stored_under_the_pre_534_key_encoding_shows_as_cached() {
+        let (storage, put_old) = object_store_with_old_keys();
+        storage
+            .put("npm/@scope/pkg/metadata.json", &npm_packument())
+            .await
+            .unwrap();
+        put_old("npm/@scope/pkg/tarballs/pkg-1.0.0.tgz", b"legacy").await;
+        put_old("npm/@scope/pkg/tarballs/pkg-1.1.0.tgz", &[b'o'; 99]).await;
+        storage
+            .put("npm/@scope/pkg/tarballs/pkg-1.1.0.tgz", &[b'x'; 11])
+            .await
+            .unwrap();
+
+        let detail = get_npm_detail(&storage, "@scope/pkg", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("2.0.0", 77, "2026-03-04", false),
+                row("1.1.0", 11, "2026-01-02", true),
+                row("1.0.0", 6, "2026-01-02", true),
+            ]
+        );
+    }
+
+    /// A packument naming 1.0.0, 1.1.0 and 2.0.0.
+    fn npm_packument() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "versions": {
+                "1.0.0": {"dist": {"unpackedSize": 5}},
+                "1.1.0": {"dist": {"unpackedSize": 5}},
+                "2.0.0": {"dist": {"unpackedSize": 77}},
+            },
+            "time": {
+                "1.0.0": "2026-01-02T03:04:05.000Z",
+                "1.1.0": "2026-01-02T03:04:05.000Z",
+                "2.0.0": "2026-03-04T05:06:07.000Z",
+            },
+        }))
+        .unwrap()
+    }
+
+    /// #1172: a store whose listing of a module's `@v/` fails while its reads answer shows
+    /// the module's versions as a stat per version did — cached, with sizes and times — not
+    /// as "not cached": a failed listing is not an empty one.
+    #[tokio::test]
+    async fn a_failed_listing_does_not_show_the_go_versions_as_not_cached() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        storage
+            .put("go/example.com/m/@v/list", b"v1.0.0\nv1.1.0\nv2.0.0\n")
+            .await
+            .unwrap();
+        storage
+            .put("go/example.com/m/@v/v1.0.0.zip", &[b'x'; 10])
+            .await
+            .unwrap();
+        storage
+            .put("go/example.com/m/@v/v1.1.0.zip", &[b'x'; 11])
+            .await
+            .unwrap();
+        outage.fail_listings_of("go/example.com/m/@v/");
+
+        let detail = get_go_detail(&storage, "example.com/m", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("v2.0.0", 0, "just now", false),
+                row("v1.1.0", 11, "just now", true),
+                row("v1.0.0", 10, "just now", true),
+            ]
+        );
+    }
+
+    /// #1172: the same for an npm package whose listing of `tarballs/` fails.
+    #[tokio::test]
+    async fn a_failed_listing_does_not_show_the_npm_versions_as_not_cached() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        storage
+            .put("npm/pkg/metadata.json", &npm_packument())
+            .await
+            .unwrap();
+        storage
+            .put("npm/pkg/tarballs/pkg-1.0.0.tgz", &[b'x'; 10])
+            .await
+            .unwrap();
+        storage
+            .put("npm/pkg/tarballs/pkg-1.1.0.tgz", &[b'x'; 11])
+            .await
+            .unwrap();
+        outage.fail_listings_of("npm/pkg/tarballs/");
+
+        let detail = get_npm_detail(&storage, "pkg", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("2.0.0", 77, "2026-03-04", false),
+                row("1.1.0", 11, "2026-01-02", true),
+                row("1.0.0", 10, "2026-01-02", true),
+            ]
+        );
+    }
+}
+
+#[cfg(test)]
 mod maven_pages_from_index {
     use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
     use crate::test_helpers::{body_bytes, create_test_context_with_storage, send, TestContext};
@@ -2172,8 +2831,8 @@ mod mount_points {
             let json: serde_json::Value = serde_json::from_str(&body).unwrap();
             assert_eq!(
                 mount(&json, "npm")["proxy_upstreams"],
-                serde_json::json!(["https://registry.npmjs.org/"]),
-                "an address without credentials shows as the client reads it"
+                serde_json::json!(["https://registry.npmjs.org"]),
+                "an address without credentials shows as written"
             );
             assert_eq!(
                 mount(&json, "PyPI")["proxy_upstreams"],

@@ -77,6 +77,36 @@ pub fn start(dir: &std::path::Path, envs: &[(&str, &str)]) -> Started {
 
 /// [`start`] on `port`, once.
 pub fn start_on(dir: &std::path::Path, envs: &[(&str, &str)], port: u16) -> Started {
+    let mut nora = spawn_on(dir, envs, port);
+    match nora.until(|log| log.contains(STARTED)) {
+        Some(_) => Started::Serving(nora),
+        None => {
+            let (code, stderr) = nora.exited();
+            Started::Exited(code, stderr)
+        }
+    }
+}
+
+/// Runs `nora serve` that is expected to stop: its exit code and everything it wrote, stdout
+/// (the log) then stderr. Panics if it serves.
+#[allow(dead_code)]
+pub fn run_to_exit(dir: &std::path::Path, envs: &[(&str, &str)]) -> (Option<i32>, String) {
+    for _ in 0..5 {
+        let mut nora = spawn_on(dir, envs, free_port());
+        if nora.until(|log| log.contains(STARTED)).is_some() {
+            panic!("served; expected to stop");
+        }
+        let (code, stderr) = nora.exited();
+        if PORT_TAKEN.iter().all(|says| stderr.contains(says)) {
+            continue;
+        }
+        let stdout = nora.stdout.lock().unwrap().clone();
+        return (code, format!("{stdout}{stderr}"));
+    }
+    panic!("no free port in five tries")
+}
+
+fn spawn_on(dir: &std::path::Path, envs: &[(&str, &str)], port: u16) -> Nora {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nora"));
     command
         .arg("serve")
@@ -98,19 +128,12 @@ pub fn start_on(dir: &std::path::Path, envs: &[(&str, &str)], port: u16) -> Star
         collect(child.stdout.take().unwrap(), Arc::clone(&stdout)),
         collect(child.stderr.take().unwrap(), Arc::clone(&stderr)),
     ];
-    let mut nora = Nora {
+    Nora {
         child,
         port,
         stdout,
         stderr,
         readers,
-    };
-    match nora.until(|log| log.contains(STARTED)) {
-        Some(_) => Started::Serving(nora),
-        None => {
-            let (code, stderr) = nora.exited();
-            Started::Exited(code, stderr)
-        }
     }
 }
 

@@ -4512,7 +4512,11 @@ pub async fn fetch_manifest_from_upstream(
         request = request.header("Authorization", basic_auth_header(credentials));
     }
     let response = request.send().await.map_err(|e| {
-        tracing::error!(error = %e, url = %url, "Failed to send request to upstream");
+        tracing::error!(
+            error = %e,
+            url = %crate::url_userinfo::masked(&url),
+            "Failed to send request to upstream"
+        );
         cb.record_failure(&cb_key, probe);
         ProxyError::Network(e.to_string())
     })?;
