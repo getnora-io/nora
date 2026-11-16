@@ -10632,7 +10632,12 @@ mod own_links_follow_the_serving_instance {
 
     /// Packument of `pkg` as the server serves it: its versions, and each tarball link.
     async fn served_links(app: &axum::Router) -> Vec<(String, String)> {
-        let got = send(app, Method::GET, "/npm/pkg", "").await;
+        served_links_at(app, "/npm/pkg").await
+    }
+
+    /// The packument at `path` as the server serves it: its versions, and each tarball link.
+    async fn served_links_at(app: &axum::Router, path: &str) -> Vec<(String, String)> {
+        let got = send(app, Method::GET, path, "").await;
         assert_eq!(got.status(), StatusCode::OK);
         let doc: serde_json::Value = serde_json::from_slice(&body_bytes(got).await).unwrap();
         let mut out: Vec<(String, String)> = doc["versions"]
@@ -10789,6 +10794,116 @@ mod own_links_follow_the_serving_instance {
         let got = send(&server.app, Method::GET, "/npm/pkg/-/pkg-1.0.0.tgz", "").await;
         assert_eq!(got.status(), StatusCode::OK);
         assert_eq!(&body_bytes(got).await[..], b"tarball-bytes");
+    }
+
+    /// `npm.proxies` with two upstreams: the default one, and the one owning the `@two` scope.
+    fn two_upstreams(public: &str, private: &str) -> Vec<crate::config::NpmProxyEntry> {
+        toml::from_str::<crate::config::NpmConfig>(&format!(
+            r#"proxies = ["{public}", {{ url = "{private}", scopes = ["@two"] }}]"#
+        ))
+        .unwrap()
+        .proxies
+    }
+
+    /// Serves `name` at `up`: its packument with a 1.0.0 tarball at `up`'s own address, and that
+    /// tarball.
+    async fn serve_package(up: &MockServer, name: &str) {
+        let short = name.rsplit('/').next().unwrap();
+        let base = up.uri();
+        let doc = serde_json::to_vec(&serde_json::json!({
+            "name": name,
+            "versions": { "1.0.0": { "name": name, "version": "1.0.0",
+                "dist": { "tarball": format!("{base}/{name}/-/{short}-1.0.0.tgz") } } },
+            "dist-tags": { "latest": "1.0.0" },
+        }))
+        .unwrap();
+        let packument = format!("/{name}");
+        Mock::given(method("GET"))
+            .and(path(packument.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(doc))
+            .mount(up)
+            .await;
+        let tarball = format!("/{name}/-/{short}-1.0.0.tgz");
+        Mock::given(method("GET"))
+            .and(path(tarball.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"tarball-bytes".to_vec()))
+            .mount(up)
+            .await;
+    }
+
+    /// Two upstreams, as `npm.proxies` routes them: `pkg` comes from the default one, `@two/pkg`
+    /// from the one owning `@two`. Once the store is at another address and both upstreams are
+    /// down, each package's held tarball moves to that address the same way (#1180): what decides
+    /// it is the store, not which upstream the packument came from.
+    #[tokio::test]
+    async fn a_held_tarball_moves_the_same_whichever_upstream_its_packument_came_from() {
+        let public = MockServer::start().await;
+        let private = MockServer::start().await;
+        serve_package(&public, "pkg").await;
+        serve_package(&private, "@two/pkg").await;
+        let (public_uri, private_uri) = (public.uri(), private.uri());
+        let writer = create_test_context_with_config({
+            let proxies = two_upstreams(&public_uri, &private_uri);
+            move |cfg| {
+                cfg.server.public_url = Some(WRITER.to_string());
+                cfg.npm.proxies = proxies;
+            }
+        });
+        for path in ["/npm/pkg", "/npm/@two/pkg"] {
+            assert_eq!(
+                send(&writer.app, Method::GET, path, "").await.status(),
+                StatusCode::OK
+            );
+        }
+        for name in ["pkg", "@two/pkg"] {
+            wait_until_stored(
+                &writer.state.storage,
+                &super::origin_key(&super::upstream_packument_key(name)),
+            )
+            .await;
+        }
+        for path in ["/npm/pkg/-/pkg-1.0.0.tgz", "/npm/@two/pkg/-/pkg-1.0.0.tgz"] {
+            assert_eq!(
+                send(&writer.app, Method::GET, path, "").await.status(),
+                StatusCode::OK
+            );
+        }
+        for key in [
+            "npm/pkg/tarballs/pkg-1.0.0.tgz",
+            "npm/@two/pkg/tarballs/pkg-1.0.0.tgz",
+        ] {
+            wait_until_stored(&writer.state.storage, key).await;
+        }
+
+        for up in [&public, &private] {
+            up.reset().await;
+            for name in ["/pkg", "/@two/pkg"] {
+                Mock::given(method("GET"))
+                    .and(path(name))
+                    .respond_with(ResponseTemplate::new(503))
+                    .mount(up)
+                    .await;
+            }
+        }
+        let server =
+            create_test_context_with_storage_and_config(writer.state.storage.clone(), move |cfg| {
+                cfg.server.public_url = Some(SERVER.to_string());
+                cfg.npm.proxies = two_upstreams(&public_uri, &private_uri);
+            });
+        assert_eq!(
+            served_links_at(&server.app, "/npm/pkg").await,
+            vec![(
+                "1.0.0".to_string(),
+                format!("{SERVER}/npm/pkg/-/pkg-1.0.0.tgz")
+            )]
+        );
+        assert_eq!(
+            served_links_at(&server.app, "/npm/@two/pkg").await,
+            vec![(
+                "1.0.0".to_string(),
+                format!("{SERVER}/npm/@two/pkg/-/pkg-1.0.0.tgz")
+            )]
+        );
     }
 }
 
