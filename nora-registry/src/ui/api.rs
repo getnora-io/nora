@@ -167,7 +167,10 @@ pub struct RegistryCardStats {
 pub struct MountPoint {
     pub registry: String,
     pub mount_path: String,
+    /// The upstream addresses, for a caller NORA knows; credentials an address carries are cut.
     pub proxy_upstreams: Vec<String>,
+    /// The registry has upstreams the caller is not shown: `proxy_upstreams` is empty for them.
+    pub proxy_hidden: bool,
 }
 
 // ============ API Handlers ============
@@ -210,10 +213,27 @@ pub async fn api_dashboard(
     Json(build_dashboard_response(&state, authenticated).await)
 }
 
+/// The upstream address `url` as the dashboard shows it: read by the parser the proxy client
+/// sends with (`reqwest::Url`), so every spelling it accepts (`https:///u:p@host`, a
+/// backslash for a slash) is judged as it is sent, then shown without its credentials. `None`
+/// for an address that is not an `http(s)` URL with a host: it is not shown at all, since
+/// whatever it carries cannot be told apart.
+fn shown_address(url: &str) -> Option<String> {
+    let mut parsed = reqwest::Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return None;
+    }
+    parsed.set_username("").ok()?;
+    parsed.set_password(None).ok()?;
+    Some(parsed.to_string())
+}
+
 /// Build the dashboard JSON payload.
 ///
 /// When `authenticated` is false, `proxy_upstreams` is redacted (empty vec)
-/// to avoid leaking upstream registry topology to anonymous callers.
+/// to avoid leaking upstream registry topology to anonymous callers, and
+/// `proxy_hidden` says a registry has upstreams. When it is true, each address
+/// shows without the credentials it may carry.
 pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> DashboardResponse {
     let mut total_storage: u64 = 0;
     let mut total_artifacts: usize = 0;
@@ -241,67 +261,85 @@ pub async fn build_dashboard_response(state: &AppState, authenticated: bool) -> 
             size_bytes: size,
         });
 
+        let configured: Vec<String> = match reg {
+            RegistryType::Docker => state
+                .config
+                .docker
+                .upstreams
+                .iter()
+                .map(|u| u.url.clone())
+                .collect(),
+            RegistryType::Maven => state
+                .config
+                .maven
+                .proxies
+                .iter()
+                .map(|p| p.url().to_string())
+                .collect(),
+            RegistryType::Npm => state
+                .config
+                .npm
+                .upstream_urls()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+            RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
+            RegistryType::PyPI => state
+                .config
+                .pypi
+                .upstreams()
+                .iter()
+                .map(|u| u.url().to_string())
+                .collect(),
+            RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
+            RegistryType::Raw => vec![],
+            RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
+            RegistryType::Terraform => state.config.terraform.proxy.clone().into_iter().collect(),
+            RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
+            RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
+            RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
+            RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
+            RegistryType::Rpm => state
+                .config
+                .rpm
+                .proxies
+                .values()
+                .map(|p| p.url().to_string())
+                .collect(),
+            RegistryType::Deb => state
+                .config
+                .deb
+                .proxies
+                .values()
+                .map(|p| p.url().to_string())
+                .collect(),
+            RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
+            RegistryType::Composer => state
+                .config
+                .composer
+                .upstreams()
+                .iter()
+                .map(|u| u.url().to_string())
+                .collect(),
+            RegistryType::HuggingFace => state.config.hf.proxy.clone().into_iter().collect(),
+        };
+        // A caller NORA does not know sees no address; a known one sees each address the
+        // client parser reads, and an address it cannot read stays hidden.
         let proxy_upstreams: Vec<String> = if authenticated {
-            match reg {
-                RegistryType::Docker => state
-                    .config
-                    .docker
-                    .upstreams
-                    .iter()
-                    .map(|u| u.url.clone())
-                    .collect(),
-                RegistryType::Maven => state
-                    .config
-                    .maven
-                    .proxies
-                    .iter()
-                    .map(|p| p.url().to_string())
-                    .collect(),
-                RegistryType::Npm => state
-                    .config
-                    .npm
-                    .upstream_urls()
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                RegistryType::Cargo => state.config.cargo.proxy.clone().into_iter().collect(),
-                RegistryType::PyPI => state
-                    .config
-                    .pypi
-                    .upstreams()
-                    .iter()
-                    .map(|u| u.url().to_string())
-                    .collect(),
-                RegistryType::Go => state.config.go.proxy.clone().into_iter().collect(),
-                RegistryType::Raw => vec![],
-                RegistryType::Gems => state.config.gems.proxy.clone().into_iter().collect(),
-                RegistryType::Terraform => {
-                    state.config.terraform.proxy.clone().into_iter().collect()
-                }
-                RegistryType::Ansible => state.config.ansible.proxy.clone().into_iter().collect(),
-                RegistryType::Nuget => state.config.nuget.proxy.clone().into_iter().collect(),
-                RegistryType::PubDart => state.config.pub_dart.proxy.clone().into_iter().collect(),
-                RegistryType::Conan => state.config.conan.proxy.clone().into_iter().collect(),
-                RegistryType::Rpm => vec![],
-                RegistryType::Deb => vec![],
-                RegistryType::Cpan => state.config.cpan.proxy.clone().into_iter().collect(),
-                RegistryType::Composer => state
-                    .config
-                    .composer
-                    .upstreams()
-                    .iter()
-                    .map(|u| u.url().to_string())
-                    .collect(),
-                RegistryType::HuggingFace => state.config.hf.proxy.clone().into_iter().collect(),
-            }
+            configured
+                .iter()
+                .filter_map(|url| shown_address(url))
+                .collect()
         } else {
             vec![]
         };
+        let proxy_hidden = proxy_upstreams.len() < configured.len();
 
         mount_points.push(MountPoint {
             registry: reg.display_name().to_string(),
             mount_path: reg.mount_point().to_string(),
             proxy_upstreams,
+            proxy_hidden,
         });
     }
 
@@ -2476,5 +2514,73 @@ mod registry_stats_cover_every_registry {
             .map(|rt| rt.as_str().to_string())
             .collect();
         assert_eq!(keys, names);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod userinfo_tests {
+    use super::shown_address;
+
+    /// Every spelling of an address is judged by the parser the proxy client sends with: what
+    /// the dashboard shows has the host, port, path and query of the request reqwest builds
+    /// from the configured address, and none of the credentials that request carries.
+    #[test]
+    fn an_address_shows_as_the_client_reads_it_without_its_credentials() {
+        let forms = [
+            "https://ci-bot:s3cr3t@mirror.example/simple",
+            "https:///ci-bot:s3cr3t@mirror.example/simple",
+            "https:/ci-bot:s3cr3t@mirror.example/simple",
+            "https://ci-bot@mirror.example/simple",
+            "https://ci%40bot:s3%40cr3t@mirror.example/simple",
+            "https://ci-bot:s3@cr3t@mirror.example/x",
+            "https://ci-bot:s3cr3t@[2001:db8::1]:8443/simple",
+            "https://ci-bot:s3cr3t@mirror.example:8443/simple",
+            "https://mirror.example\\@scope/pkg",
+            "https://mirror.example/@scope/pkg",
+            "https://mirror.example/simple?ref=a@b",
+            "https://mirror.example/simple#a@b",
+            "https://registry.npmjs.org",
+        ];
+        let client = reqwest::Client::new();
+        for form in forms {
+            let sent = client.get(form).build().unwrap();
+            let shown = shown_address(form).unwrap_or_else(|| panic!("{form} parses"));
+            let shown_url = reqwest::Url::parse(&shown).unwrap();
+            let sent_url = sent.url();
+            assert_eq!(shown_url.host_str(), sent_url.host_str(), "{form}: host");
+            assert_eq!(
+                shown_url.port_or_known_default(),
+                sent_url.port_or_known_default(),
+                "{form}"
+            );
+            assert_eq!(shown_url.path(), sent_url.path(), "{form}: path");
+            assert_eq!(shown_url.query(), sent_url.query(), "{form}: query");
+            assert_eq!(shown_url.username(), "", "{form}: no user");
+            assert_eq!(shown_url.password(), None, "{form}: no password");
+            for secret in [
+                "ci-bot",
+                "ci%40bot",
+                "ci@bot",
+                "s3cr3t",
+                "s3%40cr3t",
+                "cr3t",
+            ] {
+                assert!(!shown.contains(secret), "{form} shows {secret}: {shown}");
+            }
+        }
+    }
+
+    /// An address the client cannot parse is not shown at all, rather than as written.
+    #[test]
+    fn an_address_that_does_not_parse_is_not_shown() {
+        for form in [
+            "ci-bot:s3cr3t@mirror.example/simple",
+            "ftp://ci-bot:s3cr3t@mirror.example/simple",
+            "not an address",
+            "",
+        ] {
+            assert_eq!(shown_address(form), None, "{form}");
+        }
     }
 }

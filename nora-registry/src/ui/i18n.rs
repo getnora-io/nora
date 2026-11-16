@@ -75,6 +75,10 @@ pub struct Translations {
     pub registry: &'static str,
     pub mount_path: &'static str,
     pub proxy_upstream: &'static str,
+    /// The upstreams are not shown to this caller; signing in shows them.
+    pub proxy_hidden_sign_in: &'static str,
+    /// The upstreams are not shown, on an instance without sign-in.
+    pub proxy_hidden: &'static str,
 
     // Activity
     pub recent_activity: &'static str,
@@ -196,6 +200,8 @@ pub static TRANSLATIONS_EN: Translations = Translations {
     registry: "Registry",
     mount_path: "Mount Path",
     proxy_upstream: "Proxy Upstream",
+    proxy_hidden_sign_in: "Hidden — sign in to see",
+    proxy_hidden: "Hidden",
 
     // Activity
     recent_activity: "Recent Activity",
@@ -309,6 +315,8 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     registry: "Реестр",
     mount_path: "Путь",
     proxy_upstream: "Прокси",
+    proxy_hidden_sign_in: "Скрыто — войдите, чтобы увидеть",
+    proxy_hidden: "Скрыто",
 
     // Activity
     recent_activity: "Последняя активность",
@@ -422,6 +430,8 @@ pub static TRANSLATIONS_ZH: Translations = Translations {
     registry: "注册表",
     mount_path: "挂载路径",
     proxy_upstream: "代理上游",
+    proxy_hidden_sign_in: "已隐藏 — 登录后可见",
+    proxy_hidden: "已隐藏",
 
     // Activity
     recent_activity: "最近活动",

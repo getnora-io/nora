@@ -257,7 +257,9 @@ async fn dashboard(
     let auth_enabled = state.auth.is_some();
     let authenticated = user.map(|Extension(u)| u.0 != "anonymous").unwrap_or(false);
     let response = build_dashboard_response(&state, authenticated).await;
-    Html(render_dashboard(&response, lang, auth_enabled))
+    // Offer sign-in only to a caller who can sign in and has not.
+    let can_sign_in = auth_enabled && !authenticated;
+    Html(render_dashboard(&response, lang, auth_enabled, can_sign_in))
 }
 
 // Docker pages
@@ -1929,6 +1931,281 @@ mod maven_pages_from_index {
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
+        }
+    }
+}
+
+/// The dashboard's mount points: who sees which upstream addresses. A caller NORA does not know
+/// sees that a registry has upstreams, not where they are; a signed-in caller sees the addresses,
+/// never the credentials an address may carry.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod mount_points {
+    use crate::config::{EnableSpec, RegistriesSection};
+    use crate::registry_type::RegistryType;
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_anonymous_read_and_config,
+        create_test_context_with_config, send, send_with_headers, TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+
+    const SECRET_MIRROR: &str = "https://ci-bot:s3cr3t-token@pypi.mirror.example/simple";
+
+    fn configure(c: &mut crate::config::Config) {
+        c.npm.proxy = Some("https://registry.npmjs.org".into());
+        c.pypi.proxy = Some(SECRET_MIRROR.into());
+        // Not an address the client can read: shown to nobody.
+        c.cpan.enabled = true;
+        c.cpan.proxy = Some("ci-bot:s3cr3t-token@cpan.mirror.example".into());
+    }
+
+    async fn get(ctx: &TestContext, uri: &str, auth: Option<&str>) -> String {
+        let resp = match auth {
+            Some(value) => {
+                send_with_headers(
+                    &ctx.app,
+                    Method::GET,
+                    uri,
+                    vec![("authorization", value)],
+                    "",
+                )
+                .await
+            }
+            None => send(&ctx.app, Method::GET, uri, "").await,
+        };
+        assert_eq!(resp.status(), StatusCode::OK, "{uri}");
+        String::from_utf8_lossy(&body_bytes(resp).await).into_owned()
+    }
+
+    fn mount<'a>(json: &'a serde_json::Value, registry: &str) -> &'a serde_json::Value {
+        json["mount_points"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["registry"].as_str() == Some(registry))
+            .unwrap_or_else(|| panic!("{registry} mount"))
+    }
+
+    fn bearer(ctx: &TestContext, role: crate::tokens::Role) -> String {
+        let token = ctx
+            .state
+            .tokens
+            .as_ref()
+            .unwrap()
+            .create_token("admin", 30, None, role)
+            .unwrap();
+        format!("Bearer {token}")
+    }
+
+    /// The table row of `registry` on the dashboard page.
+    fn row<'a>(html: &'a str, registry: &str) -> &'a str {
+        let cell = format!(r#"<td class="px-4 py-3 text-slate-300">{registry}</td>"#);
+        let start = html.find(&cell).unwrap_or_else(|| panic!("{registry} row"));
+        let rest = &html[start..];
+        &rest[..rest.find("</tr>").unwrap()]
+    }
+
+    /// An anonymous caller on an instance with sign-in: the registries with upstreams say the
+    /// addresses are hidden until sign-in, the ones without say nothing, and no address shows.
+    #[tokio::test]
+    async fn an_anonymous_caller_is_told_the_upstreams_are_hidden() {
+        let ctx =
+            create_test_context_with_anonymous_read_and_config(&[("admin", "secret")], configure);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&get(&ctx, "/api/ui/dashboard", None).await).unwrap();
+        for registry in ["npm", "PyPI"] {
+            let m = mount(&json, registry);
+            assert_eq!(m["proxy_upstreams"], serde_json::json!([]), "{registry}");
+            assert_eq!(m["proxy_hidden"], true, "{registry} has hidden upstreams");
+        }
+        assert_eq!(mount(&json, "Raw")["proxy_hidden"], false, "raw has none");
+
+        let html = get(&ctx, "/ui/", None).await;
+        assert!(row(&html, "npm").contains("sign in"), "npm row says why");
+        assert!(row(&html, "PyPI").contains("sign in"), "PyPI row says why");
+        assert!(row(&html, "Raw").contains(">-<"), "raw row has no upstream");
+        assert!(!html.contains("registry.npmjs.org"), "no address");
+        assert!(!html.contains("pypi.mirror.example"), "no address");
+    }
+
+    /// Without sign-in on the instance nobody is known: the upstreams are hidden, and the page does
+    /// not send the reader to a sign-in that does not exist.
+    #[tokio::test]
+    async fn without_auth_the_upstreams_are_hidden_with_no_sign_in_to_offer() {
+        let ctx = create_test_context_with_config(configure);
+
+        let json: serde_json::Value =
+            serde_json::from_str(&get(&ctx, "/api/ui/dashboard", None).await).unwrap();
+        assert_eq!(mount(&json, "npm")["proxy_hidden"], true);
+        assert_eq!(
+            mount(&json, "npm")["proxy_upstreams"],
+            serde_json::json!([])
+        );
+
+        let html = get(&ctx, "/ui/", None).await;
+        let npm = row(&html, "npm");
+        assert!(
+            npm.contains("Hidden"),
+            "npm row says the upstreams are hidden"
+        );
+        assert!(!npm.contains("sign in"), "no sign-in to offer");
+        assert!(!html.contains("registry.npmjs.org"), "no address");
+    }
+
+    /// Point `reg`'s upstream at `url`; `false` for a format with no upstream. The match is
+    /// exhaustive, so a new format has to say here how it proxies.
+    fn give_upstream(c: &mut crate::config::Config, reg: RegistryType, url: &str) -> bool {
+        use crate::config::{DockerUpstream, MavenProxyEntry, RepoProxyEntry};
+        let url = url.to_string();
+        match reg {
+            RegistryType::Docker => {
+                c.docker.upstreams = vec![DockerUpstream {
+                    url,
+                    auth: None,
+                    namespace: None,
+                    prefix: None,
+                    namespaces: Vec::new(),
+                }]
+            }
+            RegistryType::Maven => c.maven.proxies = vec![MavenProxyEntry::Simple(url)],
+            RegistryType::Npm => c.npm.proxy = Some(url),
+            RegistryType::Cargo => c.cargo.proxy = Some(url),
+            RegistryType::PyPI => c.pypi.proxy = Some(url),
+            RegistryType::Go => c.go.proxy = Some(url),
+            RegistryType::Raw => return false,
+            RegistryType::Gems => c.gems.proxy = Some(url),
+            RegistryType::Terraform => c.terraform.proxy = Some(url),
+            RegistryType::Ansible => c.ansible.proxy = Some(url),
+            RegistryType::Nuget => c.nuget.proxy = Some(url),
+            RegistryType::PubDart => c.pub_dart.proxy = Some(url),
+            RegistryType::Conan => c.conan.proxy = Some(url),
+            RegistryType::Rpm => {
+                c.rpm
+                    .proxies
+                    .insert("fedora".into(), RepoProxyEntry::Simple(url));
+            }
+            RegistryType::Deb => {
+                c.deb
+                    .proxies
+                    .insert("debian".into(), RepoProxyEntry::Simple(url));
+            }
+            RegistryType::Cpan => c.cpan.proxy = Some(url),
+            RegistryType::Composer => c.composer.proxy = Some(url),
+            RegistryType::HuggingFace => c.hf.proxy = Some(url),
+        }
+        true
+    }
+
+    /// Each format alone, with an upstream where it has one: without authentication the
+    /// dashboard says the upstream is hidden; signed in, the address shows, credentials cut.
+    #[tokio::test]
+    async fn every_format_with_an_upstream_reports_it() {
+        for reg in RegistryType::all().iter().copied() {
+            let url = format!("https://ci-bot:s3cr3t@up-{}.example/x", reg.as_str());
+            let mut proxies = false;
+            let only = vec![reg.as_str().to_string()];
+            let open = create_test_context_with_config(|c| {
+                c.registries = Some(RegistriesSection {
+                    enable: Some(EnableSpec::List(only.clone())),
+                });
+                proxies = give_upstream(c, reg, &url);
+            });
+            let json: serde_json::Value =
+                serde_json::from_str(&get(&open, "/api/ui/dashboard", None).await).unwrap();
+            let m = mount(&json, reg.display_name());
+            assert_eq!(
+                m["proxy_hidden"],
+                proxies,
+                "{}: hidden without auth",
+                reg.as_str()
+            );
+            assert_eq!(
+                m["proxy_upstreams"],
+                serde_json::json!([]),
+                "{}",
+                reg.as_str()
+            );
+
+            let signed =
+                create_test_context_with_anonymous_read_and_config(&[("admin", "secret")], |c| {
+                    c.registries = Some(RegistriesSection {
+                        enable: Some(EnableSpec::List(only.clone())),
+                    });
+                    give_upstream(c, reg, &url);
+                });
+            let auth = bearer(&signed, crate::tokens::Role::Read);
+            let body = get(&signed, "/api/ui/dashboard", Some(&auth)).await;
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            let m = mount(&json, reg.display_name());
+            assert_eq!(
+                m["proxy_hidden"],
+                false,
+                "{}: shown signed in",
+                reg.as_str()
+            );
+            let host = format!("up-{}.example", reg.as_str());
+            assert_eq!(
+                m["proxy_upstreams"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|u| u.as_str().unwrap().contains(&host)),
+                proxies,
+                "{}: the address shows",
+                reg.as_str()
+            );
+            assert!(!body.contains("s3cr3t"), "{}: {body}", reg.as_str());
+        }
+    }
+
+    /// A signed-in caller, a read-only one included, sees the addresses, and an address that
+    /// carries credentials shows without them.
+    #[tokio::test]
+    async fn a_signed_in_caller_sees_addresses_without_their_credentials() {
+        let ctx =
+            create_test_context_with_anonymous_read_and_config(&[("admin", "secret")], configure);
+
+        for role in [crate::tokens::Role::Read, crate::tokens::Role::Admin] {
+            let auth = bearer(&ctx, role);
+            let body = get(&ctx, "/api/ui/dashboard", Some(&auth)).await;
+            let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                mount(&json, "npm")["proxy_upstreams"],
+                serde_json::json!(["https://registry.npmjs.org/"]),
+                "an address without credentials shows as the client reads it"
+            );
+            assert_eq!(
+                mount(&json, "PyPI")["proxy_upstreams"],
+                serde_json::json!(["https://pypi.mirror.example/simple"]),
+                "the credentials are cut from the address"
+            );
+            assert_eq!(mount(&json, "npm")["proxy_hidden"], false);
+            assert!(
+                !body.contains("s3cr3t-token") && !body.contains("ci-bot"),
+                "{body}"
+            );
+
+            let cpan = mount(&json, "CPAN");
+            assert_eq!(
+                cpan["proxy_upstreams"],
+                serde_json::json!([]),
+                "unreadable: not shown"
+            );
+            assert_eq!(cpan["proxy_hidden"], true, "unreadable: said to be hidden");
+
+            let html = get(&ctx, "/ui/", Some(&auth)).await;
+            assert!(
+                html.contains("pypi.mirror.example/simple"),
+                "the address shows"
+            );
+            let cpan_row = row(&html, "CPAN");
+            assert!(cpan_row.contains("Hidden"), "CPAN row: hidden");
+            assert!(
+                !cpan_row.contains("sign in"),
+                "signing in again shows nothing more"
+            );
+            assert!(!html.contains("s3cr3t-token") && !html.contains("ci-bot"));
         }
     }
 }
