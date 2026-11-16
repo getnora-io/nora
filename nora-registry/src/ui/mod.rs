@@ -1818,45 +1818,205 @@ mod listing_cost_tests {
         );
     }
 
-    /// #1172, the one difference: on an object store, a Go version stored by NORA 0.9.2 or
-    /// earlier — under the `_at_` key encoding #534 replaced — is not in the listing of the
-    /// module's `@v/` prefix, so its versions page shows it as not cached, where a stat per
-    /// version found it through the read fallback. It is still read (and so served).
-    #[tokio::test]
-    async fn a_go_version_stored_under_the_pre_534_key_encoding_shows_as_not_cached() {
+    /// Each version as its page shows it: version, size, time, cached.
+    fn rows(detail: &PackageDetail) -> Vec<(String, u64, String, bool)> {
+        detail
+            .versions
+            .iter()
+            .map(|v| (v.version.clone(), v.size, v.published.clone(), v.cached))
+            .collect()
+    }
+
+    fn row(version: &str, size: u64, published: &str, cached: bool) -> (String, u64, String, bool) {
+        (version.to_string(), size, published.to_string(), cached)
+    }
+
+    /// An in-memory object store, and a writer of objects under the key a NORA of 0.9.2 or
+    /// earlier gave them: `@` spelled `_at_`, the encoding #534 replaced and reads still
+    /// fall back to.
+    fn object_store_with_old_keys() -> (
+        Storage,
+        impl Fn(&'static str, &'static [u8]) -> futures::future::BoxFuture<'static, ()>,
+    ) {
         use crate::storage::{ObjectStorage, StorageBackend};
         use object_store::{path::Path, ObjectStoreExt, PutPayload};
         use std::sync::Arc;
 
         let backend = Arc::new(ObjectStorage::in_memory());
         let storage = Storage::from_backend(Arc::clone(&backend) as Arc<dyn StorageBackend>);
+        let put_old = move |key: &'static str, data: &'static [u8]| {
+            let backend = Arc::clone(&backend);
+            let old = key.replace('@', "_at_");
+            Box::pin(async move {
+                backend
+                    .store()
+                    .put(&Path::from(old.as_str()), PutPayload::from_static(data))
+                    .await
+                    .unwrap();
+            }) as futures::future::BoxFuture<'static, ()>
+        };
+        (storage, put_old)
+    }
+
+    /// #1172: on an object store, a Go version stored by NORA 0.9.2 or earlier — under the
+    /// `_at_` key encoding #534 replaced, which reads still fall back to — shows as it did
+    /// with a stat per version: cached, with its archive's size and time; a version list
+    /// stored that way gives the time of the versions not cached. Where both forms hold a
+    /// file, the current one is shown, as a read finds it first.
+    #[tokio::test]
+    async fn a_go_version_stored_under_the_pre_534_key_encoding_shows_as_cached() {
+        let (storage, put_old) = object_store_with_old_keys();
+        put_old("go/example.com/m/@v/list", b"v1.0.0\nv1.1.0\nv2.0.0\n").await;
+        put_old("go/example.com/m/@v/v1.0.0.zip", b"legacy").await;
+        put_old("go/example.com/m/@v/v1.1.0.zip", &[b'o'; 99]).await;
         storage
-            .put("go/example.com/m/@v/list", b"v1.0.0\nv1.1.0\n")
+            .put("go/example.com/m/@v/v1.1.0.zip", &[b'x'; 11])
+            .await
+            .unwrap();
+
+        let detail = get_go_detail(&storage, "example.com/m", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("v2.0.0", 0, "just now", false),
+                row("v1.1.0", 11, "just now", true),
+                row("v1.0.0", 6, "just now", true),
+            ]
+        );
+    }
+
+    /// #1172: when only the listing of the older key form fails, the page asks per version,
+    /// as before #1172 — a stat finds either form — rather than show what it could not list
+    /// as not cached.
+    #[tokio::test]
+    async fn a_failed_listing_of_older_keys_falls_back_to_reading_each_go_version() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        storage
+            .put("go/example.com/m/@v/list", b"v1.0.0\nv1.1.0\nv2.0.0\n")
+            .await
+            .unwrap();
+        storage
+            .put("go/example.com/m/@v/v1.0.0.zip", &[b'x'; 10])
             .await
             .unwrap();
         storage
             .put("go/example.com/m/@v/v1.1.0.zip", &[b'x'; 11])
             .await
             .unwrap();
-        // As 0.9.2 wrote it: `@` spelled `_at_`.
-        backend
-            .store()
-            .put(
-                &Path::from("go/example.com/m/_at_v/v1.0.0.zip"),
-                PutPayload::from_static(b"legacy"),
-            )
+        outage.fail_older_listings_of("go/example.com/m/@v/");
+
+        let detail = get_go_detail(&storage, "example.com/m", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("v2.0.0", 0, "just now", false),
+                row("v1.1.0", 11, "just now", true),
+                row("v1.0.0", 10, "just now", true),
+            ]
+        );
+    }
+
+    /// #1172: the same for a scoped npm package's tarball stored by NORA 0.9.2 or earlier.
+    #[tokio::test]
+    async fn a_scoped_npm_tarball_stored_under_the_pre_534_key_encoding_shows_as_cached() {
+        let (storage, put_old) = object_store_with_old_keys();
+        storage
+            .put("npm/@scope/pkg/metadata.json", &npm_packument())
+            .await
+            .unwrap();
+        put_old("npm/@scope/pkg/tarballs/pkg-1.0.0.tgz", b"legacy").await;
+        put_old("npm/@scope/pkg/tarballs/pkg-1.1.0.tgz", &[b'o'; 99]).await;
+        storage
+            .put("npm/@scope/pkg/tarballs/pkg-1.1.0.tgz", &[b'x'; 11])
             .await
             .unwrap();
 
+        let detail = get_npm_detail(&storage, "@scope/pkg", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("2.0.0", 77, "2026-03-04", false),
+                row("1.1.0", 11, "2026-01-02", true),
+                row("1.0.0", 6, "2026-01-02", true),
+            ]
+        );
+    }
+
+    /// A packument naming 1.0.0, 1.1.0 and 2.0.0.
+    fn npm_packument() -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "versions": {
+                "1.0.0": {"dist": {"unpackedSize": 5}},
+                "1.1.0": {"dist": {"unpackedSize": 5}},
+                "2.0.0": {"dist": {"unpackedSize": 77}},
+            },
+            "time": {
+                "1.0.0": "2026-01-02T03:04:05.000Z",
+                "1.1.0": "2026-01-02T03:04:05.000Z",
+                "2.0.0": "2026-03-04T05:06:07.000Z",
+            },
+        }))
+        .unwrap()
+    }
+
+    /// #1172: a store whose listing of a module's `@v/` fails while its reads answer shows
+    /// the module's versions as a stat per version did — cached, with sizes and times — not
+    /// as "not cached": a failed listing is not an empty one.
+    #[tokio::test]
+    async fn a_failed_listing_does_not_show_the_go_versions_as_not_cached() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        storage
+            .put("go/example.com/m/@v/list", b"v1.0.0\nv1.1.0\nv2.0.0\n")
+            .await
+            .unwrap();
+        storage
+            .put("go/example.com/m/@v/v1.0.0.zip", &[b'x'; 10])
+            .await
+            .unwrap();
+        storage
+            .put("go/example.com/m/@v/v1.1.0.zip", &[b'x'; 11])
+            .await
+            .unwrap();
+        outage.fail_listings_of("go/example.com/m/@v/");
+
         let detail = get_go_detail(&storage, "example.com/m", true, true).await;
-        let shown: Vec<_> = detail
-            .versions
-            .iter()
-            .map(|v| (v.version.as_str(), v.size, v.cached))
-            .collect();
-        assert_eq!(shown, [("v1.1.0", 11, true), ("v1.0.0", 0, false)]);
-        let bytes = storage.get("go/example.com/m/@v/v1.0.0.zip").await.unwrap();
-        assert_eq!(&bytes[..], b"legacy", "still read through the fallback");
+        assert_eq!(
+            rows(&detail),
+            [
+                row("v2.0.0", 0, "just now", false),
+                row("v1.1.0", 11, "just now", true),
+                row("v1.0.0", 10, "just now", true),
+            ]
+        );
+    }
+
+    /// #1172: the same for an npm package whose listing of `tarballs/` fails.
+    #[tokio::test]
+    async fn a_failed_listing_does_not_show_the_npm_versions_as_not_cached() {
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        storage
+            .put("npm/pkg/metadata.json", &npm_packument())
+            .await
+            .unwrap();
+        storage
+            .put("npm/pkg/tarballs/pkg-1.0.0.tgz", &[b'x'; 10])
+            .await
+            .unwrap();
+        storage
+            .put("npm/pkg/tarballs/pkg-1.1.0.tgz", &[b'x'; 11])
+            .await
+            .unwrap();
+        outage.fail_listings_of("npm/pkg/tarballs/");
+
+        let detail = get_npm_detail(&storage, "pkg", true, true).await;
+        assert_eq!(
+            rows(&detail),
+            [
+                row("2.0.0", 77, "2026-03-04", false),
+                row("1.1.0", 11, "2026-01-02", true),
+                row("1.0.0", 10, "2026-01-02", true),
+            ]
+        );
     }
 }
 

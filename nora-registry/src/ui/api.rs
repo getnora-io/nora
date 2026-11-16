@@ -671,6 +671,57 @@ pub async fn get_maven_detail(storage: &Storage, path: &str) -> MavenDetail {
     MavenDetail { artifacts }
 }
 
+/// The files under one prefix with their size and time, from listings rather than a stat
+/// per file — a HEAD per file on an object store (#1172).
+struct Listed {
+    /// Under the current encoding of their keys, as [`Storage::list_with_meta`] names them.
+    current: Vec<(String, crate::storage::FileMeta)>,
+    /// Every file a read finds, by key: `current`, and the files stored under an older
+    /// encoding of their key (`_at_`, NORA 0.9.2 and earlier) that reads still fall back
+    /// to, the current form first as a read tries it first. `None` when the older form
+    /// could not be listed: the files are then asked one by one.
+    readable: Option<HashMap<String, crate::storage::FileMeta>>,
+}
+
+impl Listed {
+    /// The files under `prefix`; `None` when the listing fails. A failed listing is not an
+    /// empty one: the caller then asks per file, as before #1172, instead of showing what
+    /// is stored as missing.
+    async fn of(storage: &Storage, prefix: &str) -> Option<Listed> {
+        let current = match storage.list_with_meta(prefix).await {
+            Ok(current) => current,
+            Err(e) => {
+                tracing::warn!(prefix, error = %e, "listing failed; the page reads each file's metadata instead");
+                return None;
+            }
+        };
+        let readable = match storage.list_legacy_with_meta(prefix).await {
+            Ok(older) => {
+                let mut readable: HashMap<_, _> = older.unwrap_or_default().into_iter().collect();
+                readable.extend(current.iter().cloned());
+                Some(readable)
+            }
+            Err(e) => {
+                tracing::warn!(prefix, error = %e, "listing of older keys failed; the page reads each file's metadata instead");
+                None
+            }
+        };
+        Some(Listed { current, readable })
+    }
+}
+
+/// What a read finds of `key`: from `listed` when its listings answered, else a stat.
+async fn stored_meta(
+    storage: &Storage,
+    listed: Option<&Listed>,
+    key: &str,
+) -> Option<crate::storage::FileMeta> {
+    match listed.and_then(|l| l.readable.as_ref()) {
+        Some(files) => files.get(key).cloned(),
+        None => storage.stat(key).await,
+    }
+}
+
 /// The versions a package's stored tarballs add to the ones its packument names (`listed`,
 /// shown or not): each stored file curation's parser reads as a tarball of `name` — any
 /// layout it reads — once, so one version stored in two layouts is one version, and none
@@ -703,15 +754,10 @@ pub async fn get_npm_detail(
     // Every version the packument names, shown or not, so a stored tarball adds only the rest.
     let mut listed = std::collections::HashSet::new();
 
-    // The package's stored tarballs with their sizes, from one listing: whether a version
-    // the packument names is cached is looked up here, not stat'ed — a HEAD per version on
-    // an object store (#1172).
+    // The package's stored tarballs with their sizes, from listings: whether a version the
+    // packument names is cached is looked up there, not stat'ed per version (#1172).
     let tarballs = format!("npm/{}/tarballs/", name);
-    let stored = storage.list_with_meta(&tarballs).await;
-    let stored_meta: HashMap<&str, &crate::storage::FileMeta> = stored
-        .as_ref()
-        .map(|entries| entries.iter().map(|(k, m)| (k.as_str(), m)).collect())
-        .unwrap_or_default();
+    let stored = Listed::of(storage, &tarballs).await;
 
     // Parse metadata.json for version info
     if let Ok(data) = storage.get(&metadata_key).await {
@@ -752,10 +798,11 @@ pub async fn get_npm_detail(
                     };
                     let tarball_key =
                         format!("npm/{}/tarballs/{}-{}.tgz", name, name_part, version);
-                    let (size, cached) = match stored_meta.get(tarball_key.as_str()) {
-                        Some(meta) => (meta.size, true),
-                        None => (meta_size, false),
-                    };
+                    let (size, cached) =
+                        match stored_meta(storage, stored.as_ref(), &tarball_key).await {
+                            Some(meta) => (meta.size, true),
+                            None => (meta_size, false),
+                        };
 
                     stable_versions.push(VersionInfo {
                         version: version.clone(),
@@ -771,8 +818,9 @@ pub async fn get_npm_detail(
     // A tarball stored without its packument is a stored version too: a lockfile install
     // fetches tarballs only, and with release dates off no packument is cached. List every
     // stored tarball of this package the packument does not name.
-    if let Ok(stored) = stored {
+    if let Some(stored) = stored {
         let files = stored
+            .current
             .into_iter()
             .filter_map(|(key, meta)| Some((key.strip_prefix(&tarballs)?.to_string(), meta)));
         for (version, meta) in stored_only_versions(name, &listed, files) {
@@ -1161,11 +1209,14 @@ pub async fn get_go_detail(
         }
     }
 
-    // Also scan for .zip files that might exist without being in the list. The listing
-    // carries each file's size and time, so no version costs a stat — a HEAD on an
-    // object store (#1172).
-    let stored = storage.list_with_meta(&prefix).await.unwrap_or_default();
-    for (key, _) in stored.iter().filter(|(k, _)| ends_with_ci(k, ".zip")) {
+    // Also scan for .zip files that might exist without being in the list. The listings
+    // carry each file's size and time, so no version costs a stat (#1172).
+    let stored = Listed::of(storage, &prefix).await;
+    let current = stored
+        .as_ref()
+        .map(|l| l.current.as_slice())
+        .unwrap_or_default();
+    for (key, _) in current.iter().filter(|(k, _)| ends_with_ci(k, ".zip")) {
         if let Some(rest) = key.strip_prefix(&prefix) {
             if let Some(version) = rest.strip_suffix(".zip") {
                 if !known_versions.iter().any(|v| v == version) {
@@ -1174,21 +1225,21 @@ pub async fn get_go_detail(
             }
         }
     }
-    let stored: HashMap<String, crate::storage::FileMeta> = stored.into_iter().collect();
 
-    let list_ts = stored
-        .get(&list_key)
+    let list_ts = stored_meta(storage, stored.as_ref(), &list_key)
+        .await
         .map(|m| format_timestamp(m.modified))
         .unwrap_or_else(|| "N/A".to_string());
 
     let mut versions = Vec::new();
     for v in &known_versions {
         let zip_key = format!("{}{}.zip", prefix, v);
-        let (size, published, cached) = if let Some(meta) = stored.get(&zip_key) {
-            (meta.size, format_timestamp(meta.modified), true)
-        } else {
-            (0, list_ts.clone(), false)
-        };
+        let (size, published, cached) =
+            if let Some(meta) = stored_meta(storage, stored.as_ref(), &zip_key).await {
+                (meta.size, format_timestamp(meta.modified), true)
+            } else {
+                (0, list_ts.clone(), false)
+            };
         versions.push(VersionInfo {
             version: v.clone(),
             size,

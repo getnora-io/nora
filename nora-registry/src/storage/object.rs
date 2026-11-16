@@ -439,6 +439,50 @@ impl StorageBackend for ObjectStorage {
             .collect())
     }
 
+    async fn list_legacy_with_meta(&self, prefix: &str) -> Result<Option<Vec<(String, FileMeta)>>> {
+        // Without `@` the two encodings write the same key: nothing else to list.
+        if !prefix.contains('@') {
+            return Ok(None);
+        }
+        let legacy_prefix = Path::from(encode_object_key_legacy(prefix));
+        let objects: Vec<_> = self
+            .store
+            .list(Some(&legacy_prefix))
+            .try_collect()
+            .await
+            .map_err(map_err)?;
+
+        // Named as a read finds them: the prefix as asked, then the rest of the stored key.
+        // `stat`/`get` of that name miss the current encoding and fall back to this object.
+        // The old encoding wrote every `@` as `_at_`, so a rest holding an encoded `@` is an
+        // object of the current encoding under another key, which that name would not read.
+        let base = prefix.trim_end_matches('/');
+        Ok(Some(
+            objects
+                .into_iter()
+                .filter_map(|meta| {
+                    let rest = meta
+                        .location
+                        .as_ref()
+                        .strip_prefix(legacy_prefix.as_ref())?
+                        .strip_prefix('/')?;
+                    if decode_object_key(rest) != rest {
+                        return None;
+                    }
+                    let modified = meta.last_modified.timestamp().try_into().unwrap_or(0u64);
+                    Some((
+                        format!("{base}/{rest}"),
+                        FileMeta {
+                            size: meta.size,
+                            modified,
+                        },
+                    ))
+                })
+                .filter(|(key, _)| !super::is_reserved_signing_key(key))
+                .collect(),
+        ))
+    }
+
     async fn stat(&self, key: &str) -> Option<FileMeta> {
         let encoded = encode_object_key(key);
         let path = Path::from(encoded);
@@ -680,6 +724,75 @@ mod tests {
             object.stat(key).await.is_none(),
             "deleted under the legacy encoding"
         );
+    }
+
+    /// #1172: the older-encoding listing names each object as a read finds it — a `stat` of
+    /// the name returns that object — lists nothing a read under the current encoding finds
+    /// first, and asks the store nothing when the prefix has no `@`.
+    #[tokio::test]
+    async fn the_older_encoding_listing_names_each_object_as_a_read_finds_it() {
+        let object = ObjectStorage::in_memory();
+        let put_raw = |path: &str, data: &'static [u8]| {
+            let path = Path::from(path);
+            let store = object.store();
+            async move {
+                store
+                    .put(&path, object_store::PutPayload::from_static(data))
+                    .await
+                    .unwrap();
+            }
+        };
+        // As 0.9.2 wrote `go/example.com/m/@v/...`, and one file of another key under the
+        // current encoding that happens to start with the same old-form prefix.
+        put_raw("go/example.com/m/_at_v/v1.0.0.zip", b"legacy").await;
+        put_raw("go/example.com/m/_at_v/list", b"v1.0.0\n").await;
+        let sha = hex::encode(sha2::Sha256::digest(b"current"));
+        object
+            .put("go/example.com/m/@v/v1.1.0.zip", b"current", &sha)
+            .await
+            .unwrap();
+        object
+            .put("go/example.com/m/_at_v/@v/v9.zip", b"current", &sha)
+            .await
+            .unwrap();
+
+        let listed = object
+            .list_legacy_with_meta("go/example.com/m/@v/")
+            .await
+            .unwrap()
+            .expect("a prefix with @ has an older form");
+        let mut names: Vec<_> = listed.iter().map(|(k, m)| (k.as_str(), m.size)).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                ("go/example.com/m/@v/list", 7),
+                ("go/example.com/m/@v/v1.0.0.zip", 6)
+            ]
+        );
+        for (name, meta) in &listed {
+            let read = object
+                .stat(name)
+                .await
+                .expect("a read finds the listed name");
+            assert_eq!(
+                (read.size, read.modified),
+                (meta.size, meta.modified),
+                "{name}"
+            );
+        }
+        assert!(object
+            .list_legacy_with_meta("go/example.com/plain/")
+            .await
+            .unwrap()
+            .is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let local = crate::storage::LocalStorage::new(dir.path().to_str().unwrap());
+        assert!(local
+            .list_legacy_with_meta("go/example.com/m/@v/")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -529,7 +529,7 @@ pub async fn body_bytes(response: axum::http::Response<Body>) -> axum::body::Byt
 // ── Storage round-trip counting ─────────────────────────────────────────────
 
 /// Backend methods an [`OpCountingBackend`] counts, in reporting order.
-const COUNTED_METHODS: [&str; 11] = [
+const COUNTED_METHODS: [&str; 12] = [
     "put",
     "get",
     "pin",
@@ -537,6 +537,7 @@ const COUNTED_METHODS: [&str; 11] = [
     "list",
     "stat",
     "list_with_meta",
+    "list_legacy_with_meta",
     "put_from_path",
     "copy",
     "get_reader",
@@ -671,6 +672,21 @@ impl crate::storage::StorageBackend for OpCountingBackend {
         Ok(keys)
     }
 
+    async fn list_legacy_with_meta(
+        &self,
+        prefix: &str,
+    ) -> crate::storage::Result<Option<Vec<(String, crate::storage::FileMeta)>>> {
+        // Counted when the store is asked: without an older encoding for `prefix` it is not.
+        let listed = self.inner.list_legacy_with_meta(prefix).await;
+        if !matches!(listed, Ok(None)) {
+            self.counts.hit("list_legacy_with_meta");
+        }
+        if let Ok(Some(keys)) = &listed {
+            self.counts.enumerated(keys.len());
+        }
+        listed
+    }
+
     async fn health_check(&self) -> bool {
         self.inner.health_check().await
     }
@@ -750,6 +766,8 @@ struct Faults {
     reads: Vec<(String, ReadFault)>,
     /// Prefixes whose listings fail.
     listings: Vec<String>,
+    /// Prefixes whose listings under an older key encoding fail.
+    older_listings: Vec<String>,
     /// Key suffixes whose writes fail.
     writes: Vec<String>,
     /// Key suffixes `stat` cannot answer for.
@@ -848,6 +866,13 @@ impl StorageOutage {
     /// read answer.
     pub fn fail_listings_of(&self, prefix: &str) {
         self.faults().listings.push(prefix.to_string());
+    }
+
+    /// Fail only the listing of `prefix` under an older key encoding
+    /// ([`StorageBackend::list_legacy_with_meta`](crate::storage::StorageBackend::list_legacy_with_meta))
+    /// with a network error; its current listing and every read answer.
+    pub fn fail_older_listings_of(&self, prefix: &str) {
+        self.faults().older_listings.push(prefix.to_string());
     }
 
     /// Fail the writes of the keys ending with `suffix` with a network error; other writes and
@@ -1082,6 +1107,27 @@ impl crate::storage::StorageBackend for OutageBackend {
             return Err(network_error());
         }
         self.inner.list_with_meta(prefix).await
+    }
+
+    async fn list_legacy_with_meta(
+        &self,
+        prefix: &str,
+    ) -> crate::storage::Result<Option<Vec<(String, crate::storage::FileMeta)>>> {
+        self.outage.wait_answer().await;
+        // A fault meets only a listing the store is asked for: without an older encoding for
+        // `prefix` the store is not asked and answers `None`, down or not.
+        let listed = self.inner.list_legacy_with_meta(prefix).await?;
+        let refused = self.outage.listing_fails(prefix)
+            || self
+                .outage
+                .faults()
+                .older_listings
+                .iter()
+                .any(|p| p == prefix);
+        if listed.is_some() && refused {
+            return Err(network_error());
+        }
+        Ok(listed)
     }
 
     async fn health_check(&self) -> bool {

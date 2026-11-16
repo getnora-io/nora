@@ -144,6 +144,20 @@ pub trait StorageBackend: Send + Sync {
         }
         Ok(out)
     }
+    /// The objects under `prefix` that a read finds only under an older encoding of their
+    /// key, named as they are read, with size/mtime from the listing — `Ok(None)` when this
+    /// store has no older encoding for `prefix`, and then without a request.
+    ///
+    /// An object store wrote `@` as `_at_` before #534 (NORA 0.9.2 and earlier) and still
+    /// reads such keys through a fallback (`get`, `stat`), but a listing of the current form
+    /// does not return them. A caller that tells which of a set of keys are stored — a page
+    /// of versions — lists both forms, two requests, rather than a stat per key (#1172).
+    async fn list_legacy_with_meta(
+        &self,
+        _prefix: &str,
+    ) -> Result<Option<Vec<(String, FileMeta)>>> {
+        Ok(None)
+    }
     async fn health_check(&self) -> bool;
     /// Total size of all stored artifacts in bytes
     async fn total_size(&self) -> u64;
@@ -533,6 +547,39 @@ impl Storage {
             .into_iter()
             .filter(|(k, _)| !k.starts_with(".nora-"))
             .collect())
+    }
+
+    /// The objects under `prefix` a read finds only under an older encoding of their key,
+    /// see [`StorageBackend::list_legacy_with_meta`], with the `.nora-` filter of
+    /// [`list`](Self::list). A listing the store does is counted as one `list_with_meta`.
+    pub async fn list_legacy_with_meta(
+        &self,
+        prefix: &str,
+    ) -> Result<Option<Vec<(String, FileMeta)>>> {
+        if !prefix.is_empty() {
+            validate_storage_key(listing_key(prefix))?;
+        }
+        let entries = match self.inner.list_legacy_with_meta(prefix).await {
+            Ok(None) => return Ok(None),
+            Ok(Some(entries)) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["list_with_meta", "ok"])
+                    .inc();
+                entries
+            }
+            Err(e) => {
+                STORAGE_OPERATIONS
+                    .with_label_values(&["list_with_meta", "error"])
+                    .inc();
+                return Err(e);
+            }
+        };
+        Ok(Some(
+            entries
+                .into_iter()
+                .filter(|(k, _)| !k.starts_with(".nora-"))
+                .collect(),
+        ))
     }
 
     pub async fn stat(&self, key: &str) -> Option<FileMeta> {
@@ -1187,6 +1234,40 @@ mod tests {
     /// The failing half of the same contract: a listing that the backend refuses must
     /// land on `list`/`error`, so an operator can tell "the store is answering with
     /// nothing" from "the store is not answering".
+    /// #1172: a listing of the older key form is a round-trip and counted as a
+    /// `list_with_meta`, a refused one as an error; where the store has no older form for the
+    /// prefix nothing is asked and the call answers `None`.
+    #[tokio::test]
+    async fn older_encoding_listings_are_counted() {
+        let count =
+            |op: &str, status: &str| STORAGE_OPERATIONS.with_label_values(&[op, status]).get();
+        let (storage, outage) = crate::test_helpers::outage_storage();
+        let ok = count("list_with_meta", "ok");
+        assert!(storage
+            .list_legacy_with_meta("npm/@scope/pkg/tarballs/")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(count("list_with_meta", "ok") > ok, "asked: counted");
+
+        outage.fail_older_listings_of("npm/@scope/pkg/tarballs/");
+        let error = count("list_with_meta", "error");
+        assert!(storage
+            .list_legacy_with_meta("npm/@scope/pkg/tarballs/")
+            .await
+            .is_err());
+        assert!(
+            count("list_with_meta", "error") > error,
+            "refused: an error"
+        );
+
+        assert!(storage
+            .list_legacy_with_meta("npm/pkg/tarballs/")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
     #[tokio::test]
     async fn failed_listings_are_counted_as_errors() {
         /// Refuses both listing calls; every other method is unused by this test.
@@ -1691,6 +1772,7 @@ mod tests {
         "get_verified",
         "list",
         "list_internal",
+        "list_legacy_with_meta",
         "list_with_meta",
         "pin",
         "put",
@@ -1749,6 +1831,10 @@ mod tests {
                     ("list", s.list(prefix).await.is_err()),
                     ("list_internal", s.list_internal(prefix).await.is_err()),
                     ("list_with_meta", s.list_with_meta(prefix).await.is_err()),
+                    (
+                        "list_legacy_with_meta",
+                        s.list_legacy_with_meta(prefix).await.is_err(),
+                    ),
                 ];
                 for (method, ok) in checks {
                     assert!(ok, "{b} {method} {prefix}");
