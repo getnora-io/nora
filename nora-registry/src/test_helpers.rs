@@ -110,6 +110,7 @@ pub fn docker_upstream(url: impl Into<String>) -> DockerUpstream {
         namespace: None,
         prefix: None,
         namespaces: Vec::new(),
+        metadata_ttl: None,
     }
 }
 
