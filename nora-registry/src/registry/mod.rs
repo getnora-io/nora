@@ -4,7 +4,7 @@
 #![cfg_attr(not(test), deny(clippy::disallowed_types))]
 
 pub(crate) mod ansible;
-mod cargo_registry;
+pub(crate) mod cargo_registry;
 pub(crate) mod composer;
 mod conan;
 pub(crate) mod cpan;
