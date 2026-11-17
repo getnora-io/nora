@@ -65,14 +65,11 @@ impl Default for Timing {
 /// How a process is ended; replaced in tests.
 pub type ExitHook = Arc<dyn Fn(i32) + Send + Sync>;
 
-/// [`ExitHook`] of the real process. In tests it records the exit code instead
-/// ([`exits_requested`]), so a test can see that a task the process cannot run without ends
-/// it, and the test runner lives on.
-pub fn process_exit() -> ExitHook {
-    #[cfg(test)]
-    return Arc::new(exits::record);
-    #[cfg(not(test))]
-    Arc::new(|code| std::process::exit(code))
+/// [`ExitHook`] of tests: records the exit code ([`exits_requested`]), so a test can see that
+/// a task the process cannot run without ends it, and the test runner lives on.
+#[cfg(test)]
+pub fn recorded_exit() -> ExitHook {
+    Arc::new(exits::record)
 }
 
 #[cfg(test)]
@@ -86,7 +83,7 @@ mod exits {
         REQUESTED.lock().unwrap().push(code);
     }
 
-    /// The exit codes [`super::process_exit`] has been asked for in this test process.
+    /// The exit codes [`super::recorded_exit`] has been asked for in this test process.
     pub fn requested() -> Vec<i32> {
         REQUESTED.lock().unwrap().clone()
     }

@@ -579,6 +579,11 @@ mod one_judge_tests {
         ),
         (
             "npm_links.rs",
+            "own_link_tail",
+            "refuses a tarball link that carries a user or password: read by the client parser, not shown",
+        ),
+        (
+            "npm_links.rs",
             "upstream_url_forms",
             "the http and https spellings an upstream link may take, searched for, not shown",
         ),

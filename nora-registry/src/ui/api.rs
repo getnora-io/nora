@@ -1874,6 +1874,56 @@ pub async fn get_composer_detail(storage: &Storage, name: &str) -> ComposerDetai
     ComposerDetail { versions }
 }
 
+/// Hugging Face detail: the files cached for repository `repo` (`name` or `org/name`), each
+/// under the digest it is stored by, newest first. `None` when `repo` is not a repository id
+/// (one or two segments of letters, digits, `-`, `_` and `.`, starting with a letter or digit).
+pub async fn get_hf_detail(storage: &Storage, repo: &str) -> Option<PackageDetail> {
+    let segments: Vec<&str> = repo.split('/').collect();
+    let valid = (1..=2).contains(&segments.len())
+        && segments.iter().all(|segment| {
+            segment
+                .bytes()
+                .next()
+                .is_some_and(|b| b.is_ascii_alphanumeric())
+                && segment
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+                && !segment.contains("..")
+        });
+    if !valid {
+        return None;
+    }
+    let prefix = format!("hf/models/{}/blobs/", repo.to_ascii_lowercase());
+    let mut files: Vec<(String, u64, u64)> = storage
+        .list_with_meta(&prefix)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(key, meta)| {
+            let digest = key.strip_prefix(&prefix)?;
+            (!digest.is_empty() && !digest.contains('/'))
+                .then(|| (digest.to_string(), meta.size, meta.modified))
+        })
+        .collect();
+    files.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+    let total_stable = files.len();
+    let versions = files
+        .into_iter()
+        .map(|(digest, size, modified)| VersionInfo {
+            version: digest,
+            size,
+            published: format_timestamp(modified),
+            cached: true,
+        })
+        .collect();
+    Some(PackageDetail {
+        versions,
+        prerelease_count: 0,
+        total_stable,
+        metadata: PackageMetadata::default(),
+    })
+}
+
 /// Fallback: scan storage for files matching {registry}/{name}/*
 async fn get_storage_scan_detail(
     storage: &Storage,
