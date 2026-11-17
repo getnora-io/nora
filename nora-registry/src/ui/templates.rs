@@ -1338,6 +1338,7 @@ pub fn render_package_detail(
             let package_name = distribution.replace('-', "::");
             format!("cpanm --from {}/cpan {}", base_url, package_name)
         }
+        Some(RegistryType::HuggingFace) => format!("HF_ENDPOINT={}/hf hf download {}", base_url, name),
         _ => String::new(),
     };
 
@@ -1376,10 +1377,17 @@ pub fn render_package_detail(
                 .map(encode_uri_component)
                 .collect::<Vec<_>>()
                 .join("/");
-            if i == segments.len() - 1 {
+            // A Hugging Face owner is not a repository and has no page: the segment is text.
+            if i == segments.len() - 1 || rt == Some(RegistryType::HuggingFace) {
+                let class = if i == segments.len() - 1 {
+                    "text-slate-200 font-medium"
+                } else {
+                    "text-slate-400"
+                };
                 let _ = write!(
                     crumbs,
-                    r#"<span class="mx-2 text-slate-500">/</span><span class="text-slate-200 font-medium">{}</span>"#,
+                    r#"<span class="mx-2 text-slate-500">/</span><span class="{}">{}</span>"#,
+                    class,
                     html_escape(seg)
                 );
             } else {
@@ -1499,7 +1507,7 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         install_label = _t.install_command,
         cmd = html_escape(&install_cmd),
         metadata_panel = metadata_panel,
-        versions_label = if rt == Some(RegistryType::Raw) {
+        versions_label = if matches!(rt, Some(RegistryType::Raw | RegistryType::HuggingFace)) {
             _t.files
         } else if matches!(rt, Some(RegistryType::Rpm | RegistryType::Deb)) {
             _t.items
@@ -1511,6 +1519,9 @@ if (copyBtn) {{ copyBtn.addEventListener('click', function() {{
         prerelease = prerelease_toggle,
         col_version = if rt == Some(RegistryType::Raw) {
             _t.filename
+        } else if rt == Some(RegistryType::HuggingFace) {
+            // Hugging Face files are cached by content, named by their digest.
+            _t.digest
         } else if matches!(rt, Some(RegistryType::Rpm | RegistryType::Deb)) {
             _t.items
         } else {

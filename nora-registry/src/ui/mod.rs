@@ -146,6 +146,8 @@ pub fn routes() -> Router<AppState> {
         .route("/ui/cpan/{*path}", get(cpan_browse))
         .route("/ui/composer", get(generic_registry_list))
         .route("/ui/composer/{*name}", get(composer_detail))
+        .route("/ui/hf", get(generic_registry_list))
+        .route("/ui/hf/{*name}", get(hf_detail))
         .route("/ui/gems/{name}", get(generic_registry_detail))
         .route("/ui/terraform/{name}", get(generic_registry_detail))
         // Token management UI (protected by auth middleware)
@@ -694,6 +696,7 @@ async fn generic_registry_list(
         Some(crate::registry_type::RegistryType::Deb) => "Debian (APT)",
         Some(crate::registry_type::RegistryType::Cpan) => "CPAN",
         Some(crate::registry_type::RegistryType::Composer) => "Composer (PHP)",
+        Some(crate::registry_type::RegistryType::HuggingFace) => "Hugging Face Hub",
         _ => registry_key,
     };
 
@@ -877,6 +880,39 @@ async fn composer_detail(
         &name,
         &detail,
         lang,
+        auth_enabled,
+    ))
+    .into_response()
+}
+
+// Hugging Face detail: a repository id is `name` or `org/name`, linked with its slash encoded
+// or not; the page lists the files NORA has cached for it.
+async fn hf_detail(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(query): Query<LangQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    // An id NORA holds no file of has nothing to show or download: no page, as for an id
+    // that is not one.
+    let Some(detail) = api::get_hf_detail(&state.storage, &name)
+        .await
+        .filter(|detail| !detail.versions.is_empty())
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let lang = extract_lang(
+        &Query(query),
+        headers.get("cookie").and_then(|v| v.to_str().ok()),
+    );
+    let base_url = resolve_base_url(&state);
+    let auth_enabled = state.auth.is_some();
+    Html(templates::render_package_detail(
+        "hf",
+        &name,
+        &detail,
+        lang,
+        &base_url,
         auth_enabled,
     ))
     .into_response()
@@ -2865,6 +2901,167 @@ mod mount_points {
                 "signing in again shows nothing more"
             );
             assert!(!html.contains("s3cr3t-token") && !html.contains("ci-bot"));
+        }
+    }
+}
+
+/// The dashboard links each registry card to `/ui/{name}`: every such page has to answer, and
+/// the cards are exactly the enabled registries. Hugging Face, the opt-in format, had a card
+/// whose link answered 404.
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod registry_pages {
+    use crate::config::{EnableSpec, RegistriesSection};
+    use crate::registry_type::RegistryType;
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+    use std::collections::BTreeSet;
+
+    fn ctx_enabling(spec: &[&str]) -> TestContext {
+        let spec: Vec<String> = spec.iter().map(|s| s.to_string()).collect();
+        create_test_context_with_config(move |c| {
+            c.registries = Some(RegistriesSection {
+                enable: Some(EnableSpec::List(spec)),
+            });
+        })
+    }
+
+    async fn page(ctx: &TestContext, uri: &str) -> (StatusCode, String) {
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        let status = resp.status();
+        let body = body_bytes(resp).await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// The registry pages the dashboard cards link to: `href="/ui/{name}"` with `{name}` a
+    /// registry, a link of one segment.
+    fn card_links(html: &str) -> BTreeSet<String> {
+        html.split("href=\"/ui/")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('"').map(|(name, _)| name))
+            .filter(|name| RegistryType::from_str_opt(name).is_some())
+            .map(str::to_string)
+            .collect()
+    }
+
+    fn names(regs: &[RegistryType]) -> BTreeSet<String> {
+        regs.iter().map(|r| r.as_str().to_string()).collect()
+    }
+
+    /// Everything on, the opt-in Hugging Face too: a card per registry, and each card's page
+    /// answers.
+    #[tokio::test]
+    async fn every_dashboard_card_links_to_a_page_that_answers() {
+        let ctx = ctx_enabling(&["all", "hf"]);
+        let (status, dashboard) = page(&ctx, "/ui/").await;
+        assert_eq!(status, StatusCode::OK);
+
+        let (_, stats) = page(&ctx, "/api/ui/dashboard").await;
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        let cards: BTreeSet<String> = stats["registry_stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cards, names(RegistryType::all()), "a card per registry");
+
+        let linked = card_links(&dashboard);
+        assert!(cards.is_subset(&linked), "each card links its page");
+        for name in &linked {
+            let (status, _) = page(&ctx, &format!("/ui/{name}")).await;
+            assert_eq!(status, StatusCode::OK, "/ui/{name} answers");
+        }
+    }
+
+    /// A registry left off has no card and no link on the dashboard.
+    #[tokio::test]
+    async fn a_registry_left_off_has_no_card() {
+        let ctx = ctx_enabling(&["docker", "npm"]);
+        let (_, stats) = page(&ctx, "/api/ui/dashboard").await;
+        let stats: serde_json::Value = serde_json::from_str(&stats).unwrap();
+        let cards: BTreeSet<String> = stats["registry_stats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(cards, names(&[RegistryType::Docker, RegistryType::Npm]));
+        let (_, dashboard) = page(&ctx, "/ui/").await;
+        // The sidebar of a test context lists every format (its filter is set at startup only),
+        // so the card is told by its title.
+        assert!(
+            !dashboard.contains("Hugging Face Hub"),
+            "no Hugging Face card"
+        );
+    }
+
+    /// A cached Hugging Face file lists its repository, and the repository's page names the
+    /// cached file, under the encoded link the list gives and the plain one alike.
+    #[tokio::test]
+    async fn a_cached_hugging_face_repository_is_listed_and_has_a_page() {
+        let ctx = ctx_enabling(&["hf"]);
+        let digest = "a".repeat(64);
+        ctx.state
+            .storage
+            .put(&format!("hf/models/org/model/blobs/{digest}"), b"weights")
+            .await
+            .unwrap();
+        // Not a cached file: a digest is one segment, nothing nests under `blobs/`.
+        ctx.state
+            .storage
+            .put("hf/models/org/model/blobs/nested/stray", b"x")
+            .await
+            .unwrap();
+
+        let (status, list) = page(&ctx, "/ui/hf").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(list.contains("Hugging Face"), "the list is titled");
+        assert!(
+            list.contains("/ui/hf/org%2Fmodel"),
+            "the list links the repository"
+        );
+
+        // A repository id is not a path: three segments, a segment that does not start with a
+        // letter or digit, or one holding `..`, have no page. Nor has an id NORA holds no file
+        // of, the owner of a cached one included: there is nothing to show or download.
+        for uri in [
+            "/ui/hf/org",
+            "/ui/hf/org/other",
+            "/ui/hf/gpt2",
+            "/ui/hf/org/model/blobs",
+            "/ui/hf/org/.model",
+            "/ui/hf/org/model..x",
+            "/ui/hf/..%2Fmodel",
+        ] {
+            let (status, _) = page(&ctx, uri).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{uri}");
+        }
+
+        // The cache keeps ids in lower case; the page answers to the id as the Hub writes it.
+        for uri in ["/ui/hf/org%2Fmodel", "/ui/hf/org/model", "/ui/hf/Org/Model"] {
+            let (status, detail) = page(&ctx, uri).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert!(detail.contains(&digest), "{uri} names the cached file");
+            assert!(!detail.contains("stray"), "{uri} lists cached files only");
+            // The owner in the breadcrumbs is not a repository: no link leads there.
+            assert!(
+                !detail.contains("href=\"/ui/hf/org\""),
+                "{uri} links no owner page"
+            );
+            // The rows are cached files named by digest, not versions.
+            assert!(
+                detail.contains(">Digest</th>"),
+                "{uri} names the column by what it holds"
+            );
+            assert!(
+                !detail.contains(">Versions</th>") && !detail.contains(">Versions ("),
+                "{uri} does not call the files versions"
+            );
+            assert!(
+                detail.contains("HF_ENDPOINT="),
+                "{uri} shows how to download"
+            );
         }
     }
 }

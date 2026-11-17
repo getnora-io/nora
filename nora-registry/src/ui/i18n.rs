@@ -117,6 +117,8 @@ pub struct Translations {
     pub published: &'static str,
     pub filename: &'static str,
     pub files: &'static str,
+    /// The column of a content-addressed file list: each row is a file's digest.
+    pub digest: &'static str,
 
     // Bragging footer
     pub built_for_speed: &'static str,
@@ -240,6 +242,7 @@ pub static TRANSLATIONS_EN: Translations = Translations {
     published: "Published",
     filename: "Filename",
     files: "files",
+    digest: "Digest",
 
     // Bragging footer
     built_for_speed: "Built for speed",
@@ -355,6 +358,7 @@ pub static TRANSLATIONS_RU: Translations = Translations {
     published: "Опубликован",
     filename: "Файл",
     files: "файлов",
+    digest: "Дайджест",
 
     // Bragging footer
     built_for_speed: "Создан для скорости",
@@ -470,6 +474,7 @@ pub static TRANSLATIONS_ZH: Translations = Translations {
     published: "发布于",
     filename: "文件名",
     files: "个文件",
+    digest: "摘要",
 
     // Bragging footer
     built_for_speed: "为速度而生",
