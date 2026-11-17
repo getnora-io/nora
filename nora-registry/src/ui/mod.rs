@@ -2756,6 +2756,7 @@ mod mount_points {
         match reg {
             RegistryType::Docker => {
                 c.docker.upstreams = vec![DockerUpstream {
+                    metadata_ttl: None,
                     url,
                     auth: None,
                     namespace: None,

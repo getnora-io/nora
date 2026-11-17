@@ -2476,6 +2476,7 @@ mod first_download_integrity {
             "/v2/corp/app/manifests/1.0",
             |c, u| {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
+                    metadata_ttl: None,
                     url: u,
                     auth: None,
                     namespace: None,
@@ -2571,6 +2572,7 @@ mod first_download_integrity {
             "/v2/app/manifests/1.0",
             |c, u| {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
+                    metadata_ttl: None,
                     url: u,
                     auth: None,
                     namespace: None,
@@ -3694,6 +3696,7 @@ mod upstream_failure_matrix {
         cfg.docker.upstreams = urls
             .into_iter()
             .map(|url| DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: None,
