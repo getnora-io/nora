@@ -1673,7 +1673,9 @@ pub async fn rebuild_crate_name_records(storage: &Storage) {
     }
 }
 
-fn crate_index_prefix(name: &str) -> String {
+/// The sparse index directory of a crate (RFC 2789): `1`, `2`, `3/{first char}` or
+/// `{first two}/{next two}` of its lowercase name. `nora mirror cargo` builds index paths with it.
+pub(crate) fn crate_index_prefix(name: &str) -> String {
     let lower = name.to_lowercase();
     match lower.len() {
         1 => "1".to_string(),
@@ -1695,7 +1697,7 @@ fn is_valid_crate_version(version: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
 }
 
-fn is_valid_crate_name(name: &str) -> bool {
+pub(crate) fn is_valid_crate_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 64 {
         return false;
     }
