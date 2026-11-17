@@ -8307,6 +8307,7 @@ mod integration_tests {
             namespace: None,
             prefix: None,
             namespaces: Vec::new(),
+            metadata_ttl: None,
         };
         let ns = upstream.resolved_namespace();
         let ctx = create_test_context_with_config(move |cfg| {
@@ -8401,6 +8402,7 @@ mod integration_tests {
             namespace: None,
             prefix: None,
             namespaces: Vec::new(),
+            metadata_ttl: None,
         };
         let ns = upstream.resolved_namespace();
         let ctx = create_test_context_with_config(move |cfg| {
@@ -8459,6 +8461,7 @@ mod integration_tests {
             namespace: None,
             prefix: None,
             namespaces: Vec::new(),
+            metadata_ttl: None,
         };
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![upstream];
