@@ -29,6 +29,112 @@ fn streaming_client_options() -> object_store::ClientOptions {
     object_store::ClientOptions::new().with_timeout(STREAM_ATTEMPT_TIMEOUT)
 }
 
+/// Why the bundle `[tls] ca_cert` names cannot be trusted by the object store client.
+#[derive(Debug, thiserror::Error)]
+pub enum CaBundleError {
+    #[error("tls.ca_cert {path} is not readable: {source}")]
+    Unreadable {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("tls.ca_cert {path} is not a PEM certificate bundle: {source}")]
+    Pem {
+        path: String,
+        source: rustls::pki_types::pem::Error,
+    },
+    #[error("tls.ca_cert {path} holds a certificate that cannot be a trust anchor: {source}")]
+    Anchor { path: String, source: rustls::Error },
+    #[error("tls.ca_cert {path} holds a certificate the storage client cannot take: {source}")]
+    Client {
+        path: String,
+        source: object_store::Error,
+    },
+    #[error("tls.ca_cert {path} holds no certificate")]
+    Empty { path: String },
+}
+
+/// The certificates of the `[tls] ca_cert` bundle, for the S3 and GCS clients to trust next to
+/// the system trust store (#1186); none when the setting is unset. Each one is checked here, as
+/// a trust anchor, so a bundle the client could not take stops the start with its path instead
+/// of failing every request later with nothing about the certificate.
+pub fn root_certificates(
+    ca_cert: Option<&str>,
+) -> std::result::Result<Vec<object_store::Certificate>, CaBundleError> {
+    use rustls::pki_types::pem::PemObject;
+    use rustls::pki_types::CertificateDer;
+
+    let Some(path) = ca_cert else {
+        return Ok(Vec::new());
+    };
+    let pem = std::fs::read(path).map_err(|source| CaBundleError::Unreadable {
+        path: path.to_string(),
+        source,
+    })?;
+    let at = || path.to_string();
+    let mut anchors = rustls::RootCertStore::empty();
+    let mut roots = Vec::new();
+    for der in CertificateDer::pem_slice_iter(&pem) {
+        let der = der.map_err(|source| CaBundleError::Pem { path: at(), source })?;
+        anchors
+            .add(der.clone())
+            .map_err(|source| CaBundleError::Anchor { path: at(), source })?;
+        roots.push(
+            object_store::Certificate::from_der(&der)
+                .map_err(|source| CaBundleError::Client { path: at(), source })?,
+        );
+    }
+    if roots.is_empty() {
+        return Err(CaBundleError::Empty {
+            path: path.to_string(),
+        });
+    }
+    Ok(roots)
+}
+
+/// `options` trusting `roots` as well. The system trust store stays: object_store verifies
+/// with it plus the roots added here, unless told `with_no_system_certificates`.
+fn trusting(
+    options: object_store::ClientOptions,
+    roots: &[object_store::Certificate],
+) -> object_store::ClientOptions {
+    roots
+        .iter()
+        .cloned()
+        .fold(options, |options, root| options.with_root_certificate(root))
+}
+
+/// The client options `GoogleCloudStorageBuilder::from_env` holds for `env`: the builder's own
+/// default (plain HTTP allowed, for the metadata server) and every `GOOGLE_*` client key, plus
+/// the streaming timeout unless `GOOGLE_TIMEOUT` sets one. Root certificates can only be added
+/// by replacing the builder's options, and this keeps what the environment put there.
+fn gcs_env_client_options(
+    env: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> object_store::ClientOptions {
+    use object_store::gcp::GoogleConfigKey;
+    let mut options = object_store::ClientOptions::new().with_allow_http(true);
+    let mut timeout_set = false;
+    for (key, value) in env {
+        let (Some(key), Some(value)) = (key.to_str(), value.to_str()) else {
+            continue;
+        };
+        if !key.starts_with("GOOGLE_") {
+            continue;
+        }
+        if let Ok(GoogleConfigKey::Client(client_key)) = key.to_ascii_lowercase().parse() {
+            timeout_set |= client_key == object_store::ClientConfigKey::Timeout;
+            options = options.with_config(client_key, value);
+        }
+    }
+    if timeout_set {
+        options
+    } else {
+        options.with_config(
+            object_store::ClientConfigKey::Timeout,
+            format!("{}s", STREAM_ATTEMPT_TIMEOUT.as_secs()),
+        )
+    }
+}
+
 /// object_store's reqwest 0.13 has no built-in TLS provider (`rustls-no-provider` keeps
 /// aws-lc-rs out), so install ring; an install Err means a concurrent caller installed it.
 /// Every object_store client must be built after this call: reqwest panics when it builds a
@@ -87,6 +193,7 @@ impl ObjectStorage {
         access_key: Option<&str>,
         secret_key: Option<&str>,
         virtual_hosted: bool,
+        roots: &[object_store::Certificate],
     ) -> Self {
         install_ring_provider();
         let url = s3_url.trim_end_matches('/');
@@ -98,7 +205,10 @@ impl ObjectStorage {
             .with_region(region)
             // One combined ClientOptions: with_client_options REPLACES the
             // options with_allow_http would have accumulated.
-            .with_client_options(streaming_client_options().with_allow_http(allow_http))
+            .with_client_options(trusting(
+                streaming_client_options().with_allow_http(allow_http),
+                roots,
+            ))
             .with_virtual_hosted_style_request(virtual_hosted)
             .with_retry(streaming_retry_config());
 
@@ -138,6 +248,7 @@ impl ObjectStorage {
         bucket: &str,
         service_account_path: Option<&str>,
         base_url: Option<&str>,
+        roots: &[object_store::Certificate],
     ) -> Self {
         install_ring_provider();
         let mut builder = GoogleCloudStorageBuilder::from_env()
@@ -157,12 +268,16 @@ impl ObjectStorage {
         }
         if let Some(url) = base_url {
             let allow_http = url.starts_with("http://");
-            builder = builder
-                .with_base_url(url)
-                .with_client_options(streaming_client_options().with_allow_http(allow_http));
+            builder = builder.with_base_url(url).with_client_options(trusting(
+                streaming_client_options().with_allow_http(allow_http),
+                roots,
+            ));
             if allow_http {
                 builder = builder.with_skip_signature(true);
             }
+        } else if !roots.is_empty() {
+            builder = builder
+                .with_client_options(trusting(gcs_env_client_options(std::env::vars_os()), roots));
         }
         let store = builder.build().expect("Failed to build GCS client");
 
@@ -887,6 +1002,7 @@ mod tests {
             Some("access"),
             Some("secret"),
             false,
+            &[],
         );
         assert_eq!(storage.backend_name(), "s3");
     }
@@ -896,7 +1012,7 @@ mod tests {
     /// The true-path is the background refresh loop against a live store.
     #[tokio::test]
     async fn test_health_check_cached_not_live() {
-        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
+        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false, &[]);
         assert!(!storage.health_check().await);
         storage.refresh_reachability().await;
         assert!(!storage.health_check().await);
@@ -922,6 +1038,7 @@ mod tests {
             Some("access"),
             Some("secret"),
             false,
+            &[],
         );
         tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -955,6 +1072,7 @@ mod tests {
             Some("access"),
             Some("secret"),
             false,
+            &[],
         );
         storage.cached_reachable.store(true, Relaxed);
         storage
@@ -978,7 +1096,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_size_count_leaves_reachability_alone() {
         use std::sync::atomic::Ordering::Relaxed;
-        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
+        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false, &[]);
         storage.cached_reachable.store(true, Relaxed);
         storage
             .last_refresh_unix
@@ -993,7 +1111,7 @@ mod tests {
     #[tokio::test]
     async fn test_health_check_expires_when_refresh_stalls() {
         use std::sync::atomic::Ordering::Relaxed;
-        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false);
+        let storage = ObjectStorage::new("http://127.0.0.1:1", "b", "r", None, None, false, &[]);
         let now = crate::cache_ttl::now_unix();
 
         // A since-dead refresh loop: reachable was true, but the last refresh is ancient.
@@ -1077,6 +1195,7 @@ mod tests {
             None,
             None,
             false,
+            &[],
         );
         assert_eq!(storage.backend_name(), "s3");
     }
@@ -1087,7 +1206,8 @@ mod tests {
     #[test]
     fn test_gcs_storage_creation_emulator() {
         let _lock = crate::test_env::env_lock();
-        let storage = ObjectStorage::new_gcs("test-bucket", None, Some("http://localhost:4443"));
+        let storage =
+            ObjectStorage::new_gcs("test-bucket", None, Some("http://localhost:4443"), &[]);
         assert_eq!(storage.backend_name(), "gcs");
     }
 
@@ -1096,7 +1216,7 @@ mod tests {
     #[test]
     fn test_gcs_storage_creation_default_endpoint() {
         let _lock = crate::test_env::env_lock();
-        let storage = ObjectStorage::new_gcs("test-bucket", None, None);
+        let storage = ObjectStorage::new_gcs("test-bucket", None, None, &[]);
         assert_eq!(storage.backend_name(), "gcs");
     }
 
@@ -1126,6 +1246,7 @@ mod tests {
             Some("access"),
             Some("secret"),
             virtual_hosted,
+            &[],
         );
         assert!(!storage.health_check().await);
         storage.refresh_reachability().await;
@@ -1158,6 +1279,7 @@ mod tests {
             Some("access"),
             Some("secret"),
             false,
+            &[],
         );
         assert!(!storage
             .size_cache_initialized
@@ -1265,6 +1387,288 @@ mod tests {
             encode_object_key_legacy("npm/chalk/metadata.json"),
             "npm/chalk/metadata.json"
         );
+    }
+}
+
+/// `[tls] ca_cert` reaches the S3 and GCS clients (#1186), over a TLS store whose certificate a
+/// private CA signed.
+#[cfg(test)]
+mod ca_cert_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // Test-only material (tests/fixtures/storage-ca): a private CA, the certificate it signed for
+    // 127.0.0.1 and localhost with its key, and a CA unrelated to both.
+    const STORE_CA: &str = include_str!("../../tests/fixtures/storage-ca/ca.pem");
+    const OTHER_CA: &str = include_str!("../../tests/fixtures/storage-ca/other-ca.pem");
+    const STORE_CERT: &str = include_str!("../../tests/fixtures/storage-ca/store.pem");
+    const STORE_KEY: &str = include_str!("../../tests/fixtures/storage-ca/store-key.pem");
+
+    /// What the store saw: HTTP requests read after a handshake, and handshakes refused.
+    #[derive(Default)]
+    struct Seen {
+        requests: AtomicUsize,
+        refused: AtomicUsize,
+    }
+
+    /// A store over TLS with [`STORE_CERT`] that answers every request 404 (`NoSuchKey`), as S3
+    /// and GCS answer a key they do not hold. Returns its `https://` address.
+    fn private_ca_store() -> (String, Arc<Seen>) {
+        use rustls::pki_types::pem::PemObject;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![CertificateDer::from_pem_slice(STORE_CERT.as_bytes()).unwrap()],
+            PrivateKeyDer::from_pem_slice(STORE_KEY.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let config = Arc::new(config);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = format!(
+            "https://127.0.0.1:{}",
+            listener.local_addr().unwrap().port()
+        );
+        let seen = Arc::new(Seen::default());
+        let counts = seen.clone();
+        std::thread::spawn(move || {
+            for tcp in listener.incoming() {
+                let Ok(tcp) = tcp else { continue };
+                let (config, counts) = (config.clone(), counts.clone());
+                std::thread::spawn(move || {
+                    let connection = rustls::ServerConnection::new(config).unwrap();
+                    let mut tls = rustls::StreamOwned::new(connection, tcp);
+                    loop {
+                        let mut head = Vec::new();
+                        let mut byte = [0u8; 1];
+                        while !head.ends_with(b"\r\n\r\n") {
+                            match tls.read(&mut byte) {
+                                Ok(1) => head.push(byte[0]),
+                                Ok(_) => return,
+                                Err(_) => {
+                                    if tls.conn.is_handshaking() {
+                                        counts.refused.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                        counts.requests.fetch_add(1, Ordering::SeqCst);
+                        let body = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>NoSuchKey</Code><Message>none</Message></Error>";
+                        let answer = format!(
+                            "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{body}",
+                            body.len()
+                        );
+                        if tls
+                            .write_all(answer.as_bytes())
+                            .and_then(|()| tls.flush())
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (address, seen)
+    }
+
+    fn bundle(pems: &[&str]) -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        for pem in pems {
+            writeln!(file, "{pem}").unwrap();
+        }
+        file
+    }
+
+    fn roots_of(pems: &[&str]) -> Vec<object_store::Certificate> {
+        let file = bundle(pems);
+        root_certificates(Some(file.path().to_str().unwrap())).unwrap()
+    }
+
+    /// A GCS key file for a store that takes no token (`disable_oauth`): the client asks for
+    /// one on every request, and the fields must be there though nothing reads them.
+    fn no_oauth_key() -> tempfile::NamedTempFile {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(
+            file,
+            r#"{{"disable_oauth": true, "private_key": "unused", "private_key_id": "unused", "client_email": "nora@test"}}"#
+        )
+        .unwrap();
+        file
+    }
+
+    /// What a store said to a key it does not hold.
+    #[derive(Debug, PartialEq)]
+    enum Answer {
+        /// The store's own answer: not found.
+        NotFound,
+        /// Anything else, including no answer within a few seconds: a client that does not
+        /// trust the store retries the handshake for minutes.
+        Otherwise(String),
+    }
+
+    async fn ask(storage: &ObjectStorage) -> Answer {
+        // CANCEL-SAFETY: a read of a key; dropped at the deadline, it leaves nothing behind.
+        match tokio::time::timeout(std::time::Duration::from_secs(5), storage.get("absent")).await {
+            Ok(Err(StorageError::NotFound)) => Answer::NotFound,
+            Ok(other) => Answer::Otherwise(format!("{:?}", other.map(|_| ()))),
+            Err(_) => Answer::Otherwise("no answer".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_s3_store_signed_by_a_private_ca_is_trusted_through_ca_cert() {
+        let (address, seen) = private_ca_store();
+        // The store's CA second in the bundle: every certificate of it is trusted, not the first.
+        let roots = roots_of(&[OTHER_CA, STORE_CA]);
+        assert_eq!(roots.len(), 2);
+        let storage = ObjectStorage::new(&address, "b", "r", None, None, false, &roots);
+        assert_eq!(ask(&storage).await, Answer::NotFound);
+        assert!(seen.requests.load(Ordering::SeqCst) >= 1);
+        assert_eq!(seen.refused.load(Ordering::SeqCst), 0);
+    }
+
+    /// The control: the same store without the CA is not trusted, and the store sees the
+    /// handshake refused, not a request.
+    #[tokio::test]
+    async fn an_s3_store_signed_by_a_private_ca_is_refused_without_it() {
+        let (address, seen) = private_ca_store();
+        for roots in [Vec::new(), roots_of(&[OTHER_CA])] {
+            let storage = ObjectStorage::new(&address, "b", "r", None, None, false, &roots);
+            assert_ne!(ask(&storage).await, Answer::NotFound);
+        }
+        assert_eq!(seen.requests.load(Ordering::SeqCst), 0);
+        assert!(seen.refused.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn a_gcs_store_signed_by_a_private_ca_is_trusted_through_ca_cert() {
+        // The GCS client reads the environment while it is built.
+        let _lock = crate::test_env::env_lock();
+        let (address, seen) = private_ca_store();
+        let key = no_oauth_key();
+        let key = key.path().to_str().unwrap();
+        let refused = ObjectStorage::new_gcs("b", Some(key), Some(&address), &[]);
+        let trusted =
+            ObjectStorage::new_gcs("b", Some(key), Some(&address), &roots_of(&[STORE_CA]));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            assert_ne!(ask(&refused).await, Answer::NotFound);
+            assert_eq!(seen.requests.load(Ordering::SeqCst), 0);
+            assert_eq!(ask(&trusted).await, Answer::NotFound);
+            assert!(seen.requests.load(Ordering::SeqCst) >= 1);
+        });
+    }
+
+    #[test]
+    fn a_bundle_that_cannot_be_trusted_is_refused_with_its_path() {
+        assert!(root_certificates(None).unwrap().is_empty());
+        let missing = root_certificates(Some("/nonexistent/ca.pem")).unwrap_err();
+        assert!(
+            matches!(missing, CaBundleError::Unreadable { .. }),
+            "{missing}"
+        );
+        assert!(
+            missing.to_string().contains("/nonexistent/ca.pem"),
+            "{missing}"
+        );
+
+        let text = bundle(&["not a certificate"]);
+        let empty = root_certificates(Some(text.path().to_str().unwrap())).unwrap_err();
+        assert!(matches!(empty, CaBundleError::Empty { .. }), "{empty}");
+
+        let broken = bundle(&[
+            STORE_CA,
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----",
+        ]);
+        let invalid = root_certificates(Some(broken.path().to_str().unwrap())).unwrap_err();
+        assert!(matches!(invalid, CaBundleError::Anchor { .. }), "{invalid}");
+
+        // A key is not a certificate: a bundle of the key alone holds none.
+        let key = bundle(&[STORE_KEY]);
+        let keyonly = root_certificates(Some(key.path().to_str().unwrap())).unwrap_err();
+        assert!(matches!(keyonly, CaBundleError::Empty { .. }), "{keyonly}");
+    }
+
+    /// The roots are added to the system trust store, not put in its place.
+    #[test]
+    fn the_system_trust_store_stays() {
+        let options = trusting(streaming_client_options(), &roots_of(&[STORE_CA]));
+        assert_eq!(
+            options
+                .get_config_value(&object_store::ClientConfigKey::NoSystemCertificates)
+                .as_deref(),
+            Some("false")
+        );
+    }
+
+    /// Without a base URL the GCS client options come from the environment; adding the roots
+    /// replaces them, so they are rebuilt as `GoogleCloudStorageBuilder` reads them.
+    #[test]
+    fn gcs_options_rebuilt_from_the_environment_hold_what_the_builder_reads() {
+        use object_store::gcp::{GoogleCloudStorageBuilder, GoogleConfigKey};
+        use object_store::ClientConfigKey as K;
+        let keys = [
+            K::AllowHttp,
+            K::AllowInvalidCertificates,
+            K::ConnectTimeout,
+            K::ProxyUrl,
+            K::ProxyExcludes,
+            K::Timeout,
+            K::UserAgent,
+            K::PoolIdleTimeout,
+        ];
+        let os = |k: &str, v: &str| (std::ffi::OsString::from(k), std::ffi::OsString::from(v));
+        for env in [
+            vec![
+                os("GOOGLE_PROXY_URL", "http://proxy.example:3128"),
+                os("GOOGLE_PROXY_EXCLUDES", "metadata.google.internal"),
+                os("GOOGLE_CONNECT_TIMEOUT", "2s"),
+                os("GOOGLE_TIMEOUT", "7s"),
+                os("GOOGLE_BUCKET", "elsewhere"),
+                os("AWS_TIMEOUT", "1s"),
+                os("PATH", "/bin"),
+            ],
+            vec![os("GOOGLE_USER_AGENT", "nora-test")],
+        ] {
+            let ours = gcs_env_client_options(env.clone());
+            // What `new_gcs` holds without roots: `from_env` over this environment, plus the
+            // streaming timeout when the environment sets none.
+            let mut builder = GoogleCloudStorageBuilder::default();
+            for (key, value) in &env {
+                let key = key.to_str().unwrap();
+                if key.starts_with("GOOGLE_") {
+                    if let Ok(config_key) = key.to_ascii_lowercase().parse::<GoogleConfigKey>() {
+                        builder = builder.with_config(config_key, value.to_str().unwrap());
+                    }
+                }
+            }
+            if !env.iter().any(|(k, _)| k == "GOOGLE_TIMEOUT") {
+                builder = builder.with_config(
+                    GoogleConfigKey::Client(K::Timeout),
+                    format!("{}s", STREAM_ATTEMPT_TIMEOUT.as_secs()),
+                );
+            }
+            for key in &keys {
+                assert_eq!(
+                    ours.get_config_value(key).map(|v| v.replace(' ', "")),
+                    builder
+                        .get_config_value(&GoogleConfigKey::Client(*key))
+                        .map(|v| v.replace(' ', "")),
+                    "{key:?} for {env:?}"
+                );
+            }
+        }
     }
 }
 

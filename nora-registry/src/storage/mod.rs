@@ -6,7 +6,10 @@ mod object;
 
 pub use local::LocalStorage;
 pub(crate) use local::NameTaken;
-pub use object::ObjectStorage;
+pub use object::{root_certificates, ObjectStorage};
+
+/// A certificate the S3 or GCS client trusts besides the system trust store (`[tls] ca_cert`).
+pub type RootCertificate = object_store::Certificate;
 
 use crate::metrics::{STORAGE_GET_BYTES, STORAGE_OPERATIONS, STORAGE_VERIFY_DURATION_SECONDS};
 use crate::validation::{listing_key, validate_storage_key, ValidationError};
@@ -265,6 +268,7 @@ impl Storage {
         access_key: Option<&str>,
         secret_key: Option<&str>,
         virtual_hosted: bool,
+        roots: &[RootCertificate],
     ) -> Self {
         Self {
             inner: Arc::new(ObjectStorage::new(
@@ -274,6 +278,7 @@ impl Storage {
                 access_key,
                 secret_key,
                 virtual_hosted,
+                roots,
             )),
         }
     }
@@ -282,12 +287,14 @@ impl Storage {
         bucket: &str,
         service_account_path: Option<&str>,
         base_url: Option<&str>,
+        roots: &[RootCertificate],
     ) -> Self {
         Self {
             inner: Arc::new(ObjectStorage::new_gcs(
                 bucket,
                 service_account_path,
                 base_url,
+                roots,
             )),
         }
     }
@@ -797,7 +804,7 @@ mod tests {
     /// The GCS wrapper constructs without credentials or network.
     #[test]
     fn test_new_gcs_wrapper() {
-        let storage = Storage::new_gcs("test-bucket", None, Some("http://localhost:4443"));
+        let storage = Storage::new_gcs("test-bucket", None, Some("http://localhost:4443"), &[]);
         assert_eq!(storage.backend_name(), "gcs");
     }
 
