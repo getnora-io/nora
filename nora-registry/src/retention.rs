@@ -264,7 +264,6 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
         std::collections::HashMap<String, Vec<String>>,
     > = std::collections::HashMap::new();
 
-    let mut metadata_keys = Vec::new();
     for key in &all_keys {
         let parts: Vec<&str> = key
             .strip_prefix("maven/")
@@ -279,7 +278,6 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
         let version = parts[parts.len() - 2].to_string();
         let artifact_path = parts[..parts.len() - 2].join("/");
         if parts[parts.len() - 1].starts_with("maven-metadata") {
-            metadata_keys.push((artifact_path, version, key.clone()));
             continue;
         }
         artifacts
@@ -289,20 +287,11 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
             .or_default()
             .push(key.clone());
     }
-    // A version-level maven-metadata.xml (a SNAPSHOT's) and its checksums belong to the
-    // version: left behind, they keep the version directory alive and the next metadata
-    // regeneration lists the retired version again (#1281). The path alone does not tell it
-    // from an artifact-level document (`g/a/maven-metadata.xml` reads as artifact `g`, version
-    // `a`), so a metadata key joins only a version that holds artifact files; an artifact's
-    // own document is never a version's key and is reconciled after the deletions instead.
-    for (artifact_path, version, key) in metadata_keys {
-        if let Some(keys) = artifacts
-            .get_mut(&artifact_path)
-            .and_then(|versions| versions.get_mut(&version))
-        {
-            keys.push(key);
-        }
-    }
+    // Metadata documents are never a version's keys: the path alone does not tell a version-level
+    // document (a SNAPSHOT's) from an artifact-level one (`g/a/maven-metadata.xml` reads as
+    // artifact `g`, version `a`), and only its content does. Retention reconciles both after the
+    // deletions: an artifact's document from its files, a retired SNAPSHOT's by removing it once
+    // no file of the version is left (#1281).
 
     let mut result = Vec::new();
     for (artifact, versions) in &artifacts {
@@ -962,15 +951,7 @@ pub async fn run_retention(
                 ));
             }
             for plan in &plans {
-                for key in &plan.keys {
-                    // Serialize with concurrent publish to prevent deleting
-                    // an artifact that is being referenced by a new publish.
-                    let lock = crate::acquire_publish_lock(publish_locks, key);
-                    let _guard = lock.lock().await;
-                    if storage.delete(key).await.is_ok() {
-                        total_deleted_keys += 1;
-                    }
-                }
+                total_deleted_keys += delete_plan_keys(storage, publish_locks, plan).await;
                 total_bytes += plan.size;
                 info!(
                     group = %group_name,
@@ -1039,34 +1020,7 @@ pub async fn run_retention(
         }
     }
 
-    // Reconcile the maven-metadata.xml of every Maven artifact retention touched (#1281): the
-    // document is derived too, and a client resolving RELEASE, LATEST or a range from one that
-    // still lists a deleted version gets a 404. Only the deleted versions leave it; versions a
-    // hosted+proxy read merged in from an upstream stay (#885). Under the lock uploads and
-    // proxy merges of the artifact take. Fail-open per artifact like npm: the deletions are
-    // already durable, a failure logs and leaves the document as it was.
-    for (artifact, retired) in &maven_regen {
-        let Some((group_path, artifact_id)) = artifact.rsplit_once('/') else {
-            continue;
-        };
-        let lock_key = format!("maven/{artifact}/maven-metadata.xml");
-        let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
-        let _guard = lock.lock().await;
-        match crate::registry::maven_reconcile_metadata_after_retention(
-            storage,
-            group_path,
-            artifact_id,
-            retired,
-        )
-        .await
-        {
-            Ok(()) => {
-                info!(registry = "maven", artifact = %artifact, "retention: maven-metadata.xml reconciled")
-            }
-            Err(e) => tracing::error!(registry = "maven", artifact = %artifact, error = %e,
-                "retention: maven-metadata.xml reconciliation failed — it still lists the deleted versions"),
-        }
-    }
+    reconcile_maven_metadata(storage, publish_locks, &maven_regen).await;
 
     // Rebuild + re-sign the indexes of every rpm/deb repo retention touched,
     // under the same per-repo publish lock the handlers use. Fail-open per
@@ -1124,6 +1078,76 @@ pub async fn run_retention(
         bytes_freed: total_bytes,
         duration_secs: duration,
         plans: all_plans,
+    }
+}
+
+/// Delete the keys of one plan, each under the publish lock of its key, so a concurrent publish
+/// of the same key is never interleaved. Returns the number of keys deleted.
+async fn delete_plan_keys(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    plan: &DeletionPlan,
+) -> usize {
+    let mut deleted = 0;
+    for key in &plan.keys {
+        // Serialize with concurrent publish to prevent deleting
+        // an artifact that is being referenced by a new publish.
+        let lock = crate::acquire_publish_lock(publish_locks, key);
+        let _guard = lock.lock().await;
+        if storage.delete(key).await.is_ok() {
+            deleted += 1;
+        }
+    }
+    deleted
+}
+
+/// Reconcile the Maven documents of the artifacts retention touched (#1281), `regen` mapping each
+/// artifact (`group/path/artifact`) to the versions it lost. The document is derived too, and a
+/// client resolving RELEASE, LATEST or a range from one that still lists a deleted version gets a
+/// 404. Under the artifact's metadata lock, the lock its deploys take: a retired SNAPSHOT's
+/// version-level document goes first (once no file of the version is left), then the artifact's
+/// document drops the deleted versions; versions a hosted+proxy read merged in from an upstream
+/// stay (#885). Fail-open per artifact: the deletions are already durable, a failure logs and
+/// leaves the document as it was.
+pub(crate) async fn reconcile_maven_metadata(
+    storage: &Storage,
+    publish_locks: &PublishLocks,
+    regen: &std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+) {
+    for (artifact, retired) in regen {
+        let Some((group_path, artifact_id)) = artifact.rsplit_once('/') else {
+            continue;
+        };
+        let lock_key = crate::registry::maven_artifact_metadata_lock_key(group_path, artifact_id);
+        let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
+        let _guard = lock.lock().await;
+        for version in retired {
+            if let Err(e) = crate::registry::maven_reconcile_version_metadata_after_retention(
+                storage,
+                group_path,
+                artifact_id,
+                version,
+            )
+            .await
+            {
+                tracing::error!(registry = "maven", artifact = %artifact, version = %version, error = %e,
+                    "retention: version-level maven-metadata.xml removal failed — it stays under the version");
+            }
+        }
+        match crate::registry::maven_reconcile_metadata_after_retention(
+            storage,
+            group_path,
+            artifact_id,
+            retired,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(registry = "maven", artifact = %artifact, "retention: maven-metadata.xml reconciled")
+            }
+            Err(e) => tracing::error!(registry = "maven", artifact = %artifact, error = %e,
+                "retention: maven-metadata.xml reconciliation failed — it still lists the deleted versions"),
+        }
     }
 }
 
@@ -3844,6 +3868,360 @@ mod format_retention_tests {
             assert_eq!(xml.matches("<version>").count(), 1, "{xml}");
             assert_metadata_resolves(&ctx, artifact).await;
         }
+    }
+
+    /// A SNAPSHOT version's `<version>` document, as maven-deploy writes it.
+    fn snapshot_document(artifact: &str, timestamp: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\"?><metadata modelVersion=\"1.1.0\"><groupId>com.example</groupId><artifactId>{artifact}</artifactId><version>1.0-SNAPSHOT</version><versioning><snapshot><timestamp>{timestamp}</timestamp><buildNumber>1</buildNumber></snapshot><lastUpdated>{timestamp}</lastUpdated></versioning></metadata>"
+        )
+    }
+
+    /// `com.example:lib:tools` and `com.example.lib:tools:1.0` share the directory
+    /// `com/example/lib/tools/`: the document of the second sits where a version `tools` of the
+    /// first keeps its files. A rule for version `tools` must not take that document (#1281).
+    #[tokio::test]
+    async fn test_maven_retention_keeps_a_sibling_artifacts_document() {
+        let ctx = create_test_context();
+        maven_put(&ctx, "com/example/lib/tools/lib-tools.jar", "jar").await;
+        maven_put(&ctx, "com/example/lib/tools/1.0/tools-1.0.jar", "jar").await;
+        let rule: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "maven", "name_glob": "com/example/lib",
+            "include_tags": ["tools"], "keep_last": 0
+        }))
+        .unwrap();
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &[rule],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1, "version `tools` of com.example:lib");
+        let (status, xml) = maven_get(&ctx, "com/example/lib/tools/maven-metadata.xml").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "sibling artifact's document deleted"
+        );
+        assert!(xml.contains("<artifactId>tools</artifactId>"), "{xml}");
+    }
+
+    /// A retired SNAPSHOT of `com.example:lib` shares its directory with the artifact-level
+    /// document of `com.example.lib:1.0-SNAPSHOT`. Only the document whose `<version>` is the
+    /// retired version belongs to that version; the sibling's must survive (#1281).
+    #[tokio::test]
+    async fn test_maven_retired_snapshot_keeps_a_sibling_artifacts_document() {
+        let ctx = create_test_context();
+        maven_put(
+            &ctx,
+            "com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar",
+            "jar",
+        )
+        .await;
+        maven_put(
+            &ctx,
+            "com/example/lib/1.0-SNAPSHOT/2.0/1.0-SNAPSHOT-2.0.jar",
+            "jar",
+        )
+        .await;
+        let rule: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "maven", "name_glob": "com/example/lib",
+            "include_tags": ["*-SNAPSHOT"], "keep_last": 0
+        }))
+        .unwrap();
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &[rule],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        assert!(
+            ctx.state
+                .storage
+                .stat("maven/com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar")
+                .await
+                .is_none(),
+            "retired SNAPSHOT jar kept"
+        );
+        let (status, xml) =
+            maven_get(&ctx, "com/example/lib/1.0-SNAPSHOT/maven-metadata.xml").await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "sibling artifact's document deleted"
+        );
+        assert!(
+            xml.contains("<artifactId>1.0-SNAPSHOT</artifactId>"),
+            "{xml}"
+        );
+    }
+
+    /// A SNAPSHOT redeployed while retention runs keeps its new document. The plan takes the old
+    /// files, a deploy writes new files and a new document under the same key, then the plan's
+    /// remaining keys go: the new document must survive (#1281).
+    #[tokio::test]
+    async fn test_maven_snapshot_redeployed_during_retention_keeps_its_document() {
+        let ctx = create_test_context();
+        let storage = &ctx.state.storage;
+        let base = "com/example/race/1.0-SNAPSHOT";
+        maven_put(
+            &ctx,
+            &format!("{base}/race-1.0-20261101.000000-1.jar"),
+            "old",
+        )
+        .await;
+        maven_put(
+            &ctx,
+            &format!("{base}/maven-metadata.xml"),
+            &snapshot_document("race", "20261101.000000"),
+        )
+        .await;
+        maven_put(&ctx, "com/example/race/1.1/race-1.1.jar", "release").await;
+
+        let groups = collect_maven_versions(storage).await;
+        let versions = groups
+            .into_iter()
+            .find(|(name, _)| name == "maven:com/example/race")
+            .expect("group")
+            .1;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let plans = plan_deletions(versions, &maven_rule("*-SNAPSHOT"), now);
+        assert_eq!(plans.len(), 1);
+        let (documents, files): (Vec<String>, Vec<String>) =
+            plans[0].keys.iter().cloned().partition(|key| {
+                key.rsplit('/')
+                    .next()
+                    .is_some_and(|name| name.starts_with("maven-metadata"))
+            });
+        for key in &files {
+            storage.delete(key).await.unwrap();
+        }
+        maven_put(
+            &ctx,
+            &format!("{base}/race-1.0-20261117.120000-2.jar"),
+            "new",
+        )
+        .await;
+        maven_put(
+            &ctx,
+            &format!("{base}/maven-metadata.xml"),
+            &snapshot_document("race", "20261117.120000"),
+        )
+        .await;
+        for key in &documents {
+            storage.delete(key).await.unwrap();
+        }
+
+        let regen = std::collections::BTreeMap::from([(
+            "com/example/race".to_string(),
+            std::collections::BTreeSet::from(["1.0-SNAPSHOT".to_string()]),
+        )]);
+        reconcile_maven_metadata(storage, &ctx.state.publish_locks, &regen).await;
+
+        let doc = storage
+            .get(&format!("maven/{base}/maven-metadata.xml"))
+            .await;
+        assert!(
+            doc.is_ok(),
+            "the new deploy's document was deleted by the plan"
+        );
+        let doc = String::from_utf8(doc.unwrap().to_vec()).unwrap();
+        assert!(doc.contains("20261117.120000"), "{doc}");
+        assert!(
+            storage
+                .stat(&format!("maven/{base}/race-1.0-20261117.120000-2.jar"))
+                .await
+                .is_some(),
+            "the new deploy's jar is gone"
+        );
+    }
+
+    /// The metadata lock of `com.example:lock`, the key a deploy of its documents and retention's
+    /// reconciliation both take.
+    const LOCK_KEY: &str = "maven/com/example/lock/maven-metadata.xml";
+
+    /// A retired SNAPSHOT whose files are gone keeps only its document, until reconciliation
+    /// removes it. Reconciliation waits for the artifact's metadata lock while another writer
+    /// holds it (#1281).
+    #[tokio::test]
+    async fn test_maven_version_document_removal_waits_for_the_artifact_lock() {
+        let ctx = create_test_context();
+        let storage = ctx.state.storage.clone();
+        let locks = ctx.state.publish_locks.clone();
+        let doc = "maven/com/example/lock/1.0-SNAPSHOT/maven-metadata.xml";
+        storage
+            .put(doc, snapshot_document("lock", "20261117.120000").as_bytes())
+            .await
+            .unwrap();
+        let regen = std::collections::BTreeMap::from([(
+            "com/example/lock".to_string(),
+            std::collections::BTreeSet::from(["1.0-SNAPSHOT".to_string()]),
+        )]);
+
+        let held_lock = crate::acquire_publish_lock(&locks, LOCK_KEY);
+        let held = held_lock.lock().await;
+        let task = tokio::spawn({
+            let (storage, locks) = (storage.clone(), locks.clone());
+            async move { reconcile_maven_metadata(&storage, &locks, &regen).await }
+        });
+        // Yield until the task ends or the bound is spent: a blocked task never ends, an unlocked
+        // one ends well inside the bound (the HTTP path of a deploy takes ~18k turns).
+        let mut turns = 0u32;
+        while !task.is_finished() && turns < 50_000 {
+            tokio::task::yield_now().await;
+            turns += 1;
+        }
+        // Blocked on the lock, the task has not finished; without the lock it finishes in its
+        // first polls, before any of the yields above end.
+        assert!(
+            !task.is_finished(),
+            "reconciliation ran while the artifact lock was held"
+        );
+        assert!(
+            storage.stat(doc).await.is_some(),
+            "reconciliation removed the document while the artifact lock was held"
+        );
+        drop(held);
+        task.await.unwrap();
+        assert!(
+            storage.stat(doc).await.is_none(),
+            "retired version's document left behind"
+        );
+    }
+
+    /// A deploy of a version-level document takes the artifact's metadata lock, the lock the
+    /// reconciliation of that document takes: it waits while the lock is held (#1281).
+    #[tokio::test]
+    async fn test_maven_version_document_deploy_waits_for_the_artifact_lock() {
+        let ctx = create_test_context();
+        let storage = ctx.state.storage.clone();
+        let held_lock = crate::acquire_publish_lock(&ctx.state.publish_locks, LOCK_KEY);
+        let held = held_lock.lock().await;
+        let app = ctx.app.clone();
+        let body = snapshot_document("lock", "20261117.120000");
+        let deploy = tokio::spawn(async move {
+            crate::test_helpers::send(
+                &app,
+                Method::PUT,
+                "/maven2/com/example/lock/1.0-SNAPSHOT/maven-metadata.xml",
+                body,
+            )
+            .await
+            .status()
+        });
+        // Yield until the request ends or the bound is spent: a blocked request never ends, an
+        // unlocked one ends well inside the bound (a deploy's HTTP path takes ~18k turns).
+        let mut turns = 0u32;
+        while !deploy.is_finished() && turns < 50_000 {
+            tokio::task::yield_now().await;
+            turns += 1;
+        }
+        assert!(
+            !deploy.is_finished(),
+            "the document was deployed while the artifact lock was held"
+        );
+        assert!(
+            storage
+                .stat("maven/com/example/lock/1.0-SNAPSHOT/maven-metadata.xml")
+                .await
+                .is_none(),
+            "the document was written while the artifact lock was held"
+        );
+        drop(held);
+        assert_eq!(deploy.await.unwrap(), StatusCode::CREATED);
+    }
+
+    /// A file of another coordinate nested under a retired SNAPSHOT's directory does not keep the
+    /// version's document: the version still goes once its own files are gone (#1281).
+    #[tokio::test]
+    async fn test_maven_nested_foreign_file_does_not_keep_a_retired_snapshot_document() {
+        let ctx = create_test_context();
+        let storage = &ctx.state.storage;
+        let base = "com/example/nest/1.0-SNAPSHOT";
+        maven_put(&ctx, &format!("{base}/nest-1.0-SNAPSHOT.jar"), "jar").await;
+        maven_put(
+            &ctx,
+            &format!("{base}/maven-metadata.xml"),
+            &snapshot_document("nest", "20261117.120000"),
+        )
+        .await;
+        // Stored directly: a deploy of `nest:1.0-SNAPSHOT:9.0` would also write that artifact's
+        // document at the very key the version's document has.
+        storage
+            .put(&format!("maven/{base}/9.0/nest-9.0.jar"), b"foreign")
+            .await
+            .unwrap();
+        maven_put(&ctx, "com/example/nest/1.1/nest-1.1.jar", "release").await;
+
+        let result = run_retention(
+            storage,
+            &ctx.state.publish_locks,
+            None,
+            &[maven_rule("*-SNAPSHOT")],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        assert!(
+            storage
+                .stat(&format!("maven/{base}/maven-metadata.xml"))
+                .await
+                .is_none(),
+            "retired SNAPSHOT's document kept by a nested file of another coordinate"
+        );
+        assert!(
+            storage
+                .stat(&format!("maven/{base}/9.0/nest-9.0.jar"))
+                .await
+                .is_some(),
+            "the nested foreign file was deleted"
+        );
+    }
+
+    /// Only a SNAPSHOT has a version-level document: a retired release version's directory keeps
+    /// its `maven-metadata.xml` whatever it declares (#1281).
+    #[tokio::test]
+    async fn test_maven_retired_release_keeps_its_directory_document() {
+        let ctx = create_test_context();
+        let storage = &ctx.state.storage;
+        maven_put(&ctx, "com/example/rel/1.0/rel-1.0.jar", "jar").await;
+        storage
+            .put(
+                "maven/com/example/rel/1.0/maven-metadata.xml",
+                b"<?xml version=\"1.0\"?><metadata><groupId>com.example</groupId><artifactId>rel</artifactId><version>1.0</version></metadata>",
+            )
+            .await
+            .unwrap();
+        maven_put(&ctx, "com/example/rel/2.0/rel-2.0.jar", "jar").await;
+
+        let result = run_retention(
+            storage,
+            &ctx.state.publish_locks,
+            None,
+            &[maven_rule("1.0")],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        assert!(storage
+            .stat("maven/com/example/rel/1.0/rel-1.0.jar")
+            .await
+            .is_none());
+        assert!(
+            storage
+                .stat("maven/com/example/rel/1.0/maven-metadata.xml")
+                .await
+                .is_some(),
+            "a release version's directory document was removed"
+        );
     }
 
     /// A dry run deletes nothing and rewrites nothing.
