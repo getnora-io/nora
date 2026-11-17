@@ -1341,8 +1341,12 @@ async fn flatcontainer_download(
 
             state.spawn_cache_immutable("nuget", storage_key, Bytes::from(bytes.clone()));
 
-            // Best-effort: fetch flatcontainer index.json if missing (for local search)
-            if ends_with_ci(filename, ".nupkg") {
+            // Best-effort: fetch flatcontainer index.json if missing (for local search). Not
+            // while the store leaves this request unanswered: the task runs outside it and
+            // would wait for the store as long as the client retries (#1182).
+            if ends_with_ci(filename, ".nupkg")
+                && !crate::storage::answer::unanswered_in_this_request()
+            {
                 let index_key = format!("nuget/flatcontainer/{}/index.json", id_lower);
                 let state2 = state.clone();
                 let proxy_url2 = proxy_url.clone();
