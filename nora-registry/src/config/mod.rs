@@ -4160,6 +4160,27 @@ proxies = [
         assert!(!errors.iter().any(|e| e.contains("docker")), "{errors:?}");
     }
 
+    /// #1271: a namespace with no dot is a namespace like any other — derived from a host
+    /// (`http://harbor:5000`) or given explicitly, the config does not refuse it.
+    #[test]
+    fn a_dotless_docker_namespace_is_accepted() {
+        let _lock = crate::test_env::env_lock();
+        let mut config = Config::default();
+        config.docker.upstreams = vec![DockerUpstream {
+            url: "http://harbor:5000".to_string(),
+            auth: None,
+            namespace: None,
+            prefix: None,
+            namespaces: Vec::new(),
+            metadata_ttl: None,
+        }];
+        let (_, errors) = config.validate();
+        assert!(!errors.iter().any(|e| e.contains("docker")), "{errors:?}");
+        config.docker.upstreams[0].namespace = Some("harbor".to_string());
+        let (_, errors) = config.validate();
+        assert!(!errors.iter().any(|e| e.contains("docker")), "{errors:?}");
+    }
+
     /// #1188 warnings: deny with only bound upstreams is not a deny-everything trap; every entry
     /// bound leaves public names local; a namespace curation calls internal is never proxied.
     #[test]

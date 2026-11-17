@@ -11,8 +11,9 @@
 //!
 //! Algorithm:
 //! 1. List all keys under `docker/`
-//! 2. Classify each key as namespaced (first segment after `docker/` contains a dot)
-//!    or legacy (no dot — plain image name)
+//! 2. Classify each key as namespaced or legacy (plain image name). A key is namespaced when its
+//!    first segment is the storage namespace of a configured Docker upstream — the one the proxy
+//!    writes its copies under, dotless or not — or holds a dot, as it always did (#1271)
 //! 3. For legacy keys:
 //!    - If a namespaced equivalent already exists → delete legacy (dedup)
 //!    - If no namespaced equivalent → copy data to namespaced key, verify, delete legacy (migrate)
@@ -23,8 +24,41 @@
 use indicatif::{ProgressBar, ProgressStyle};
 use tracing::{info, warn};
 
-use crate::registry::docker::strip_docker_namespace;
+use crate::config::DockerConfig;
 use crate::storage::Storage;
+
+/// The storage namespace of every Docker upstream, as the proxy computes it
+/// ([`crate::config::DockerUpstream::resolved_namespace`]: explicit, or derived from its url).
+/// The first is where legacy keys move, as before; with no upstream it is `docker.io`.
+pub fn upstream_namespaces(docker: &DockerConfig) -> Vec<String> {
+    if docker.upstreams.is_empty() {
+        return vec!["docker.io".to_string()];
+    }
+    docker
+        .upstreams
+        .iter()
+        .map(|upstream| upstream.resolved_namespace())
+        .collect()
+}
+
+/// Whether the repository of a key under `docker/` already carries a storage namespace: its
+/// leading segments are a namespace some upstream was given (`harbor/team/app` for `harbor`), or
+/// its first segment holds a dot, as it always did — that keeps the copies of a host no upstream
+/// here is configured for. A bare name is never namespaced, nor a name with nothing after the
+/// namespace (#1271).
+fn is_namespaced(repo: &str, namespaces: &[String]) -> bool {
+    let dotted = repo
+        .split_once('/')
+        .is_some_and(|(first, rest)| first.contains('.') && !rest.is_empty());
+    dotted
+        || namespaces.iter().any(|ns| {
+            !ns.is_empty()
+                && repo
+                    .strip_prefix(ns.as_str())
+                    .and_then(|rest| rest.strip_prefix('/'))
+                    .is_some_and(|rest| !rest.is_empty())
+        })
+}
 
 /// Migration options
 #[derive(Default)]
@@ -52,13 +86,16 @@ pub struct MigrateDockerKeysStats {
 
 /// Migrate legacy Docker storage keys to namespaced format.
 ///
-/// `namespace` is the target namespace prefix (e.g., `"docker.io"`), typically
-/// derived from `DockerUpstream::resolved_namespace()`.
+/// `namespaces` is the storage namespace of every Docker upstream ([`upstream_namespaces`]); a key
+/// already under one of them is kept. Legacy keys move under the first, the target.
 pub async fn migrate_docker_keys(
     storage: &Storage,
-    namespace: &str,
+    namespaces: &[String],
     options: MigrateDockerKeysOptions,
 ) -> Result<MigrateDockerKeysStats, String> {
+    let Some(namespace) = namespaces.first() else {
+        return Err("no Docker upstream namespace to migrate legacy keys under".to_string());
+    };
     println!("Docker key migration: legacy → namespaced (namespace: {namespace})");
 
     if options.dry_run {
@@ -93,7 +130,7 @@ pub async fn migrate_docker_keys(
         ..Default::default()
     };
 
-    let pushed = pushed_repositories(storage, &all_keys)
+    let pushed = pushed_repositories(storage, &all_keys, namespaces)
         .await
         .map_err(|e| format!("Failed to read a push record: {e}"))?;
 
@@ -111,9 +148,8 @@ pub async fn migrate_docker_keys(
             continue;
         };
 
-        // Classify: if strip_docker_namespace changes the name, it's already namespaced
-        let canonical = strip_docker_namespace(repo_name);
-        if canonical != repo_name {
+        // Already under an upstream's namespace (or a dotted host): no action needed
+        if is_namespaced(repo_name, namespaces) {
             // Already namespaced — no action needed
             stats.skipped += 1;
             pb.inc(1);
@@ -288,6 +324,7 @@ fn repository_of(rest: &str) -> Option<&str> {
 async fn pushed_repositories(
     storage: &Storage,
     keys: &[String],
+    namespaces: &[String],
 ) -> crate::storage::Result<std::collections::HashSet<String>> {
     let mut pushed = std::collections::HashSet::new();
     for key in keys {
@@ -300,7 +337,7 @@ async fn pushed_repositories(
         let file = &rest[repo.len()..];
         if !file.starts_with("/manifests/")
             || !file.ends_with(".meta.json")
-            || strip_docker_namespace(repo) != repo
+            || is_namespaced(repo, namespaces)
         {
             continue;
         }
@@ -320,6 +357,11 @@ async fn pushed_repositories(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// The storage namespaces of the upstreams a test configures; the first one is the target.
+    fn names(namespaces: &[&str]) -> Vec<String> {
+        namespaces.iter().map(|ns| ns.to_string()).collect()
+    }
 
     /// A tag pushed here records the push in its bare `.meta.json`: its repository is hosted and
     /// keeps every bare key — with or without a proxied copy of the same tag. A repository without
@@ -351,7 +393,7 @@ mod tests {
 
         let stats = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
@@ -384,7 +426,7 @@ mod tests {
         }
         let stats = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
@@ -438,7 +480,7 @@ mod tests {
         }
         migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
@@ -465,7 +507,7 @@ mod tests {
             .unwrap();
         migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
@@ -517,7 +559,7 @@ mod tests {
 
         let result = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await;
@@ -548,7 +590,7 @@ mod tests {
 
         let stats = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
@@ -591,7 +633,7 @@ mod tests {
 
         let stats = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
@@ -629,7 +671,7 @@ mod tests {
 
         let stats = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
@@ -652,7 +694,7 @@ mod tests {
 
         let stats = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: true },
         )
         .await
@@ -679,7 +721,7 @@ mod tests {
 
         let stats = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
@@ -702,7 +744,7 @@ mod tests {
 
         let stats = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
@@ -731,7 +773,7 @@ mod tests {
         // First run: migrates
         let stats1 = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
@@ -741,12 +783,306 @@ mod tests {
         // Second run: nothing to do
         let stats2 = migrate_docker_keys(
             &storage,
-            "docker.io",
+            &names(&["docker.io"]),
             MigrateDockerKeysOptions { dry_run: false },
         )
         .await
         .unwrap();
         assert_eq!(stats2.migrated, 0);
         assert_eq!(stats2.skipped, 1);
+    }
+
+    /// A copy a pull through an upstream whose namespace has no dot leaves under that namespace
+    /// (`http://harbor:5000` → `harbor`, `localhost:5000` → `localhost`) is already namespaced,
+    /// flat or deep: it stays where it is and is not written a second time under itself (#1271).
+    #[tokio::test]
+    async fn a_copy_under_a_one_word_namespace_is_not_moved() {
+        let cases: [(&str, &[&str]); 2] = [
+            (
+                "harbor",
+                &[
+                    "docker/harbor/team/app/manifests/1.0.json",
+                    "docker/harbor/team/app/blobs/sha256:11",
+                    "docker/harbor/team/sub/app/manifests/1.0.json",
+                ],
+            ),
+            ("localhost", &["docker/localhost/app/manifests/latest.json"]),
+        ];
+        for (namespace, keys) in cases {
+            let dir = TempDir::new().unwrap();
+            let storage = Storage::new_local(dir.path().to_str().unwrap());
+            for key in keys {
+                storage.put(key, b"proxied").await.unwrap();
+            }
+
+            let stats = migrate_docker_keys(
+                &storage,
+                &names(&[namespace]),
+                MigrateDockerKeysOptions { dry_run: false },
+            )
+            .await
+            .unwrap();
+
+            for key in keys {
+                assert!(
+                    storage.get(key).await.is_ok(),
+                    "{key} moved under {namespace}"
+                );
+            }
+            assert!(storage
+                .get(&format!(
+                    "docker/{namespace}/{namespace}/team/app/manifests/1.0.json"
+                ))
+                .await
+                .is_err());
+            assert_eq!(stats.migrated, 0, "{namespace}");
+            assert_eq!(stats.skipped, keys.len(), "{namespace}");
+        }
+    }
+
+    /// A bare key whose first segment is an upstream's namespace, with no push record, stays where
+    /// it is: the layout cannot tell it from a copy under that namespace, and moving a pushed image
+    /// is the mistake this migration must not make. Where the namespace and a bare name meet, the
+    /// namespace wins (#1271).
+    #[tokio::test]
+    async fn a_bare_key_under_an_upstream_namespace_stays_without_a_push_record() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put("docker/harbor/app/manifests/1.0.json", b"unrecorded")
+            .await
+            .unwrap();
+
+        let stats = migrate_docker_keys(
+            &storage,
+            &names(&["harbor"]),
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await
+        .unwrap();
+
+        assert!(storage
+            .get("docker/harbor/app/manifests/1.0.json")
+            .await
+            .is_ok());
+        assert_eq!(stats.migrated, 0);
+    }
+
+    /// The same first segment with a push record: the repository is hosted and keeps every key,
+    /// as before the fix (#1271 — the pushed set is unchanged).
+    #[tokio::test]
+    async fn a_pushed_repository_under_an_upstream_namespace_keeps_its_keys() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for (key, data) in [
+            ("docker/harbor/app/manifests/1.0.json", &b"pushed"[..]),
+            (
+                "docker/harbor/app/manifests/1.0.meta.json",
+                &br#"{"push_timestamp":1,"last_pulled":0,"downloads":0,"size_bytes":0,"os":"","arch":"","layers":[],"pushed_digest":"sha256:00"}"#[..],
+            ),
+            ("docker/harbor/app/blobs/sha256:11", &b"layer"[..]),
+        ] {
+            storage.put(key, data).await.unwrap();
+        }
+
+        let stats = migrate_docker_keys(
+            &storage,
+            &names(&["harbor"]),
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await
+        .unwrap();
+
+        assert!(storage
+            .get("docker/harbor/app/manifests/1.0.json")
+            .await
+            .is_ok());
+        assert!(storage
+            .get("docker/harbor/app/blobs/sha256:11")
+            .await
+            .is_ok());
+        assert!(storage
+            .get("docker/harbor/harbor/app/manifests/1.0.json")
+            .await
+            .is_err());
+        assert_eq!(stats.migrated, 0);
+    }
+
+    /// The namespace of each upstream is the one the proxy writes its copies under: explicit, or
+    /// derived from its url (`http://harbor:5000` → `harbor`). The first is the migration's target.
+    #[test]
+    fn upstream_namespaces_are_the_proxy_s_own() {
+        use crate::config::DockerUpstream;
+        let upstream = |url: &str, namespace: Option<&str>| DockerUpstream {
+            url: url.to_string(),
+            auth: None,
+            namespace: namespace.map(str::to_string),
+            prefix: None,
+            namespaces: Vec::new(),
+            metadata_ttl: None,
+        };
+        let mut docker = DockerConfig::default();
+        docker.upstreams = vec![
+            upstream("http://harbor:5000", None),
+            upstream("https://registry-1.docker.io", None),
+            upstream("http://localhost:5000", None),
+            upstream("https://mirror.example", Some("team")),
+        ];
+        assert_eq!(
+            upstream_namespaces(&docker),
+            names(&["harbor", "docker.io", "localhost", "team"])
+        );
+        docker.upstreams.clear();
+        assert_eq!(upstream_namespaces(&docker), names(&["docker.io"]));
+    }
+
+    /// A name whose first segment holds a dot is classified as before: namespaced, so kept — the
+    /// dot rule stays for hosts no upstream here is configured for (#1271: dotted names unchanged).
+    #[tokio::test]
+    async fn a_dotted_host_key_is_kept_as_before() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put("docker/ghcr.io/org/img/manifests/1.0.json", b"copy")
+            .await
+            .unwrap();
+
+        let stats = migrate_docker_keys(
+            &storage,
+            &names(&["docker.io"]),
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await
+        .unwrap();
+
+        assert!(storage
+            .get("docker/ghcr.io/org/img/manifests/1.0.json")
+            .await
+            .is_ok());
+        assert_eq!(stats.migrated, 0);
+    }
+
+    /// The dry run takes the same decision for every key as the real run and leaves the storage as
+    /// it found it (#1271: dry-run prints the decision the real run makes).
+    #[tokio::test]
+    async fn a_dry_run_decides_what_the_real_run_does() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        let keys = [
+            "docker/library/nginx/manifests/latest.json",
+            "docker/app/manifests/1.0.json",
+            "docker/harbor/app/manifests/1.0.json",
+            "docker/harbor/team/app/manifests/1.0.json",
+            "docker/_/quay.io/org/img/manifests/v1.json",
+        ];
+        for key in keys {
+            storage.put(key, b"x").await.unwrap();
+        }
+
+        let dry = migrate_docker_keys(
+            &storage,
+            &names(&["harbor"]),
+            MigrateDockerKeysOptions { dry_run: true },
+        )
+        .await
+        .unwrap();
+        for key in keys {
+            assert!(storage.get(key).await.is_ok(), "dry run touched {key}");
+        }
+
+        let real = migrate_docker_keys(
+            &storage,
+            &names(&["harbor"]),
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            (dry.migrated, dry.deduped, dry.skipped, dry.failed),
+            (real.migrated, real.deduped, real.skipped, real.failed)
+        );
+        assert_eq!(
+            (real.migrated, real.deduped, real.skipped),
+            (1, 1, 3),
+            "only the library copy and the flat duplicate move; the harbor copies and the host push stay"
+        );
+        assert!(storage
+            .get("docker/harbor/app/manifests/1.0.json")
+            .await
+            .is_ok());
+        assert!(storage
+            .get("docker/harbor/team/app/manifests/1.0.json")
+            .await
+            .is_ok());
+    }
+
+    /// Every Docker upstream's namespace keeps its copies, not only the first one's; a legacy key
+    /// still moves under the first, the target, as before (#1271).
+    #[tokio::test]
+    async fn every_upstream_namespace_keeps_its_copies() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        for key in [
+            "docker/harbor/team/app/manifests/1.0.json",
+            "docker/localhost/app/blobs/sha256:11",
+            "docker/docker.io/library/nginx/manifests/latest.json",
+            "docker/app/manifests/1.0.json",
+        ] {
+            storage.put(key, b"x").await.unwrap();
+        }
+
+        let stats = migrate_docker_keys(
+            &storage,
+            &names(&["docker.io", "harbor", "localhost"]),
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await
+        .unwrap();
+
+        assert!(storage
+            .get("docker/harbor/team/app/manifests/1.0.json")
+            .await
+            .is_ok());
+        assert!(storage
+            .get("docker/localhost/app/blobs/sha256:11")
+            .await
+            .is_ok());
+        assert!(storage
+            .get("docker/docker.io/app/manifests/1.0.json")
+            .await
+            .is_ok());
+        assert!(storage.get("docker/app/manifests/1.0.json").await.is_err());
+        assert_eq!((stats.migrated, stats.skipped), (1, 3));
+    }
+
+    /// A namespace is matched by whole segment: `harborx/app` is a bare name, not a copy under
+    /// `harbor`, and it moves as any legacy key does (#1271).
+    #[tokio::test]
+    async fn a_namespace_is_matched_by_segment_not_by_prefix() {
+        let dir = TempDir::new().unwrap();
+        let storage = Storage::new_local(dir.path().to_str().unwrap());
+        storage
+            .put("docker/harborx/app/manifests/1.0.json", b"legacy")
+            .await
+            .unwrap();
+
+        let stats = migrate_docker_keys(
+            &storage,
+            &names(&["harbor"]),
+            MigrateDockerKeysOptions { dry_run: false },
+        )
+        .await
+        .unwrap();
+
+        assert!(storage
+            .get("docker/harborx/app/manifests/1.0.json")
+            .await
+            .is_err());
+        assert!(storage
+            .get("docker/harbor/harborx/app/manifests/1.0.json")
+            .await
+            .is_ok());
+        assert_eq!(stats.migrated, 1);
     }
 }
