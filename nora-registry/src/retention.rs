@@ -3396,4 +3396,80 @@ mod format_retention_tests {
             "one prefix version survives: {keys:?}"
         );
     }
+
+    /// The rule from #1097: Maven prerelease builds are selected by name with `include_tags`
+    /// (`+` build metadata included, however the client encodes it); stable releases and a
+    /// SNAPSHOT that no pattern names are kept. Local and object store.
+    async fn maven_prerelease_rule_prunes_only_prereleases(ctx: crate::test_helpers::TestContext) {
+        const PRERELEASES: [&str; 4] = [
+            "0.14.0-dev.11+e47ab9f",
+            "1.2.0-alpha.1",
+            "1.2.0-beta.2",
+            "1.2.0-rc.1",
+        ];
+        const KEPT: [&str; 3] = ["0.13.0", "1.2.0", "1.3.0-SNAPSHOT"];
+        for v in KEPT.iter().chain(PRERELEASES.iter()) {
+            // A client may send the build-metadata `+` percent-encoded; it is the same version.
+            let path_v = v.replace('+', "%2B");
+            let r = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/maven2/com/example/app/{path_v}/app-{path_v}.jar"),
+                format!("jar {v}"),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED, "upload {v}");
+        }
+        let jar_key = |v: &str| format!("maven/com/example/app/{v}/app-{v}.jar");
+        for v in PRERELEASES {
+            assert!(
+                ctx.state.storage.stat(&jar_key(v)).await.is_some(),
+                "{v} stored under its decoded name"
+            );
+        }
+
+        let rule: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "maven",
+            "include_tags": ["*-dev.*+*", "*-alpha*", "*-beta*", "*-rc*"],
+            "keep_last": 0
+        }))
+        .unwrap();
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &[rule],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, PRERELEASES.len(), "{:?}", result.plans);
+
+        for v in KEPT {
+            let jar = format!("/maven2/com/example/app/{v}/app-{v}.jar");
+            let r = send(&ctx.app, Method::GET, &jar, "").await;
+            assert_eq!(r.status(), StatusCode::OK, "{v} must survive");
+        }
+        for v in PRERELEASES {
+            assert!(
+                ctx.state.storage.stat(&jar_key(v)).await.is_none(),
+                "{v} must be deleted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_maven_prerelease_rule_local() {
+        maven_prerelease_rule_prunes_only_prereleases(create_test_context()).await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_prerelease_rule_object_store() {
+        let storage = Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        maven_prerelease_rule_prunes_only_prereleases(
+            crate::test_helpers::create_test_context_with_storage(storage),
+        )
+        .await;
+    }
 }
