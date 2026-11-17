@@ -896,12 +896,26 @@ async fn fetch_upstream_tarball(
     let mut decided = step(None);
     if matches!(decided, TarballStep::Refetch) {
         let key = upstream_packument_key(ask.package());
-        let refetched =
-            match refetch_metadata(state, ask.package(), &key, &key, true, false, None).await {
-                Ok(doc) => Refetched::Packument(npm_links::listed_link(&doc, ask.version())),
-                Err(ProxyError::NotFound) => Refetched::NoPackument,
-                Err(e) => Refetched::Failed(e),
-            };
+        // The copy a ledger may start from is read here, once, for the refetch (#1064).
+        let seed_body = match state.storage.get(&key).await {
+            Ok(body) => body,
+            Err(_) => Bytes::new(),
+        };
+        let refetched = match refetch_metadata(
+            state,
+            ask.package(),
+            &key,
+            (key.as_str(), seed_body),
+            true,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(doc) => Refetched::Packument(npm_links::listed_link(&doc, ask.version())),
+            Err(ProxyError::NotFound) => Refetched::NoPackument,
+            Err(e) => Refetched::Failed(e),
+        };
         decided = step(Some(refetched));
     }
     let (asked, named) = match decided {
@@ -1116,7 +1130,12 @@ fn packument_versions(body: &[u8]) -> Option<Vec<String>> {
 /// ledger existed starts the versions it lists at its file time, when NORA last wrote it —
 /// never earlier than NORA saw them. Awaited before the packument is served, so a client
 /// cannot ask for a version the ledger does not hold yet.
-async fn record_first_seen(state: &AppState, key: &str, body: &[u8], seed_from: Option<&str>) {
+async fn record_first_seen(
+    state: &AppState,
+    key: &str,
+    body: &[u8],
+    seed_from: Option<(&str, &[u8])>,
+) {
     if !first_seen_tracked(state) {
         return;
     }
@@ -1140,7 +1159,10 @@ async fn record_first_seen(state: &AppState, key: &str, body: &[u8], seed_from: 
         // No ledger yet: a cached packument (this key's, or what an older release cached)
         // starts its versions at its own write time.
         Err(crate::storage::StorageError::NotFound) => match seed_from {
-            Some(seed) => (cached_first_seen(&state.storage, seed).await, false),
+            Some((seed_key, seed_body)) => (
+                cached_first_seen(&state.storage, seed_key, seed_body).await,
+                false,
+            ),
             None => (FirstSeen::new(), false),
         },
         // The bytes do not match their pin: the ledger is known bad, not merely unread.
@@ -1189,17 +1211,14 @@ async fn copy_time(storage: &crate::Storage, key: &str) -> Option<i64> {
     Some(confirmed.map_or(written, |at| at.max(written)))
 }
 
-/// First-seen times of a packument cached before the ledger: every version it lists at its
-/// file time. The body is read before the time, so a write landing in between can only make
-/// the time later.
-async fn cached_first_seen(storage: &crate::Storage, key: &str) -> FirstSeen {
-    let Ok(body) = storage.get(key).await else {
-        return FirstSeen::new();
-    };
+/// First-seen times of a packument cached before the ledger: every version `body` lists, which
+/// the caller has already read, at the copy's file time. The body was read before the time, so a
+/// write landing in between can only make the time later (#1064: no second read of the object).
+async fn cached_first_seen(storage: &crate::Storage, key: &str, body: &[u8]) -> FirstSeen {
     let Some(written) = copy_time(storage, key).await else {
         return FirstSeen::new();
     };
-    packument_versions(&body)
+    packument_versions(body)
         .unwrap_or_default()
         .into_iter()
         .map(|version| (version, written))
@@ -1309,11 +1328,12 @@ async fn refetch_metadata(
     state: &AppState,
     path: &str,
     key: &str,
-    seed_key: &str,
+    seed: (&str, Bytes),
     ledger: bool,
     conditional: bool,
-    held: Option<Bytes>,
+    held: Option<(Bytes, Validators)>,
 ) -> Result<Vec<u8>, ProxyError> {
+    let (seed_key, seed_body) = seed;
     let upstream = state.config.npm.route(path).ok_or(ProxyError::NotFound)?;
     let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
@@ -1321,10 +1341,15 @@ async fn refetch_metadata(
     // Revalidate with a conditional request when enabled and we have stored
     // validators. Empty validators ⇒ no conditional headers ⇒ always a 200,
     // which is also how the first fetch captures validators for next time (#596).
+    // The validators the held body was read with are the ones asked with: a write since then
+    // must not be confirmed by an answer about the older copy (#1064).
     let validators = if state.config.npm.revalidate && conditional {
-        read_validators(&state.storage, key)
-            .await
-            .unwrap_or_default()
+        match &held {
+            Some((_, read_with)) => read_with.clone(),
+            None => read_validators(&state.storage, key)
+                .await
+                .unwrap_or_default(),
+        }
     } else {
         Validators::default()
     };
@@ -1345,10 +1370,38 @@ async fn refetch_metadata(
         // refresh its freshness so we don't revalidate again until the next TTL
         // window. No body was downloaded.
         Ok(Revalidation::NotModified) => {
-            let cached = match held {
-                Some(body) => Ok(body),
-                None => state.storage.get(key).await,
+            // The validators now stored. Unchanged: the 304 is about the copy held, and that
+            // body is served and confirmed. Changed since the request: a write landed meanwhile,
+            // so the 304 says nothing about it; its copy is served as stored, unconfirmed by this
+            // request, and keeps its own record (#1064).
+            let current = read_validators(&state.storage, key)
+                .await
+                .unwrap_or_default();
+            let unchanged = current == validators;
+            let origin = origin_of(proxy_url);
+            let mut cached = match held {
+                Some((body, _)) if unchanged => Ok(body),
+                _ => state.storage.get(key).await,
             };
+            // Confirmed only while the record of the stored bytes names the body served: a writer
+            // that replaced the body before its validators leaves a record for other bytes, and a
+            // 304 neither confirms that body nor overwrites the record (#1064). Then the stored
+            // copy is read and served as it is.
+            let confirm = unchanged
+                && match &cached {
+                    // No record names any bytes (a copy from before provenance): nothing contradicts.
+                    Ok(body) => match state.storage.get(&origin_key(key)).await {
+                        Ok(record) => {
+                            record.as_ref() == provenance_record(&origin, body).as_bytes()
+                        }
+                        Err(crate::storage::StorageError::NotFound) => true,
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
+                };
+            if unchanged && !confirm {
+                cached = state.storage.get(key).await;
+            }
             match cached {
                 Ok(cached) => {
                     crate::metrics::PROXY_UPSTREAM_304_TOTAL
@@ -1360,27 +1413,31 @@ async fn refetch_metadata(
                     // The release ages are not in the confirmation: before it, the ledger takes
                     // over a cache from before it existed.
                     if ledger {
-                        record_first_seen(state, key, &cached, Some(seed_key)).await;
+                        record_first_seen(state, key, &cached, Some((seed_key, &seed_body))).await;
                     }
-                    // The body is not written again (#1064): the upstream confirmed it, and the
-                    // time of that confirmation goes to the validator sidecar, which the freshness
-                    // check reads. The origin record is written as a 200 writes it.
-                    let confirmed = Validators {
-                        checked: Some(crate::cache_ttl::now_unix()),
-                        ..validators.clone()
-                    };
-                    let storage = state.storage.clone();
-                    let key_clone = key.to_string();
-                    let body = cached.clone();
-                    let origin = origin_of(proxy_url);
-                    state.cache_writes.spawn("npm", async move {
-                        let record = provenance_record(&origin, &body);
-                        if let Err(e) = storage.put(&origin_key(&key_clone), record.as_bytes()).await
-                        {
-                            tracing::warn!(key = %key_clone, error = ?e, "npm: failed to record cache provenance");
-                        }
-                        write_validators(&storage, &key_clone, &confirmed).await;
-                    });
+                    if confirm {
+                        // The body is not written again (#1064): the upstream confirmed it, and the
+                        // time of that confirmation goes to the validator sidecar, which the freshness
+                        // check reads. Its record already names these bytes, so only the sidecar is
+                        // written, and only if it still holds what the 304 was asked with.
+                        let confirmed = Validators {
+                            checked: Some(crate::cache_ttl::now_unix()),
+                            ..validators.clone()
+                        };
+                        let storage = state.storage.clone();
+                        let key_clone = key.to_string();
+                        let asked_with = validators.clone();
+                        state.cache_writes.spawn("npm", async move {
+                            if read_validators(&storage, &key_clone)
+                                .await
+                                .unwrap_or_default()
+                                != asked_with
+                            {
+                                return;
+                            }
+                            write_validators(&storage, &key_clone, &confirmed).await;
+                        });
+                    }
                     Ok(cached.to_vec())
                 }
                 Err(_) => {
@@ -1405,7 +1462,7 @@ async fn refetch_metadata(
 
             // Before the cached copy is replaced: it may be the one a ledger starts from.
             if ledger {
-                record_first_seen(state, key, &rewritten, Some(seed_key)).await;
+                record_first_seen(state, key, &rewritten, Some((seed_key, &seed_body))).await;
             }
             let storage = state.storage.clone();
             let key_clone = key.to_string();
@@ -2224,6 +2281,11 @@ async fn upstream_metadata(
     document: Document,
 ) -> Response {
     let legacy_key = legacy_cache_key(path);
+    // The validators are read before the body: a 304 is asked with these, and the body held is
+    // confirmed only while they still describe the stored copy (#1064).
+    let read_with = read_validators(&state.storage, cache_key)
+        .await
+        .unwrap_or_default();
     let mut cached = None;
     let mut read_failure = None;
     for key in [cache_key, legacy_key.as_str()] {
@@ -2251,7 +2313,8 @@ async fn upstream_metadata(
         // again, and refetched in full whatever its age: a 304 would keep it as it is.
         let claims = store_claims(state, path, name, &data).await;
         // The body already read: a 304 serves it, rather than reading the same object again (#1064).
-        let held = (from_key == cache_key).then(|| data.clone());
+        let seed_body = data.clone();
+        let held = (from_key == cache_key).then(|| (data.clone(), read_with.clone()));
         let (served, past_nora) = served_copy(state, path, data, &|file: &str| claims.holds(file));
         let fresh = !past_nora && packument_fresh(state, &from_key).await;
         // #68 namespace isolation: an internal-namespace package is never revalidated upstream.
@@ -2273,7 +2336,7 @@ async fn upstream_metadata(
                 state,
                 path,
                 cache_key,
-                &from_key,
+                (from_key.as_str(), seed_body.clone()),
                 document == Document::Packument,
                 !past_nora,
                 held.clone(),
@@ -6316,7 +6379,16 @@ mod spec_conformance_tests {
         // Call refetch_metadata directly — simulates the race where the handler
         // entered the cache-hit path (body was present at get_verified), TTL
         // expired, but GC deleted the body before refetch_metadata re-reads it.
-        let result = refetch_metadata(&ctx.state, "ghost-pkg", key, key, true, true, None).await;
+        let result = refetch_metadata(
+            &ctx.state,
+            "ghost-pkg",
+            key,
+            (key, axum::body::Bytes::new()),
+            true,
+            true,
+            None,
+        )
+        .await;
         assert!(result.is_err(), "must fail when body is missing on 304");
 
         // The critical assertion: .meta must be gone after the 304 body-miss.
@@ -8225,6 +8297,337 @@ mod release_age_first_seen {
             let (status, body) = tarball(&ctx, "1.0.0").await;
             assert_eq!(status, StatusCode::OK, "{}: {body}", backend.name());
         }
+    }
+
+    /// A backend that counts the reads of one key and, when a landing is set, writes a newer copy
+    /// (body, validators, provenance) right after its next read of that key: the write that lands
+    /// between a request's body read and its refetch, without a sleep (#1064).
+    struct Racing {
+        inner: std::sync::Arc<dyn crate::storage::StorageBackend>,
+        key: String,
+        reads: std::sync::atomic::AtomicUsize,
+        landing: std::sync::Mutex<Option<Landing>>,
+    }
+
+    struct Landing {
+        body: Vec<u8>,
+        validators: Validators,
+        provenance: Option<String>,
+    }
+
+    impl Racing {
+        fn new(inner: std::sync::Arc<dyn crate::storage::StorageBackend>, key: &str) -> Self {
+            Self {
+                inner,
+                key: key.to_string(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+                landing: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn sha(data: &[u8]) -> String {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(data))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for Racing {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(key, data, sha256).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            let got = self.inner.get(key).await;
+            if key == self.key {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let landing = self.landing.lock().unwrap().take();
+                if let Some(l) = landing {
+                    let validators = serde_json::to_vec(&l.validators).unwrap();
+                    self.inner
+                        .put(key, &l.body, &Self::sha(&l.body))
+                        .await
+                        .unwrap();
+                    let origin = super::origin_key(key);
+                    if let Some(record) = &l.provenance {
+                        self.inner
+                            .put(&origin, record.as_bytes(), &Self::sha(record.as_bytes()))
+                            .await
+                            .unwrap();
+                    }
+                    let sidecar = super::validators_key(key);
+                    self.inner
+                        .put(&sidecar, &validators, &Self::sha(&validators))
+                        .await
+                        .unwrap();
+                }
+            }
+            got
+        }
+
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+
+        async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
+            self.inner.stat(key).await
+        }
+
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+
+        fn backend_name(&self) -> &'static str {
+            self.inner.backend_name()
+        }
+
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+
+        async fn copy(
+            &self,
+            src: &str,
+            dst: &str,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            start: u64,
+            end: u64,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_range(key, start, end).await
+        }
+    }
+
+    /// A packument of the upstream's listing (`1.0.0`) carrying `marker`, so a test can tell
+    /// which copy it was served.
+    fn marked_packument(upstream: &MockServer, marker: &str) -> Vec<u8> {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&packument(&upstream.uri(), &["1.0.0"])).unwrap();
+        doc["marker"] = marker.into();
+        doc.to_string().into_bytes()
+    }
+
+    /// A 304 for a packument whose ledger is missing reads the packument once: the body the
+    /// request read seeds the ledger, as it does on a 200 (#1064).
+    #[tokio::test]
+    async fn a_304_without_a_ledger_reads_the_packument_once() {
+        let racing = std::sync::Arc::new(Racing::new(
+            std::sync::Arc::new(crate::storage::ObjectStorage::in_memory()),
+            KEY,
+        ));
+        let storage = Storage::from_backend(racing.clone());
+        let upstream = upstream(&["1.0.0"], true).await;
+        seen_two_hours_ago(&Backend::Object, &storage, &upstream).await;
+        storage.delete(&first_seen_key(KEY)).await.unwrap();
+        racing.reads.store(0, std::sync::atomic::Ordering::SeqCst);
+        let ctx = context(&upstream, storage.clone());
+
+        let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "packument");
+        ctx.state.cache_writes.settled().await;
+
+        assert_eq!(
+            racing.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the 304 read the packument body more than once"
+        );
+    }
+
+    /// A copy written between the request's body read and its refetch is not confirmed by a 304
+    /// that answers about the earlier validators: the 304 serves the copy it was asked about only
+    /// if that copy is still the stored one, and the newer copy keeps its own record (#1064).
+    #[tokio::test]
+    async fn a_304_does_not_confirm_a_copy_written_while_it_was_read() {
+        let upstream = upstream(&["1.0.0"], true).await;
+        let racing = std::sync::Arc::new(Racing::new(
+            std::sync::Arc::new(crate::storage::ObjectStorage::in_memory()),
+            KEY,
+        ));
+        let storage = Storage::from_backend(racing.clone());
+        seen_two_hours_ago(&Backend::Object, &storage, &upstream).await;
+        storage
+            .put(KEY, &marked_packument(&upstream, "V1"))
+            .await
+            .unwrap();
+        let newer = marked_packument(&upstream, "V2");
+        let origin = super::origin_of(&upstream.uri());
+        *racing.landing.lock().unwrap() = Some(Landing {
+            provenance: Some(super::provenance_record(&origin, &newer)),
+            body: newer,
+            validators: Validators {
+                etag: Some("\"v2\"".to_string()),
+                last_modified: None,
+                checked: None,
+            },
+        });
+        let ctx = context(&upstream, storage.clone());
+
+        let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "packument");
+        let served = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        ctx.state.cache_writes.settled().await;
+
+        assert!(
+            served.contains("V2"),
+            "served the body the 304 did not confirm: {served}"
+        );
+        let sidecar = crate::registry::read_validators(&storage, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            sidecar.etag.as_deref(),
+            Some("\"v2\""),
+            "the sidecar was replaced"
+        );
+        assert_eq!(
+            sidecar.checked, None,
+            "the newer copy was confirmed by a 304 it did not get"
+        );
+        let record = storage.get(&super::origin_key(KEY)).await.unwrap();
+        assert_eq!(
+            record.as_ref(),
+            super::provenance_record(&origin, &marked_packument(&upstream, "V2")).as_bytes(),
+            "provenance does not describe the stored bytes"
+        );
+    }
+
+    /// A writer that replaces the body before its validators leaves the validators as they were.
+    /// A 304 for those validators must not confirm the body it held, nor overwrite the record of
+    /// the bytes now stored: it serves the stored copy, whose record names it (#1064).
+    #[tokio::test]
+    async fn a_304_does_not_overwrite_the_record_of_bytes_it_did_not_hold() {
+        let upstream = upstream(&["1.0.0"], true).await;
+        let racing = std::sync::Arc::new(Racing::new(
+            std::sync::Arc::new(crate::storage::ObjectStorage::in_memory()),
+            KEY,
+        ));
+        let storage = Storage::from_backend(racing.clone());
+        seen_two_hours_ago(&Backend::Object, &storage, &upstream).await;
+        storage
+            .put(KEY, &marked_packument(&upstream, "V1"))
+            .await
+            .unwrap();
+        let newer = marked_packument(&upstream, "V2");
+        let origin = super::origin_of(&upstream.uri());
+        *racing.landing.lock().unwrap() = Some(Landing {
+            provenance: Some(super::provenance_record(&origin, &newer)),
+            body: newer,
+            validators: Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                checked: None,
+            },
+        });
+        let ctx = context(&upstream, storage.clone());
+
+        let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "packument");
+        let served = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        ctx.state.cache_writes.settled().await;
+
+        assert!(
+            served.contains("V2"),
+            "served bytes its record does not name: {served}"
+        );
+        let record = storage.get(&super::origin_key(KEY)).await.unwrap();
+        assert_eq!(
+            record.as_ref(),
+            super::provenance_record(&origin, &marked_packument(&upstream, "V2")).as_bytes(),
+            "the record of the stored bytes was overwritten"
+        );
+        let sidecar = crate::registry::read_validators(&storage, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            sidecar.checked, None,
+            "the stored copy was confirmed by a 304 it did not answer"
+        );
+    }
+
+    /// A writer that replaced the body and the validators, with no provenance record (a copy from
+    /// before records): the 304 was asked with the validators it held, which no longer describe the
+    /// stored copy, so it confirms nothing and the stored copy is served (#1064).
+    #[tokio::test]
+    async fn a_304_does_not_confirm_a_moved_copy_that_has_no_record() {
+        let upstream = upstream(&["1.0.0"], true).await;
+        let racing = std::sync::Arc::new(Racing::new(
+            std::sync::Arc::new(crate::storage::ObjectStorage::in_memory()),
+            KEY,
+        ));
+        let storage = Storage::from_backend(racing.clone());
+        seen_two_hours_ago(&Backend::Object, &storage, &upstream).await;
+        storage
+            .put(KEY, &marked_packument(&upstream, "V1"))
+            .await
+            .unwrap();
+        *racing.landing.lock().unwrap() = Some(Landing {
+            body: marked_packument(&upstream, "V2"),
+            validators: Validators {
+                etag: Some("\"v2\"".to_string()),
+                last_modified: None,
+                checked: None,
+            },
+            provenance: None,
+        });
+        let ctx = context(&upstream, storage.clone());
+
+        let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "packument");
+        let served = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        ctx.state.cache_writes.settled().await;
+
+        assert!(
+            served.contains("V2"),
+            "served the held body the 304 did not confirm: {served}"
+        );
+        let sidecar = crate::registry::read_validators(&storage, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            sidecar.checked, None,
+            "the moved copy was confirmed by a 304 it did not get"
+        );
     }
 
     /// A ledger whose bytes no longer match their pin is rewritten at the next refetch, so it
