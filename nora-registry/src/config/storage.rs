@@ -58,6 +58,17 @@ pub struct StorageConfig {
     /// object PUT and `x-goog-copy-source` copies: fake-gcs-server does not.
     #[serde(default)]
     pub gcs_base_url: Option<String>,
+    /// S3/GCS: seconds a read waits for the store to answer (the response headers; a body that
+    /// has started streams at its own pace) before the request is answered 503 with
+    /// `Retry-After`, and writes are refused until the store answers again (#1182). `0` waits
+    /// as long as the store client retries, as NORA 1.4.5 and earlier did: for a slow store
+    /// that is recovering. Env: `NORA_STORAGE_ANSWER_TIMEOUT_SECS`.
+    #[serde(default = "default_answer_timeout_secs")]
+    pub answer_timeout_secs: u64,
+}
+
+pub(super) fn default_answer_timeout_secs() -> u64 {
+    10
 }
 
 pub(super) fn default_s3_region() -> String {
@@ -89,11 +100,18 @@ impl Default for StorageConfig {
             s3_virtual_hosted: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
+            answer_timeout_secs: default_answer_timeout_secs(),
         }
     }
 }
 
 impl StorageConfig {
+    /// How long a read waits for the object store's answer; `None` for no limit (`0`).
+    pub fn answer_timeout(&self) -> Option<std::time::Duration> {
+        (self.answer_timeout_secs > 0)
+            .then(|| std::time::Duration::from_secs(self.answer_timeout_secs))
+    }
+
     /// Apply environment variable overrides for storage config.
     ///
     /// Returns `Err` if `NORA_STORAGE_MODE` has an unrecognized value — fail-closed (#562).
@@ -145,6 +163,13 @@ impl StorageConfig {
         }
         if let Ok(val) = env::var("NORA_STORAGE_S3_VIRTUAL_HOSTED") {
             self.s3_virtual_hosted = val.to_lowercase() == "true" || val == "1";
+        }
+        if let Ok(val) = env::var("NORA_STORAGE_ANSWER_TIMEOUT_SECS") {
+            super::parse_env_warn(
+                "NORA_STORAGE_ANSWER_TIMEOUT_SECS",
+                &val,
+                &mut self.answer_timeout_secs,
+            );
         }
 
         Ok(())

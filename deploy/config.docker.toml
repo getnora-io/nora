@@ -20,6 +20,7 @@ public_url = "http://localhost:4000" # override for real deployments
 [storage]
 mode = "local"
 path = "/data/storage"               # backed by the /data volume
+# answer_timeout_secs = 10           # S3/GCS: wait for the store's answer, then 503 + Retry-After; 0 = no limit
 
 [auth]
 token_storage = "/data/tokens"

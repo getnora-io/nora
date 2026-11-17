@@ -183,6 +183,7 @@ fn build_context_full(
             s3_virtual_hosted: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
+            answer_timeout_secs: 10,
         },
         maven: MavenConfig {
             enabled: true,

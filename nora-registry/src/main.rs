@@ -66,6 +66,7 @@ mod secrets;
 mod server_conn;
 mod signing;
 mod storage;
+mod store_answer;
 mod supervise;
 mod tokens;
 mod ui;
@@ -440,6 +441,16 @@ pub struct AppState {
     pub(crate) maintenance: Arc<supervise::Heartbeat>,
 }
 
+/// Whether a proxied answer is left uncached: the object store left the current request
+/// unanswered, and a write to it would wait behind it (#1182). One debug line per skipped key.
+fn skip_cache_write(key: &str) -> bool {
+    let skip = storage::answer::unanswered_in_this_request();
+    if skip {
+        tracing::debug!(key, "object store did not answer this request; not cached");
+    }
+    skip
+}
+
 impl AppState {
     /// Load a snapshot of the current curation engine (lock-free read via ArcSwap).
     pub fn curation(&self) -> arc_swap::Guard<Arc<ReloadableConfig>> {
@@ -466,6 +477,9 @@ impl AppState {
     /// Guarantees that `repo_index.invalidate()` is called AFTER the write completes,
     /// avoiding the race condition where invalidation fires before the file lands on S3.
     pub fn spawn_cache(&self, registry: &'static str, key: String, data: Bytes) {
+        if skip_cache_write(&key) {
+            return;
+        }
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
         tokio::spawn(
@@ -485,6 +499,9 @@ impl AppState {
 
     /// Like [`spawn_cache`], but skips the write if the key already exists (immutable artifacts).
     pub fn spawn_cache_immutable(&self, registry: &'static str, key: String, data: Bytes) {
+        if skip_cache_write(&key) {
+            return;
+        }
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
         tokio::spawn(
@@ -739,6 +756,11 @@ pub(crate) fn request_layers(router: Router<AppState>, state: &AppState) -> Rout
         .layer(middleware::from_fn_with_state(
             state.clone(),
             auth::auth_middleware,
+        ))
+        // Outside auth, so a token or user looked up in a store that did not answer counts
+        // too; inside the panic guard, which answers its 500 as it is (#1182).
+        .layer(middleware::from_fn(
+            store_answer::unanswered_store_middleware,
         ))
         // Outermost of these, so a panic in auth, a middleware or a handler answers 500
         // (counted by the metrics layer outside) and the panic message goes to the log only.
@@ -2155,6 +2177,7 @@ async fn main() {
             )
         }
     };
+    storage.set_answer_timeout(config.storage.answer_timeout());
 
     // Dispatch to command
     match cli.command {
@@ -6125,5 +6148,52 @@ mod cargo_name_records_before_listening {
             &missing[at..]
         );
         assert!(!rebuilt_before_binding(&late));
+    }
+}
+
+#[cfg(test)]
+mod unanswered_cache_write_tests {
+    use crate::test_helpers::*;
+    use axum::body::Bytes;
+
+    /// A proxied answer is not cached when the store left the request unanswered: no write
+    /// is spawned to wait behind it (#1182). The control: the same call caches when the
+    /// store answered.
+    #[tokio::test]
+    async fn a_request_the_store_left_unanswered_caches_nothing() {
+        let (storage, counts) = op_counting_storage();
+        let ctx = create_test_context_with_storage(storage);
+        let ((), _) = crate::storage::answer::scope(async {
+            crate::storage::answer::note_unanswered();
+            ctx.state.spawn_cache(
+                "maven",
+                "maven/a/1/a-1.jar".into(),
+                Bytes::from_static(b"A"),
+            );
+            ctx.state.spawn_cache_immutable(
+                "maven",
+                "maven/b/1/b-1.jar".into(),
+                Bytes::from_static(b"B"),
+            );
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(counts.snapshot().get("put").copied().unwrap_or(0), 0);
+
+        let ((), _) = crate::storage::answer::scope(async {
+            ctx.state.spawn_cache(
+                "maven",
+                "maven/c/1/c-1.jar".into(),
+                Bytes::from_static(b"C"),
+            );
+        })
+        .await;
+        for _ in 0..200 {
+            if counts.snapshot().get("put").copied().unwrap_or(0) > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(counts.snapshot().get("put").copied().unwrap_or(0), 1);
     }
 }

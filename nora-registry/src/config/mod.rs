@@ -6557,6 +6557,7 @@ proxies = [
             s3_virtual_hosted: false,
             gcs_service_account_path: None,
             gcs_base_url: None,
+            answer_timeout_secs: 10,
         };
         let debug_output = format!("{:?}", config);
         assert!(

@@ -1,6 +1,7 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+pub mod answer;
 mod local;
 mod object;
 
@@ -79,6 +80,11 @@ pub enum StorageError {
     /// (handlers map this to 5xx). See #582.
     #[error("Integrity violation: artifact failed hash-pin verification")]
     IntegrityViolation,
+
+    /// The object store did not answer within `[storage] answer_timeout_secs`, or a write was
+    /// refused because it has not answered since it last failed to (#1182).
+    #[error("Storage unavailable: {0}")]
+    Unavailable(#[from] answer::Unanswered),
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -173,6 +179,9 @@ pub trait StorageBackend: Send + Sync {
     /// `health_check`, so a probe never waits on the store. No-op for backends whose
     /// `health_check` asks the store itself.
     async fn refresh_reachability(&self) {}
+    /// How long a read waits for the store's answer (`None`: as long as the client retries).
+    /// No-op for backends that do not wait on a remote store (#1182).
+    fn set_answer_timeout(&self, _limit: Option<std::time::Duration>) {}
     /// Refresh any cached size data. No-op for backends without caching. It may take as
     /// long as listing the whole store, and does not say whether the store answers.
     async fn refresh_total_size(&self) {}
@@ -675,6 +684,11 @@ impl Storage {
         }
         self.inner.put(key, &data, &expected).await?;
         Ok(RepinOutcome::Updated { old, new: expected })
+    }
+
+    /// See [`StorageBackend::set_answer_timeout`].
+    pub fn set_answer_timeout(&self, limit: Option<std::time::Duration>) {
+        self.inner.set_answer_timeout(limit);
     }
 
     /// See [`StorageBackend::refresh_reachability`].

@@ -51,7 +51,9 @@ fn streaming_retry_config() -> object_store::RetryConfig {
 /// `object_store` crate. Everything past construction goes through the
 /// [`ObjectStore`] trait, so both providers share one implementation.
 pub struct ObjectStorage {
-    store: Box<dyn ObjectStore>,
+    /// Every call except the maintenance probes waits for the store's answer as long as
+    /// `[storage] answer_timeout_secs` allows (#1182).
+    store: super::answer::Answering,
     /// "s3" or "gcs" — surfaced in /health.
     name: &'static str,
     /// Cached total size in bytes, refreshed by background task.
@@ -114,7 +116,7 @@ impl ObjectStorage {
         let store = builder.build().expect("Failed to build S3 client");
 
         Self {
-            store: Box::new(store),
+            store: super::answer::Answering::new(Box::new(store)),
             name: "s3",
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
@@ -167,7 +169,7 @@ impl ObjectStorage {
         let store = builder.build().expect("Failed to build GCS client");
 
         Self {
-            store: Box::new(store),
+            store: super::answer::Answering::new(Box::new(store)),
             name: "gcs",
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
@@ -181,7 +183,7 @@ impl ObjectStorage {
     #[cfg(test)]
     pub(crate) fn in_memory() -> Self {
         Self {
-            store: Box::new(object_store::memory::InMemory::new()),
+            store: super::answer::Answering::new(Box::new(object_store::memory::InMemory::new())),
             name: "s3",
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
@@ -201,7 +203,7 @@ impl ObjectStorage {
     #[cfg(test)]
     pub(crate) fn over_named(store: Box<dyn ObjectStore>, name: &'static str) -> Self {
         Self {
-            store,
+            store: super::answer::Answering::new(store),
             name,
             cached_total_size: std::sync::atomic::AtomicU64::new(0),
             size_cache_initialized: std::sync::atomic::AtomicBool::new(false),
@@ -210,11 +212,17 @@ impl ObjectStorage {
         }
     }
 
+    /// Test-only handle on the answer policy of the store (#1182).
+    #[cfg(test)]
+    pub(crate) fn answer_policy(&self) -> &super::answer::AnswerPolicy {
+        self.store.policy()
+    }
+
     /// Test-only handle on the raw store, for writing objects NORA itself would
     /// never write (e.g. one with no pin metadata).
     #[cfg(test)]
     pub(crate) fn store(&self) -> &dyn ObjectStore {
-        self.store.as_ref()
+        self.store.unbounded()
     }
 
     /// Serve `reachable` to the probes from now on.
@@ -333,7 +341,10 @@ fn read_pin(attributes: &Attributes) -> Option<String> {
 fn map_err(e: object_store::Error) -> StorageError {
     match e {
         object_store::Error::NotFound { .. } => StorageError::NotFound,
-        other => StorageError::Network(other.to_string()),
+        other => match super::answer::unanswered_of(other) {
+            Ok(why) => StorageError::Unavailable(why),
+            Err(other) => StorageError::Network(other.to_string()),
+        },
     }
 }
 
@@ -424,7 +435,7 @@ impl StorageBackend for ObjectStorage {
             .list(list_prefix)
             .try_collect()
             .await
-            .map_err(|e| StorageError::Network(e.to_string()))?;
+            .map_err(map_err)?;
 
         Ok(objects
             .into_iter()
@@ -449,7 +460,7 @@ impl StorageBackend for ObjectStorage {
             .list(list_prefix)
             .try_collect()
             .await
-            .map_err(|e| StorageError::Network(e.to_string()))?;
+            .map_err(map_err)?;
 
         // The LIST response already carries size/last_modified — reuse it
         // instead of issuing a HEAD per key (#738).
@@ -591,19 +602,30 @@ impl StorageBackend for ObjectStorage {
         // One request whatever the bucket holds: the first page of its listing (the listing
         // is fetched page by page, and only the first is asked for). An empty bucket answers
         // with an empty page, which is an answer.
+        // Asked of the store itself, with the maintenance deadline, not the answer timeout:
+        // `/ready` is decided as before #1182. An answer lets writes through again.
         let reachable = self
             .store
+            .unbounded()
             .list(None)
             .next()
             .await
             .is_none_or(|first| first.is_ok());
         unanswered.0 = None;
+        if reachable {
+            self.store.policy().answered();
+        }
         self.record_reachability(reachable);
+    }
+
+    fn set_answer_timeout(&self, limit: Option<std::time::Duration>) {
+        self.store.policy().set_limit(limit);
     }
 
     async fn refresh_total_size(&self) {
         // The whole listing, as long as it takes; readiness does not wait for it.
-        let result: std::result::Result<Vec<_>, _> = self.store.list(None).try_collect().await;
+        let result: std::result::Result<Vec<_>, _> =
+            self.store.unbounded().list(None).try_collect().await;
         if let Ok(objects) = result {
             let total: u64 = objects.iter().map(|m| m.size).sum();
             self.cached_total_size
