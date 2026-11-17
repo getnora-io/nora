@@ -264,6 +264,7 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
         std::collections::HashMap<String, Vec<String>>,
     > = std::collections::HashMap::new();
 
+    let mut metadata_keys = Vec::new();
     for key in &all_keys {
         let parts: Vec<&str> = key
             .strip_prefix("maven/")
@@ -275,18 +276,32 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
         if parts.len() < 4 {
             continue;
         }
-        // Skip maven-metadata.xml at artifact level
+        let version = parts[parts.len() - 2].to_string();
+        let artifact_path = parts[..parts.len() - 2].join("/");
         if parts[parts.len() - 1].starts_with("maven-metadata") {
+            metadata_keys.push((artifact_path, version, key.clone()));
             continue;
         }
-        let version = parts[parts.len() - 2];
-        let artifact_path = parts[..parts.len() - 2].join("/");
         artifacts
             .entry(artifact_path)
             .or_default()
-            .entry(version.to_string())
+            .entry(version)
             .or_default()
             .push(key.clone());
+    }
+    // A version-level maven-metadata.xml (a SNAPSHOT's) and its checksums belong to the
+    // version: left behind, they keep the version directory alive and the next metadata
+    // regeneration lists the retired version again (#1281). The path alone does not tell it
+    // from an artifact-level document (`g/a/maven-metadata.xml` reads as artifact `g`, version
+    // `a`), so a metadata key joins only a version that holds artifact files; an artifact's
+    // own document is never a version's key and is reconciled after the deletions instead.
+    for (artifact_path, version, key) in metadata_keys {
+        if let Some(keys) = artifacts
+            .get_mut(&artifact_path)
+            .and_then(|versions| versions.get_mut(&version))
+        {
+            keys.push(key);
+        }
     }
 
     let mut result = Vec::new();
@@ -895,6 +910,9 @@ pub async fn run_retention(
     // npm packages retention touched, with the versions it removed from each.
     let mut npm_regen: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
         std::collections::BTreeMap::new();
+    // Maven artifacts (`group/path/artifact`) retention touched, with the versions it removed.
+    let mut maven_regen: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
     let mut regen: std::collections::BTreeSet<(&'static str, String)> =
         std::collections::BTreeSet::new();
 
@@ -914,6 +932,12 @@ pub async fn run_retention(
         total_planned += plans.len();
 
         if !dry_run {
+            if let Some(artifact) = group_name.strip_prefix("maven:") {
+                maven_regen
+                    .entry(artifact.to_string())
+                    .or_default()
+                    .extend(plans.iter().map(|plan| plan.version_name.clone()));
+            }
             if let Some(package) = group_name.strip_prefix("npm:") {
                 npm_regen
                     .entry(package.to_string())
@@ -1012,6 +1036,35 @@ pub async fn run_retention(
             }
             Err(e) => tracing::error!(registry = "npm", package = %package, error = %e,
                 "retention: packument reconciliation failed — the next publish or read heals it"),
+        }
+    }
+
+    // Reconcile the maven-metadata.xml of every Maven artifact retention touched (#1281): the
+    // document is derived too, and a client resolving RELEASE, LATEST or a range from one that
+    // still lists a deleted version gets a 404. Only the deleted versions leave it; versions a
+    // hosted+proxy read merged in from an upstream stay (#885). Under the lock uploads and
+    // proxy merges of the artifact take. Fail-open per artifact like npm: the deletions are
+    // already durable, a failure logs and leaves the document as it was.
+    for (artifact, retired) in &maven_regen {
+        let Some((group_path, artifact_id)) = artifact.rsplit_once('/') else {
+            continue;
+        };
+        let lock_key = format!("maven/{artifact}/maven-metadata.xml");
+        let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
+        let _guard = lock.lock().await;
+        match crate::registry::maven_reconcile_metadata_after_retention(
+            storage,
+            group_path,
+            artifact_id,
+            retired,
+        )
+        .await
+        {
+            Ok(()) => {
+                info!(registry = "maven", artifact = %artifact, "retention: maven-metadata.xml reconciled")
+            }
+            Err(e) => tracing::error!(registry = "maven", artifact = %artifact, error = %e,
+                "retention: maven-metadata.xml reconciliation failed — it still lists the deleted versions"),
         }
     }
 
@@ -2187,6 +2240,7 @@ mod format_retention_tests {
     use super::*;
     use crate::test_helpers::{body_bytes, create_test_context, send};
     use axum::http::{Method, StatusCode};
+    use sha1::Digest as _;
 
     fn rule(
         registry: &str,
@@ -3471,5 +3525,362 @@ mod format_retention_tests {
             crate::test_helpers::create_test_context_with_storage(storage),
         )
         .await;
+    }
+
+    // ── #1281: Maven metadata after retention ──────────────────────────────────────────
+
+    fn maven_rule(include: &str) -> RetentionRule {
+        serde_json::from_value(serde_json::json!({
+            "registry": "maven", "include_tags": [include], "keep_last": 0
+        }))
+        .unwrap()
+    }
+
+    async fn maven_put(ctx: &crate::test_helpers::TestContext, path: &str, body: &str) {
+        let r = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/maven2/{path}"),
+            body.to_string(),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::CREATED, "upload {path}");
+    }
+
+    async fn maven_get(ctx: &crate::test_helpers::TestContext, path: &str) -> (StatusCode, String) {
+        let r = send(&ctx.app, Method::GET, &format!("/maven2/{path}"), "").await;
+        let status = r.status();
+        (
+            status,
+            String::from_utf8_lossy(&body_bytes(r).await).into_owned(),
+        )
+    }
+
+    fn xml_tag<'x>(xml: &'x str, tag: &str) -> &'x str {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let start = xml.find(&open).map(|i| i + open.len()).unwrap_or(0);
+        let end = xml[start..]
+            .find(&close)
+            .map(|i| start + i)
+            .unwrap_or(start);
+        &xml[start..end]
+    }
+
+    /// The artifact's `<latest>` and `<release>` jars answer 200, and the stored `.sha1` of
+    /// the document matches the document.
+    async fn assert_metadata_resolves(ctx: &crate::test_helpers::TestContext, artifact: &str) {
+        let doc_path = format!("com/example/{artifact}/maven-metadata.xml");
+        let (status, xml) = maven_get(ctx, &doc_path).await;
+        assert_eq!(status, StatusCode::OK);
+        for tag in ["latest", "release"] {
+            let v = xml_tag(&xml, tag);
+            assert!(!v.is_empty(), "<{tag}> empty:\n{xml}");
+            let (status, _) = maven_get(
+                ctx,
+                &format!("com/example/{artifact}/{v}/{artifact}-{v}.jar"),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "<{tag}>{v} does not resolve:\n{xml}"
+            );
+        }
+        let (status, sha1) = maven_get(ctx, &format!("{doc_path}.sha1")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(sha1, hex::encode(sha1::Sha1::digest(xml.as_bytes())));
+    }
+
+    /// Retention that deletes Maven versions must stop advertising them: the artifact's
+    /// `maven-metadata.xml` lists only versions still stored, `<latest>` and `<release>`
+    /// never name a deleted one, and the next deploy does not bring a deleted one back.
+    async fn maven_metadata_drops_retired_versions(ctx: crate::test_helpers::TestContext) {
+        for v in ["1.0.0", "1.1.0-rc.1"] {
+            maven_put(&ctx, &format!("com/example/meta/{v}/meta-{v}.jar"), v).await;
+        }
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &[maven_rule("*-rc*")],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+
+        let (_, xml) = maven_get(&ctx, "com/example/meta/maven-metadata.xml").await;
+        assert!(xml.contains("<version>1.0.0</version>"), "{xml}");
+        assert!(
+            !xml.contains("1.1.0-rc.1"),
+            "retired version still advertised:\n{xml}"
+        );
+        assert_metadata_resolves(&ctx, "meta").await;
+
+        maven_put(&ctx, "com/example/meta/1.2.0/meta-1.2.0.jar", "1.2.0").await;
+        let (_, xml) = maven_get(&ctx, "com/example/meta/maven-metadata.xml").await;
+        assert!(
+            !xml.contains("1.1.0-rc.1"),
+            "next deploy brought it back:\n{xml}"
+        );
+        assert_metadata_resolves(&ctx, "meta").await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_metadata_drops_retired_versions_local() {
+        maven_metadata_drops_retired_versions(create_test_context()).await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_metadata_drops_retired_versions_object_store() {
+        let storage = Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        maven_metadata_drops_retired_versions(
+            crate::test_helpers::create_test_context_with_storage(storage),
+        )
+        .await;
+    }
+
+    /// A retired SNAPSHOT leaves nothing behind: its version-level `maven-metadata.xml` and
+    /// checksums go with it, so the version directory is gone and nothing lists it again.
+    async fn maven_retired_snapshot_leaves_no_version_metadata(
+        ctx: crate::test_helpers::TestContext,
+    ) {
+        let base = "com/example/snap/1.0-SNAPSHOT";
+        maven_put(
+            &ctx,
+            &format!("{base}/snap-1.0-20261117.120000-1.jar"),
+            "jar",
+        )
+        .await;
+        let version_meta = "<?xml version=\"1.0\"?><metadata modelVersion=\"1.1.0\"><groupId>com.example</groupId><artifactId>snap</artifactId><version>1.0-SNAPSHOT</version><versioning><snapshot><timestamp>20261117.120000</timestamp><buildNumber>1</buildNumber></snapshot><lastUpdated>20261117120000</lastUpdated></versioning></metadata>";
+        maven_put(&ctx, &format!("{base}/maven-metadata.xml"), version_meta).await;
+        maven_put(
+            &ctx,
+            &format!("{base}/maven-metadata.xml.sha1"),
+            &hex::encode(sha1::Sha1::digest(version_meta.as_bytes())),
+        )
+        .await;
+        maven_put(&ctx, "com/example/snap/1.1/snap-1.1.jar", "jar").await;
+
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &[maven_rule("*-SNAPSHOT")],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        let left = ctx
+            .state
+            .storage
+            .list("maven/com/example/snap/1.0-SNAPSHOT/")
+            .await
+            .unwrap();
+        assert!(left.is_empty(), "retired SNAPSHOT left behind: {left:?}");
+
+        maven_put(&ctx, "com/example/snap/1.2/snap-1.2.jar", "jar").await;
+        let (_, xml) = maven_get(&ctx, "com/example/snap/maven-metadata.xml").await;
+        assert!(!xml.contains("1.0-SNAPSHOT"), "{xml}");
+        assert_metadata_resolves(&ctx, "snap").await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_retired_snapshot_leaves_no_version_metadata_local() {
+        maven_retired_snapshot_leaves_no_version_metadata(create_test_context()).await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_retired_snapshot_leaves_no_version_metadata_object_store() {
+        let storage = Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        maven_retired_snapshot_leaves_no_version_metadata(
+            crate::test_helpers::create_test_context_with_storage(storage),
+        )
+        .await;
+    }
+
+    /// A hosted+proxy document (#885) lists upstream versions this registry never stored.
+    /// Retention removes the versions it deleted and nothing else: the upstream ones stay.
+    #[tokio::test]
+    async fn test_maven_retention_keeps_upstream_versions_of_merged_metadata() {
+        use crate::config::MavenProxyEntry;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let upstream_metadata = r#"<?xml version="1.0" encoding="UTF-8"?>
+<metadata>
+  <groupId>com.example</groupId>
+  <artifactId>mixed</artifactId>
+  <versioning>
+    <latest>0.9.0</latest>
+    <release>0.9.0</release>
+    <versions>
+      <version>0.8.0</version>
+      <version>0.9.0</version>
+    </versions>
+    <lastUpdated>20260728010000</lastUpdated>
+  </versioning>
+</metadata>
+"#;
+        Mock::given(method("GET"))
+            .and(path("/com/example/mixed/maven-metadata.xml"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_raw(upstream_metadata, "application/xml"),
+            )
+            .mount(&upstream)
+            .await;
+        let upstream_url = upstream.uri();
+        let ctx = crate::test_helpers::create_test_context_with_config(move |config| {
+            config.maven.proxies = vec![MavenProxyEntry::Simple(upstream_url)];
+            config.maven.metadata_ttl = 3600;
+        });
+
+        let (status, _) = maven_get(&ctx, "com/example/mixed/maven-metadata.xml").await;
+        assert_eq!(status, StatusCode::OK);
+        for v in ["1.0.0", "1.1.0-rc.1"] {
+            maven_put(&ctx, &format!("com/example/mixed/{v}/mixed-{v}.jar"), v).await;
+        }
+        let (_, merged) = maven_get(&ctx, "com/example/mixed/maven-metadata.xml").await;
+        for v in ["0.8.0", "0.9.0", "1.0.0", "1.1.0-rc.1"] {
+            assert!(
+                merged.contains(&format!("<version>{v}</version>")),
+                "{merged}"
+            );
+        }
+
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &[maven_rule("*-rc*")],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+
+        let (_, xml) = maven_get(&ctx, "com/example/mixed/maven-metadata.xml").await;
+        for v in ["0.8.0", "0.9.0", "1.0.0"] {
+            assert!(
+                xml.contains(&format!("<version>{v}</version>")),
+                "version {v} dropped:\n{xml}"
+            );
+        }
+        assert!(!xml.contains("1.1.0-rc.1"), "{xml}");
+        assert_eq!(xml_tag(&xml, "latest"), "1.0.0", "{xml}");
+        assert_eq!(xml_tag(&xml, "release"), "1.0.0", "{xml}");
+        assert_eq!(
+            upstream.received_requests().await.unwrap().len(),
+            1,
+            "the document after retention must come from storage, not a fresh merge"
+        );
+    }
+
+    /// Retention whose last version goes leaves no artifact-level document advertising it.
+    #[tokio::test]
+    async fn test_maven_retention_of_every_version_removes_the_document() {
+        let ctx = create_test_context();
+        maven_put(
+            &ctx,
+            "com/example/gone/1.0.0-rc.1/gone-1.0.0-rc.1.jar",
+            "jar",
+        )
+        .await;
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &[maven_rule("*-rc*")],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        let left = ctx
+            .state
+            .storage
+            .list("maven/com/example/gone/")
+            .await
+            .unwrap();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    /// An artifact's own `maven-metadata.xml` is never a version's key. Its path reads as
+    /// artifact `com/example`, version `<artifactId>`, so two artifacts of one group would form
+    /// a group of two "versions" a `keep_last` rule could prune, deleting one artifact's document.
+    #[tokio::test]
+    async fn test_maven_retention_never_takes_an_artifact_document_for_a_version() {
+        let ctx = create_test_context();
+        for artifact in ["left", "right"] {
+            for v in ["1.0.0", "2.0.0"] {
+                maven_put(
+                    &ctx,
+                    &format!("com/example/{artifact}/{v}/{artifact}-{v}.jar"),
+                    v,
+                )
+                .await;
+            }
+        }
+        let keep_one: RetentionRule = serde_json::from_value(serde_json::json!({
+            "registry": "maven", "keep_last": 1
+        }))
+        .unwrap();
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &[keep_one],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 2, "one version of each artifact");
+        for artifact in ["left", "right"] {
+            let (status, xml) =
+                maven_get(&ctx, &format!("com/example/{artifact}/maven-metadata.xml")).await;
+            assert_eq!(status, StatusCode::OK, "{artifact}: document deleted");
+            assert_eq!(xml.matches("<version>").count(), 1, "{xml}");
+            assert_metadata_resolves(&ctx, artifact).await;
+        }
+    }
+
+    /// A dry run deletes nothing and rewrites nothing.
+    #[tokio::test]
+    async fn test_maven_retention_dry_run_leaves_metadata_untouched() {
+        let ctx = create_test_context();
+        for v in ["1.0.0", "1.1.0-rc.1"] {
+            maven_put(&ctx, &format!("com/example/dry/{v}/dry-{v}.jar"), v).await;
+        }
+        let before = ctx
+            .state
+            .storage
+            .list("maven/com/example/dry/")
+            .await
+            .unwrap();
+        let mut snapshot = Vec::new();
+        for key in &before {
+            snapshot.push(ctx.state.storage.get(key).await.unwrap());
+        }
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &[maven_rule("*-rc*")],
+            true,
+        )
+        .await;
+        assert_eq!(result.planned, 1);
+        let after = ctx
+            .state
+            .storage
+            .list("maven/com/example/dry/")
+            .await
+            .unwrap();
+        assert_eq!(before, after);
+        for (key, data) in before.iter().zip(&snapshot) {
+            assert_eq!(&ctx.state.storage.get(key).await.unwrap(), data, "{key}");
+        }
     }
 }
