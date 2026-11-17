@@ -265,25 +265,15 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
     > = std::collections::HashMap::new();
 
     for key in &all_keys {
-        let parts: Vec<&str> = key
-            .strip_prefix("maven/")
-            .unwrap_or("")
-            .split('/')
-            .collect();
-        // maven/{group...}/{artifact}/{version}/{file}
-        // Minimum: maven/g/a/v/f = 4+ segments after maven/
-        if parts.len() < 4 {
+        // maven/{group...}/{artifact}/{version}/{file}, read the way the registry reads which
+        // versions an artifact stores (#1291).
+        let Some(file) = crate::registry::MavenVersionFile::parse(key) else {
             continue;
-        }
-        let version = parts[parts.len() - 2].to_string();
-        let artifact_path = parts[..parts.len() - 2].join("/");
-        if parts[parts.len() - 1].starts_with("maven-metadata") {
-            continue;
-        }
+        };
         artifacts
-            .entry(artifact_path)
+            .entry(format!("{}/{}", file.group_path, file.artifact_id))
             .or_default()
-            .entry(version)
+            .entry(file.version.to_string())
             .or_default()
             .push(key.clone());
     }
@@ -3961,6 +3951,86 @@ mod format_retention_tests {
         );
     }
 
+    /// `com.example:lib:1.0-SNAPSHOT` and `com.example.lib:1.0-SNAPSHOT:2.0` both stored: the files
+    /// of the second sit under `com/example/lib/1.0-SNAPSHOT/2.0/`. Once retention removes the
+    /// first's SNAPSHOT, the document of `com.example:lib` stops listing it: those files are a
+    /// version of another artifact, not of `lib` (#1291).
+    async fn maven_foreign_artifact_under_a_version_directory_is_not_that_version(
+        ctx: crate::test_helpers::TestContext,
+    ) {
+        maven_put(&ctx, "com/example/lib/0.9/lib-0.9.jar", "jar").await;
+        maven_put(
+            &ctx,
+            "com/example/lib/1.0-SNAPSHOT/lib-1.0-SNAPSHOT.jar",
+            "jar",
+        )
+        .await;
+        maven_put(
+            &ctx,
+            "com/example/lib/1.0-SNAPSHOT/2.0/1.0-SNAPSHOT-2.0.jar",
+            "jar",
+        )
+        .await;
+        let (_, before) = maven_get(&ctx, "com/example/lib/maven-metadata.xml").await;
+        assert!(
+            before.contains("<version>1.0-SNAPSHOT</version>"),
+            "{before}"
+        );
+
+        let result = run_retention(
+            &ctx.state.storage,
+            &ctx.state.publish_locks,
+            None,
+            &[maven_rule("*-SNAPSHOT")],
+            false,
+        )
+        .await;
+        assert_eq!(result.planned, 1, "only the SNAPSHOT of com.example:lib");
+
+        let (status, xml) = maven_get(&ctx, "com/example/lib/maven-metadata.xml").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            !xml.contains("1.0-SNAPSHOT"),
+            "the retired SNAPSHOT is still listed:\n{xml}"
+        );
+        assert_metadata_resolves(&ctx, "lib").await;
+
+        maven_put(&ctx, "com/example/lib/1.1/lib-1.1.jar", "jar").await;
+        let (_, xml) = maven_get(&ctx, "com/example/lib/maven-metadata.xml").await;
+        assert!(
+            !xml.contains("1.0-SNAPSHOT"),
+            "the next deploy listed the retired SNAPSHOT again:\n{xml}"
+        );
+        assert_metadata_resolves(&ctx, "lib").await;
+        let (status, _) = maven_get(
+            &ctx,
+            "com/example/lib/1.0-SNAPSHOT/2.0/1.0-SNAPSHOT-2.0.jar",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "the other artifact's file was deleted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_maven_foreign_artifact_under_a_version_directory_local() {
+        maven_foreign_artifact_under_a_version_directory_is_not_that_version(create_test_context())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_foreign_artifact_under_a_version_directory_object_store() {
+        let storage = Storage::from_backend(std::sync::Arc::new(
+            crate::storage::ObjectStorage::in_memory(),
+        ));
+        maven_foreign_artifact_under_a_version_directory_is_not_that_version(
+            crate::test_helpers::create_test_context_with_storage(storage),
+        )
+        .await;
+    }
+
     /// A SNAPSHOT redeployed while retention runs keeps its new document. The plan takes the old
     /// files, a deploy writes new files and a new document under the same key, then the plan's
     /// remaining keys go: the new document must survive (#1281).
@@ -4260,5 +4330,223 @@ mod format_retention_tests {
         for (key, data) in before.iter().zip(&snapshot) {
             assert_eq!(&ctx.state.storage.get(key).await.unwrap(), data, "{key}");
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod maven_proxy_document_and_retention {
+    //! A proxy fetch caching a SNAPSHOT's version-level `maven-metadata.xml` while retention
+    //! removes that document (#1291): the document and its checksums are written and removed
+    //! under one lock, so no checksum is left without its document.
+    use crate::storage::{FileMeta, LocalStorage, ObjectStorage, Result, StorageBackend};
+    use crate::Storage;
+    use axum::body::Bytes;
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest as _;
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    const DIR: &str = "maven/com/example/lib/1.0-SNAPSHOT/";
+    const DOCUMENT: &str = "maven/com/example/lib/1.0-SNAPSHOT/maven-metadata.xml";
+    const ARTIFACT_LOCK: &str = "maven/com/example/lib/maven-metadata.xml";
+
+    /// Holds the first `put` of `key` until released: the proxy write has stored the document
+    /// and not yet its checksums.
+    struct HeldPut {
+        inner: Arc<dyn StorageBackend>,
+        key: String,
+        armed: AtomicBool,
+        reached: Arc<Notify>,
+        release: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for HeldPut {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> Result<()> {
+            if key == self.key && self.armed.swap(false, Ordering::SeqCst) {
+                self.reached.notify_one();
+                self.release.notified().await;
+            }
+            self.inner.put(key, data, sha256).await
+        }
+        async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
+            self.inner.get(key).await
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<FileMeta> {
+            self.inner.stat(key).await
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            0
+        }
+        fn backend_name(&self) -> &'static str {
+            "held-put"
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> Result<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+        async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+    }
+
+    /// A GET through the proxy stores the document of retired `com.example:lib:1.0-SNAPSHOT` (no
+    /// file of the version is left) and is held before its checksums; retention's reconciliation
+    /// of the artifact starts; the GET goes on once the reconciliation has finished or waits
+    /// behind it. Every checksum left in the version directory has its document beside it and
+    /// matches it.
+    async fn no_checksum_outlives_its_document(inner: Arc<dyn StorageBackend>) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        let document = "<?xml version=\"1.0\"?><metadata modelVersion=\"1.1.0\"><groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0-SNAPSHOT</version><versioning><snapshot><timestamp>20261117.120000</timestamp><buildNumber>1</buildNumber></snapshot><lastUpdated>20261117120000</lastUpdated></versioning></metadata>";
+        Mock::given(method("GET"))
+            .and(path("/com/example/lib/1.0-SNAPSHOT/maven-metadata.xml"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(document, "application/xml"))
+            .mount(&upstream)
+            .await;
+
+        let reached = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let storage = Storage::from_backend(Arc::new(HeldPut {
+            inner,
+            key: format!("{DOCUMENT}.md5"),
+            armed: AtomicBool::new(true),
+            reached: Arc::clone(&reached),
+            release: Arc::clone(&release),
+        }));
+        let upstream_url = upstream.uri();
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            storage,
+            move |config| {
+                config.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(upstream_url)];
+            },
+        );
+
+        let app = ctx.app.clone();
+        let fetch = tokio::spawn(async move {
+            crate::test_helpers::send(
+                &app,
+                Method::GET,
+                "/maven2/com/example/lib/1.0-SNAPSHOT/maven-metadata.xml",
+                "",
+            )
+            .await
+            .status()
+        });
+        // Deadline, not a schedule: a proxy write that never reaches its checksums (a lock taken
+        // twice) fails here instead of hanging the suite.
+        let deadline = std::time::Duration::from_secs(60);
+        tokio::time::timeout(deadline, reached.notified())
+            .await
+            .expect("the proxy write never reached its checksums");
+        let storage = ctx.state.storage.clone();
+        assert!(
+            storage.stat(DOCUMENT).await.is_some(),
+            "the proxy write is held after its document"
+        );
+
+        let locks = ctx.state.publish_locks.clone();
+        let artifact_lock = crate::acquire_publish_lock(&locks, ARTIFACT_LOCK);
+        let regen = BTreeMap::from([(
+            "com/example/lib".to_string(),
+            BTreeSet::from(["1.0-SNAPSHOT".to_string()]),
+        )]);
+        let retention = tokio::spawn({
+            let (storage, locks) = (storage.clone(), locks.clone());
+            async move { super::reconcile_maven_metadata(&storage, &locks, &regen).await }
+        });
+        // The reconciliation either finishes (it does not wait for the proxy write) or queues on
+        // the artifact lock the proxy write holds: then four handles of that lock are out (the
+        // lock map, this test, the proxy write, the reconciliation).
+        let mut turns = 0u64;
+        while !retention.is_finished() && Arc::strong_count(&artifact_lock) < 4 {
+            tokio::task::yield_now().await;
+            turns += 1;
+            assert!(
+                turns < 10_000_000,
+                "the reconciliation neither finished nor queued on the artifact lock"
+            );
+        }
+        release.notify_one();
+        let status = tokio::time::timeout(deadline, fetch)
+            .await
+            .expect("the proxy GET never finished")
+            .unwrap();
+        assert_eq!(status, StatusCode::OK);
+        tokio::time::timeout(deadline, retention)
+            .await
+            .expect("the reconciliation never finished")
+            .unwrap();
+
+        let left = storage.list(DIR).await.unwrap();
+        for key in &left {
+            let Some((document, suffix)) = key
+                .rsplit_once('.')
+                .filter(|(_, suffix)| matches!(*suffix, "md5" | "sha1" | "sha256" | "sha512"))
+            else {
+                continue;
+            };
+            let data = match storage.get(document).await {
+                Ok(data) => data,
+                Err(e) => panic!("checksum {key} left without its document ({e}); left: {left:?}"),
+            };
+            let expected = match suffix {
+                "md5" => hex::encode(md5::Md5::digest(&data)),
+                "sha1" => hex::encode(sha1::Sha1::digest(&data)),
+                "sha256" => hex::encode(sha2::Sha256::digest(&data)),
+                _ => hex::encode(sha2::Sha512::digest(&data)),
+            };
+            let sum = storage.get(key).await.unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&sum),
+                expected,
+                "{key} does not match its document"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_maven_proxy_document_write_and_retention_local() {
+        let dir = tempfile::tempdir().unwrap();
+        no_checksum_outlives_its_document(Arc::new(LocalStorage::new(
+            dir.path().to_str().unwrap(),
+        )))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_proxy_document_write_and_retention_object_store() {
+        no_checksum_outlives_its_document(Arc::new(ObjectStorage::in_memory())).await;
     }
 }
