@@ -6,6 +6,8 @@
 use super::{create_progress_bar, MirrorResult};
 use crate::circuit_breaker::CircuitBreakerRegistry;
 use crate::registry::docker_auth::DockerAuth;
+use crate::registry::ProxyError;
+use futures::future::BoxFuture;
 use reqwest::Client;
 use std::time::Duration;
 
@@ -18,6 +20,41 @@ enum PushError {
     Status { context: &'static str, status: u16 },
     #[error("Missing Location header from upload start")]
     MissingLocation,
+}
+
+/// Why one image could not be mirrored.
+#[derive(Debug, thiserror::Error)]
+enum MirrorError {
+    #[error("Failed to fetch manifest {reference} for {name}: {cause:?}")]
+    FetchManifest {
+        reference: String,
+        name: String,
+        cause: ProxyError,
+    },
+    #[error("Failed to fetch blob {digest}: {cause:?}")]
+    FetchBlob { digest: String, cause: ProxyError },
+    #[error("Failed to read fetched blob: {0}")]
+    ReadBlob(std::io::Error),
+    #[error("Invalid manifest JSON for {reference}: {cause}")]
+    InvalidManifest {
+        reference: String,
+        cause: serde_json::Error,
+    },
+    #[error("manifest {reference}: image indexes nested deeper than {MAX_INDEX_DEPTH}")]
+    IndexTooDeep { reference: String },
+    #[error("Manifest list has no manifests array")]
+    NoManifestsArray,
+    #[error("Manifest list entry missing digest")]
+    EntryWithoutDigest,
+    /// Content whose hash is not the digest it was asked for (#587/#608).
+    #[error("{0}")]
+    Integrity(String),
+    #[error("Failed to mount blob {digest}: {cause}")]
+    MountBlob { digest: String, cause: PushError },
+    #[error("Failed to push blob {digest}: {cause}")]
+    PushBlob { digest: String, cause: PushError },
+    #[error("Failed to push manifest {reference}: {cause}")]
+    PushManifest { reference: String, cause: PushError },
 }
 
 const DEFAULT_REGISTRY: &str = "https://registry-1.docker.io";
@@ -157,134 +194,204 @@ pub async fn run_docker_mirror(
     })
 }
 
-/// Mirror a single image: fetch manifest + blobs from upstream, push to NORA.
+/// Where one image is mirrored from and to: the upstream it is read from and the NORA it is
+/// pushed into.
+struct ImageMirror<'a> {
+    client: &'a Client,
+    nora_base: &'a str,
+    image: &'a ImageRef,
+    docker_auth: &'a DockerAuth,
+    /// Mirror uses a no-op circuit breaker — it's a background sync job, not user-facing.
+    cb: CircuitBreakerRegistry,
+}
+
+/// How deep image indexes may nest. An index that lists an index is valid OCI; content
+/// addressing rules out a cycle, and this bounds what a hostile upstream can make us walk.
+const MAX_INDEX_DEPTH: usize = 4;
+
+/// Mirror a single image: its manifest and everything that manifest references, fetched from
+/// upstream and pushed to NORA. Returns the bytes fetched from upstream.
 async fn mirror_single_image(
     client: &Client,
     nora_base: &str,
     image: &ImageRef,
     docker_auth: &DockerAuth,
-) -> Result<u64, String> {
-    let mut bytes = 0u64;
-
-    // Mirror uses a no-op circuit breaker — it's a background sync job, not user-facing.
-    let noop_cb = CircuitBreakerRegistry::noop();
-
-    // 1. Fetch manifest from upstream
-    let (manifest_bytes, content_type) = crate::registry::docker::fetch_manifest_from_upstream(
+) -> Result<u64, MirrorError> {
+    let mirror = ImageMirror {
         client,
-        &image.registry,
-        &image.name,
-        &image.reference,
+        nora_base,
+        image,
         docker_auth,
-        DEFAULT_TIMEOUT,
-        None,
-        &noop_cb,
-    )
-    .await
-    .map_err(|e| format!("Failed to fetch manifest for {}: {:?}", image.name, e))?;
-
-    // If pinned by digest, the manifest's content hash must match the requested
-    // digest before we propagate it (#608). No-op for tag references.
-    verify_manifest_digest(&image.reference, &manifest_bytes)?;
-
-    bytes += manifest_bytes.len() as u64;
-
-    // 2. Parse manifest to find layer digests
-    let manifest_json: serde_json::Value = serde_json::from_slice(&manifest_bytes)
-        .map_err(|e| format!("Invalid manifest JSON: {}", e))?;
-
-    // Check if this is a manifest list / OCI index
-    let manifests_to_process = if is_manifest_list(&content_type, &manifest_json) {
-        // Pick linux/amd64 manifest from the list
-        resolve_platform_manifest(
-            client,
-            &image.registry,
-            &image.name,
-            docker_auth,
-            &manifest_json,
-        )
-        .await?
-    } else {
-        vec![(
-            manifest_bytes.clone(),
-            manifest_json.clone(),
-            content_type.clone(),
-        )]
+        cb: CircuitBreakerRegistry::noop(),
     };
 
-    for (mf_bytes, mf_json, mf_ct) in &manifests_to_process {
-        // 3. Get config digest and layer digests
-        let blobs = extract_blob_digests(mf_json);
+    let (manifest_bytes, content_type) = mirror.fetch_manifest(&image.reference).await?;
+    // If pinned by digest, the manifest's content hash must match the requested
+    // digest before we propagate it (#608). No-op for tag references.
+    verify_manifest_digest(&image.reference, &manifest_bytes).map_err(MirrorError::Integrity)?;
 
-        // 4. For each blob, check if NORA already has it, otherwise fetch and push
-        for digest in &blobs {
-            if blob_exists(client, nora_base, &image.name, digest).await {
-                tracing::debug!(digest = %digest, "Blob already exists, skipping");
-                continue;
+    mirror
+        .mirror_manifest(image.reference.clone(), manifest_bytes, content_type, 0)
+        .await
+}
+
+impl ImageMirror<'_> {
+    /// Fetch a manifest (by tag or digest) from the upstream.
+    async fn fetch_manifest(&self, reference: &str) -> Result<(Vec<u8>, String), MirrorError> {
+        crate::registry::docker::fetch_manifest_from_upstream(
+            self.client,
+            &self.image.registry,
+            &self.image.name,
+            reference,
+            self.docker_auth,
+            DEFAULT_TIMEOUT,
+            None,
+            &self.cb,
+        )
+        .await
+        .map_err(|cause| MirrorError::FetchManifest {
+            reference: reference.to_string(),
+            name: self.image.name.clone(),
+            cause,
+        })
+    }
+
+    /// Mirror a manifest and everything it references, the referenced content first. NORA
+    /// refuses a manifest that names a blob or a sub-manifest it does not hold
+    /// (`MANIFEST_BLOB_UNKNOWN`), so an image index goes in after every manifest it lists —
+    /// each platform and each attestation, exactly as the index names them, so its digest is
+    /// the upstream's — and an image manifest after its config and layers (#1184).
+    ///
+    /// `reference` is the tag or digest the manifest is pushed under: the image's own
+    /// reference at the top, its digest for a manifest an index lists.
+    fn mirror_manifest(
+        &self,
+        reference: String,
+        bytes: Vec<u8>,
+        content_type: String,
+        depth: usize,
+    ) -> BoxFuture<'_, Result<u64, MirrorError>> {
+        Box::pin(async move {
+            let json: serde_json::Value =
+                serde_json::from_slice(&bytes).map_err(|cause| MirrorError::InvalidManifest {
+                    reference: reference.clone(),
+                    cause,
+                })?;
+            let mut fetched = bytes.len() as u64;
+
+            if is_manifest_list(&content_type, &json) {
+                if depth >= MAX_INDEX_DEPTH {
+                    return Err(MirrorError::IndexTooDeep { reference });
+                }
+                // Fetch and verify every listed manifest before any blob is downloaded, so a
+                // tampered entry stops the image before its layers cost anything.
+                let mut children = Vec::new();
+                for digest in index_entry_digests(&json)? {
+                    let (child, child_ct) = self.fetch_manifest(&digest).await?;
+                    // An index entry is content-addressed by `digest`: its bytes must hash to
+                    // it, or a tampered upstream could swap the layers of a multi-arch image
+                    // (#608).
+                    verify_manifest_digest(&digest, &child).map_err(MirrorError::Integrity)?;
+                    children.push((digest, child, child_ct));
+                }
+                for (digest, child, child_ct) in children {
+                    fetched += self
+                        .mirror_manifest(digest, child, child_ct, depth + 1)
+                        .await?;
+                }
+            } else {
+                for digest in extract_blob_digests(&json) {
+                    fetched += self.mirror_blob(&digest).await?;
+                }
             }
 
-            let mirror_temp = std::env::temp_dir().join("nora-mirror");
-            let _ = std::fs::create_dir_all(&mirror_temp);
-            let fetched = crate::registry::docker::fetch_blob_from_upstream(
-                client,
-                &image.registry,
-                &image.name,
-                digest,
-                docker_auth,
-                DEFAULT_TIMEOUT,
-                60, // per-chunk read timeout
-                None,
-                &noop_cb,
-                &mirror_temp,
+            push_manifest(
+                self.client,
+                self.nora_base,
+                &self.image.name,
+                &reference,
+                &bytes,
+                &content_type,
             )
             .await
-            .map_err(|e| format!("Failed to fetch blob {}: {:?}", digest, e))?;
-
-            // Verify the blob's content hash matches the requested digest
-            // BEFORE propagating it. A compromised / MITM'd / misconfigured
-            // upstream can return arbitrary bytes for sha256:<X>; without this
-            // check `nora mirror` would accept and push them as that digest.
-            // Fail-closed, mirroring the proxy-path check in registry/docker.rs
-            // (#587, the mirror counterpart of #581).
-            verify_blob_digest(digest, &fetched.sha256)?;
-
-            let blob_data = tokio::fs::read(&fetched.path)
-                .await
-                .map_err(|e| format!("Failed to read fetched blob: {}", e))?;
-            bytes += blob_data.len() as u64;
-            push_blob(client, nora_base, &image.name, digest, &blob_data)
-                .await
-                .map_err(|e| format!("Failed to push blob {}: {}", digest, e))?;
-        }
-
-        // 5. Push manifest to NORA
-        push_manifest(
-            client,
-            nora_base,
-            &image.name,
-            &image.reference,
-            mf_bytes,
-            mf_ct,
-        )
-        .await
-        .map_err(|e| e.to_string())?;
+            .map_err(|cause| MirrorError::PushManifest { reference, cause })?;
+            Ok(fetched)
+        })
     }
 
-    // If this was a manifest list, also push the list itself
-    if manifests_to_process.len() > 1 || is_manifest_list(&content_type, &manifest_json) {
-        push_manifest(
-            client,
-            nora_base,
-            &image.name,
-            &image.reference,
-            &manifest_bytes,
-            &content_type,
+    /// Leave one blob in the image's repository on NORA. Returns the bytes fetched from
+    /// upstream (0 when NORA already had the blob).
+    ///
+    /// NORA's HEAD answers 200 for a blob readable under the name, a copy cached by a pull
+    /// through NORA included, while a pushed manifest is checked against what the repository
+    /// itself holds. So a blob NORA reports is mounted into the repository from wherever it
+    /// lies rather than skipped; where the mount cannot happen, NORA opens an upload and the
+    /// blob is fetched and pushed (#1184).
+    async fn mirror_blob(&self, digest: &str) -> Result<u64, MirrorError> {
+        let name = &self.image.name;
+        let session = if blob_exists(self.client, self.nora_base, name, digest).await {
+            match mount_blob(self.client, self.nora_base, name, digest)
+                .await
+                .map_err(|cause| MirrorError::MountBlob {
+                    digest: digest.to_string(),
+                    cause,
+                })? {
+                Mount::Mounted => {
+                    tracing::debug!(digest = %digest, "Blob already in NORA, mounted");
+                    return Ok(0);
+                }
+                Mount::Upload(location) => Some(location),
+            }
+        } else {
+            None
+        };
+
+        let mirror_temp = std::env::temp_dir().join("nora-mirror");
+        let _ = std::fs::create_dir_all(&mirror_temp);
+        let fetched = crate::registry::docker::fetch_blob_from_upstream(
+            self.client,
+            &self.image.registry,
+            name,
+            digest,
+            self.docker_auth,
+            DEFAULT_TIMEOUT,
+            60, // per-chunk read timeout
+            None,
+            &self.cb,
+            &mirror_temp,
         )
         .await
-        .map_err(|e| e.to_string())?;
-    }
+        .map_err(|cause| MirrorError::FetchBlob {
+            digest: digest.to_string(),
+            cause,
+        })?;
 
-    Ok(bytes)
+        // Verify the blob's content hash matches the requested digest
+        // BEFORE propagating it. A compromised / MITM'd / misconfigured
+        // upstream can return arbitrary bytes for sha256:<X>; without this
+        // check `nora mirror` would accept and push them as that digest.
+        // Fail-closed, mirroring the proxy-path check in registry/docker.rs
+        // (#587, the mirror counterpart of #581).
+        verify_blob_digest(digest, &fetched.sha256).map_err(MirrorError::Integrity)?;
+
+        let blob_data = tokio::fs::read(&fetched.path)
+            .await
+            .map_err(MirrorError::ReadBlob)?;
+        let push_failed = |cause| MirrorError::PushBlob {
+            digest: digest.to_string(),
+            cause,
+        };
+        let location = match session {
+            Some(location) => location,
+            None => start_upload(self.client, self.nora_base, name)
+                .await
+                .map_err(push_failed)?,
+        };
+        finish_upload(self.client, self.nora_base, &location, digest, &blob_data)
+            .await
+            .map_err(push_failed)?;
+        Ok(blob_data.len() as u64)
+    }
 }
 
 /// Check if a manifest is a manifest list (fat manifest) or OCI index.
@@ -294,65 +401,21 @@ fn is_manifest_list(content_type: &str, json: &serde_json::Value) -> bool {
         || json.get("manifests").is_some()
 }
 
-/// From a manifest list, resolve the linux/amd64 platform manifest.
-async fn resolve_platform_manifest(
-    client: &Client,
-    upstream_url: &str,
-    name: &str,
-    docker_auth: &DockerAuth,
-    list_json: &serde_json::Value,
-) -> Result<Vec<(Vec<u8>, serde_json::Value, String)>, String> {
-    let manifests = list_json
+/// The digest of every manifest an image index lists, in its order. An entry without a
+/// digest makes the index unmirrorable: NORA could not hold what it names.
+fn index_entry_digests(index: &serde_json::Value) -> Result<Vec<String>, MirrorError> {
+    index
         .get("manifests")
         .and_then(|m| m.as_array())
-        .ok_or("Manifest list has no manifests array")?;
-
-    // Find linux/amd64 manifest
-    let target = manifests
+        .ok_or(MirrorError::NoManifestsArray)?
         .iter()
-        .find(|m| {
-            let platform = m.get("platform");
-            let os = platform
-                .and_then(|p| p.get("os"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let arch = platform
-                .and_then(|p| p.get("architecture"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            os == "linux" && arch == "amd64"
+        .map(|m| {
+            m.get("digest")
+                .and_then(|d| d.as_str())
+                .map(String::from)
+                .ok_or(MirrorError::EntryWithoutDigest)
         })
-        .or_else(|| manifests.first())
-        .ok_or("No suitable platform manifest found")?;
-
-    let digest = target
-        .get("digest")
-        .and_then(|d| d.as_str())
-        .ok_or("Manifest entry missing digest")?;
-
-    let noop_cb = CircuitBreakerRegistry::noop();
-    let (mf_bytes, mf_ct) = crate::registry::docker::fetch_manifest_from_upstream(
-        client,
-        upstream_url,
-        name,
-        digest,
-        docker_auth,
-        DEFAULT_TIMEOUT,
-        None,
-        &noop_cb,
-    )
-    .await
-    .map_err(|e| format!("Failed to fetch platform manifest {}: {:?}", digest, e))?;
-
-    // The platform sub-manifest is content-addressed by `digest` from the (already
-    // digest-verified) list — its bytes must hash to that digest, or a tampered
-    // upstream could swap the layers of a multi-arch image (#608).
-    verify_manifest_digest(digest, &mf_bytes)?;
-
-    let mf_json: serde_json::Value = serde_json::from_slice(&mf_bytes)
-        .map_err(|e| format!("Invalid platform manifest: {}", e))?;
-
-    Ok(vec![(mf_bytes, mf_json, mf_ct)])
+        .collect()
 }
 
 /// Extract all blob digests from a manifest (config + layers).
@@ -438,29 +501,71 @@ async fn blob_exists(client: &Client, nora_base: &str, name: &str, digest: &str)
     )
 }
 
-/// Push a blob to NORA via monolithic upload.
-async fn push_blob(
+/// What NORA did with a blob mount request.
+enum Mount {
+    /// The blob is in the repository now (it was there, or NORA linked its copy in).
+    Mounted,
+    /// NORA could not mount it and opened an upload session at this location instead.
+    Upload(String),
+}
+
+/// The `Location` header of an upload response.
+fn upload_location(response: &reqwest::Response) -> Result<String, PushError> {
+    response
+        .headers()
+        .get("location")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .ok_or(PushError::MissingLocation)
+}
+
+/// Ask NORA to mount a blob it already holds for `name` into `name`'s own repository:
+/// `POST /v2/<name>/blobs/uploads/?mount=<digest>&from=<name>`. 201 means the repository holds
+/// it; per the OCI distribution spec a registry that cannot mount opens an upload (202).
+async fn mount_blob(
     client: &Client,
     nora_base: &str,
     name: &str,
     digest: &str,
-    data: &[u8],
-) -> Result<(), PushError> {
-    // Start upload session
+) -> Result<Mount, PushError> {
+    let url = format!(
+        "{}/v2/{}/blobs/uploads/?mount={}&from={}",
+        nora_base, name, digest, name
+    );
+    let response = client
+        .post(&url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await?;
+    match response.status().as_u16() {
+        201 => Ok(Mount::Mounted),
+        202 => upload_location(&response).map(Mount::Upload),
+        status => Err(PushError::Status {
+            context: "blob mount",
+            status,
+        }),
+    }
+}
+
+/// Open an upload session for a blob in `name`; returns its location.
+async fn start_upload(client: &Client, nora_base: &str, name: &str) -> Result<String, PushError> {
     let start_url = format!("{}/v2/{}/blobs/uploads/", nora_base, name);
     let response = client
         .post(&start_url)
         .timeout(Duration::from_secs(30))
         .send()
         .await?;
+    upload_location(&response)
+}
 
-    let location = response
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .ok_or(PushError::MissingLocation)?
-        .to_string();
-
+/// Complete an upload session with the whole blob (monolithic upload).
+async fn finish_upload(
+    client: &Client,
+    nora_base: &str,
+    location: &str,
+    digest: &str,
+    data: &[u8],
+) -> Result<(), PushError> {
     // Complete upload with digest
     let upload_url = if location.contains('?') {
         format!("{}&digest={}", location, digest)
@@ -532,7 +637,7 @@ mod tests {
 
     /// Regression for #587: the mirror path must abort when an upstream blob's
     /// content hash does not match the requested digest, instead of pushing
-    /// tampered bytes onward. `mirror_single_image` gates its `push_blob` on
+    /// tampered bytes onward. `ImageMirror::mirror_blob` gates its upload on
     /// this exact function, so it is the real call-path check, not a vacuum
     /// reimplementation.
     #[test]
@@ -732,7 +837,7 @@ mod tests {
     /// Integration regression for #608 (multi-arch): a manifest LIST entry is
     /// content-addressed by digest, so the fetched platform sub-manifest must
     /// hash to that digest. A tampered sub-manifest body must abort the mirror —
-    /// driving the real `resolve_platform_manifest` gate.
+    /// driving the real gate in `ImageMirror::mirror_manifest`.
     #[tokio::test]
     async fn mirror_aborts_on_tampered_platform_submanifest() {
         use wiremock::matchers::{method, path_regex};
@@ -792,6 +897,452 @@ mod tests {
         assert_eq!(result.fetched, 0);
         let nora_hits = nora.received_requests().await.unwrap_or_default().len();
         assert_eq!(nora_hits, 0, "must abort before pushing the swapped layers");
+    }
+
+    // --- an image index mirrors whole (#1184) ---
+
+    /// `sha256:<hex>` of some bytes.
+    fn digest_of(bytes: &[u8]) -> String {
+        use sha2::Digest;
+        format!("sha256:{}", hex::encode(sha2::Sha256::digest(bytes)))
+    }
+
+    const OCI_INDEX: &str = "application/vnd.oci.image.index.v1+json";
+    const OCI_MANIFEST: &str = "application/vnd.oci.image.manifest.v1+json";
+
+    /// An upstream image laid out the way Docker Hub serves `alpine:3.20`: an OCI index whose
+    /// entries are a linux/amd64 manifest, that manifest's attestation (platform
+    /// `unknown/unknown`) and a linux/arm64 manifest, each with its own config and layer.
+    struct IndexedImage {
+        index: Vec<u8>,
+        index_digest: String,
+        /// Every manifest the index references: (digest, body).
+        manifests: Vec<(String, Vec<u8>)>,
+        /// Every blob those manifests reference: (digest, body).
+        blobs: Vec<(String, Vec<u8>)>,
+    }
+
+    impl IndexedImage {
+        fn new() -> Self {
+            let mut blobs = Vec::new();
+            let mut manifests = Vec::new();
+            let mut entries = Vec::new();
+            for (label, platform) in [
+                ("amd64", r#"{"architecture":"amd64","os":"linux"}"#),
+                (
+                    "attestation",
+                    r#"{"architecture":"unknown","os":"unknown"}"#,
+                ),
+                ("arm64", r#"{"architecture":"arm64","os":"linux"}"#),
+            ] {
+                let config = format!(r#"{{"label":"{label}"}}"#).into_bytes();
+                let layer = format!("the {label} layer").into_bytes();
+                let manifest = format!(
+                    r#"{{"schemaVersion":2,"mediaType":"{OCI_MANIFEST}","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{}","size":{}}},"layers":[{{"mediaType":"application/vnd.oci.image.layer.v1.tar+gzip","digest":"{}","size":{}}}]}}"#,
+                    digest_of(&config),
+                    config.len(),
+                    digest_of(&layer),
+                    layer.len()
+                )
+                .into_bytes();
+                entries.push(format!(
+                    r#"{{"mediaType":"{OCI_MANIFEST}","digest":"{}","size":{},"platform":{platform}}}"#,
+                    digest_of(&manifest),
+                    manifest.len()
+                ));
+                blobs.push((digest_of(&config), config));
+                blobs.push((digest_of(&layer), layer));
+                manifests.push((digest_of(&manifest), manifest));
+            }
+            let index = format!(
+                r#"{{"schemaVersion":2,"mediaType":"{OCI_INDEX}","manifests":[{}]}}"#,
+                entries.join(",")
+            )
+            .into_bytes();
+            Self {
+                index_digest: digest_of(&index),
+                index,
+                manifests,
+                blobs,
+            }
+        }
+
+        /// Serve the image as `library/demo:3.20` (and the index by its digest).
+        async fn serve(&self) -> wiremock::MockServer {
+            use wiremock::matchers::path;
+            use wiremock::{Mock, MockServer, ResponseTemplate};
+            let upstream = MockServer::start().await;
+            let body = |ct: &str, b: &[u8]| {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", ct)
+                    .insert_header("docker-content-digest", digest_of(b).as_str())
+                    .set_body_bytes(b.to_vec())
+            };
+            for reference in ["3.20", self.index_digest.as_str()] {
+                Mock::given(path(format!("/v2/library/demo/manifests/{reference}")))
+                    .respond_with(body(OCI_INDEX, &self.index))
+                    .mount(&upstream)
+                    .await;
+            }
+            for (d, m) in &self.manifests {
+                Mock::given(path(format!("/v2/library/demo/manifests/{d}")))
+                    .respond_with(body(OCI_MANIFEST, m))
+                    .mount(&upstream)
+                    .await;
+            }
+            for (d, b) in &self.blobs {
+                Mock::given(path(format!("/v2/library/demo/blobs/{d}")))
+                    .respond_with(body("application/octet-stream", b))
+                    .mount(&upstream)
+                    .await;
+            }
+            upstream
+        }
+    }
+
+    /// A NORA instance served over real HTTP, as `nora mirror` talks to one; the server
+    /// stops when this is dropped.
+    struct ServedNora {
+        url: String,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl Drop for ServedNora {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    async fn serve_nora(ctx: &crate::test_helpers::TestContext) -> ServedNora {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let app = ctx.app.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        ServedNora { url, server }
+    }
+
+    /// GET through NORA: status, `Docker-Content-Digest` and body.
+    async fn nora_get(
+        ctx: &crate::test_helpers::TestContext,
+        uri: &str,
+    ) -> (u16, Option<String>, Vec<u8>) {
+        let response = crate::test_helpers::send_with_headers(
+            &ctx.app,
+            axum::http::Method::GET,
+            uri,
+            vec![("accept", &format!("{OCI_INDEX}, {OCI_MANIFEST}"))],
+            "",
+        )
+        .await;
+        let status = response.status().as_u16();
+        let digest = response
+            .headers()
+            .get("docker-content-digest")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        let body = crate::test_helpers::body_bytes(response).await.to_vec();
+        (status, digest, body)
+    }
+
+    fn demo(upstream: &wiremock::MockServer, reference: &str) -> ImageRef {
+        ImageRef {
+            registry: upstream.uri(),
+            name: "library/demo".to_string(),
+            reference: reference.to_string(),
+        }
+    }
+
+    /// #1184: `nora mirror docker --images alpine:3.20` failed with "references an absent
+    /// blob/sub-manifest (sha256:6243dec9…)" — that digest is the second entry of the
+    /// alpine:3.20 index, the amd64 attestation. The mirror stored one platform and pushed an
+    /// index that names them all. Now every manifest the index references, and every blob
+    /// those reference, is in NORA before the index; with no upstream configured, NORA serves
+    /// the whole image from what the mirror stored.
+    #[tokio::test]
+    async fn mirror_stores_every_manifest_an_index_references() {
+        let image = IndexedImage::new();
+        let upstream = image.serve().await;
+        let ctx = crate::test_helpers::create_test_context_in_memory(|_| {});
+        let nora = serve_nora(&ctx).await;
+        let nora_url = nora.url.as_str();
+
+        let result = run_docker_mirror(&Client::new(), nora_url, &[demo(&upstream, "3.20")], 1)
+            .await
+            .expect("mirror run completes");
+        assert_eq!((result.fetched, result.failed), (1, 0), "the image mirrors");
+        drop(upstream);
+
+        let (status, digest, body) = nora_get(&ctx, "/v2/library/demo/manifests/3.20").await;
+        assert_eq!(status, 200, "the tag is served");
+        assert_eq!(digest.as_deref(), Some(image.index_digest.as_str()));
+        assert_eq!(
+            body, image.index,
+            "the tag is the upstream index, byte for byte"
+        );
+        for (d, m) in &image.manifests {
+            let (status, _, body) =
+                nora_get(&ctx, &format!("/v2/library/demo/manifests/{d}")).await;
+            assert_eq!(status, 200, "sub-manifest {d} is stored");
+            assert_eq!(&body, m);
+        }
+        for (d, b) in &image.blobs {
+            let (status, _, body) = nora_get(&ctx, &format!("/v2/library/demo/blobs/{d}")).await;
+            assert_eq!(status, 200, "blob {d} is stored");
+            assert_eq!(&body, b);
+        }
+    }
+
+    /// #1184, an image pinned by its index digest (`alpine@sha256:<index>`): the platform
+    /// manifests go in under their own digests and the index under the pinned one.
+    #[tokio::test]
+    async fn mirror_by_index_digest_stores_the_index_under_it() {
+        let image = IndexedImage::new();
+        let upstream = image.serve().await;
+        let ctx = crate::test_helpers::create_test_context_in_memory(|_| {});
+        let nora = serve_nora(&ctx).await;
+        let nora_url = nora.url.as_str();
+
+        let pinned = demo(&upstream, &image.index_digest);
+        let result = run_docker_mirror(&Client::new(), nora_url, &[pinned], 1)
+            .await
+            .expect("mirror run completes");
+        assert_eq!((result.fetched, result.failed), (1, 0), "the image mirrors");
+        drop(upstream);
+
+        let uri = format!("/v2/library/demo/manifests/{}", image.index_digest);
+        let (status, _, body) = nora_get(&ctx, &uri).await;
+        assert_eq!(status, 200);
+        assert_eq!(body, image.index);
+    }
+
+    /// #1184, after a `docker pull` of the image through NORA: the pull cached the amd64
+    /// blobs, so NORA's HEAD answers 200 for them, but a manifest pushed to the repository is
+    /// checked against what the repository itself holds. The mirror must leave every blob in
+    /// the repository, not skip the cached ones and have the manifest refused.
+    #[tokio::test]
+    async fn mirror_after_a_pull_through_nora_still_mirrors() {
+        let image = IndexedImage::new();
+        let upstream = image.serve().await;
+        let url = upstream.uri();
+        let ctx = crate::test_helpers::create_test_context_in_memory(|cfg| {
+            cfg.docker.upstreams = vec![crate::test_helpers::docker_upstream(url)];
+        });
+        let nora = serve_nora(&ctx).await;
+        let nora_url = nora.url.as_str();
+
+        // `docker pull` on amd64: the index, the amd64 manifest, its config and layer.
+        let (amd64, amd64_manifest) = &image.manifests[0];
+        assert_eq!(
+            nora_get(&ctx, "/v2/library/demo/manifests/3.20").await.0,
+            200
+        );
+        assert_eq!(
+            nora_get(&ctx, &format!("/v2/library/demo/manifests/{amd64}"))
+                .await
+                .0,
+            200
+        );
+        let manifest: serde_json::Value = serde_json::from_slice(amd64_manifest).unwrap();
+        let pulled = extract_blob_digests(&manifest);
+        let client = Client::new();
+        for d in &pulled {
+            assert_eq!(
+                nora_get(&ctx, &format!("/v2/library/demo/blobs/{d}"))
+                    .await
+                    .0,
+                200
+            );
+        }
+        // The cache fill lands in the background: wait until NORA's HEAD reports every pulled
+        // blob present, which is the answer that used to make the mirror skip them.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        for d in &pulled {
+            while !blob_exists(&client, nora_url, "library/demo", d).await {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the pulled blob {d} never became visible to HEAD"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        let result = run_docker_mirror(&client, nora_url, &[demo(&upstream, "3.20")], 1)
+            .await
+            .expect("mirror run completes");
+        assert_eq!((result.fetched, result.failed), (1, 0), "the image mirrors");
+
+        let (status, digest, _) = nora_get(&ctx, "/v2/library/demo/manifests/3.20").await;
+        assert_eq!(status, 200);
+        assert_eq!(digest.as_deref(), Some(image.index_digest.as_str()));
+    }
+
+    /// Wrap `inner` in `levels` image indexes, each listing the one below; returns the
+    /// outermost index and every wrapper as (digest, body), outermost first.
+    fn wrap_in_indexes(inner: &[u8], levels: usize) -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+        let mut wrappers = Vec::new();
+        let mut current = inner.to_vec();
+        for _ in 0..levels {
+            current = format!(
+                r#"{{"schemaVersion":2,"mediaType":"{OCI_INDEX}","manifests":[{{"mediaType":"{OCI_INDEX}","digest":"{}","size":{}}}]}}"#,
+                digest_of(&current),
+                current.len()
+            )
+            .into_bytes();
+            wrappers.push((digest_of(&current), current.clone()));
+        }
+        wrappers.reverse();
+        (current, wrappers)
+    }
+
+    /// Serve `top` as `library/demo:nested`, and every listed index by its digest, on top of
+    /// the [`IndexedImage`] fixture.
+    async fn serve_nested(
+        image: &IndexedImage,
+        top: &[u8],
+        wrappers: &[(String, Vec<u8>)],
+    ) -> wiremock::MockServer {
+        use wiremock::matchers::path;
+        use wiremock::{Mock, ResponseTemplate};
+        let upstream = image.serve().await;
+        let mut served: Vec<(String, Vec<u8>)> = wrappers.to_vec();
+        served.push(("nested".to_string(), top.to_vec()));
+        for (reference, body) in served {
+            Mock::given(path(format!("/v2/library/demo/manifests/{reference}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", OCI_INDEX)
+                        .set_body_bytes(body),
+                )
+                .mount(&upstream)
+                .await;
+        }
+        upstream
+    }
+
+    /// An index may list an index (valid OCI): the mirror walks down to the image manifests
+    /// and stores every level before the one that lists it.
+    #[tokio::test]
+    async fn mirror_stores_an_index_that_lists_an_index() {
+        let image = IndexedImage::new();
+        let (top, wrappers) = wrap_in_indexes(&image.index, 1);
+        let upstream = serve_nested(&image, &top, &wrappers[1..]).await;
+        let ctx = crate::test_helpers::create_test_context_in_memory(|_| {});
+        let nora = serve_nora(&ctx).await;
+        let nora_url = nora.url.as_str();
+
+        let result = run_docker_mirror(&Client::new(), nora_url, &[demo(&upstream, "nested")], 1)
+            .await
+            .expect("mirror run completes");
+        assert_eq!((result.fetched, result.failed), (1, 0), "the image mirrors");
+        drop(upstream);
+
+        let (status, _, body) = nora_get(&ctx, "/v2/library/demo/manifests/nested").await;
+        assert_eq!((status, body), (200, top));
+        let inner = format!("/v2/library/demo/manifests/{}", image.index_digest);
+        assert_eq!(nora_get(&ctx, &inner).await.0, 200, "the listed index");
+        for (d, _) in &image.blobs {
+            let blob = format!("/v2/library/demo/blobs/{d}");
+            assert_eq!(nora_get(&ctx, &blob).await.0, 200, "blob {d}");
+        }
+    }
+
+    /// Indexes nested past `MAX_INDEX_DEPTH` are refused before anything reaches NORA.
+    #[tokio::test]
+    async fn mirror_refuses_indexes_nested_too_deep() {
+        let image = IndexedImage::new();
+        let (top, wrappers) = wrap_in_indexes(&image.index, MAX_INDEX_DEPTH);
+        let upstream = serve_nested(&image, &top, &wrappers[1..]).await;
+        let nora = wiremock::MockServer::start().await;
+
+        let result =
+            run_docker_mirror(&Client::new(), &nora.uri(), &[demo(&upstream, "nested")], 1)
+                .await
+                .expect("mirror run completes");
+        assert_eq!(
+            (result.fetched, result.failed),
+            (0, 1),
+            "the image is refused"
+        );
+        let nora_hits = nora.received_requests().await.unwrap_or_default().len();
+        assert_eq!(nora_hits, 0, "nothing is pushed for a refused image");
+    }
+
+    /// #1184, a NORA that reports a blob but does not mount it (a server without cross-repo
+    /// mount answers 202 with an upload session, as the OCI distribution spec has it): the
+    /// mirror fetches the blob and completes that session, rather than taking the HEAD 200
+    /// as the blob being in the repository.
+    #[tokio::test]
+    async fn mirror_uploads_a_blob_nora_reports_but_does_not_mount() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let layer = b"a layer NORA reports but cannot mount".to_vec();
+        let layer_digest = digest_of(&layer);
+        let manifest = format!(
+            r#"{{"schemaVersion":2,"mediaType":"{OCI_MANIFEST}","config":{{"digest":"{layer_digest}","size":{}}},"layers":[]}}"#,
+            layer.len()
+        );
+        let upstream = MockServer::start().await;
+        Mock::given(path("/v2/library/demo/manifests/1.0"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", OCI_MANIFEST)
+                    .set_body_string(manifest),
+            )
+            .mount(&upstream)
+            .await;
+        Mock::given(path(format!("/v2/library/demo/blobs/{layer_digest}")))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(layer.clone()))
+            .mount(&upstream)
+            .await;
+
+        let nora = MockServer::start().await;
+        Mock::given(method("HEAD"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&nora)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/library/demo/blobs/uploads/"))
+            .and(query_param("mount", layer_digest.as_str()))
+            .and(query_param("from", "library/demo"))
+            .respond_with(
+                ResponseTemplate::new(202)
+                    .insert_header("location", "/v2/library/demo/blobs/uploads/session-1"),
+            )
+            .mount(&nora)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(201))
+            .mount(&nora)
+            .await;
+
+        let result = run_docker_mirror(&Client::new(), &nora.uri(), &[demo(&upstream, "1.0")], 1)
+            .await
+            .expect("mirror run completes");
+        assert_eq!((result.fetched, result.failed), (1, 0), "the image mirrors");
+
+        let requests = nora.received_requests().await.unwrap_or_default();
+        let posts = requests
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::POST)
+            .count();
+        assert_eq!(
+            posts, 1,
+            "the mount's session is used, no second one opened"
+        );
+        let upload = requests
+            .iter()
+            .find(|r| r.url.path() == "/v2/library/demo/blobs/uploads/session-1")
+            .expect("the blob goes into the session the mount opened");
+        assert_eq!(upload.method, wiremock::http::Method::PUT);
+        assert_eq!(upload.body, layer, "the blob itself is uploaded");
     }
 
     // --- parse_image_ref tests ---
