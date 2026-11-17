@@ -4169,27 +4169,22 @@ mod tests {
         format!("hf/models/org/model/blobs/{CONFIG_BLOB}")
     }
 
-    /// A fill is committed by a task of its own once the body ends: wait for it, with a deadline.
-    /// Committed means pinned — the object is visible a moment before its pin is recorded, and
-    /// a copy without a pin is not served.
+    /// A fill is committed by a task of its own once the body ends, a counted cache write: wait
+    /// for the cache writes to finish. Committed means pinned — the object is visible a moment
+    /// before its pin is recorded, and a copy without a pin is not served.
     async fn wait_stored(ctx: &TestContext, key: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while !matches!(ctx.state.storage.get_reader(key).await, Ok((_, Some(_), _))) {
-            assert!(tokio::time::Instant::now() < deadline, "{key} never stored");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        ctx.state.cache_writes.settled().await;
+        assert!(
+            matches!(ctx.state.storage.get_reader(key).await, Ok((_, Some(_), _))),
+            "{key} never stored"
+        );
     }
 
-    /// A failed commit removes its temp file from its own task: wait for it, with a deadline.
+    /// A failed commit removes its temp file from its own task, a counted cache write: wait for
+    /// the cache writes to finish.
     async fn wait_no_fill_temps(ctx: &TestContext) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while fill_temps(ctx) != 0 {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "a fill temp file stayed behind"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        ctx.state.cache_writes.settled().await;
+        assert_eq!(fill_temps(ctx), 0, "a fill temp file stayed behind");
     }
 
     /// Long enough for a fill task that should not exist to have run.
@@ -4290,21 +4285,16 @@ mod tests {
         assert_eq!(body_bytes(second).await.to_vec(), CONFIG);
         wait_stored(&ctx, &config_key()).await;
         let size = (weights().len() + CONFIG.len()) as u64;
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let idx = ctx.state.repo_index.get("hf", &ctx.state.storage).await;
-            if idx.first().is_some_and(|r| r.versions == 2) {
-                assert_eq!(idx.len(), 1, "{idx:?}");
-                assert_eq!(idx[0].name, "org/model");
-                assert_eq!(idx[0].size, size);
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the index never saw both cached files: {idx:?}"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
+        // Both commits have finished (wait_stored), and each marked the index stale on its way
+        // out: it is rebuilt on this read.
+        let idx = ctx.state.repo_index.get("hf", &ctx.state.storage).await;
+        assert!(
+            idx.first().is_some_and(|r| r.versions == 2),
+            "the index did not see both cached files: {idx:?}"
+        );
+        assert_eq!(idx.len(), 1, "{idx:?}");
+        assert_eq!(idx[0].name, "org/model");
+        assert_eq!(idx[0].size, size);
         let stats: Value = serde_json::from_slice(
             &body_bytes(send(&ctx.app, Method::GET, "/api/ui/stats", "").await).await,
         )
@@ -4639,14 +4629,11 @@ mod tests {
         assert_eq!(upstream_paths(&cdn).await.len(), 1);
         // A copy that fails its pin is dropped, so the next download heals the cache instead
         // of failing the same way forever (a torn write after a power cut ends here too).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while ctx.state.storage.stat(&weights_key()).await.is_some() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the bad copy stayed"
-            );
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
+        ctx.state.cache_writes.settled().await;
+        assert!(
+            ctx.state.storage.stat(&weights_key()).await.is_none(),
+            "the bad copy stayed"
+        );
         let resp = send(&ctx.app, Method::GET, WEIGHTS_PATH, "").await;
         assert_eq!(received(resp).await, (weights(), true));
         assert_eq!(upstream_paths(&cdn).await.len(), 2);
