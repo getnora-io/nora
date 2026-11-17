@@ -52,6 +52,7 @@ pub(crate) use maven::artifact_metadata_lock_key as maven_artifact_metadata_lock
 pub(crate) use maven::reconcile_metadata_after_retention as maven_reconcile_metadata_after_retention;
 pub(crate) use maven::reconcile_version_metadata_after_retention as maven_reconcile_version_metadata_after_retention;
 pub(crate) use maven::storage_key as maven_storage_key;
+pub(crate) use maven::MavenVersionFile;
 pub use nuget::alias_routes as nuget_alias_routes;
 pub use nuget::routes as nuget_routes;
 pub(crate) use nuget::{

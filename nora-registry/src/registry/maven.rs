@@ -204,6 +204,57 @@ fn classify_path(path: &str) -> MavenPathKind {
     MavenPathKind::Opaque
 }
 
+/// A stored file of one Maven version, read from its storage key
+/// `maven/<group path>/<artifact>/<version>/<file>` (#1291).
+///
+/// The key is split from its end: the file is the last segment, the version and the artifact
+/// the two before it, the group everything else. So `com/example/lib/1.0-SNAPSHOT/2.0/x.jar` is
+/// a file of version `2.0` of `com.example.lib:1.0-SNAPSHOT` and never one of version
+/// `1.0-SNAPSHOT` of `com.example:lib`. A `maven-metadata.xml` document is no version's file: its
+/// path alone does not tell whose document it is (a SNAPSHOT version's, or an artifact's that
+/// shares the directory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MavenVersionFile<'k> {
+    pub(crate) group_path: &'k str,
+    pub(crate) artifact_id: &'k str,
+    pub(crate) version: &'k str,
+    pub(crate) file: &'k str,
+}
+
+impl<'k> MavenVersionFile<'k> {
+    pub(crate) fn parse(key: &'k str) -> Option<Self> {
+        let mut segments = key.strip_prefix("maven/")?.rsplitn(4, '/');
+        let file = segments.next()?;
+        let version = segments.next()?;
+        let artifact_id = segments.next()?;
+        let group_path = segments.next()?;
+        if [group_path, artifact_id, version, file]
+            .iter()
+            .any(|segment| segment.is_empty())
+            || is_metadata_document(file)
+        {
+            return None;
+        }
+        Some(Self {
+            group_path,
+            artifact_id,
+            version,
+            file,
+        })
+    }
+
+    /// Whether this is a file of `artifact_id` in group `group_path`.
+    pub(crate) fn of_artifact(&self, group_path: &str, artifact_id: &str) -> bool {
+        self.group_path == group_path && self.artifact_id == artifact_id
+    }
+}
+
+/// A `maven-metadata.xml` document or one of its checksums. An artifact whose id starts with
+/// `maven-metadata` (`maven-metadata-tools-1.0.jar`) is an artifact like any other.
+fn is_metadata_document(file: &str) -> bool {
+    file == "maven-metadata.xml" || file.starts_with("maven-metadata.xml.")
+}
+
 /// The artifacts a `maven-metadata.xml` path can belong to. maven-resolver writes metadata at
 /// three levels (`Maven2RepositoryLayoutFactory`): an artifact's (`group/artifact/`), a snapshot
 /// version's (`group/artifact/1.0-SNAPSHOT/`) and a group's plugin list (`group/`), and the path
@@ -1111,7 +1162,9 @@ async fn stored_artifact_versions(
     stored_versions(&state.storage, group_path, artifact_id).await
 }
 
-/// The version directories of an artifact that hold at least one key.
+/// The versions of an artifact that hold at least one file of their own (see
+/// [`MavenVersionFile`]): a key of another artifact nested under a version directory, or a
+/// `maven-metadata*` document left there, does not make that version stored (#1291).
 async fn stored_versions(
     storage: &crate::storage::Storage,
     group_path: &str,
@@ -1119,21 +1172,12 @@ async fn stored_versions(
 ) -> Result<BTreeSet<String>, StorageError> {
     let prefix = format!("maven/{}/{}/", group_path, artifact_id);
     let keys = storage.list(&prefix).await?;
-    let mut versions = BTreeSet::new();
-
-    for key in &keys {
-        let relative = match key.strip_prefix(&prefix) {
-            Some(relative) => relative,
-            None => continue,
-        };
-        if let Some(version) = relative.split('/').next() {
-            if !version.is_empty() && !version.starts_with("maven-metadata") {
-                versions.insert(version.to_string());
-            }
-        }
-    }
-
-    Ok(versions)
+    Ok(keys
+        .iter()
+        .filter_map(|key| MavenVersionFile::parse(key))
+        .filter(|file| file.of_artifact(group_path, artifact_id))
+        .map(|file| file.version.to_string())
+        .collect())
 }
 
 fn merge_artifact_metadata(
@@ -1221,6 +1265,20 @@ async fn merge_and_cache_proxy_metadata(
     // upload path locks the artifact's `maven-metadata.xml` key; locking the document key here
     // — identical for artifact-level metadata — keeps `publish_lock serializes all writes to the
     // same artifact path` intact on the proxy path too (#886). Held across the writes below.
+    //
+    // A SNAPSHOT version's document (`g/a/1.0-SNAPSHOT/maven-metadata.xml`) is also written
+    // under the lock of its artifact's document, the lock its deploy takes and retention's
+    // removal of a retired version's document holds (#1281): the document and its checksums
+    // are written whole or removed whole, never a checksum left without its document (#1291).
+    // The path may be the artifact-level document of `g.a:1.0-SNAPSHOT` too, so the document's
+    // own lock is held as well. The artifact's lock is taken first: every holder of two of these
+    // locks takes the shorter path first, so no two wait on each other.
+    let owner_lock = version_document_owner(group_path, artifact_id)
+        .map(|(group, artifact)| state.publish_lock(&artifact_metadata_lock_key(group, artifact)));
+    let _owner_guard = match &owner_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
     let lock = state.publish_lock(&key);
     let _guard = lock.lock().await;
 
@@ -1336,12 +1394,12 @@ pub(crate) async fn reconcile_version_metadata_after_retention(
                 .is_some_and(|rest| !rest.contains('/'))
         })
         .collect();
-    let is_document = |key: &str| {
-        key.rsplit('/')
-            .next()
-            .is_some_and(|name| name.starts_with("maven-metadata"))
+    let own_file = |key: &&String| {
+        MavenVersionFile::parse(key).is_some_and(|file| {
+            file.of_artifact(group_path, artifact_id) && file.version == version
+        })
     };
-    if direct.iter().any(|key| !is_document(key)) {
+    if direct.iter().any(own_file) {
         return Ok(());
     }
     let document_key = format!("{dir}maven-metadata.xml");
@@ -2357,6 +2415,50 @@ mod integration_tests {
         assert!(xml.contains("<version>2.0.0</version>"));
         assert!(xml.contains("<latest>2.0.0</latest>"));
         assert!(xml.contains("<release>2.0.0</release>"));
+    }
+
+    /// An artifact whose id starts with `maven-metadata` is an artifact like any other: its jar
+    /// is a file of its version, so the generated document lists that version. Only the
+    /// metadata documents themselves (`maven-metadata.xml` and its checksums) are no version's
+    /// file (#1291).
+    async fn artifact_named_like_metadata_is_listed(ctx: crate::test_helpers::TestContext) {
+        for v in ["1.0", "2.0"] {
+            let r = send(
+                &ctx.app,
+                Method::PUT,
+                &format!(
+                    "/maven2/com/example/maven-metadata-tools/{v}/maven-metadata-tools-{v}.jar"
+                ),
+                Body::from(format!("jar {v}")),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED, "upload {v}");
+        }
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/example/maven-metadata-tools/maven-metadata.xml",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let xml = String::from_utf8_lossy(&body_bytes(resp).await).to_string();
+        assert!(xml.contains("<version>1.0</version>"), "{xml}");
+        assert!(xml.contains("<version>2.0</version>"), "{xml}");
+        assert!(xml.contains("<latest>2.0</latest>"), "{xml}");
+    }
+
+    #[tokio::test]
+    async fn test_maven_artifact_named_like_metadata_is_listed_local() {
+        artifact_named_like_metadata_is_listed(create_test_context()).await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_artifact_named_like_metadata_is_listed_object_store() {
+        artifact_named_like_metadata_is_listed(crate::test_helpers::create_test_context_in_memory(
+            |_| {},
+        ))
+        .await;
     }
 
     #[tokio::test]
