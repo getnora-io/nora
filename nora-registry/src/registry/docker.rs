@@ -2871,17 +2871,25 @@ fn serve_cached_manifest(
 /// Return the first blob / sub-manifest digest a manifest references that is NOT present
 /// in storage, or `None` when every referenced item exists. Per the OCI Distribution Spec
 /// a manifest pointing at content we do not have must be rejected (`MANIFEST_BLOB_UNKNOWN`)
-/// rather than stored as a broken image. Bodies we cannot parse return `None` — malformed
-/// manifests are out of scope here.
-async fn missing_manifest_ref(body: &[u8], storage: &Storage, name: &str) -> Option<String> {
+/// rather than stored as a broken image. Each item is looked up the way `check_blob` and
+/// `manifest_keys` look it up — the namespaced copy a pull through the proxy leaves, then the
+/// bare key — so a client that skipped its upload on the HEAD 200 is not refused for it. Bodies
+/// we cannot parse return `None` — malformed manifests are out of scope here.
+async fn missing_manifest_ref(
+    body: &[u8],
+    storage: &Storage,
+    ns: Option<&str>,
+    name: &str,
+    local: &str,
+) -> Option<String> {
     let json = serde_json::from_slice::<serde_json::Value>(body).ok()?;
 
     // Image index / manifest list: referenced sub-manifests live under manifests/.
     if let Some(manifests) = json.get("manifests").and_then(|v| v.as_array()) {
         for m in manifests {
             if let Some(d) = m.get("digest").and_then(|v| v.as_str()) {
-                if storage
-                    .stat(&format!("docker/{}/manifests/{}.json", name, d))
+                let (key, legacy) = manifest_keys(ns, name, local, d);
+                if storage_stat_with_fallback(storage, &key, &legacy)
                     .await
                     .is_none()
                 {
@@ -2909,8 +2917,8 @@ async fn missing_manifest_ref(body: &[u8], storage: &Storage, name: &str) -> Opt
         }
     }
     for d in refs {
-        if storage
-            .stat(&format!("docker/{}/blobs/{}", name, d))
+        let (key, legacy) = blob_keys(ns, name, local, d);
+        if storage_stat_with_fallback(storage, &key, &legacy)
             .await
             .is_none()
         {
@@ -2959,7 +2967,9 @@ async fn put_manifest(
 
     // Reject a manifest that references content (config / layers / sub-manifests) we do
     // not have — a broken image must not be pushable (OCI MANIFEST_BLOB_UNKNOWN).
-    if let Some(missing) = missing_manifest_ref(&body, &state.storage, &local).await {
+    if let Some(missing) =
+        missing_manifest_ref(&body, &state.storage, ns.as_deref(), &name, &local).await
+    {
         tracing::warn!(
             name = %name,
             reference = %reference,
@@ -9540,6 +9550,225 @@ mod integration_tests {
             .unwrap();
         let resp = send(&hosted.app, Method::GET, &request, Body::empty()).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// A pull through the proxy stores the layers under the upstream namespace, and the HEAD probe
+    /// (check_blob) answers 200 for them. A client that pushes the same image to that name then
+    /// skips the upload on the 200 and sends only the manifest: the manifest check must find the
+    /// blobs where the probe found them, or the push is refused for content the registry holds.
+    #[tokio::test]
+    async fn a_push_after_a_pull_finds_the_layers_the_pull_cached() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+        use sha2::Digest;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let upstream = DockerUpstream {
+            url: server.uri(),
+            auth: None,
+            namespace: None,
+            prefix: None,
+            namespaces: Vec::new(),
+            metadata_ttl: None,
+        };
+        let ns = upstream.resolved_namespace();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![upstream];
+        });
+        let config = b"{\"architecture\":\"amd64\",\"os\":\"linux\"}".to_vec();
+        let layer = b"layer bytes that a pull through the proxy cached".to_vec();
+        let config_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&config)));
+        let layer_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&layer)));
+        for (digest, bytes) in [(&config_digest, &config), (&layer_digest, &layer)] {
+            ctx.state
+                .storage
+                .put(&super::blob_key(Some(&ns), "corp/app", digest), bytes)
+                .await
+                .unwrap();
+        }
+        let manifest = |layer_digest: &str| {
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "config": {
+                    "mediaType": "application/vnd.docker.container.image.v1+json",
+                    "size": config.len(),
+                    "digest": config_digest
+                },
+                "layers": [{
+                    "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                    "size": layer.len(),
+                    "digest": layer_digest
+                }]
+            }))
+            .unwrap()
+        };
+
+        let probe = send(
+            &ctx.app,
+            Method::HEAD,
+            &format!("/v2/corp/app/blobs/{layer_digest}"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(
+            probe.status(),
+            StatusCode::OK,
+            "the probe sees the cached layer"
+        );
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/corp/app/manifests/1.0",
+            Body::from(manifest(&layer_digest)),
+        )
+        .await;
+        let status = resp.status();
+        let body = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "the push that skipped the upload is accepted: {body}"
+        );
+
+        // Control: a layer present under neither key is still refused.
+        let absent = format!(
+            "sha256:{}",
+            hex::encode(sha2::Sha256::digest(b"never stored anywhere"))
+        );
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/corp/app/manifests/2.0",
+            Body::from(manifest(&absent)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let body = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert!(body.contains("MANIFEST_BLOB_UNKNOWN"), "{body}");
+    }
+
+    /// An image index whose sub-manifest a pull cached under the upstream namespace is accepted
+    /// for the same reason: the sub-manifest check reads the copy the pull stored.
+    #[tokio::test]
+    async fn a_push_of_an_index_finds_the_sub_manifests_the_pull_cached() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+        use sha2::Digest;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let upstream = DockerUpstream {
+            url: server.uri(),
+            auth: None,
+            namespace: None,
+            prefix: None,
+            namespaces: Vec::new(),
+            metadata_ttl: None,
+        };
+        let ns = upstream.resolved_namespace();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![upstream];
+        });
+        let child = b"{\"schemaVersion\":2,\"layers\":[]}".to_vec();
+        let child_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&child)));
+        ctx.state
+            .storage
+            .put(
+                &super::manifest_key(Some(&ns), "corp/app", &child_digest),
+                &child,
+            )
+            .await
+            .unwrap();
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",
+            "manifests": [{
+                "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+                "size": child.len(),
+                "digest": child_digest,
+                "platform": { "architecture": "amd64", "os": "linux" }
+            }]
+        }))
+        .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/corp/app/manifests/1.0",
+            Body::from(index),
+        )
+        .await;
+        let status = resp.status();
+        let body = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "the index whose sub-manifest the pull cached is accepted: {body}"
+        );
+    }
+
+    /// A layer a client uploaded under the bare name (no pull through the proxy) is still found
+    /// by the manifest check when the image is pushed to the proxied name.
+    #[tokio::test]
+    async fn a_push_finds_a_layer_uploaded_under_the_bare_name() {
+        use crate::config::DockerUpstream;
+        use crate::test_helpers::create_test_context_with_config;
+        use sha2::Digest;
+        use wiremock::MockServer;
+
+        let server = MockServer::start().await;
+        let upstream = DockerUpstream {
+            url: server.uri(),
+            auth: None,
+            namespace: None,
+            prefix: None,
+            namespaces: Vec::new(),
+            metadata_ttl: None,
+        };
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![upstream];
+        });
+        let config = b"{\"architecture\":\"amd64\",\"os\":\"linux\"}".to_vec();
+        let layer = b"layer uploaded by a plain push".to_vec();
+        let config_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&config)));
+        let layer_digest = format!("sha256:{}", hex::encode(sha2::Sha256::digest(&layer)));
+        for (digest, bytes) in [(&config_digest, &config), (&layer_digest, &layer)] {
+            ctx.state
+                .storage
+                .put(&super::blob_key(None, "corp/app", digest), bytes)
+                .await
+                .unwrap();
+        }
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.docker.distribution.manifest.v2+json",
+            "config": {
+                "mediaType": "application/vnd.docker.container.image.v1+json",
+                "size": config.len(),
+                "digest": config_digest
+            },
+            "layers": [{
+                "mediaType": "application/vnd.docker.image.rootfs.diff.tar.gzip",
+                "size": layer.len(),
+                "digest": layer_digest
+            }]
+        }))
+        .unwrap();
+        let resp = send(
+            &ctx.app,
+            Method::PUT,
+            "/v2/corp/app/manifests/1.0",
+            Body::from(manifest),
+        )
+        .await;
+        let status = resp.status();
+        let body = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "a layer under the bare name satisfies the manifest: {body}"
+        );
     }
 
     /// A manifest pushed by digest is that digest's content: other bytes are refused with OCI
