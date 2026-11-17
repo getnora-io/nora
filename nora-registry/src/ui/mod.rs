@@ -48,6 +48,13 @@ struct DetailQuery {
     all: Option<bool>,
 }
 
+/// The repository page's query: the language, and the tag filter (#855).
+#[derive(Debug, serde::Deserialize)]
+struct DockerDetailQuery {
+    lang: Option<String>,
+    q: Option<String>,
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct ListQuery {
     lang: Option<String>,
@@ -293,19 +300,23 @@ async fn docker_list(
 async fn docker_detail(
     State(state): State<AppState>,
     Path(name): Path<String>,
-    Query(query): Query<LangQuery>,
+    Query(query): Query<DockerDetailQuery>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let lang = extract_lang(
-        &Query(query),
+        &Query(LangQuery {
+            lang: query.lang.clone(),
+        }),
         headers.get("cookie").and_then(|v| v.to_str().ok()),
     );
     let base_url = resolve_base_url(&state);
     let auth_enabled = state.auth.is_some();
     let detail = get_docker_detail(&state, &name).await;
+    let filter = query.q.unwrap_or_default();
     Html(render_docker_detail(
         &name,
         &detail,
+        &filter,
         lang,
         &base_url,
         auth_enabled,
@@ -3064,5 +3075,73 @@ mod registry_pages {
                 "{uri} shows how to download"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod docker_tag_filter {
+    use crate::test_helpers::{body_bytes, create_test_context_with_config, send, TestContext};
+    use axum::http::{Method, StatusCode};
+
+    async fn page(ctx: &TestContext, uri: &str) -> (StatusCode, String) {
+        let resp = send(&ctx.app, Method::GET, uri, "").await;
+        let status = resp.status();
+        let body = body_bytes(resp).await;
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    /// A repository `team/app` with one manifest per tag, as a push stores them.
+    async fn seeded(tags: &[&str]) -> TestContext {
+        let ctx = create_test_context_with_config(|_| {});
+        for tag in tags {
+            let key = format!("docker/team/app/manifests/{tag}.json");
+            ctx.state
+                .storage
+                .put(&key, br#"{"schemaVersion":2}"#)
+                .await
+                .unwrap();
+        }
+        ctx
+    }
+
+    /// #855: the tags page keeps the tags whose name holds the filter text, whatever the case,
+    /// and says how many match.
+    #[tokio::test]
+    async fn the_tags_page_filters_by_substring() {
+        let ctx = seeded(&["develop", "PR-12345", "v1.0", "main"]).await;
+
+        let (status, html) = page(&ctx, "/ui/docker/team%2Fapp?q=dev").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(html.contains(">develop<"), "develop matches dev");
+        assert!(!html.contains(">v1.0<"), "v1.0 does not match dev");
+        assert!(!html.contains(">main<"), "main does not match dev");
+        assert!(html.contains("Tags (1 of 4 total)"), "{html}");
+
+        let (_, html) = page(&ctx, "/ui/docker/team%2Fapp?q=pr-").await;
+        assert!(
+            html.contains(">PR-12345<"),
+            "the case of the filter does not matter"
+        );
+        assert!(!html.contains(">develop<"));
+    }
+
+    /// A filter nothing matches says so, and its text is shown back escaped, not as markup.
+    #[tokio::test]
+    async fn a_filter_nothing_matches_says_so_and_escapes_its_text() {
+        let ctx = seeded(&["v1.0"]).await;
+        let (_, html) = page(&ctx, "/ui/docker/team%2Fapp?q=%3Cb%3Ezzz").await;
+        assert!(html.contains("No tags match"), "{html}");
+        assert!(html.contains("&lt;b&gt;zzz"), "the filter is escaped");
+        assert!(!html.contains("<b>zzz"), "no markup from the filter");
+        assert!(!html.contains(">v1.0<"));
+    }
+
+    /// Without a filter the page lists every tag, as before.
+    #[tokio::test]
+    async fn an_unfiltered_tags_page_is_as_before() {
+        let ctx = seeded(&["develop", "v1.0"]).await;
+        let (_, html) = page(&ctx, "/ui/docker/team%2Fapp").await;
+        assert!(html.contains(">develop<") && html.contains(">v1.0<"));
+        assert!(html.contains("Tags (2 total)"), "{html}");
     }
 }
