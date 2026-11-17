@@ -596,7 +596,7 @@ fn format_artifact(module: &str, file: &str) -> String {
 /// (`master`), revisions (`abcdef`), partial queries (`v1`, `v1.2`), and operators (`latest`),
 /// all of which resolve to a moving target. When in doubt this returns `false` (treat as mutable
 /// → revalidate), which is the fail-safe for freshness.
-fn is_canonical_go_version(v: &str) -> bool {
+pub(crate) fn is_canonical_go_version(v: &str) -> bool {
     let Some(rest) = v.strip_prefix('v') else {
         return false;
     };

@@ -13,7 +13,13 @@
 //! - a version that go.sum lists with a module hash (`<path> <version> h1:…`): the same three —
 //!   `go build`, `go test` and `go list -deps -test all` read them;
 //! - a version that go.sum lists only with a go.mod hash (`<path> <version>/go.mod h1:…`): the
-//!   `.mod` — the go command reads that go.mod to build the module graph, never the code.
+//!   `.mod` — the go command reads that go.mod to build the module graph, never the code —
+//!   unless go.mod's `go` line is older than 1.17 or missing: then `go mod download` downloads
+//!   the whole build list (`cmd/go/internal/modcmd/download.go`), and every go.sum version is
+//!   fetched in full (measured with go 1.22.5 and 1.26.3);
+//! - a requirement on a query rather than a version (`vnext`, `master`): its `.info`, which
+//!   names the version, then that version's `.info`, `.mod` and `.zip` — the go command asks
+//!   for nothing else, and writes that version into go.mod.
 //!
 //! Paths and versions are escaped as the go command escapes them (`!` before a lowercase letter
 //! for each capital), so the stored key is the one an offline client asks for.
@@ -76,6 +82,15 @@ pub(super) enum LineError {
     ModulePath(String),
     #[error("`{0}` is not a module version")]
     Version(String),
+    #[error("`{0}` is not a module version or a query (a branch, tag or revision)")]
+    Query(String),
+    #[error(
+        "{0} {1}: the go command resolves `{1}` from the module's version list; \
+         run `go mod tidy` to write the version it picks into go.mod"
+    )]
+    ListQuery(String, String),
+    #[error("a quoted string is not closed, or has an escape Go does not allow: `{0}`")]
+    Quoted(String),
     #[error("the block opened here with `(` is not closed")]
     Unclosed,
 }
@@ -87,6 +102,10 @@ enum FetchError {
     Http(#[from] reqwest::Error),
     #[error("HTTP {0}")]
     Status(reqwest::StatusCode),
+    #[error("the .info names no module version: {0}")]
+    Info(String),
+    #[error("the .info is not JSON with a Version: {0}")]
+    InfoJson(#[source] serde_json::Error),
 }
 
 /// Where a `replace` directive sends a module.
@@ -109,11 +128,35 @@ struct Replace {
 /// The requirements and replacements of a go.mod.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct GoMod {
+    /// The version on the `go` line, if there is one.
+    go: Option<String>,
     requires: Vec<(String, String)>,
     replaces: Vec<Replace>,
 }
 
 impl GoMod {
+    /// Whether `go mod download` downloads the whole build list rather than the required modules
+    /// only: the `go` line is missing or older than 1.17 (`download.go`: `modFile.Go == nil ||
+    /// gover.Compare(modFile.Go.Version, "1.17") < 0`). In `gover` order no `1.17…` is below
+    /// 1.17, so the major and minor numbers decide; a line they cannot be read from counts as
+    /// old, which fetches more, never less.
+    fn downloads_build_list(&self) -> bool {
+        let Some(go) = &self.go else {
+            return true;
+        };
+        let number = |s: Option<&str>| {
+            let s = s.unwrap_or("");
+            let digits = s.bytes().take_while(u8::is_ascii_digit).count();
+            s[..digits].parse::<u64>().ok()
+        };
+        let mut parts = go.splitn(3, '.');
+        match (number(parts.next()), number(parts.next())) {
+            (Some(1), Some(minor)) => minor < 17,
+            (Some(major), _) => major < 1,
+            (None, _) => true,
+        }
+    }
+
     /// The module versions the go command fetches for the requirements: each one replaced as
     /// a `replace` directive says (one naming the version wins over one for every version),
     /// none for a module replaced by a directory.
@@ -165,10 +208,44 @@ fn is_version(version: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+'))
 }
 
-/// A replacement target without a version, which go.mod allows only for a directory.
+/// What a requirement may name instead of a version, as far as a URL needs: a branch, tag or
+/// revision of letters, digits, `-`, `.`, `_`, `~` and `+`, starting with a letter or digit.
+/// The go command resolves it through `@v/<query>.info`.
+fn is_query(query: &str) -> bool {
+    query
+        .as_bytes()
+        .first()
+        .is_some_and(u8::is_ascii_alphanumeric)
+        && query
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+'))
+}
+
+/// A query the go command resolves from the module's version list (`@v/list`, `@latest`)
+/// rather than from `@v/<query>.info` (`modload/query.go`, `newQueryMatcher`): `latest`,
+/// `upgrade`, `patch` and a semantic-version prefix (`v1`, `v1.2`). Every other query that is not
+/// a version is a revision query (a branch, tag or commit), resolved through its `.info`.
+fn is_list_query(query: &str) -> bool {
+    let numeric = |s: &str| {
+        !s.is_empty()
+            && s.bytes().all(|b| b.is_ascii_digit())
+            && (s.len() == 1 || !s.starts_with('0'))
+    };
+    matches!(query, "latest" | "upgrade" | "patch")
+        || query.strip_prefix('v').is_some_and(|rest| {
+            let parts: Vec<&str> = rest.split('.').collect();
+            parts.len() <= 2 && parts.iter().all(|p| numeric(p))
+        })
+}
+
+/// A replacement target without a version, which go.mod allows only for a directory: the go
+/// command's `modfile.IsDirectoryPath`, Unix and Windows forms both.
 fn is_directory(target: &str) -> bool {
     let b = target.as_bytes();
-    target.starts_with('.')
+    matches!(target, "." | "..")
+        || ["./", ".\\", "../", "..\\"]
+            .iter()
+            .any(|p| target.starts_with(p))
         || target.starts_with('/')
         || target.starts_with('\\')
         || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
@@ -189,16 +266,151 @@ fn escape(s: &str) -> String {
     out
 }
 
-/// A token of go.mod with its quotes, if any, taken off.
-fn unquote(token: &str) -> &str {
-    token
-        .strip_prefix('"')
-        .and_then(|t| t.strip_suffix('"'))
-        .or_else(|| token.strip_prefix('`').and_then(|t| t.strip_suffix('`')))
-        .unwrap_or(token)
+/// One token of a go.mod line, as the go command's lexer (`modfile/read.go`) splits it: a word,
+/// a punctuation mark or a quoted string, with its quotes taken off and its escapes read.
+#[derive(Debug, PartialEq, Eq)]
+struct Token {
+    text: String,
+    quoted: bool,
 }
 
-/// A module path and version read from go.mod, both checked.
+impl Token {
+    /// Whether this is the punctuation mark `mark`, not a string that holds it.
+    fn is(&self, mark: &str) -> bool {
+        !self.quoted && self.text == mark
+    }
+}
+
+/// Punctuation the go.mod lexer makes a token of its own.
+fn is_punctuation(c: char) -> bool {
+    matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',')
+}
+
+/// The escapes of a `"…"` string, read as Go's `strconv.Unquote` reads them; `None` for one it
+/// refuses. A byte escape above ASCII becomes the character of that code, which no module path
+/// or directory prefix holds.
+fn unescape(body: &str) -> Option<String> {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    // The character of the next `n` digits in `radix`.
+    fn code(chars: &mut std::str::Chars, n: usize, radix: u32) -> Option<char> {
+        let digits: String = chars.by_ref().take(n).collect();
+        if digits.chars().count() != n {
+            return None;
+        }
+        u32::from_str_radix(&digits, radix)
+            .ok()
+            .and_then(char::from_u32)
+    }
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        let e = chars.next()?;
+        out.push(match e {
+            'a' => '\u{7}',
+            'b' => '\u{8}',
+            'f' => '\u{c}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'v' => '\u{b}',
+            '\\' => '\\',
+            '"' => '"',
+            'x' => code(&mut chars, 2, 16)?,
+            'u' => code(&mut chars, 4, 16)?,
+            'U' => code(&mut chars, 8, 16)?,
+            '0'..='7' => {
+                let rest = u32::from(code(&mut chars, 2, 8)?);
+                let value = e.to_digit(8)? * 64 + rest;
+                if value > 0xff {
+                    return None;
+                }
+                char::from_u32(value)?
+            }
+            _ => return None,
+        });
+    }
+    Some(out)
+}
+
+/// Split one go.mod line into tokens: `//` outside a string starts a comment, a `"…"` or
+/// `` `…` `` string is one token whatever it holds (a space or `//` included) and ends on the
+/// same line.
+fn lex(line: &str) -> Result<Vec<Token>, LineError> {
+    let quoted = || LineError::Quoted(line.trim().to_string());
+    let mut tokens = Vec::new();
+    let mut rest = line;
+    loop {
+        rest = rest.trim_start_matches([' ', '\t', '\r']);
+        let Some(c) = rest.chars().next() else {
+            return Ok(tokens);
+        };
+        if rest.starts_with("//") {
+            return Ok(tokens);
+        }
+        if is_punctuation(c) {
+            tokens.push(Token {
+                text: c.to_string(),
+                quoted: false,
+            });
+            rest = &rest[1..];
+        } else if c == '"' || c == '`' {
+            // The closing quote: the first one not escaped (a raw string has no escapes).
+            let body = &rest[1..];
+            let mut end = None;
+            let mut escaped = false;
+            for (i, d) in body.char_indices() {
+                if escaped {
+                    escaped = false;
+                } else if d == '\\' && c == '"' {
+                    escaped = true;
+                } else if d == c {
+                    end = Some(i);
+                    break;
+                }
+            }
+            let end = end.ok_or_else(quoted)?;
+            let text = if c == '"' {
+                unescape(&body[..end]).ok_or_else(quoted)?
+            } else {
+                body[..end].to_string()
+            };
+            tokens.push(Token { text, quoted: true });
+            rest = &body[end + 1..];
+        } else {
+            let end = rest
+                .char_indices()
+                .find(|&(i, d)| {
+                    d.is_whitespace() || is_punctuation(d) || rest[i..].starts_with("//")
+                })
+                .map_or(rest.len(), |(i, _)| i);
+            tokens.push(Token {
+                text: rest[..end].to_string(),
+                quoted: false,
+            });
+            rest = &rest[end..];
+        }
+    }
+}
+
+/// A module path and a version or query read from a requirement or a replacement target, both
+/// checked; the go command resolves a query (`vnext`, `master`) to a version.
+fn module_query(path: &str, query: &str) -> Result<(String, String), LineError> {
+    if !is_module_path(path) {
+        return Err(LineError::ModulePath(path.to_string()));
+    }
+    if !is_query(query) {
+        return Err(LineError::Query(query.to_string()));
+    }
+    if is_list_query(query) {
+        return Err(LineError::ListQuery(path.to_string(), query.to_string()));
+    }
+    Ok((path.to_string(), query.to_string()))
+}
+
+/// A module path and version read from go.sum, both checked.
 fn module_version(path: &str, version: &str) -> Result<(String, String), LineError> {
     if !is_module_path(path) {
         return Err(LineError::ModulePath(path.to_string()));
@@ -210,21 +422,21 @@ fn module_version(path: &str, version: &str) -> Result<(String, String), LineErr
 }
 
 /// One requirement: `<module path> <version>`.
-fn parse_require(tokens: &[&str], line: &str) -> Result<(String, String), LineError> {
+fn parse_require(tokens: &[Token], line: &str) -> Result<(String, String), LineError> {
     match tokens {
-        [path, version] => module_version(path, version),
+        [path, version] => module_query(&path.text, &version.text),
         _ => Err(LineError::Require(line.to_string())),
     }
 }
 
 /// One replacement: `<path> [<version>] => <path> <version>` or `… => <directory>`.
-fn parse_replace(tokens: &[&str], line: &str) -> Result<Replace, LineError> {
+fn parse_replace(tokens: &[Token], line: &str) -> Result<Replace, LineError> {
     let bad = || LineError::Replace(line.to_string());
-    let arrow = tokens.iter().position(|t| *t == "=>").ok_or_else(bad)?;
+    let arrow = tokens.iter().position(|t| t.is("=>")).ok_or_else(bad)?;
     let (from, to) = (&tokens[..arrow], &tokens[arrow + 1..]);
     let (path, version) = match from {
-        [path] => (*path, None),
-        [path, version] => (*path, Some(*version)),
+        [path] => (path.text.as_str(), None),
+        [path, version] => (path.text.as_str(), Some(version.text.as_str())),
         _ => return Err(bad()),
     };
     if !is_module_path(path) {
@@ -237,10 +449,10 @@ fn parse_replace(tokens: &[&str], line: &str) -> Result<Replace, LineError> {
     }
     let to = match to {
         [target, version] => {
-            let (path, version) = module_version(target, version)?;
+            let (path, version) = module_query(&target.text, &version.text)?;
             Replacement::Module { path, version }
         }
-        [target] if is_directory(target) => Replacement::Directory,
+        [target] if is_directory(&target.text) => Replacement::Directory,
         _ => return Err(bad()),
     };
     Ok(Replace {
@@ -250,8 +462,8 @@ fn parse_replace(tokens: &[&str], line: &str) -> Result<Replace, LineError> {
     })
 }
 
-/// Read the `require` and `replace` directives of a go.mod, single-line and in blocks; every
-/// other directive is ignored. A directive that cannot be read fails with its line number:
+/// Read the `go`, `require` and `replace` directives of a go.mod, single-line and in blocks;
+/// every other directive is ignored. A directive that cannot be read fails with its line number:
 /// skipping it would leave a module out of the store and still report success.
 fn parse_go_mod(content: &str) -> Result<GoMod, (usize, LineError)> {
     let mut go_mod = GoMod::default();
@@ -259,32 +471,28 @@ fn parse_go_mod(content: &str) -> Result<GoMod, (usize, LineError)> {
     let mut block: Option<(String, usize)> = None;
     for (i, raw) in content.lines().enumerate() {
         let n = i + 1;
-        let line = raw.split("//").next().unwrap_or("").trim();
-        if line.is_empty() {
+        let tokens = lex(raw).map_err(|e| (n, e))?;
+        let Some(first) = tokens.first() else {
             continue;
-        }
-        let tokens: Vec<&str> = line.split_whitespace().map(unquote).collect();
-        let (verb, args): (String, &[&str]) = match &block {
-            Some(_) if line == ")" => {
+        };
+        let line = raw.trim();
+        let (verb, args): (String, &[Token]) = match &block {
+            Some(_) if tokens.len() == 1 && first.is(")") => {
                 block = None;
                 continue;
             }
             Some((verb, _)) => (verb.clone(), &tokens[..]),
             None => {
-                let first = tokens[0];
                 // `require (` and `require(` both open a block.
-                let (word, opens) = match first.strip_suffix('(') {
-                    Some(w) => (w, true),
-                    None => (first, tokens.get(1) == Some(&"(")),
-                };
-                if opens {
-                    block = Some((word.to_string(), n));
+                if tokens.get(1).is_some_and(|t| t.is("(")) {
+                    block = Some((first.text.clone(), n));
                     continue;
                 }
-                (word.to_string(), &tokens[1..])
+                (first.text.clone(), &tokens[1..])
             }
         };
         match verb.as_str() {
+            "go" => go_mod.go = args.first().map(|t| t.text.clone()),
             "require" => go_mod
                 .requires
                 .push(parse_require(args, line).map_err(|e| (n, e))?),
@@ -331,7 +539,8 @@ fn read(path: &Path) -> Result<String, GoListError> {
 }
 
 /// Every module version to fetch and the files it needs: go.mod's requirements in full, and
-/// what go.sum lists, deduplicated (a version needed in full and for its go.mod is fetched in
+/// what go.sum lists — in full too when go.mod's `go` line makes `go mod download` download the
+/// whole build list — deduplicated (a version needed in full and for its go.mod is fetched in
 /// full), in a stable order.
 fn module_versions(
     modfile: &Path,
@@ -346,8 +555,10 @@ fn module_versions(
     for key in go_mod.fetched() {
         versions.insert(key, Need::Full);
     }
+    let build_list = go_mod.downloads_build_list();
     if let Some(sumfile) = sumfile {
         for (path, version, need) in parse_go_sum(&read(sumfile)?).map_err(at(sumfile))? {
+            let need = if build_list { Need::Full } else { need };
             let entry = versions.entry((path, version)).or_insert(need);
             *entry = (*entry).max(need);
         }
@@ -369,23 +580,69 @@ async fn fetch(client: &reqwest::Client, url: &str) -> Result<u64, FetchError> {
     Ok(n)
 }
 
-/// Fetch the files of one module version, in order. Every file is asked for even after one
-/// fails, so the store holds as much as NORA can serve; the version counts as failed if any did.
+/// The most of a `.info` read: it is a line of JSON.
+const INFO_LIMIT: usize = 64 * 1024;
+
+/// GET the `.info` of a query (`vnext`, `master`) through NORA and read the version it names,
+/// which is what the go command asks for next. The version must be canonical: it is what the go
+/// command writes into go.mod.
+async fn resolve(client: &reqwest::Client, url: &str) -> Result<(u64, String), FetchError> {
+    #[derive(serde::Deserialize)]
+    struct Info {
+        #[serde(rename = "Version")]
+        version: String,
+    }
+    let mut resp = client.get(url).send().await?;
+    if !resp.status().is_success() {
+        return Err(FetchError::Status(resp.status()));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() > INFO_LIMIT {
+            return Err(FetchError::Info(format!("over {INFO_LIMIT} bytes")));
+        }
+    }
+    let info: Info = serde_json::from_slice(&body).map_err(FetchError::InfoJson)?;
+    if !crate::registry::is_canonical_go_version(&info.version) {
+        return Err(FetchError::Info(format!("`{}`", info.version)));
+    }
+    Ok((body.len() as u64, info.version))
+}
+
+/// Fetch the files of one module version, in order. A requirement on a query is first resolved
+/// through its `.info` (kept in the store: an offline `go mod download` asks for it) and then the
+/// files of the version it names are fetched, as the go command fetches them. Every file is
+/// asked for even after one fails, so the store holds as much as NORA can serve; the version
+/// counts as failed if any did.
 async fn fetch_version(
     client: &reqwest::Client,
     base: &str,
     path: &str,
     version: &str,
     need: Need,
-) -> (u64, Vec<(&'static str, FetchError)>) {
-    let (path_e, version_e) = (escape(path), escape(version));
+) -> (u64, Vec<(String, FetchError)>) {
+    let path_e = escape(path);
+    let url = |version: &str, ext: &str| format!("{base}/go/{path_e}/@v/{}.{ext}", escape(version));
     let mut bytes = 0;
     let mut misses = Vec::new();
+    let mut version = version.to_string();
+    if need == Need::Full && !crate::registry::is_canonical_go_version(&version) {
+        match resolve(client, &url(&version, "info")).await {
+            Ok((n, resolved)) => {
+                bytes += n;
+                version = resolved;
+            }
+            Err(e) => {
+                misses.push((format!("{version}.info"), e));
+                return (bytes, misses);
+            }
+        }
+    }
     for ext in need.files() {
-        let url = format!("{base}/go/{path_e}/@v/{version_e}.{ext}");
-        match fetch(client, &url).await {
+        match fetch(client, &url(&version, ext)).await {
             Ok(n) => bytes += n,
-            Err(e) => misses.push((*ext, e)),
+            Err(e) => misses.push((format!("{version}.{ext}"), e)),
         }
     }
     (bytes, misses)
@@ -450,8 +707,8 @@ pub(super) async fn run_go_mirror(
             fetched += 1;
         } else {
             failed += 1;
-            for (ext, e) in &misses {
-                pb.suspend(|| eprintln!("  WARN: {path}@{version} .{ext} -> {e}"));
+            for (file, e) in &misses {
+                pb.suspend(|| eprintln!("  WARN: {path}@{version}: {file} -> {e}"));
             }
         }
         pb.set_message(format!("{path}@{version}"));
@@ -732,11 +989,13 @@ github.com/Upper/Mod v1.2.0/go.mod h1:KKKK=
              \texample.com/orig v1.0.0\n\
              \texample.com/other v0.5.0\n\
              \texample.com/local v0.0.0-00010101000000-000000000000\n\
+             \texample.com/spaced v0.0.0-00010101000000-000000000000\n\
              )\n\n\
              replace (\n\
              \texample.com/orig v1.0.0 => example.com/fork v1.0.1\n\
              \texample.com/local => ../local\n\
              )\n\n\
+             replace example.com/spaced => \"../local module\" // a directory with a space\n\
              replace example.com/other => example.com/ForkTwo v2.0.0\n",
         );
         // go.sum elsewhere, named on the command line; go writes it for the replacements only.
@@ -769,11 +1028,74 @@ github.com/Upper/Mod v1.2.0/go.mod h1:KKKK=
             "/example.com/orig/",
             "/example.com/other/",
             "/example.com/local/",
+            "/example.com/spaced/",
         ] {
             assert!(
                 !paths.iter().any(|p| p.starts_with(replaced)),
                 "a replaced module was fetched: {paths:?}"
             );
+        }
+        upstream.verify().await;
+    }
+
+    /// go 1.22.5 and 1.26.3, measured against a logging fake proxy: for `require <module> vnext`
+    /// (or `master`) `go mod download` asks `@v/vnext.info`, then the `.mod` and `.zip` of the
+    /// version that `.info` names, and writes that version into go.mod; `go build` then asks its
+    /// `.info`. It never asks for `vnext.mod` or `vnext.zip`.
+    #[tokio::test]
+    async fn go_mirror_resolves_a_branch_requirement_through_its_info() {
+        let upstream = MockServer::start().await;
+        for (m, query, version) in [
+            (
+                "example.com/c",
+                "vnext",
+                "v0.0.0-20240102030405-abcdefabcdef",
+            ),
+            ("example.com/d", "master", "v1.2.3"),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/{m}/@v/{query}.info")))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(body_of(m, version, "info")),
+                )
+                .expect(1)
+                .mount(&upstream)
+                .await;
+            for ext in ["info", "mod", "zip"] {
+                upstream_file(&upstream, m, version, ext, 1).await;
+            }
+            for ext in ["mod", "zip"] {
+                upstream_file(&upstream, m, query, ext, 0).await;
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let modfile = write(
+            dir.path(),
+            "go.mod",
+            "module example.com/app\n\ngo 1.21\n\n\
+             require (\n\texample.com/c vnext\n\texample.com/d master\n)\n",
+        );
+        let ctx = online(&upstream);
+        let nora = serve(&ctx).await;
+        let failure = mirror(&nora.url, &["go", "--modfile", &modfile]).await;
+        assert!(failure.is_none(), "mirror: {failure:?}");
+
+        let off = offline(&ctx);
+        for (m, query, version) in [
+            (
+                "example.com/c",
+                "vnext",
+                "v0.0.0-20240102030405-abcdefabcdef",
+            ),
+            ("example.com/d", "master", "v1.2.3"),
+        ] {
+            // The query answers offline with the version it named.
+            let got = get_ok(&off, &format!("/go/{m}/@v/{query}.info")).await;
+            assert_eq!(got, body_of(m, version, "info"), "{m}@{query}.info");
+            for ext in ["info", "mod", "zip"] {
+                assert_offline(&off, m, version, ext).await;
+            }
         }
         upstream.verify().await;
     }
@@ -974,6 +1296,81 @@ gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
         assert_eq!(planned(MEASURED_GO_MOD, MEASURED_GO_SUM), measured);
     }
 
+    /// The project go 1.22.5 and 1.26.3 were measured on: a main module that requires A, whose
+    /// go.mod requires B; no package imports B, so `go mod tidy` leaves only B's go.mod hash.
+    const OLD_GO_SUM: &str = "\
+example.com/a v1.0.0 h1:9aAWzYdrnCCuhn6lIn0dr5KoazV3CRN2tMk1gWbwACk=
+example.com/a v1.0.0/go.mod h1:W/a93JNhRNWPjLZJn8IC+dq18BuLzHUOS8BW9vG2fas=
+example.com/b v1.0.0/go.mod h1:dFYOyd6FjirzV0EpGfCRpL1g8tqPwL+WQHAY5bcfsoA=
+";
+
+    /// With `go 1.16` (or no `go` line: `go mod download` then adds `require B // indirect` and
+    /// the next download asks for B in full) `go mod download` downloads the whole build list,
+    /// B's `.info` and `.zip` included; from `go 1.17` on only B's `.mod`.
+    #[test]
+    fn a_main_module_before_go_1_17_needs_every_go_sum_version_in_full() {
+        let a = [
+            "example.com/a/@v/v1.0.0.info",
+            "example.com/a/@v/v1.0.0.mod",
+            "example.com/a/@v/v1.0.0.zip",
+        ];
+        let b_full = [
+            "example.com/b/@v/v1.0.0.info",
+            "example.com/b/@v/v1.0.0.mod",
+            "example.com/b/@v/v1.0.0.zip",
+        ];
+        let old: Vec<String> = a.iter().chain(&b_full).map(|f| f.to_string()).collect();
+        let new: Vec<String> = a
+            .iter()
+            .chain(&["example.com/b/@v/v1.0.0.mod"])
+            .map(|f| f.to_string())
+            .collect();
+        let require = "require example.com/a v1.0.0\n";
+        for (go_line, want) in [
+            ("go 1.16\n", &old),
+            ("", &old),
+            ("go 1.12\n", &old),
+            ("go 1.17\n", &new),
+            ("go 1.21\n", &new),
+            ("go 1.22.5\n", &new),
+            ("go 1.17rc1\n", &new),
+            ("go 1.100\n", &new),
+        ] {
+            let go_mod = format!("module example.com/app\n\n{go_line}\n{require}");
+            assert_eq!(&planned(&go_mod, OLD_GO_SUM), want, "{go_line:?}");
+        }
+    }
+
+    #[test]
+    fn a_quoted_token_is_one_argument_whatever_it_holds() {
+        let go_mod = "module m\n\nrequire (\n\texample.com/a v1.0.0\n\texample.com/b v1.0.0\n\
+                      \texample.com/c v1.0.0\n\texample.com/d v1.0.0\n\texample.com/e v1.0.0\n)\n\
+                      replace example.com/a => \"../local module\"\n\
+                      replace example.com/b => \"./a//b\" // the `//` inside the quotes is not a comment\n\
+                      replace example.com/c v1.0.0 => \"..\\\\win dir\\\\c\"\n\
+                      replace (\n\t\"example.com/d\" => \"example.com/\\x64fork\" \"v1.0.1\"\n)\n";
+        let fetched = parse_go_mod(go_mod).unwrap().fetched();
+        assert_eq!(
+            fetched,
+            vec![
+                ("example.com/dfork".to_string(), "v1.0.1".to_string()),
+                ("example.com/e".to_string(), "v1.0.0".to_string()),
+            ]
+        );
+        for (bad, why) in [
+            ("module m\nreplace example.com/a => \"../open\n", "quoted"),
+            ("module m\nreplace example.com/a => \"../\\q\"\n", "quoted"),
+            (
+                "module m\nreplace example.com/a => .hidden\n",
+                "replacement",
+            ),
+        ] {
+            let (n, e) = parse_go_mod(bad).expect_err(bad);
+            assert_eq!(n, 2, "{bad}");
+            assert!(e.to_string().contains(why), "{bad}: {e}");
+        }
+    }
+
     #[test]
     fn a_version_needed_in_full_is_fetched_in_full_whichever_line_comes_first() {
         let go_mod = "module m\n\nrequire example.com/a v1.0.0\n";
@@ -1064,9 +1461,24 @@ gopkg.in/yaml.v3 v3.0.1/go.mod h1:K4uyk7z7BCEPqu6E+C64Yfv1cQ7kz7rIZviUmN+EgEM=
                 "module path",
             ),
             (
-                "module m\nrequire example.com/a 1.0.0\n",
+                "module m\nrequire example.com/a -1.0.0\n",
                 2,
                 "module version",
+            ),
+            (
+                "module m\nrequire example.com/a v1.2\n",
+                2,
+                "example.com/a v1.2: the go command resolves `v1.2` from the module's version list",
+            ),
+            (
+                "module m\nrequire (\n\texample.com/a latest\n)\n",
+                3,
+                "go mod tidy",
+            ),
+            (
+                "module m\nreplace example.com/a => example.com/b v1\n",
+                2,
+                "version list",
             ),
             (
                 "module m\nrequire example.com/a v1.0.0#frag\n",
