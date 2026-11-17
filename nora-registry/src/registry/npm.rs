@@ -4550,16 +4550,13 @@ mod integration_tests {
         );
         assert_eq!(&body_bytes(resp).await[..], b"TGZ 0.9.0");
         let storage = &ctx.state.storage;
-        // The cache write runs in the background: wait for it, with a deadline.
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        // The cache write runs in the background: wait for it to finish.
+        ctx.state.cache_writes.settled().await;
         for key in [
             "npm/@vendor/a/tarballs/a-0.9.0.tgz",
             "npm/@vendor/a/tarballs/a-0.9.0.tgz.sha256",
         ] {
-            while storage.stat(key).await.is_none() {
-                assert!(tokio::time::Instant::now() < deadline, "{key} never stored");
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+            assert!(storage.stat(key).await.is_some(), "{key} never stored");
         }
         assert!(
             storage.list("npm/download/").await.unwrap().is_empty(),
@@ -6546,22 +6543,17 @@ mod multi_upstream_tests {
             );
             // The cache write is a background task; wait for it so the next pass
             // deterministically takes the stale-refetch path, not a second cold fetch.
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            ctx.state.cache_writes.settled().await;
             // Settled = body AND provenance sidecar written (#1055: an owned scope's
             // copy is only served once its origin is recorded).
-            while ctx
-                .state
-                .storage
-                .get(&super::origin_key("npm/@vendor/a/upstream/packument.json"))
-                .await
-                .is_err()
-            {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "packument never cached"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+            assert!(
+                ctx.state
+                    .storage
+                    .get(&super::origin_key("npm/@vendor/a/upstream/packument.json"))
+                    .await
+                    .is_ok(),
+                "packument never cached"
+            );
         }
         let resp = send(&ctx.app, Method::GET, "/npm/@vendor/a/-/a-1.0.0.tgz", "").await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -6633,6 +6625,30 @@ mod multi_upstream_tests {
             "the self-prime must have cached the owner's packument"
         );
         assert!(public.received_requests().await.unwrap().is_empty());
+    }
+
+    /// The tests here wait for the cache writes that follow a response by waiting for them to
+    /// finish, not for a deadline: over a store whose writes take a while, the wait still ends
+    /// with the packument stored, which only holds while npm's writes are counted (#1267).
+    #[tokio::test]
+    async fn waiting_for_the_cache_writes_waits_for_npms_own() {
+        let public = public_upstream().await;
+        let npm: NpmConfig = toml::from_str(&format!(r#"proxies = ["{}"]"#, public.uri())).unwrap();
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            crate::test_helpers::slow_write_storage(std::time::Duration::from_millis(300)),
+            move |cfg| cfg.npm.proxies = npm.proxies,
+        );
+        let resp = send(&ctx.app, Method::GET, "/npm/lodash", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        ctx.state.cache_writes.settled().await;
+        assert!(
+            ctx.state
+                .storage
+                .stat("npm/lodash/upstream/packument.json")
+                .await
+                .is_some(),
+            "the wait ended before npm's cache write"
+        );
     }
 
     #[tokio::test]
@@ -6731,17 +6747,12 @@ mod multi_upstream_tests {
             cfg.circuit_breaker.reset_timeout = 300;
         });
         let cached = |key: &str| {
+            let writes = ctx.state.cache_writes.clone();
             let storage = ctx.state.storage.clone();
             let key = key.to_string();
             async move {
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-                while storage.get(&key).await.is_err() {
-                    if tokio::time::Instant::now() >= deadline {
-                        return false;
-                    }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                true
+                writes.settled().await;
+                storage.get(&key).await.is_ok()
             }
         };
 
@@ -7266,14 +7277,11 @@ mod multi_upstream_tests {
         let resp = send(&ctx.app, Method::GET, "/npm/@vendor/a/-/a-1.0.0.tgz", "").await;
         assert_eq!(&body_bytes(resp).await[..], b"OWNER-TGZ");
         let origin_key = super::origin_key("npm/@vendor/a/tarballs/a-1.0.0.tgz");
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while ctx.state.storage.get(&origin_key).await.is_err() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "origin never recorded"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        ctx.state.cache_writes.settled().await;
+        assert!(
+            ctx.state.storage.get(&origin_key).await.is_ok(),
+            "origin never recorded"
+        );
 
         // Owner goes down: its own copy is still served from cache.
         private.reset().await;
@@ -7790,18 +7798,14 @@ mod release_age_first_seen {
     async fn refetch(ctx: &TestContext, storage: &Storage) {
         let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
         assert_eq!(resp.status(), StatusCode::OK, "packument");
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while storage
-            .stat(KEY)
-            .await
-            .is_none_or(|m| now() - (m.modified as i64) >= 60)
-        {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "the refetch never rewrote the packument"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        ctx.state.cache_writes.settled().await;
+        assert!(
+            storage
+                .stat(KEY)
+                .await
+                .is_some_and(|m| now() - (m.modified as i64) < 60),
+            "the refetch never rewrote the packument"
+        );
     }
 
     async fn tarball(ctx: &TestContext, version: &str) -> (StatusCode, String) {
@@ -8186,14 +8190,11 @@ mod published_and_upstream_keys {
     }
 
     async fn wait_for(ctx: &TestContext, key: &str) {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while ctx.state.storage.stat(key).await.is_none() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{key} never written"
-            );
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        ctx.state.cache_writes.settled().await;
+        assert!(
+            ctx.state.storage.stat(key).await.is_some(),
+            "{key} never written"
+        );
     }
 
     use crate::storage::{FileMeta, ObjectStorage, Storage, StorageBackend};
@@ -13145,16 +13146,12 @@ mod tarball_redirects {
         keys.into_iter().filter(|k| k.contains(".tgz")).collect()
     }
 
-    /// The tarballs cached once the background write lands, within a deadline: a full test run
-    /// can delay the spawned write past any fixed wait.
+    /// The tarballs cached once the background writes have finished: a full test run can
+    /// delay a spawned write past any fixed wait.
     async fn cached_tarballs_eventually(ctx: &TestContext) -> Vec<String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let cached = cached_tarballs(ctx).await;
-            if !cached.is_empty() || std::time::Instant::now() > deadline {
-                return cached;
-            }
-        }
+        ctx.state.cache_writes.settled().await;
+        let keys = ctx.state.storage.list("npm/").await.unwrap();
+        keys.into_iter().filter(|k| k.contains(".tgz")).collect()
     }
 
     /// A file storage on another origin: `/a` forwards to `/b` on the same host, which answers.
@@ -14030,14 +14027,11 @@ mod install_v1_version_manifest {
             assert_full_manifest(&uri, &content_type, &doc);
             // Warm: served from the cache once it is written.
             let key = format!("npm/pnpm/upstream/manifests/{spec}.json");
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-            while ctx.state.storage.stat(&key).await.is_none() {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "{key} never written"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+            ctx.state.cache_writes.settled().await;
+            assert!(
+                ctx.state.storage.stat(&key).await.is_some(),
+                "{key} never written"
+            );
             let (content_type, doc) = get(&ctx, &uri).await;
             assert_full_manifest(&uri, &content_type, &doc);
         }
@@ -14064,14 +14058,11 @@ mod install_v1_version_manifest {
         let (content_type, doc) = get(&ctx, "/npm/pnpm/latest").await;
         assert_full_manifest("/npm/pnpm/latest", &content_type, &doc);
         let key = "npm/pnpm/upstream/manifests/latest.json";
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-        while ctx.state.storage.stat(key).await.is_none() {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "{key} never written"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        ctx.state.cache_writes.settled().await;
+        assert!(
+            ctx.state.storage.stat(key).await.is_some(),
+            "{key} never written"
+        );
         server.reset().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(503))
