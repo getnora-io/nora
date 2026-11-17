@@ -659,7 +659,7 @@ async fn registration_index(
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
             let bump = body.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("nuget", async move {
                 let _ = storage.put(&key_clone, &bump).await;
             });
             let text = String::from_utf8_lossy(&body);
@@ -685,7 +685,7 @@ async fn registration_index(
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
             let raw_for_cache = raw.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("nuget", async move {
                 if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
                     tracing::warn!(key = %key_clone, error = ?e, "nuget proxy: failed to cache registration");
                     return;
@@ -979,7 +979,7 @@ async fn version_list(state: AppState, id: &str) -> Response {
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
             let bump = body.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("nuget", async move {
                 let _ = storage.put(&key_clone, &bump).await;
             });
             with_json(body.to_vec())
@@ -1002,7 +1002,7 @@ async fn version_list(state: AppState, id: &str) -> Response {
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
             let raw_for_cache = raw.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("nuget", async move {
                 if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
                     tracing::warn!(key = %key_clone, error = ?e, "nuget proxy: failed to cache version list");
                     return;
@@ -1153,7 +1153,7 @@ async fn flatcontainer_download(
         if ends_with_ci(filename, ".nupkg") {
             let storage = state.storage.clone();
             let meta_key = format!("nuget/flatcontainer/{}/.nora-meta.json", id_lower);
-            tokio::spawn(async move {
+            state.cache_writes.spawn("nuget", async move {
                 let now = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1307,7 +1307,7 @@ async fn flatcontainer_download(
                 let state2 = state.clone();
                 let proxy_url2 = proxy_url.clone();
                 let id2 = id_lower.clone();
-                tokio::spawn(async move {
+                state.cache_writes.spawn("nuget", async move {
                     if state2.storage.stat(&index_key).await.is_none() {
                         let url = format!(
                             "{}/v3-flatcontainer/{}/index.json",
@@ -1334,7 +1334,7 @@ async fn flatcontainer_download(
                 // Track last download time
                 let storage3 = state.storage.clone();
                 let meta_key = format!("nuget/flatcontainer/{}/.nora-meta.json", id_lower);
-                tokio::spawn(async move {
+                state.cache_writes.spawn("nuget", async move {
                     let now = std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()

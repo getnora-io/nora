@@ -241,8 +241,6 @@ async fn package_versions(
     }
 
     if !backfill.is_empty() {
-        use futures::FutureExt as _;
-        use std::panic::AssertUnwindSafe;
         let storage = state.storage.clone();
         let publish_locks = state.publish_locks.clone();
         let project = normalized.clone();
@@ -251,11 +249,7 @@ async fn package_versions(
                 backfill_hash_marker(&storage, &publish_locks, &project, &filename).await;
             }
         };
-        tokio::spawn(AssertUnwindSafe(task).catch_unwind().map(|done| {
-            if let Err(panic) = done {
-                tracing::error!(panic = ?panic, "pypi: hash marker backfill panicked");
-            }
-        }));
+        state.cache_writes.spawn("pypi", task);
     }
 
     // When proxy is configured, fetch upstream index and merge with local files.
@@ -661,7 +655,7 @@ async fn download_file(
                 let project = normalized.clone();
                 let file_name = filename.clone();
                 let repo_index = Arc::clone(&state.repo_index);
-                tokio::spawn(async move {
+                state.cache_writes.spawn("pypi", async move {
                     if storage.put(&key_clone, &data_clone).await.is_ok() {
                         let _ = storage
                             .put(&format!("{}.sha256", key_clone), hash.as_bytes())

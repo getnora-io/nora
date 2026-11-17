@@ -1158,7 +1158,7 @@ async fn fetch_and_cache_json(
             let storage = state.storage.clone();
             let key_clone = storage_key.to_string();
             let bump = body.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("conan", async move {
                 let _ = storage.put(&key_clone, &bump).await;
             });
             with_json(body.to_vec())
@@ -1181,7 +1181,7 @@ async fn fetch_and_cache_json(
             let storage = state.storage.clone();
             let key_clone = storage_key.to_string();
             let raw_for_cache = raw.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("conan", async move {
                 if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
                     tracing::warn!(key = %key_clone, error = ?e, "conan proxy: failed to cache metadata");
                     return;

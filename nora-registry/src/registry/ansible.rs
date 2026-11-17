@@ -645,7 +645,7 @@ async fn proxy_json(
             let storage = state.storage.clone();
             let key_clone = cache_key.to_string();
             let body = cached.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("ansible", async move {
                 let _ = storage.put(&key_clone, &body).await;
             });
             let text = String::from_utf8_lossy(&cached);
@@ -673,7 +673,7 @@ async fn proxy_json(
             let storage = state.storage.clone();
             let key_clone = cache_key.to_string();
             let raw_for_cache = raw.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("ansible", async move {
                 if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
                     tracing::warn!(key = %key_clone, error = ?e, "ansible proxy: failed to cache metadata");
                     return;

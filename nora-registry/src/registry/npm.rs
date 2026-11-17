@@ -773,7 +773,7 @@ async fn handle_request(
                 let hash = hex::encode(sha2::Sha256::digest(&data));
                 let hash_key = format!("{}.sha256", key);
                 let storage = state.storage.clone();
-                tokio::spawn(async move {
+                state.cache_writes.spawn("npm", async move {
                     if let Err(e) = storage.put(&hash_key, hash.as_bytes()).await {
                         tracing::warn!(key = %hash_key, error = ?e, "npm proxy: failed to cache hash sidecar");
                     }
@@ -799,7 +799,7 @@ async fn handle_request(
                 let key_clone = key.clone();
                 let repo_index = Arc::clone(&state.repo_index);
                 let origin = origin_of(proxy_url);
-                tokio::spawn(async move {
+                state.cache_writes.spawn("npm", async move {
                     if let Err(e) =
                         put_with_origin(&storage, &key_clone, &data_to_cache, &origin).await
                     {
@@ -1347,7 +1347,7 @@ async fn refetch_metadata(
                     let key_clone = key.to_string();
                     let body = cached.clone();
                     let origin = origin_of(proxy_url);
-                    tokio::spawn(async move {
+                    state.cache_writes.spawn("npm", async move {
                         let _ = put_with_origin(&storage, &key_clone, &body, &origin).await;
                     });
                     Ok(cached.to_vec())
@@ -1380,7 +1380,7 @@ async fn refetch_metadata(
             let key_clone = key.to_string();
             let cache_data = rewritten.clone();
             let origin = origin_of(proxy_url);
-            tokio::spawn(async move {
+            state.cache_writes.spawn("npm", async move {
                 // Body first; the validator sidecar must never advertise
                 // freshness for a body that isn't there (#596).
                 if let Err(e) = put_with_origin(&storage, &key_clone, &cache_data, &origin).await {
@@ -2299,8 +2299,6 @@ async fn upstream_metadata(
             if document == Document::Packument {
                 record_first_seen(state, cache_key, &rewritten, None).await;
             }
-            use futures::FutureExt as _;
-            use std::panic::AssertUnwindSafe;
             let storage = state.storage.clone();
             let key = cache_key.to_string();
             let body = rewritten.clone();
@@ -2310,11 +2308,7 @@ async fn upstream_metadata(
                     tracing::warn!(key = %key, error = ?e, "npm proxy: failed to cache metadata");
                 }
             };
-            tokio::spawn(AssertUnwindSafe(task).catch_unwind().map(|done| {
-                if let Err(panic) = done {
-                    tracing::error!(panic = ?panic, "npm metadata cache task panicked");
-                }
-            }));
+            state.cache_writes.spawn("npm", task);
             served_metadata(
                 state,
                 headers,
