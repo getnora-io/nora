@@ -3016,6 +3016,7 @@ mod format_retention_tests {
             &crate::registry::Validators {
                 etag: Some("\"upstream-etag\"".into()),
                 last_modified: None,
+                checked: None,
             },
         )
         .await;

@@ -1905,6 +1905,7 @@ mod integration_tests {
             &Validators {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
+                checked: None,
             },
         )
         .await;

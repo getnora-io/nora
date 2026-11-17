@@ -5090,6 +5090,7 @@ mod spec_conformance_tests {
             &Validators {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
+                checked: None,
             },
         )
         .await;
@@ -5573,6 +5574,7 @@ mod nuget_release_dates {
             &Validators {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
+                checked: None,
             },
         )
         .await;

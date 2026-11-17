@@ -1275,6 +1275,11 @@ pub(crate) struct Validators {
     pub etag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_modified: Option<String>,
+    /// Unix seconds of the last upstream confirmation: a 200, or a 304 that kept the copy. A cache
+    /// that does not write its body again on a 304 takes its freshness from this (npm packuments,
+    /// #1064); a sidecar without it leaves the body's write time as the freshness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checked: Option<u64>,
 }
 
 impl Validators {
@@ -1417,6 +1422,7 @@ async fn conditional_fetch(
                 let new_validators = Validators {
                     etag: header_string(&response, header::ETAG),
                     last_modified: header_string(&response, header::LAST_MODIFIED),
+                    checked: None,
                 };
                 return match response.bytes().await {
                     Ok(body) => {
@@ -1945,6 +1951,7 @@ mod tests {
         let validators = Validators {
             etag: Some("\"v1\"".to_string()),
             last_modified: None,
+            checked: None,
         };
         let cb = noop_cb();
         let out = proxy_fetch_conditional(
@@ -2205,6 +2212,7 @@ mod tests {
         let v = Validators {
             etag: Some("\"abc\"".to_string()),
             last_modified: Some("Wed, 21 Oct 2026 07:28:00 GMT".to_string()),
+            checked: None,
         };
         write_validators(&storage, key, &v).await;
 
