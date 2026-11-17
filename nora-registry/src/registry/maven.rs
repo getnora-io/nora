@@ -210,7 +210,7 @@ fn classify_path(path: &str) -> MavenPathKind {
 /// The key is split from its end: the file is the last segment, the version and the artifact
 /// the two before it, the group everything else. So `com/example/lib/1.0-SNAPSHOT/2.0/x.jar` is
 /// a file of version `2.0` of `com.example.lib:1.0-SNAPSHOT` and never one of version
-/// `1.0-SNAPSHOT` of `com.example:lib`. A `maven-metadata*` document is no version's file: its
+/// `1.0-SNAPSHOT` of `com.example:lib`. A `maven-metadata.xml` document is no version's file: its
 /// path alone does not tell whose document it is (a SNAPSHOT version's, or an artifact's that
 /// shares the directory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,7 +231,7 @@ impl<'k> MavenVersionFile<'k> {
         if [group_path, artifact_id, version, file]
             .iter()
             .any(|segment| segment.is_empty())
-            || file.starts_with("maven-metadata")
+            || is_metadata_document(file)
         {
             return None;
         }
@@ -247,6 +247,12 @@ impl<'k> MavenVersionFile<'k> {
     pub(crate) fn of_artifact(&self, group_path: &str, artifact_id: &str) -> bool {
         self.group_path == group_path && self.artifact_id == artifact_id
     }
+}
+
+/// A `maven-metadata.xml` document or one of its checksums. An artifact whose id starts with
+/// `maven-metadata` (`maven-metadata-tools-1.0.jar`) is an artifact like any other.
+fn is_metadata_document(file: &str) -> bool {
+    file == "maven-metadata.xml" || file.starts_with("maven-metadata.xml.")
 }
 
 /// The artifacts a `maven-metadata.xml` path can belong to. maven-resolver writes metadata at
@@ -2409,6 +2415,50 @@ mod integration_tests {
         assert!(xml.contains("<version>2.0.0</version>"));
         assert!(xml.contains("<latest>2.0.0</latest>"));
         assert!(xml.contains("<release>2.0.0</release>"));
+    }
+
+    /// An artifact whose id starts with `maven-metadata` is an artifact like any other: its jar
+    /// is a file of its version, so the generated document lists that version. Only the
+    /// metadata documents themselves (`maven-metadata.xml` and its checksums) are no version's
+    /// file (#1291).
+    async fn artifact_named_like_metadata_is_listed(ctx: crate::test_helpers::TestContext) {
+        for v in ["1.0", "2.0"] {
+            let r = send(
+                &ctx.app,
+                Method::PUT,
+                &format!(
+                    "/maven2/com/example/maven-metadata-tools/{v}/maven-metadata-tools-{v}.jar"
+                ),
+                Body::from(format!("jar {v}")),
+            )
+            .await;
+            assert_eq!(r.status(), StatusCode::CREATED, "upload {v}");
+        }
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/example/maven-metadata-tools/maven-metadata.xml",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let xml = String::from_utf8_lossy(&body_bytes(resp).await).to_string();
+        assert!(xml.contains("<version>1.0</version>"), "{xml}");
+        assert!(xml.contains("<version>2.0</version>"), "{xml}");
+        assert!(xml.contains("<latest>2.0</latest>"), "{xml}");
+    }
+
+    #[tokio::test]
+    async fn test_maven_artifact_named_like_metadata_is_listed_local() {
+        artifact_named_like_metadata_is_listed(create_test_context()).await;
+    }
+
+    #[tokio::test]
+    async fn test_maven_artifact_named_like_metadata_is_listed_object_store() {
+        artifact_named_like_metadata_is_listed(crate::test_helpers::create_test_context_in_memory(
+            |_| {},
+        ))
+        .await;
     }
 
     #[tokio::test]
