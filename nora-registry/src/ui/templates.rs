@@ -512,6 +512,7 @@ pub fn render_docker_detail(
     let registry_host = base_url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
+    // #855: the filter form carries the page's language, so submitting it keeps it.
     let pull_cmd = format!("docker pull {}/{}", registry_host, name);
 
     let content = format!(
@@ -544,6 +545,7 @@ pub fn render_docker_detail(
             <div class="px-3 md:px-6 py-4 border-b border-slate-700 flex items-center justify-between gap-3 flex-wrap">
                 <h2 class="text-lg font-semibold text-slate-200">{}</h2>
                 <form method="get" class="w-full md:w-auto">
+                    <input type="hidden" name="lang" value="{}">
                     <input type="text" name="q" value="{}" placeholder="Filter tags…"
                         class="w-full md:w-64 px-3 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent">
                 </form>
@@ -568,6 +570,7 @@ pub fn render_docker_detail(
         html_escape(&pull_cmd),
         html_escape(&pull_cmd),
         tags_heading,
+        lang.code(),
         html_escape(filter),
         tags_rows
     );

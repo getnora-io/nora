@@ -3104,6 +3104,19 @@ mod docker_tag_filter {
         ctx
     }
 
+    /// #855: the filter form carries the page's language, so submitting it keeps the language the
+    /// page was asked in rather than switching to the default.
+    #[tokio::test]
+    async fn the_filter_form_keeps_the_language_of_the_page() {
+        let ctx = seeded(&["latest"]).await;
+        let (status, html) = page(&ctx, "/ui/docker/team%2Fapp?lang=ru").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            html.contains(r#"<input type="hidden" name="lang" value="ru">"#),
+            "the filter form does not carry the page's language"
+        );
+    }
+
     /// #855: the tags page keeps the tags whose name holds the filter text, whatever the case,
     /// and says how many match.
     #[tokio::test]
