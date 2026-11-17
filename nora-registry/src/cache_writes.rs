@@ -46,6 +46,15 @@ impl CacheWrites {
         }
     }
 
+    /// Wait until no write is in flight, and keep taking writes: a test waits on the writes
+    /// that follow a response finishing, not on a deadline a loaded runner can pass.
+    #[cfg(test)]
+    pub(crate) async fn settled(&self) {
+        self.0.close();
+        self.0.wait().await;
+        self.0.reopen();
+    }
+
     /// Writes in flight.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
