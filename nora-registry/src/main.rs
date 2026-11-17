@@ -2528,24 +2528,19 @@ async fn run(
             }
         }
         Some(Commands::MigrateDockerKeys { dry_run }) => {
-            let namespace = config
-                .docker
-                .upstreams
-                .first()
-                .map(|u| u.resolved_namespace())
-                .unwrap_or_else(|| "docker.io".to_string());
+            let namespaces = docker_key_migration::upstream_namespaces(&config.docker);
 
             if config.docker.upstreams.len() > 1 {
                 warn!(
-                    namespace = %namespace,
+                    namespaces = ?namespaces,
                     upstream_count = config.docker.upstreams.len(),
-                    "Multiple Docker upstreams configured; using first upstream namespace for migration"
+                    "Multiple Docker upstreams configured; legacy keys move under the first upstream's namespace, copies under every upstream's namespace are kept"
                 );
             }
 
             match docker_key_migration::migrate_docker_keys(
                 &storage,
-                &namespace,
+                &namespaces,
                 docker_key_migration::MigrateDockerKeysOptions { dry_run },
             )
             .await
