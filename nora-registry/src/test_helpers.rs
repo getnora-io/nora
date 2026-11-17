@@ -1885,24 +1885,83 @@ impl Drop for EgressRecorder {
 
 /// What the current thread logs while a capture runs, as the text the server's `fmt` layer
 /// writes, for tests that prove what an event says.
+///
+/// Every capture writes through one subscriber, installed once as the global default, which
+/// keeps each event of a thread that captures in that thread's buffer. A subscriber set per
+/// thread is not enough in a test binary that runs tests side by side: while it is the only one
+/// registered, tracing asks the calling thread's subscriber when another thread first meets a
+/// callsite or rebuilds the interest cache, finds none there, and turns the event off for every
+/// thread — globally, by its level, or for that one callsite.
 #[derive(Clone, Default)]
 pub struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+thread_local! {
+    /// The capture running on this thread, if any.
+    static CAPTURING: std::cell::RefCell<Option<LogCapture>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Ends the capture of its thread when dropped.
+pub struct LogCaptureGuard(std::marker::PhantomData<*const ()>);
+
+impl Drop for LogCaptureGuard {
+    fn drop(&mut self) {
+        CAPTURING.with(|c| c.borrow_mut().take());
+    }
+}
+
+/// Where the shared subscriber writes an event: the capture of the thread that emitted it.
+#[derive(Clone, Copy)]
+struct ThreadCapture;
+
+impl std::io::Write for ThreadCapture {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        CAPTURING.with(|c| {
+            if let Some(capture) = c.borrow().as_ref() {
+                capture.0.lock().unwrap().extend_from_slice(buf);
+            }
+        });
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ThreadCapture {
+    type Writer = ThreadCapture;
+    fn make_writer(&'a self) -> Self::Writer {
+        *self
+    }
+}
 
 impl LogCapture {
     /// Capture what this thread logs, at every level, until the guard is dropped. A
     /// current-thread runtime polls its tasks here too.
-    pub fn start() -> (Self, tracing::subscriber::DefaultGuard) {
+    pub fn start() -> (Self, LogCaptureGuard) {
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            use tracing_subscriber::Layer as _;
+            // Only threads that capture have their events formatted. The filter is asked per
+            // event and every callsite stays "sometimes": one met first on a thread that does
+            // not capture is not cached as wanted by nobody.
+            let capturing = tracing_subscriber::filter::dynamic_filter_fn(|_, _| {
+                CAPTURING.with(|c| c.borrow().is_some())
+            })
+            .with_callsite_filter(|_| tracing::subscriber::Interest::sometimes());
+            let subscriber = tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(ThreadCapture)
+                    .with_ansi(false)
+                    .with_filter(capturing),
+            );
+            // A test binary that already set a global subscriber keeps it; captures then see
+            // nothing, and the test that relies on one fails at once rather than now and then.
+            let _ = tracing::subscriber::set_global_default(subscriber);
+        });
         let capture = Self::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::TRACE)
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-        // An event another test emitted first, with no subscriber of its own, may have been
-        // registered as wanted by nobody while this one was being set; ask again.
-        tracing::callsite::rebuild_interest_cache();
-        (capture, guard)
+        CAPTURING.with(|c| *c.borrow_mut() = Some(capture.clone()));
+        (capture, LogCaptureGuard(std::marker::PhantomData))
     }
 
     /// Everything captured so far.
@@ -1911,20 +1970,51 @@ impl LogCapture {
     }
 }
 
-impl std::io::Write for LogCapture {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
+#[cfg(test)]
+mod log_capture_tests {
+    use super::LogCapture;
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
-    type Writer = LogCapture;
-    fn make_writer(&'a self) -> Self::Writer {
-        self.clone()
+    #[inline(never)]
+    fn met_first_on_another_thread() {
+        tracing::warn!("a callsite another thread met first");
+    }
+
+    /// A capture keeps what its thread logs while another thread meets a callsite first and
+    /// rebuilds the interest cache: neither turns the capture's events off.
+    #[test]
+    fn a_capture_survives_what_another_thread_does_with_tracing() {
+        let (log, _guard) = LogCapture::start();
+        std::thread::spawn(|| {
+            met_first_on_another_thread();
+            tracing::callsite::rebuild_interest_cache();
+        })
+        .join()
+        .unwrap();
+        met_first_on_another_thread();
+        tracing::info!("logged after another thread rebuilt the interest cache");
+        let text = log.text();
+        assert!(
+            text.contains("a callsite another thread met first"),
+            "{text:?}"
+        );
+        assert!(text.contains("after another thread rebuilt"), "{text:?}");
+    }
+
+    /// What another thread logs is not in this thread's capture, before or after this thread
+    /// logged.
+    #[test]
+    fn a_capture_keeps_only_its_own_thread() {
+        let (log, _guard) = LogCapture::start();
+        tracing::info!("from the capturing thread");
+        std::thread::spawn(|| tracing::warn!("from a thread that does not capture"))
+            .join()
+            .unwrap();
+        let text = log.text();
+        assert!(text.contains("from the capturing thread"), "{text:?}");
+        assert!(
+            !text.contains("from a thread that does not capture"),
+            "{text:?}"
+        );
     }
 }
 
