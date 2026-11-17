@@ -1413,9 +1413,10 @@ async fn refetch_metadata(
                 };
             if unchanged && !confirm {
                 // The record names other bytes than this body (a provenance write that was lost,
-                // or a writer between its body and its record): the sidecar goes, so the next
-                // request is unconditional and writes the copy whole. Only while it still names
-                // the copy this 304 was asked with: a newer writer's sidecar stays (#1064).
+                // or a writer between its body and its record): the sidecar is emptied to `{}`,
+                // which names no copy, so the next request is unconditional and writes the copy
+                // whole. Only while it still names the copy this 304 was asked with: a newer
+                // writer's sidecar stays (#1064).
                 let storage = state.storage.clone();
                 let key_clone = key.to_string();
                 let asked_with = validators.clone();
@@ -1426,7 +1427,8 @@ async fn refetch_metadata(
                             .unwrap_or_default(),
                         &asked_with,
                     ) {
-                        let _ = storage.delete(&validators_key(&key_clone)).await;
+                        // The empty sidecar: `write_validators` would skip it, so it is written as is.
+                        let _ = storage.put(&validators_key(&key_clone), b"{}").await;
                     }
                 });
                 cached = state.storage.get(key).await;
@@ -8618,10 +8620,11 @@ mod release_age_first_seen {
             super::provenance_record(&origin, &marked_packument(&upstream, "V2")).as_bytes(),
             "the record of the stored bytes was overwritten"
         );
-        // The sidecar is removed (#1064 round 3, lead 2) or left unconfirmed: never confirmed.
-        let sidecar = crate::registry::read_validators(&storage, KEY).await;
-        assert!(
-            sidecar.as_ref().is_none_or(|v| v.checked.is_none()),
+        let sidecar = crate::registry::read_validators(&storage, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            sidecar.checked, None,
             "the stored copy was confirmed by a 304 it did not answer"
         );
     }
@@ -15136,6 +15139,8 @@ mod revalidation_1064_round3 {
         inner: Arc<dyn StorageBackend>,
         reads: Mutex<usize>,
         refuse_once: Mutex<Option<String>>,
+        /// `(key, data, skip)`: stored before the read of `key` that follows `skip` reads of it, once.
+        inject: Mutex<Option<(String, Vec<u8>, usize)>>,
     }
 
     impl Observed {
@@ -15145,6 +15150,32 @@ mod revalidation_1064_round3 {
         fn count(&self, key: &str) {
             if key == PACKUMENT {
                 *self.reads.lock().unwrap() += 1;
+            }
+        }
+        /// Stores the armed object for `key` if it is the one armed, before the read goes on.
+        async fn inject_before_read(&self, key: &str) {
+            let armed = {
+                let mut slot = self.inject.lock().unwrap();
+                let fire = match slot.as_mut() {
+                    Some((k, _, skip)) if k == key => {
+                        if *skip == 0 {
+                            true
+                        } else {
+                            *skip -= 1;
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if fire {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((k, data, _)) = armed {
+                let sha = hex::encode(sha2::Sha256::digest(&data));
+                self.inner.put(&k, &data, &sha).await.unwrap();
             }
         }
     }
@@ -15167,6 +15198,7 @@ mod revalidation_1064_round3 {
             self.inner.put(key, data, sha256).await
         }
         async fn get(&self, key: &str) -> StoreResult<(axum::body::Bytes, Option<String>)> {
+            self.inject_before_read(key).await;
             self.count(key);
             self.inner.get(key).await
         }
@@ -15178,6 +15210,7 @@ mod revalidation_1064_round3 {
             Option<String>,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
+            self.inject_before_read(key).await;
             self.count(key);
             self.inner.get_reader(key).await
         }
@@ -15220,6 +15253,7 @@ mod revalidation_1064_round3 {
             inner: Arc::new(crate::storage::ObjectStorage::in_memory()),
             reads: Mutex::new(0),
             refuse_once: Mutex::new(refuse_once.map(str::to_string)),
+            inject: Mutex::new(None),
         })
     }
 
@@ -15464,5 +15498,86 @@ mod revalidation_1064_round3 {
             "request 1 is the 200 with the lost provenance; request 2 is the 304 that rereads once; \
              request 3 is the unconditional 200 that rewrites the copy whole; request 4 is confirmed"
         );
+    }
+
+    /// Lead 2 guard, deterministic: the sidecar is emptied only while it still names the copy the
+    /// 304 was asked with. A sidecar a newer writer put meanwhile is not touched.
+    #[tokio::test]
+    async fn a_304_empties_the_sidecar_only_while_it_still_names_the_asked_copy() {
+        for newer_writer in [false, true] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/testpkg"))
+                .and(header("if-none-match", "\"e1\""))
+                .respond_with(ResponseTemplate::new(304))
+                .mount(&upstream)
+                .await;
+            let obs = observed(None);
+            let ctx = create_test_context_with_storage_and_config(store_of(&obs), |cfg| {
+                cfg.npm.proxy = Some(upstream.uri());
+                cfg.npm.revalidate = true;
+            });
+            let state = &ctx.state;
+            let body = listing(&upstream, &["1.0.0"]);
+            let other = listing(&upstream, &["2.0.0"]);
+            state.storage.put(PACKUMENT, &body).await.unwrap();
+            // The record names other bytes: the 304 confirms nothing and takes the drop path.
+            let record = provenance_record(&origin_of(&upstream.uri()), &other);
+            state
+                .storage
+                .put(&origin_key(PACKUMENT), record.as_bytes())
+                .await
+                .unwrap();
+            let asked = Validators {
+                etag: Some("\"e1\"".to_string()),
+                last_modified: None,
+                checked: Some(1),
+            };
+            write_validators(&state.storage, PACKUMENT, &asked).await;
+            if newer_writer {
+                // A newer writer's sidecar lands between the 304's decision (its first read of the
+                // sidecar) and the cleanup's read of it (the second): the cleanup finds that copy.
+                let newer = Validators {
+                    etag: Some("\"e2\"".to_string()),
+                    last_modified: None,
+                    checked: Some(2),
+                };
+                *obs.inject.lock().unwrap() = Some((
+                    validators_key(PACKUMENT),
+                    serde_json::to_vec(&newer).unwrap(),
+                    1,
+                ));
+            }
+            let served = refetch_metadata(
+                state,
+                "testpkg",
+                PACKUMENT,
+                (PACKUMENT, Some(axum::body::Bytes::from(body.clone()))),
+                false,
+                true,
+                Some((axum::body::Bytes::from(body.clone()), asked.clone())),
+            )
+            .await
+            .unwrap();
+            assert_eq!(served, body);
+            state.cache_writes.settled().await;
+            // Read past the observed store: its armed injection belongs to the cleanup's read only.
+            let sidecar: Validators = match obs.inner.get(&validators_key(PACKUMENT)).await {
+                Ok((data, _)) => serde_json::from_slice(&data).unwrap(),
+                Err(_) => Validators::default(),
+            };
+            if newer_writer {
+                assert_eq!(
+                    sidecar.etag.as_deref(),
+                    Some("\"e2\""),
+                    "a newer writer's sidecar is not emptied"
+                );
+            } else {
+                assert!(
+                    sidecar.etag.is_none() && sidecar.checked.is_none(),
+                    "the sidecar of the asked copy is emptied: {sidecar:?}"
+                );
+            }
+        }
     }
 }
