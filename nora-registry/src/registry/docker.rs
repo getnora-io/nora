@@ -6551,6 +6551,7 @@ mod integration_tests {
             namespace: Some("docker.io".to_string()),
             prefix: None,
             namespaces: Vec::new(),
+            metadata_ttl: None,
         }
     }
 
