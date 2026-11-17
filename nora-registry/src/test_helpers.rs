@@ -411,7 +411,11 @@ fn build_context_full(
         tokens,
         metrics: Arc::new(DashboardMetrics::new()),
         activity: Arc::new(ActivityLog::new(50)),
-        audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
+        audit: Arc::new(AuditLog::new(
+            &storage_path,
+            audit_mode,
+            crate::supervise::recorded_exit(),
+        )),
         docker_auth: Arc::new(docker_auth),
         docker_tokens,
         repo_index: Arc::new(RepoIndex::new()),
@@ -436,6 +440,7 @@ fn build_context_full(
         pull_stats: std::sync::Arc::new(crate::registry::docker::PullStatsAccumulator::default()),
         tasks,
         maintenance,
+        cache_writes: crate::cache_writes::CacheWrites::default(),
     };
 
     // Build router identical to run_server() but without TcpListener / rate-limiting
@@ -1307,11 +1312,15 @@ impl crate::storage::StorageBackend for LongCountBackend {
 
 /// An in-memory object store whose listing answers its first object at once and each later
 /// one after `delay`, as a large bucket listed page by page over a slow link: one page is
-/// quick, the whole listing is not. Everything else is the in-memory store as is.
+/// quick, the whole listing is not. The n-th write may wait n × `put_delay` first, as uploads
+/// over the same link, each later one slower: a wait that covers one write does not cover the
+/// next. Everything else is the in-memory store as is.
 #[derive(Debug)]
 pub struct SlowListing {
     inner: object_store::memory::InMemory,
     delay: std::time::Duration,
+    put_delay: std::time::Duration,
+    puts: std::sync::atomic::AtomicU32,
 }
 
 impl std::fmt::Display for SlowListing {
@@ -1328,6 +1337,8 @@ impl object_store::ObjectStore for SlowListing {
         payload: object_store::PutPayload,
         opts: object_store::PutOptions,
     ) -> object_store::Result<object_store::PutResult> {
+        let nth = self.puts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        tokio::time::sleep(self.put_delay * nth).await;
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -1561,6 +1572,23 @@ pub fn slow_listing_storage(delay: std::time::Duration) -> Storage {
     let store = SlowListing {
         inner: object_store::memory::InMemory::new(),
         delay,
+        put_delay: std::time::Duration::ZERO,
+        puts: std::sync::atomic::AtomicU32::new(0),
+    };
+    Storage::from_backend(Arc::new(crate::storage::ObjectStorage::over(Box::new(
+        store,
+    ))))
+}
+
+/// A [`Storage`] over an in-memory store whose n-th write takes n × `delay`: a write that runs
+/// after its response is still running when the test looks, and waiting for one write does not
+/// wait for a later one.
+pub fn slow_write_storage(delay: std::time::Duration) -> Storage {
+    let store = SlowListing {
+        inner: object_store::memory::InMemory::new(),
+        delay: std::time::Duration::ZERO,
+        put_delay: delay,
+        puts: std::sync::atomic::AtomicU32::new(0),
     };
     Storage::from_backend(Arc::new(crate::storage::ObjectStorage::over(Box::new(
         store,

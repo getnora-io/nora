@@ -45,7 +45,7 @@ use axum::{
     routing::get,
     Json, Router,
 };
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use nora_registry::verified::{stream_body, verify_while_streaming};
 use serde_json::Value;
 use sha2::Digest as _;
@@ -1150,6 +1150,8 @@ struct FillStore {
     path: PathBuf,
     /// Removes the temp file on every path but a committed fill.
     guard: TempFileGuard,
+    /// The commit runs after the response; a graceful stop waits for it.
+    writes: crate::cache_writes::CacheWrites,
 }
 
 /// Plans the check (and the fill) of a full GET. `None` — the file is passed through unchecked
@@ -1207,6 +1209,7 @@ async fn fill_store(state: &AppState, key: String) -> Option<FillStore> {
             file,
             guard: TempFileGuard::new(path.clone()),
             path,
+            writes: state.cache_writes.clone(),
         }),
         Err(e) => {
             tracing::warn!(registry = "hf", path = %path.display(), error = %e, "no temp file for the cache fill; serving uncached");
@@ -1298,6 +1301,7 @@ mod checked {
             crate::storage::Storage,
             std::sync::Arc<crate::repo_index::RepoIndex>,
             String,
+            crate::cache_writes::CacheWrites,
         )>,
     }
 
@@ -1306,10 +1310,11 @@ mod checked {
         storage: crate::storage::Storage,
         index: std::sync::Arc<crate::repo_index::RepoIndex>,
         key: String,
+        writes: crate::cache_writes::CacheWrites,
     ) -> Healing {
         Healing {
             inner,
-            drop_on_mismatch: Some((storage, index, key)),
+            drop_on_mismatch: Some((storage, index, key, writes)),
         }
     }
 
@@ -1320,8 +1325,8 @@ mod checked {
             let next = Pin::new(&mut self.inner).poll_next(cx);
             if let Poll::Ready(Some(Err(e))) = &next {
                 if e.kind() == std::io::ErrorKind::InvalidData {
-                    if let Some((storage, index, key)) = self.drop_on_mismatch.take() {
-                        super::drop_bad_copy(storage, index, key);
+                    if let Some((storage, index, key, writes)) = self.drop_on_mismatch.take() {
+                        super::drop_bad_copy(storage, index, key, &writes);
                     }
                 }
             }
@@ -1387,9 +1392,9 @@ fn drop_bad_copy(
     storage: Storage,
     index: std::sync::Arc<crate::repo_index::RepoIndex>,
     key: String,
+    writes: &crate::cache_writes::CacheWrites,
 ) {
-    use std::panic::AssertUnwindSafe;
-    let task = async move {
+    writes.spawn("hf", async move {
         match storage.delete(&key).await {
             Ok(()) => {
                 index.invalidate("hf");
@@ -1399,20 +1404,15 @@ fn drop_bad_copy(
                 tracing::warn!(registry = "hf", key = %key, error = %e, "cached copy failed its pin; drop failed")
             }
         }
-    };
-    tokio::spawn(AssertUnwindSafe(task).catch_unwind().map(|done| {
-        if let Err(panic) = done {
-            tracing::error!(panic = ?panic, "hf bad-copy drop task panicked");
-        }
-    }));
+    });
 }
 
 /// Commits a verified fill under its key, pinned to its sha256, in a task of its own: the
 /// client already has its bytes, and a client gone at the last moment must not cancel the
 /// commit halfway. A failure leaves the file uncached (the guard removes the temp file).
 fn commit_fill(store: FillStore, sha256: String) {
-    use std::panic::AssertUnwindSafe;
-    let task = async move {
+    let writes = store.writes.clone();
+    writes.spawn("hf", async move {
         let FillStore {
             storage,
             index,
@@ -1420,6 +1420,7 @@ fn commit_fill(store: FillStore, sha256: String) {
             file,
             path,
             mut guard,
+            writes: _,
         } = store;
         match sync_and_commit(&storage, &key, file, &path, &sha256).await {
             Ok(()) => {
@@ -1430,12 +1431,7 @@ fn commit_fill(store: FillStore, sha256: String) {
                 tracing::warn!(registry = "hf", key = %key, error = %e, "cache fill not committed")
             }
         }
-    };
-    tokio::spawn(AssertUnwindSafe(task).catch_unwind().map(|done| {
-        if let Err(panic) = done {
-            tracing::error!(panic = ?panic, "hf cache fill task panicked");
-        }
-    }));
+    });
 }
 
 /// Why a verified fill was not committed.
@@ -1545,6 +1541,7 @@ async fn cached_response(
             state.storage.clone(),
             std::sync::Arc::clone(&state.repo_index),
             key.to_string(),
+            state.cache_writes.clone(),
         )))
         .ok()
 }
@@ -4598,6 +4595,7 @@ mod tests {
                 file,
                 guard: TempFileGuard::new(path.clone()),
                 path,
+                writes: ctx.state.cache_writes.clone(),
             }),
         };
         let body = weights();

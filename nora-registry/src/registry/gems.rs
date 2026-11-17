@@ -281,7 +281,7 @@ async fn compact_index(
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
             let body = cached.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("gems", async move {
                 let _ = storage.put(&key_clone, &body).await;
             });
             with_text(cached.to_vec())
@@ -304,7 +304,7 @@ async fn compact_index(
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
             let raw_for_cache = raw.clone();
-            tokio::spawn(async move {
+            state.cache_writes.spawn("gems", async move {
                 if let Err(e) = storage.put(&key_clone, &raw_for_cache).await {
                     tracing::warn!(key = %key_clone, error = ?e, "gems proxy: failed to cache compact index");
                     return;

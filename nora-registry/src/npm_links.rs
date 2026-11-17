@@ -538,14 +538,24 @@ pub fn place_document(
     package_asked: Option<&str>,
     links: Links,
     key_ok: &dyn Fn(&str) -> bool,
+    held: &dyn Fn(&str) -> bool,
 ) -> Result<Placed, Unrewritable> {
+    let recorded = split_record(data).map(|(base, _)| base);
     let mut json: serde_json::Value = serde_json::from_slice(data).map_err(|e| {
         tracing::warn!(error = %e, "npm: JSON parse failed in rewrite_tarball_urls");
         Unrewritable::NotJson
     })?;
+    // The record is no part of the document: it is kept by the copy, not served (#1180).
+    if let Some(object) = json.as_object_mut() {
+        object.remove(RECORD_KEY);
+    }
 
     let upstream_trimmed = upstream_url.trim_end_matches('/');
     let nora_npm_base = format!("{}/npm", nora_base.trim_end_matches('/'));
+    let base = Base {
+        nora_npm: &nora_npm_base,
+        recorded: recorded.as_deref(),
+    };
     let package = json
         .get("name")
         .and_then(|n| n.as_str())
@@ -560,11 +570,12 @@ pub fn place_document(
             };
             match place_tarball(
                 tarball_url,
-                &nora_npm_base,
+                &base,
                 upstream_trimmed,
                 package_asked,
                 links,
                 key_ok,
+                held,
             ) {
                 Some(placed) => {
                     version_data["dist"]["tarball"] = serde_json::Value::String(placed);
@@ -580,11 +591,12 @@ pub fn place_document(
     } else if let Some(tarball_url) = tarball_of(&json) {
         let Some(placed) = place_tarball(
             tarball_url,
-            &nora_npm_base,
+            &base,
             upstream_trimmed,
             package_asked,
             links,
             key_ok,
+            held,
         ) else {
             let version = json.get("version").and_then(|v| v.as_str());
             warn_left_out(
@@ -608,8 +620,15 @@ pub fn place_document(
 
     // Safety net: byte-level replace of any remaining upstream URL prefix (#439).
     // Catches edge cases where targeted rewrite missed (e.g. new npm metadata fields).
+    let body = replace_upstream_bytes(&output, upstream_trimmed, &nora_npm_base);
+    // A copy NORA stores is written with the public base it is rewritten under (#1180).
+    let body = if links == Links::Stored {
+        with_record(body, nora_base)
+    } else {
+        body
+    };
     Ok(Placed {
-        body: replace_upstream_bytes(&output, upstream_trimmed, &nora_npm_base),
+        body,
         left_out: !left_out.is_empty(),
     })
 }
@@ -617,6 +636,206 @@ pub fn place_document(
 /// A version document's `dist.tarball`, if it names one.
 fn tarball_of(version_data: &serde_json::Value) -> Option<&str> {
     version_data.get("dist")?.get("tarball")?.as_str()
+}
+
+/// The key a stored copy keeps the public base it was rewritten under, under (#1180): the
+/// record is the first thing of the document, so the copy and its record are one put.
+const RECORD_KEY: &str = "_nora_public_base";
+
+/// Where a document is placed (#1180): NORA's npm base as this instance serves it, and the public base
+/// a stored copy was rewritten under, when the copy carries its record.
+pub struct Base<'a> {
+    pub nora_npm: &'a str,
+    pub recorded: Option<&'a str>,
+}
+
+/// The tail after NORA's `/npm` of `link`, when `link` is NORA's own tarball link for `package` to a
+/// file NORA holds: `/<package>/-/<file>` (flat, a version directory, or a scope inside it) or
+/// `/download/<@scope/name>/<version>/<sha1>` (GitHub Packages), the forms the tarball route serves
+/// ([`TarballAsk::parse`]). `origins` are the public bases the link may carry to be NORA's own: this
+/// instance's, and the one a copy was rewritten under; `None` takes any origin (a document NORA holds
+/// names its own files). The address is not decided by the path alone (#1180): the origin
+/// is, and the route must name a held file. The link is read as a URL parser reads it, and every
+/// `/npm/` in its path is a candidate, so a prefix that ends in `/npm` does not hide the route.
+pub fn own_link_tail(
+    link: &str,
+    package: &str,
+    origins: Option<&[&str]>,
+    held: &dyn Fn(&str) -> bool,
+) -> Option<String> {
+    let target = Url::parse(link).ok()?;
+    if !matches!(target.scheme(), "http" | "https")
+        || target.host_str().is_none()
+        || !target.username().is_empty()
+        || target.password().is_some()
+        || target.query().is_some()
+        || target.fragment().is_some()
+    {
+        return None;
+    }
+    if let Some(origins) = origins {
+        let own = origins
+            .iter()
+            .any(|base| Url::parse(base).is_ok_and(|base| same_origin(&target, &base)));
+        if !own {
+            return None;
+        }
+    }
+    let path = target.path();
+    path.char_indices()
+        .filter(|&(at, c)| c == '/' && path[at..].starts_with("/npm/"))
+        .find(|&(at, _)| own_route_holds(&path[at + "/npm".len()..], package, held))
+        .map(|(at, _)| path[at + "/npm".len()..].to_string())
+}
+
+/// The public base a stored copy was rewritten under, and the offset where its document goes on
+/// after the record (`None`: the bytes carry no record).
+pub fn split_record(data: &[u8]) -> Option<(String, usize)> {
+    let head = format!("{{\"{RECORD_KEY}\":");
+    let rest = data.strip_prefix(head.as_bytes())?;
+    let mut values = serde_json::Deserializer::from_slice(rest).into_iter::<String>();
+    let base = values.next()?.ok()?;
+    Some((base, head.len() + values.byte_offset()))
+}
+
+/// The document of a stored copy as it is served: its record taken out. `None` when there is no record.
+pub fn without_record(data: &[u8]) -> Option<Vec<u8>> {
+    let (_, end) = split_record(data)?;
+    match data.get(end)? {
+        b',' => {
+            let mut out = Vec::with_capacity(data.len() - end);
+            out.push(b'{');
+            out.extend_from_slice(&data[end + 1..]);
+            Some(out)
+        }
+        b'}' => Some(b"{}".to_vec()),
+        _ => None,
+    }
+}
+
+/// The document of a copy stored under `base`, with its record first (#1180). `body` is a
+/// compact JSON object; anything else is stored as it is.
+pub fn with_record(body: Vec<u8>, base: &str) -> Vec<u8> {
+    let prefix = format!(
+        "{{\"{RECORD_KEY}\":{}",
+        serde_json::to_string(base).unwrap_or_else(|_| "\"\"".to_string())
+    );
+    match body.as_slice() {
+        b"{}" => format!("{prefix}}}").into_bytes(),
+        [b'{', ..] => {
+            let mut out = prefix.into_bytes();
+            out.push(b',');
+            out.extend_from_slice(&body[1..]);
+            out
+        }
+        _ => body,
+    }
+}
+
+/// Whether `link` is NORA's own tarball link for `package` at `nora_npm_base` as it is written: the
+/// base as a prefix, then a route of a held file ([`own_route_holds`]). Nothing is parsed, so a
+/// stored copy of many versions is checked in a pass over its strings; a link this check does not
+/// take is placed again, which is safe whatever it is (#1180).
+pub fn is_own_link_at(link: &str, nora_npm_base: &str, package: &str) -> bool {
+    link.strip_prefix(nora_npm_base)
+        .is_some_and(|tail| own_route_holds(tail, package, &|_: &str| true))
+}
+
+/// Whether `tail`, the path after `/npm` (beginning `/`), is the route of a file of `package` NORA
+/// holds: the flat, version-directory or scoped `/<package>/-/<file>`, or GitHub Packages' `/download/…`
+/// (stored under the npmjs name of the version, `<name>-<version>.tgz`). The check reads only as far as
+/// the route's own bytes reach, so a long path that repeats `/npm` costs no more than its length
+/// (#1180). A scoped package's version directory names its scope inside the file, one
+/// separator more than the package's own slash (#1180).
+fn own_route_holds(tail: &str, package: &str, held: &dyn Fn(&str) -> bool) -> bool {
+    let Some(raw) = tail.strip_prefix('/') else {
+        return false;
+    };
+    if let Some(consumed) = match_decoded_prefix(raw, &format!("{package}/-/")) {
+        let rest = &raw[consumed..];
+        if !separators_at_most(rest, 1 + package.matches('/').count()) {
+            return false;
+        }
+        let Some(file) = decode(rest) else {
+            return false;
+        };
+        return parse_npm_tarball_version(package, &file).is_some() && held(&file);
+    }
+    if match_decoded_prefix(raw, "download/").is_some() && separators_at_most(raw, 4) {
+        let Some(rest) = decode(raw) else {
+            return false;
+        };
+        return match github_packages_tarball(&rest) {
+            Some((name, version)) if name == package => {
+                let bare = name.rsplit('/').next().unwrap_or(name);
+                held(&format!("{bare}-{version}.tgz"))
+            }
+            _ => false,
+        };
+    }
+    false
+}
+
+/// The raw bytes of `raw` that decode to exactly the bytes of `want` at its start, as the count of
+/// raw bytes they take. Reads only as far as `want` reaches.
+fn match_decoded_prefix(raw: &str, want: &str) -> Option<usize> {
+    let bytes = raw.as_bytes();
+    let want = want.as_bytes();
+    let (mut at, mut k) = (0usize, 0usize);
+    while k < want.len() {
+        let &b = bytes.get(at)?;
+        let (byte, step) = match b {
+            b'%' => match (
+                bytes.get(at + 1).and_then(|c| hex_value(*c)),
+                bytes.get(at + 2).and_then(|c| hex_value(*c)),
+            ) {
+                (Some(high), Some(low)) => ((high << 4) | low, 3),
+                _ => (b, 1),
+            },
+            _ => (b, 1),
+        };
+        if byte != want[k] {
+            return None;
+        }
+        at += step;
+        k += 1;
+    }
+    Some(at)
+}
+
+fn hex_value(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Whether `raw` holds at most `max` path separators, a raw `/` or an escaped `%2F` alike. Stops
+/// counting past `max`, so a long path costs no more than its first separators.
+fn separators_at_most(raw: &str, max: usize) -> bool {
+    let bytes = raw.as_bytes();
+    let (mut at, mut seen) = (0usize, 0usize);
+    while at < bytes.len() {
+        if bytes[at] == b'/' {
+            seen += 1;
+            at += 1;
+        } else if bytes[at] == b'%'
+            && bytes.get(at + 1) == Some(&b'2')
+            && matches!(bytes.get(at + 2), Some(b'F' | b'f'))
+        {
+            seen += 1;
+            at += 3;
+        } else {
+            at += 1;
+            continue;
+        }
+        if seen > max {
+            return false;
+        }
+    }
+    true
 }
 
 /// Where the tarball link `link` of an upstream document leads once NORA serves it: the
@@ -630,12 +849,14 @@ fn tarball_of(version_data: &serde_json::Value) -> Option<&str> {
 /// [`Links::Served`].
 pub fn place_tarball(
     link: &str,
-    nora_npm_base: &str,
+    base: &Base<'_>,
     upstream: &str,
     package: Option<&str>,
     links: Links,
     key_ok: &dyn Fn(&str) -> bool,
+    held: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
+    let nora_npm_base = base.nora_npm;
     let under_upstream = upstream_url_forms(upstream)
         .iter()
         .filter(|form| !form.is_empty())
@@ -652,6 +873,15 @@ pub fn place_tarball(
                     Links::Served => format!("{nora_npm_base}/{package}/-/{}", file.raw),
                 });
             }
+            // NORA's own link: of this instance's origin, or of the one the copy was rewritten under.
+            // It names a file NORA holds, so it moves to this instance's base (#1180). Its host is
+            // never asked: a download is still the upstream's own file.
+            let origins: Vec<&str> = std::iter::once(nora_npm_base)
+                .chain(base.recorded)
+                .collect();
+            if let Some(tail) = own_link_tail(link, package, Some(&origins), held) {
+                return Some(format!("{nora_npm_base}{tail}"));
+            }
         }
     }
     let placed = under_upstream.unwrap_or_else(|| link.to_string());
@@ -663,6 +893,38 @@ pub fn place_tarball(
         && target.host_str() == nora.host_str()
         && target.port_or_known_default() == nora.port_or_known_default();
     same_server.then_some(placed)
+}
+
+/// The tarball links of a document NORA holds for `package` (published or imported), at the address
+/// of the instance that wrote them: each of NORA's own links moves to `nora_npm_base` (#1180), any
+/// other link stays as it is. The document is not dropped or changed otherwise. `None` when it is
+/// not JSON.
+pub fn retarget_own_links(data: &[u8], nora_npm_base: &str, package: &str) -> Option<Vec<u8>> {
+    let mut json: serde_json::Value = serde_json::from_slice(data).ok()?;
+    if let Some(versions) = json.get_mut("versions").and_then(|v| v.as_object_mut()) {
+        for version in versions.values_mut() {
+            if let Some(dist) = version.get_mut("dist") {
+                retarget_dist(dist, nora_npm_base, package);
+            }
+        }
+    }
+    if let Some(dist) = json.get_mut("dist") {
+        retarget_dist(dist, nora_npm_base, package);
+    }
+    serde_json::to_vec(&json).ok()
+}
+
+/// [`retarget_own_links`] for one `dist` object: its `tarball`, when NORA wrote it.
+fn retarget_dist(dist: &mut serde_json::Value, nora_npm_base: &str, package: &str) {
+    let moved = dist
+        .get("tarball")
+        .and_then(|t| t.as_str())
+        // A document NORA holds for the package names its own files: no file or digest check here.
+        .and_then(|link| own_link_tail(link, package, None, &|_: &str| true))
+        .map(|tail| format!("{nora_npm_base}{tail}"));
+    if let Some(moved) = moved {
+        dist["tarball"] = serde_json::Value::String(moved);
+    }
 }
 
 /// The host a tarball link names, for a log line that must not carry the link itself (it may
@@ -771,6 +1033,70 @@ pub fn semver_key(v: &str) -> (u64, u64, u64, bool) {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// The origin of `link` as a public base: scheme, host and port (#1180).
+    fn origin_base(link: &str) -> String {
+        let url = Url::parse(link).unwrap();
+        let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+        format!("{}://{}{}", url.scheme(), url.host_str().unwrap(), port)
+    }
+
+    /// A link moves only from this instance's origin, or from the origin its copy was rewritten under
+    /// (#1180): a file of the same name is no proof of the link's origin.
+    #[test]
+    fn a_link_moves_only_from_this_origin_or_the_one_its_copy_was_rewritten_under() {
+        const UP: &str = "https://registry.example.com/repo";
+        let held = |_: &str| true;
+        let own = "https://nora.example/npm/pkg/-/pkg-1.0.0.tgz";
+        let foreign = "http://old.example:4000/npm/pkg/-/pkg-1.0.0.tgz";
+        let place = |link: &str, recorded: Option<&str>, held: &dyn Fn(&str) -> bool| {
+            place_tarball(
+                link,
+                &Base {
+                    nora_npm: NORA,
+                    recorded,
+                },
+                UP,
+                Some("pkg"),
+                Links::Served,
+                &any_key,
+                held,
+            )
+        };
+        let mut wrong = Vec::new();
+        for (what, got, want) in [
+            (
+                "this origin",
+                place(own, None, &held),
+                Some("https://nora.example/npm/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "this origin, nothing held: kept, as a link already on NORA is",
+                place(own, None, &|_: &str| false),
+                Some("https://nora.example/npm/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "a foreign origin, not recorded",
+                place(foreign, None, &held),
+                None,
+            ),
+            (
+                "a foreign origin, recorded",
+                place(foreign, Some("http://old.example:4000"), &held),
+                Some("https://nora.example/npm/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "a foreign origin, recorded elsewhere",
+                place(foreign, Some("http://other.example:4000"), &held),
+                None,
+            ),
+        ] {
+            if got.as_deref() != want {
+                wrong.push(format!("{what}: {got:?}, want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     const NORA: &str = "https://nora.example/npm";
     const PROJECT: &str = "/api/v4/projects/7/packages/npm";
@@ -1269,14 +1595,35 @@ mod tests {
                 // After the host, the same tail names another host or port.
                 let link = format!("{scheme}registry.example{tail}/p/-/p-1.0.0.tgz");
                 let host_only = "https://registry.example";
-                let placed =
-                    place_tarball(&link, nora, host_only, Some("p"), Links::Served, &any_key);
+                let placed = place_tarball(
+                    &link,
+                    &Base {
+                        nora_npm: nora,
+                        recorded: None,
+                    },
+                    host_only,
+                    Some("p"),
+                    Links::Served,
+                    &any_key,
+                    &|_: &str| false,
+                );
                 if placed.is_some() {
                     wrong.push(format!("{link} placed at {placed:?}"));
                 }
             }
             let link = format!("{at}/p/-/p-1.0.0.tgz");
-            let placed = place_tarball(&link, nora, upstream, Some("p"), Links::Served, &any_key);
+            let placed = place_tarball(
+                &link,
+                &Base {
+                    nora_npm: nora,
+                    recorded: None,
+                },
+                upstream,
+                Some("p"),
+                Links::Served,
+                &any_key,
+                &|_: &str| false,
+            );
             if placed.as_deref() != Some("https://nora.example/npm/p/-/p-1.0.0.tgz") {
                 wrong.push(format!("{link} placed at {placed:?}"));
             }
@@ -1300,5 +1647,292 @@ mod tests {
             &|_| false,
         );
         assert_eq!(got, TarballSource::NotListed);
+    }
+
+    /// A link NORA wrote names NORA's own file, at the address of the instance that wrote it.
+    /// Wherever that was, the serving instance moves it to its own `public_url`, the version
+    /// stays, for the cached copy and the copy served alike (#1180).
+    #[test]
+    fn a_link_naming_nora_for_the_package_is_moved_to_the_serving_instance() {
+        const UP: &str = "https://registry.example.com/repo";
+        let held = |file: &str| file == "pkg-1.0.0.tgz";
+        let mut wrong = Vec::new();
+        for (link, package, expected) in [
+            (
+                "http://old.example:4000/npm/pkg/-/pkg-1.0.0.tgz",
+                "pkg",
+                "https://nora.example/npm/pkg/-/pkg-1.0.0.tgz",
+            ),
+            (
+                "https://old.example/npm/@vendor/pkg/-/pkg-1.0.0.tgz",
+                "@vendor/pkg",
+                "https://nora.example/npm/@vendor/pkg/-/pkg-1.0.0.tgz",
+            ),
+            (
+                "https://old.example/npm/@vendor%2Fpkg/-/pkg-1.0.0.tgz",
+                "@vendor/pkg",
+                "https://nora.example/npm/@vendor%2Fpkg/-/pkg-1.0.0.tgz",
+            ),
+            (
+                "https://old.example:8443/nora/npm/pkg/-/pkg-1.0.0.tgz",
+                "pkg",
+                "https://nora.example/npm/pkg/-/pkg-1.0.0.tgz",
+            ),
+        ] {
+            for links in [Links::Stored, Links::Served] {
+                let recorded = origin_base(link);
+                let base = Base {
+                    nora_npm: NORA,
+                    recorded: Some(&recorded),
+                };
+                let got = place_tarball(link, &base, UP, Some(package), links, &any_key, &held);
+                if got.as_deref() != Some(expected) {
+                    wrong.push(format!("{links:?} {link} for {package}: {got:?}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A link in no form NORA writes stays out, whatever host it names: npm would download it
+    /// from there, past NORA (1.4.3). Only NORA's own form for this package moves.
+    #[test]
+    fn a_link_not_in_nora_form_stays_out_wherever_it_points() {
+        const UP: &str = "https://registry.example.com/repo";
+        let held = |_: &str| true;
+        let mut wrong = Vec::new();
+        for link in [
+            "https://evil.example/pkg/-/pkg-1.0.0.tgz",
+            "https://evil.example/npm/other/-/other-1.0.0.tgz",
+            "https://evil.example/npm/pkg/-/pkg-1.0.0.tgz?token=x",
+            "https://evil.example/npm/pkg/-/pkg-1.0.0.tgz#x",
+            "https://u:p@evil.example/npm/pkg/-/pkg-1.0.0.tgz",
+            "https://evil.example/npm/pkg/-/notatarball.tgz",
+            "https://evil.example/npm/pkg/-/sub/pkg-1.0.0.tgz",
+            "https://evil.example/npm/pkg/-/../pkg-1.0.0.tgz",
+            "https://evil.example/npmx/pkg/-/pkg-1.0.0.tgz",
+            "//evil.example/npm/pkg/-/pkg-1.0.0.tgz",
+        ] {
+            for links in [Links::Stored, Links::Served] {
+                if let Some(got) = place_tarball(
+                    link,
+                    &Base {
+                        nora_npm: NORA,
+                        recorded: None,
+                    },
+                    UP,
+                    Some("pkg"),
+                    links,
+                    &any_key,
+                    &held,
+                ) {
+                    wrong.push(format!("{links:?} {link}: kept as {got}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A link of NORA's form is NORA's only for a file NORA holds. The same form on another host
+    /// (an upstream's own project path, a stranger's host, another instance's port) names a file
+    /// NORA does not hold, and is left out as before (#1180).
+    #[test]
+    fn a_link_of_nora_form_to_a_file_nora_does_not_hold_stays_out() {
+        const UP: &str = "https://registry.example.com/repo";
+        let held = |_: &str| false;
+        let mut wrong = Vec::new();
+        for link in [
+            "https://gitlab.example/api/v4/projects/7/packages/npm/pkg/-/pkg-1.0.0.tgz",
+            "http://old.example:4000/npm/pkg/-/pkg-1.0.0.tgz",
+            "https://evil.example/npm/pkg/-/pkg-1.0.0.tgz",
+        ] {
+            for links in [Links::Stored, Links::Served] {
+                if let Some(got) = place_tarball(
+                    link,
+                    &Base {
+                        nora_npm: NORA,
+                        recorded: None,
+                    },
+                    UP,
+                    Some("pkg"),
+                    links,
+                    &any_key,
+                    &held,
+                ) {
+                    wrong.push(format!("{links:?} {link}: kept as {got}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A document NORA holds for a package (published or imported) is served with the links it
+    /// wrote moved to the serving instance; any other link stays as it is (#1180).
+    #[test]
+    fn retarget_moves_the_links_nora_wrote_and_nothing_else() {
+        let doc = serde_json::json!({
+            "name": "@vendor/pkg",
+            "versions": {
+                "1.0.0": { "dist": { "tarball": "http://old.example:4000/npm/@vendor/pkg/-/pkg-1.0.0.tgz" } },
+                "1.0.1": { "dist": { "tarball": "https://other.example/x/-/pkg-1.0.1.tgz" } },
+                "1.0.2": { "dist": { "tarball": "https://nora.example/npm/@vendor/pkg/-/pkg-1.0.2.tgz" } },
+            },
+        });
+        let out =
+            retarget_own_links(&serde_json::to_vec(&doc).unwrap(), NORA, "@vendor/pkg").unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let tarball = |v: &str| {
+            out["versions"][v]["dist"]["tarball"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            tarball("1.0.0"),
+            "https://nora.example/npm/@vendor/pkg/-/pkg-1.0.0.tgz"
+        );
+        assert_eq!(tarball("1.0.1"), "https://other.example/x/-/pkg-1.0.1.tgz");
+        assert_eq!(
+            tarball("1.0.2"),
+            "https://nora.example/npm/@vendor/pkg/-/pkg-1.0.2.tgz"
+        );
+
+        let manifest = serde_json::json!({
+            "name": "pkg",
+            "version": "1.0.0",
+            "dist": { "tarball": "http://old.example/npm/pkg/-/pkg-1.0.0.tgz" },
+        });
+        let out = retarget_own_links(&serde_json::to_vec(&manifest).unwrap(), NORA, "pkg").unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(
+            out["dist"]["tarball"],
+            "https://nora.example/npm/pkg/-/pkg-1.0.0.tgz"
+        );
+        assert_eq!(retarget_own_links(b"not json", NORA, "pkg"), None);
+    }
+
+    /// One recognizer for NORA's own tarball links (#1180): every form NORA writes and
+    /// serves (flat, version directory, GitHub Packages' `download/`, scoped) at any address and
+    /// prefix, the address's default port written out or not. A form that does not name a held
+    /// file of the package is not NORA's.
+    #[test]
+    fn own_link_tail_recognizes_every_form_nora_writes_at_any_address() {
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        let held = |file: &str| file == "pkg-1.0.0.tgz" || file == "1.0.0/pkg-1.0.0.tgz";
+        let rows: [(String, &str, Option<&str>); 14] = [
+            (
+                "http://old.example:4000/npm/pkg/-/pkg-1.0.0.tgz".into(),
+                "pkg",
+                Some("/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "http://old.example:80/npm/pkg/-/pkg-1.0.0.tgz".into(),
+                "pkg",
+                Some("/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "https://old.example:443/npm/pkg/-/1.0.0/pkg-1.0.0.tgz".into(),
+                "pkg",
+                Some("/pkg/-/1.0.0/pkg-1.0.0.tgz"),
+            ),
+            (
+                "https://old.example/repo/npm/npm/pkg/-/pkg-1.0.0.tgz".into(),
+                "pkg",
+                Some("/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "https://host/npm/archive/npm/pkg/-/pkg-1.0.0.tgz".into(),
+                "pkg",
+                Some("/pkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                "https://old.example/npm/%40vendor%2Fpkg/-/pkg-1.0.0.tgz".into(),
+                "@vendor/pkg",
+                Some("/%40vendor%2Fpkg/-/pkg-1.0.0.tgz"),
+            ),
+            (
+                format!("https://old.example/npm/download/@vendor/pkg/1.0.0/{SHA}"),
+                "@vendor/pkg",
+                Some(&format!("/download/@vendor/pkg/1.0.0/{SHA}")[..]),
+            ),
+            (
+                format!("https://old.example/npm/download/@vendor/other/1.0.0/{SHA}"),
+                "@vendor/pkg",
+                None,
+            ),
+            (
+                "https://old.example/npm/download/@vendor/pkg/1.0.0/not-hex".into(),
+                "@vendor/pkg",
+                None,
+            ),
+            (
+                "https://old.example/npm/pkg/-/1.0.1/pkg-1.0.1.tgz".into(),
+                "pkg",
+                None,
+            ),
+            (
+                "https://old.example/npm/pkg/-/2.0.0/pkg-1.0.0.tgz".into(),
+                "pkg",
+                None,
+            ),
+            (
+                "https://old.example/npm/pkg/-/pkg-1.0.0.tgz?token=x".into(),
+                "pkg",
+                None,
+            ),
+            (
+                "https://old.example/npm/pkg/-/../pkg-1.0.0.tgz".into(),
+                "pkg",
+                None,
+            ),
+            (
+                "https://old.example/pkg/-/pkg-1.0.0.tgz".into(),
+                "pkg",
+                None,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (link, package, want) in rows {
+            let got = own_link_tail(&link, package, None, &held);
+            if got.as_deref() != want {
+                wrong.push(format!("{link} for {package}: {got:?}, want {want:?}"));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Reading a link with a repeated `/npm` prefix takes time linear in its length (#1180, round
+    /// 3): the recognizer does not decode the rest of the path once per `/npm/`. Checked on the
+    /// first fetch (nothing held) as on a copy (everything held).
+    #[test]
+    fn own_link_tail_is_linear_on_a_repeated_npm_prefix() {
+        let link = format!(
+            "https://other.example{}/pkg/-/pkg-1.0.0.tgz",
+            "/npm".repeat(10_000)
+        );
+        for held_all in [false, true] {
+            let held = |_: &str| held_all;
+            let started = std::time::Instant::now();
+            let got = own_link_tail(&link, "pkg", None, &held);
+            let elapsed = started.elapsed();
+            eprintln!("MEASURE own_link_tail 10000 prefixes (held {held_all}): {elapsed:?}");
+            assert!(
+                elapsed < std::time::Duration::from_millis(500),
+                "{elapsed:?} for 10000 prefixes (held {held_all})"
+            );
+            assert_eq!(got.is_some(), held_all, "held {held_all}");
+        }
+    }
+
+    /// A scoped package's version directory (#1180): `…/-/1.0.0/@s/pkg-1.0.0.tgz` names the
+    /// file the route serves (two separators, one for the scope), and is recognized.
+    #[test]
+    fn own_link_tail_recognizes_a_scoped_version_directory() {
+        let held = |_: &str| true;
+        let link = "https://old.example/npm/@s/pkg/-/1.0.0/@s/pkg-1.0.0.tgz";
+        assert_eq!(
+            own_link_tail(link, "@s/pkg", None, &held).as_deref(),
+            Some("/@s/pkg/-/1.0.0/@s/pkg-1.0.0.tgz")
+        );
     }
 }

@@ -37,6 +37,7 @@ mod audit;
 mod auth;
 mod backup;
 mod cache_ttl;
+mod cache_writes;
 mod circuit_breaker;
 mod cleanup;
 mod config;
@@ -50,6 +51,7 @@ mod gc;
 mod hash_pin_store;
 mod health;
 mod import;
+mod log_file;
 mod log_redact;
 mod metrics;
 mod migrate;
@@ -439,6 +441,8 @@ pub struct AppState {
     pub(crate) tasks: Arc<supervise::Supervisor>,
     /// The maintenance loop's heartbeat, which `tasks` reads.
     pub(crate) maintenance: Arc<supervise::Heartbeat>,
+    /// Cache writes running after their response; a graceful stop waits for them.
+    pub(crate) cache_writes: cache_writes::CacheWrites,
 }
 
 /// Whether a proxied answer is left uncached: the object store left the current request
@@ -482,19 +486,11 @@ impl AppState {
         }
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
-        tokio::spawn(
-            std::panic::AssertUnwindSafe(async move {
-                if storage.put(&key, &data).await.is_ok() {
-                    repo_index.invalidate(registry);
-                }
-            })
-            .catch_unwind()
-            .map(|r| {
-                if let Err(e) = r {
-                    tracing::error!(panic = ?e, "background cache task panicked");
-                }
-            }),
-        );
+        self.cache_writes.spawn(registry, async move {
+            if storage.put(&key, &data).await.is_ok() {
+                repo_index.invalidate(registry);
+            }
+        });
     }
 
     /// Like [`spawn_cache`], but skips the write if the key already exists (immutable artifacts).
@@ -504,18 +500,48 @@ impl AppState {
         }
         let storage = self.storage.clone();
         let repo_index = Arc::clone(&self.repo_index);
-        tokio::spawn(
-            std::panic::AssertUnwindSafe(async move {
-                if storage.stat(&key).await.is_none() && storage.put(&key, &data).await.is_ok() {
-                    repo_index.invalidate(registry);
-                }
-            })
-            .catch_unwind()
-            .map(|r| {
-                if let Err(e) = r {
-                    tracing::error!(panic = ?e, "background cache task panicked");
-                }
-            }),
+        self.cache_writes.spawn(registry, async move {
+            if storage.stat(&key).await.is_none() && storage.put(&key, &data).await.is_ok() {
+                repo_index.invalidate(registry);
+            }
+        });
+    }
+}
+
+/// Wait for the stopped schedulers and for the cache writes in flight, together, for at most
+/// `within`; warn of what is still running when it passes. A cache write left running is
+/// dropped with the process; storage writes are atomic, so it leaves no partial file.
+async fn finish_background_work(
+    schedulers: Vec<tokio::task::JoinHandle<()>>,
+    cache_writes: &cache_writes::CacheWrites,
+    within: std::time::Duration,
+) {
+    info!(
+        schedulers = schedulers.len(),
+        "Waiting for background schedulers and cache writes to finish ({}s timeout)...",
+        within.as_secs()
+    );
+    let schedulers_done = async {
+        // CANCEL-SAFETY: timeout wraps join_all of scheduler handles. On timeout, the
+        // JoinHandles are dropped which cancels the spawned tasks — this is intentional
+        // since we're shutting down and don't need their results.
+        tokio::time::timeout(within, futures::future::join_all(schedulers))
+            .await
+            .is_ok()
+    };
+    let (schedulers_done, writes_left) = tokio::join!(schedulers_done, cache_writes.finish(within));
+    if !schedulers_done {
+        warn!(
+            "Background schedulers did not finish within {}s, proceeding with shutdown",
+            within.as_secs()
+        );
+    }
+    if writes_left > 0 {
+        warn!(
+            cache_writes = writes_left,
+            "Cache writes still running after {}s are dropped; those artifacts are fetched \
+             from the upstream again",
+            within.as_secs()
         );
     }
 }
@@ -2108,13 +2134,38 @@ async fn main() {
 
     // Initialize logging (JSON for server, plain for CLI commands)
     let is_server = matches!(cli.command, None | Some(Commands::Serve));
-    let (_log_guard, log_known) = init_logging(is_server);
+    let (log_file, log_known) = init_logging(is_server);
+    // Drains the log file when `main` returns, and when a panic unwinds it (a port already
+    // taken): every way out but an exit, which drains it itself.
+    let drained = log_file.drain_on_drop();
 
+    // The audit writer, a task the process cannot run without, ends the process from its own
+    // thread with this hook, the log file drained first, whatever the main task is doing.
+    match run(cli, is_server, log_known, log_file.exit_hook()).await {
+        Ok(()) => drop(drained),
+        Err(Exit(code)) => log_file.exit_after_logs(code),
+    }
+}
+
+/// A command that ends the process with this code (the healthcheck's 0 included). `main` ends
+/// it through [`log_file::LogFile::exit_after_logs`] instead of returning: a return waits for
+/// every blocking task of the runtime (tokio's `Runtime` drop waits for them without limit), the
+/// exit these commands always had does not.
+#[derive(Debug, PartialEq, Eq)]
+struct Exit(i32);
+
+/// The command `cli` names, up to its end: `Err` carries the code the process exits with.
+async fn run(
+    cli: Cli,
+    is_server: bool,
+    log_known: log_redact::KnownTexts,
+    exit_hook: supervise::ExitHook,
+) -> Result<(), Exit> {
     // Healthcheck is a client-side probe (Docker HEALTHCHECK) — handle it before
     // loading the full server config, which it does not need and which can abort
     // (e.g. NORA_PUBLIC_URL is required on a 0.0.0.0 bind).
     if let Some(Commands::Healthcheck { timeout_secs }) = &cli.command {
-        std::process::exit(run_healthcheck(*timeout_secs).await);
+        return Err(Exit(run_healthcheck(*timeout_secs).await));
     }
 
     let config = match Config::load() {
@@ -2125,7 +2176,7 @@ async fn main() {
             error!(error = %e, "Cannot start with this configuration");
             // stderr is not written through the log filter: the same filter, by hand.
             eprintln!("nora: {}", log_known.redact_text(&e.to_string()));
-            std::process::exit(config::EXIT_CONFIG);
+            return Err(Exit(config::EXIT_CONFIG));
         }
     };
     // The userinfo of a configured upstream that the log filter cannot find by reading a URL
@@ -2182,18 +2233,18 @@ async fn main() {
     // Dispatch to command
     match cli.command {
         None | Some(Commands::Serve) => {
-            run_server(config, storage).await;
+            run_server(config, storage, exit_hook).await?;
         }
         Some(Commands::Backup { output }) => {
             if let Err(e) = backup::create_backup(&storage, &output).await {
                 error!("Backup failed: {}", e);
-                std::process::exit(1);
+                return Err(Exit(1));
             }
         }
         Some(Commands::Restore { input }) => {
             if let Err(e) = backup::restore_backup(&storage, &input).await {
                 error!("Restore failed: {}", e);
-                std::process::exit(1);
+                return Err(Exit(1));
             }
         }
         Some(Commands::Gc { apply }) => {
@@ -2256,7 +2307,7 @@ async fn main() {
                 println!("\nNote: GC does not scan: {}", parts.join(", "));
             }
             if result.docker_mark_failed {
-                std::process::exit(1);
+                return Err(Exit(1));
             }
         }
         Some(Commands::RetentionPlan) => {
@@ -2325,7 +2376,7 @@ async fn main() {
                 // Real deletions rebuild rpm/deb indexes — sign them with the
                 // same key the server would, or clients start failing
                 // verification after a CLI retention pass.
-                let signer = build_signer(&config, &config.enabled_registries());
+                let signer = build_signer(&config, &config.enabled_registries())?;
                 let result = retention::run_retention(
                     &storage,
                     &cli_publish_locks,
@@ -2339,7 +2390,8 @@ async fn main() {
                 println!("  Keys deleted:       {}", result.deleted_keys);
                 println!("  Bytes freed:        {}", result.bytes_freed);
                 if result.planned > 0 {
-                    let audit = AuditLog::new(&config.storage.path, config.audit.mode.clone());
+                    let audit =
+                        AuditLog::new(&config.storage.path, config.audit.mode.clone(), exit_hook);
                     audit.log(audit::AuditEntry::new(
                         "retention-apply",
                         "cli",
@@ -2370,7 +2422,7 @@ async fn main() {
             if let Err(e) = mirror::run_mirror(format, &registry, concurrency, json, &client).await
             {
                 error!("Mirror failed: {}", e);
-                std::process::exit(1);
+                return Err(Exit(1));
             }
         }
         Some(Commands::Migrate { from, to, dry_run }) => {
@@ -2391,7 +2443,7 @@ async fn main() {
                 ),
                 _ => {
                     error!("Invalid source: '{}'. Use 'local', 's3', or 'gcs'", from);
-                    std::process::exit(1);
+                    return Err(Exit(1));
                 }
             };
 
@@ -2412,34 +2464,34 @@ async fn main() {
                 ),
                 _ => {
                     error!("Invalid destination: '{}'. Use 'local', 's3', or 'gcs'", to);
-                    std::process::exit(1);
+                    return Err(Exit(1));
                 }
             };
 
             if from == to {
                 error!("Source and destination cannot be the same");
-                std::process::exit(1);
+                return Err(Exit(1));
             }
 
             let options = migrate::MigrateOptions { dry_run };
 
             if let Err(e) = migrate::migrate(&source, &dest, options).await {
                 error!("Migration failed: {}", e);
-                std::process::exit(1);
+                return Err(Exit(1));
             }
         }
         Some(Commands::Curation { action }) => match action {
             CurationCommand::Validate { file } => {
-                run_curation_validate(&file);
+                run_curation_validate(&file)?;
             }
             CurationCommand::Explain { package } => {
-                run_curation_explain(&config, &package);
+                run_curation_explain(&config, &package)?;
             }
         },
         Some(Commands::Import { action }) => {
             if let Err(e) = import::run(action, &storage, &config).await {
                 error!("Import failed: {}", e);
-                std::process::exit(1);
+                return Err(Exit(1));
             }
         }
         Some(Commands::MigrateDockerKeys { dry_run }) => {
@@ -2468,12 +2520,12 @@ async fn main() {
                 Ok(stats) => {
                     if stats.failed > 0 {
                         error!("{} keys failed to migrate", stats.failed);
-                        std::process::exit(1);
+                        return Err(Exit(1));
                     }
                 }
                 Err(e) => {
                     error!("Docker key migration failed: {}", e);
-                    std::process::exit(1);
+                    return Err(Exit(1));
                 }
             }
         }
@@ -2481,7 +2533,7 @@ async fn main() {
             let expected = expected.to_ascii_lowercase();
             if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) {
                 error!("--expected must be a 64-character hex SHA-256");
-                std::process::exit(2);
+                return Err(Exit(2));
             }
             match storage.repin(&key, &expected, yes).await {
                 Ok(storage::RepinOutcome::DiskMismatch { disk, expected }) => {
@@ -2491,7 +2543,7 @@ async fn main() {
                         expected = %expected,
                         "re-pin refused: on-disk bytes do not match --expected — the artifact is corrupt. Restore it from backup, then re-pin."
                     );
-                    std::process::exit(1);
+                    return Err(Exit(1));
                 }
                 Ok(storage::RepinOutcome::AlreadyPinned { hash }) => {
                     println!("Pin already matches {hash} — nothing to do.");
@@ -2517,14 +2569,15 @@ async fn main() {
                 }
                 Err(e) => {
                     error!(key = %key, "re-pin failed: {}", e);
-                    std::process::exit(1);
+                    return Err(Exit(1));
                 }
             }
         }
-        // Handled before storage init by the early dispatch above; the process
-        // has already exited by the time control would reach here.
+        // Handled before storage init by the early dispatch above; the command
+        // has already returned by the time control would reach here.
         Some(Commands::Healthcheck { .. }) => unreachable!(),
     }
+    Ok(())
 }
 
 /// Build the repository index signer (#128). `None` disables signing:
@@ -2536,13 +2589,13 @@ async fn main() {
 fn build_signer(
     config: &config::Config,
     enabled: &std::collections::HashSet<RegistryType>,
-) -> Option<Arc<signing::RepoSigner>> {
+) -> Result<Option<Arc<signing::RepoSigner>>, Exit> {
     if !enabled.contains(&RegistryType::Rpm) && !enabled.contains(&RegistryType::Deb) {
-        return None;
+        return Ok(None);
     }
     if !config.signing.enabled {
         info!("repository index signing disabled by config");
-        return None;
+        return Ok(None);
     }
     let path = if !config.signing.key_path.is_empty() {
         std::path::PathBuf::from(&config.signing.key_path)
@@ -2553,7 +2606,7 @@ fn build_signer(
             "repository index signing disabled: storage is not local and signing.key_path \
              is not set (NORA_SIGNING_KEY_PATH)"
         );
-        return None;
+        return Ok(None);
     };
     match signing::RepoSigner::load_or_generate(&path) {
         Ok(signer) => {
@@ -2571,7 +2624,7 @@ fn build_signer(
                      Provision one key and mount it read-only on every replica."
                 );
             }
-            Some(Arc::new(signer))
+            Ok(Some(Arc::new(signer)))
         }
         Err(e) => {
             eprintln!("Fatal: repository index signing key error: {e}");
@@ -2582,17 +2635,17 @@ fn build_signer(
                 signing::KeyLoadError::Refused(_) => config::EXIT_CONFIG,
                 signing::KeyLoadError::Io(_) => 1,
             };
-            std::process::exit(code);
+            Err(Exit(code))
         }
     }
 }
 
-fn run_curation_validate(file: &Path) {
+fn run_curation_validate(file: &Path) -> Result<(), Exit> {
     let content = match std::fs::read_to_string(file) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("ERROR: Cannot read '{}': {}", file.display(), e);
-            std::process::exit(1);
+            return Err(Exit(1));
         }
     };
 
@@ -2603,7 +2656,7 @@ fn run_curation_validate(file: &Path) {
                 "ERROR: Unsupported blocklist version {} (expected 1)",
                 parsed.version
             );
-            std::process::exit(1);
+            return Err(Exit(1));
         }
         println!("OK: Valid blocklist — {} rules", parsed.rules.len());
         for (i, rule) in parsed.rules.iter().enumerate() {
@@ -2616,7 +2669,7 @@ fn run_curation_validate(file: &Path) {
                 rule.reason
             );
         }
-        return;
+        return Ok(());
     }
 
     // Try as allowlist
@@ -2626,7 +2679,7 @@ fn run_curation_validate(file: &Path) {
                 "ERROR: Unsupported allowlist version {} (expected 1)",
                 parsed.version
             );
-            std::process::exit(1);
+            return Err(Exit(1));
         }
         let with_integrity = parsed
             .entries
@@ -2653,7 +2706,7 @@ fn run_curation_validate(file: &Path) {
                 integrity_flag
             );
         }
-        return;
+        return Ok(());
     }
 
     eprintln!(
@@ -2661,7 +2714,7 @@ fn run_curation_validate(file: &Path) {
         file.display()
     );
     eprintln!("  Expected {{ \"version\": 1, \"rules\": [...] }} or {{ \"version\": 1, \"entries\": [...] }}");
-    std::process::exit(1);
+    Err(Exit(1))
 }
 
 /// The parts of a `registry:name@version` curation-explain spec.
@@ -2705,7 +2758,7 @@ fn parse_explain_spec(spec: &str) -> ExplainSpec {
     }
 }
 
-fn run_curation_explain(config: &Config, package_spec: &str) {
+fn run_curation_explain(config: &Config, package_spec: &str) -> Result<(), Exit> {
     let (registry, name, version) = match parse_explain_spec(package_spec) {
         ExplainSpec::Parsed {
             registry,
@@ -2714,7 +2767,7 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         } => (registry, name, version),
         ExplainSpec::NoColon => {
             eprintln!("ERROR: Expected format 'registry:name@version' (e.g., 'cargo:serde@1.0.0')");
-            std::process::exit(1);
+            return Err(Exit(1));
         }
         ExplainSpec::UnknownRegistry(registry_str) => {
             eprintln!(
@@ -2726,7 +2779,7 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
                     .collect::<Vec<_>>()
                     .join(", ")
             );
-            std::process::exit(1);
+            return Err(Exit(1));
         }
     };
 
@@ -2777,7 +2830,7 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
         Err(e) => {
             println!("Mode: {}", config.curation.mode);
             println!("Decision: the server refuses this configuration and does not start: {e}");
-            std::process::exit(78);
+            return Err(Exit(78));
         }
     };
 
@@ -2809,6 +2862,7 @@ fn run_curation_explain(config: &Config, package_spec: &str) {
     if result.audited {
         println!("Mode: AUDIT (would block but logs only)");
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2944,42 +2998,28 @@ mod explain_spec_tests {
 /// Initialize tracing subscriber with stdout + optional file output.
 ///
 /// When `NORA_LOG_FILE` is set, logs are duplicated to the specified file path
-/// using a non-blocking writer. The file layer uses the same format and level
-/// filter as stdout. Returns a guard that must be held for the process lifetime
-/// to ensure the non-blocking writer flushes on shutdown.
-/// The log layers, and the set of texts they also mask ([`log_redact::KnownTexts`]), filled
-/// once the configuration is read.
-fn init_logging(
-    json_format: bool,
-) -> (
-    Option<tracing_appender::non_blocking::WorkerGuard>,
-    log_redact::KnownTexts,
-) {
+/// through a writing thread ([`log_file`]). The file layer uses the same format and level
+/// filter as stdout. The returned [`log_file::LogFile`] is how the process ends with its
+/// lines in the file: `main` drains it when it returns or unwinds, and every exit goes through it.
+/// It also returns the set of texts the log layers mask besides URLs ([`log_redact::KnownTexts`]),
+/// filled once the configuration is read.
+fn init_logging(json_format: bool) -> (log_file::LogFile, log_redact::KnownTexts) {
     let known = log_redact::KnownTexts::default();
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     // Optional file output via NORA_LOG_FILE
-    let file_writer = match std::env::var("NORA_LOG_FILE") {
-        Ok(path) if !path.is_empty() => open_log_file(&path),
-        _ => None,
+    let log_file = match std::env::var("NORA_LOG_FILE") {
+        Ok(path) if !path.is_empty() => open_log_file(&path).unwrap_or_default(),
+        _ => log_file::LogFile::default(),
     };
 
     // Every layer comes from `log_redact::layer`, the one that writes through the redaction:
     // stdout always, `NORA_LOG_FILE` when set, JSON for the server and text for the commands.
-    let (file_layer, guard) = match file_writer {
-        Some((non_blocking, guard)) => {
-            let file_filter =
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-            (
-                Some(
-                    log_redact::layer(json_format, non_blocking, known.clone())
-                        .with_filter(file_filter),
-                ),
-                Some(guard),
-            )
-        }
-        None => (None, None),
-    };
+    let file_layer = log_file.lines().map(|lines| {
+        let file_filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        log_redact::layer(json_format, lines, known.clone()).with_filter(file_filter)
+    });
     tracing_subscriber::registry()
         .with(env_filter)
         .with(log_redact::layer(
@@ -2989,16 +3029,11 @@ fn init_logging(
         ))
         .with(file_layer)
         .init();
-    (guard, known)
+    (log_file, known)
 }
 
-/// Open a log file for non-blocking writes. Creates parent directories as needed.
-fn open_log_file(
-    path: &str,
-) -> Option<(
-    tracing_appender::non_blocking::NonBlocking,
-    tracing_appender::non_blocking::WorkerGuard,
-)> {
+/// Open a log file for writes through its thread. Creates parent directories as needed.
+fn open_log_file(path: &str) -> Option<log_file::LogFile> {
     let file_path = std::path::Path::new(path);
 
     // Create parent directories if needed
@@ -3026,9 +3061,8 @@ fn open_log_file(
         }
     };
 
-    let (non_blocking, guard) = tracing_appender::non_blocking(file);
     eprintln!("Log file: {path}");
-    Some((non_blocking, guard))
+    Some(log_file::LogFile::new(file))
 }
 
 /// Auth routes behind the auth limiter; registry routes behind the read and the write limiter,
@@ -3303,7 +3337,11 @@ mod rate_limited_routes_tests {
     }
 }
 
-async fn run_server(mut config: Config, storage: Storage) {
+async fn run_server(
+    mut config: Config,
+    storage: Storage,
+    exit_hook: supervise::ExitHook,
+) -> Result<(), Exit> {
     let start_time = Instant::now();
 
     // Log rate limiting configuration
@@ -3378,7 +3416,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                  persisted. Set NORA_AUTH_TOKEN_STORAGE to a writable absolute path (e.g. \
                  /var/lib/nora/tokens, inside the service's ReadWritePaths)."
             );
-            std::process::exit(1);
+            return Err(Exit(1));
         }
         info!(path = %config.auth.token_storage, "Token storage initialized");
         Some(TokenStore::with_cache_ttl(
@@ -3404,7 +3442,7 @@ async fn run_server(mut config: Config, storage: Storage) {
                     "Cannot read or create the Docker token key in token storage — \
                      auth.docker_anon_pull needs it for authenticated push"
                 );
-                std::process::exit(1);
+                return Err(Exit(1));
             }
         }
     } else {
@@ -3445,7 +3483,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         Err(e) => {
             error!(error = %e, "Cannot start in enforce mode");
             eprintln!("nora: cannot start in enforce mode: {e}");
-            std::process::exit(config::EXIT_CONFIG);
+            return Err(Exit(config::EXIT_CONFIG));
         }
     };
     if curation_engine.is_active() {
@@ -3588,7 +3626,7 @@ async fn run_server(mut config: Config, storage: Storage) {
     // Cancellation token for graceful shutdown of background tasks (#306). Created
     // before AppState so on-demand handlers (admin reindex warm-up) can observe it.
     let cancel_token = tokio_util::sync::CancellationToken::new();
-    let signer = build_signer(&config, &enabled_registries);
+    let signer = build_signer(&config, &enabled_registries)?;
 
     let (tasks, maintenance) = supervision(&config.server);
     let state = AppState {
@@ -3601,7 +3639,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         tokens,
         metrics: Arc::new(DashboardMetrics::new()),
         activity: Arc::new(ActivityLog::new(50)),
-        audit: Arc::new(AuditLog::new(&storage_path, audit_mode)),
+        audit: Arc::new(AuditLog::new(&storage_path, audit_mode, exit_hook)),
         docker_auth: Arc::new(docker_auth),
         docker_tokens,
         repo_index: Arc::new(RepoIndex::new()),
@@ -3624,6 +3662,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         pull_stats: Arc::new(registry::docker::PullStatsAccumulator::default()),
         tasks,
         maintenance,
+        cache_writes: cache_writes::CacheWrites::default(),
     };
 
     // Initialize circuit breaker gauge to 0 (Closed) for every breaker key (#441)
@@ -3909,23 +3948,19 @@ async fn run_server(mut config: Config, storage: Storage) {
         ),
     }
 
-    // Signal background schedulers to stop and wait for them (#306)
+    // Signal background schedulers to stop, and wait for them and for the cache writes still
+    // running after their response, together and within the same 10 s the schedulers always
+    // had (#306): the documented stop budget (drain + 10 s) does not grow.
     cancel_token.cancel();
-    if !scheduler_handles.is_empty() {
-        info!("Waiting for background schedulers to finish (10s timeout)...");
-        let join_all = futures::future::join_all(scheduler_handles);
-        // CANCEL-SAFETY: timeout wraps join_all of scheduler handles. On timeout,
-        // the JoinHandles are dropped which cancels the spawned tasks — this is
-        // intentional since we're shutting down and don't need their results.
-        if tokio::time::timeout(std::time::Duration::from_secs(10), join_all)
-            .await
-            .is_err()
-        {
-            warn!("Background schedulers did not finish within 10s, proceeding with shutdown");
-        }
-    }
+    finish_background_work(
+        scheduler_handles,
+        &state.cache_writes,
+        std::time::Duration::from_secs(10),
+    )
+    .await;
 
-    // Drain audit log — AFTER schedulers finish so their final entries are captured (#543)
+    // Drain audit log — AFTER schedulers and cache writes finish so their final entries are
+    // captured (#543)
     state.audit.shutdown().await;
 
     // Flush token last_used timestamps to disk
@@ -3937,6 +3972,7 @@ async fn run_server(mut config: Config, storage: Storage) {
         uptime_seconds = state.start_time.elapsed().as_secs(),
         "Nora shutdown complete"
     );
+    Ok(())
 }
 
 /// Cadence of the maintenance loop.
@@ -4111,6 +4147,122 @@ async fn maintenance_tick(state: &AppState, tick_count: u64, work: &MaintenanceW
             registry::docker::cleanup_upload_temp_dir(&storage_path);
             registry::raw::cleanup_upload_temp_dir(&storage_path);
         });
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod cache_write_stop_tests {
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_storage_and_config, send, slow_write_storage,
+    };
+    use axum::http::{Method, StatusCode};
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// The first write takes this long, each later one this much longer: far longer than
+    /// answering, all of them together far shorter than the stop's ceiling.
+    const WRITE: Duration = Duration::from_millis(300);
+
+    /// The stop as `main` runs it after the connections drained: no schedulers here.
+    async fn stop(state: &crate::AppState) {
+        super::finish_background_work(Vec::new(), &state.cache_writes, Duration::from_secs(10))
+            .await;
+    }
+
+    /// An npm tarball answered right before a graceful stop is in storage after it: the stop
+    /// waits for the write that runs after the response, so a restart without the upstream
+    /// still serves it.
+    #[tokio::test]
+    async fn an_npm_tarball_answered_before_a_stop_is_kept() {
+        let upstream = MockServer::start().await;
+        let packument = serde_json::json!({
+            "name": "testpkg",
+            "versions": { "1.0.0": { "dist": {
+                "tarball": format!("{}/testpkg/-/testpkg-1.0.0.tgz", upstream.uri())
+            } } },
+            "time": { "1.0.0": "2020-01-15T10:30:00.000Z" }
+        });
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(packument.to_string()))
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg/-/testpkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TGZ-BYTES".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_storage_and_config(slow_write_storage(WRITE), |c| {
+            c.npm.proxy = Some(uri)
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/testpkg/-/testpkg-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"TGZ-BYTES");
+        stop(&ctx.state).await;
+
+        let kept = ctx
+            .state
+            .storage
+            .get("npm/testpkg/tarballs/testpkg-1.0.0.tgz")
+            .await;
+        assert_eq!(kept.unwrap().as_ref(), b"TGZ-BYTES");
+    }
+
+    /// Both ways a handler caches through the state are waited for: `spawn_cache` and its
+    /// immutable form, which most formats use for their artifacts.
+    #[tokio::test]
+    async fn both_cache_helpers_are_waited_for() {
+        let ctx = create_test_context_with_storage_and_config(slow_write_storage(WRITE), |_| {});
+        ctx.state
+            .spawn_cache("raw", "raw/a".into(), super::Bytes::from_static(b"a"));
+        ctx.state
+            .spawn_cache_immutable("raw", "raw/b".into(), super::Bytes::from_static(b"b"));
+        stop(&ctx.state).await;
+        assert_eq!(ctx.state.storage.get("raw/a").await.unwrap().as_ref(), b"a");
+        assert_eq!(ctx.state.storage.get("raw/b").await.unwrap().as_ref(), b"b");
+    }
+
+    /// The same for an artifact cached through `spawn_cache` (Maven).
+    #[tokio::test]
+    async fn a_maven_artifact_answered_before_a_stop_is_kept() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/com/example/lib/1.0/lib-1.0.jar"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"JAR-BYTES".to_vec()))
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_storage_and_config(slow_write_storage(WRITE), |c| {
+            c.maven.proxies = vec![crate::config::MavenProxyEntry::Simple(uri)]
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/maven2/com/example/lib/1.0/lib-1.0.jar",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"JAR-BYTES");
+        stop(&ctx.state).await;
+
+        let kept = ctx
+            .state
+            .storage
+            .get("maven/com/example/lib/1.0/lib-1.0.jar")
+            .await;
+        assert_eq!(kept.unwrap().as_ref(), b"JAR-BYTES");
     }
 }
 
@@ -5340,6 +5492,80 @@ async fn print_retention_coverage(storage: &Storage, rules: &[config::RetentionR
     }
 }
 
+/// A task the process cannot run without (the audit writer) ends it at once, with 70, and with
+/// its last line in `NORA_LOG_FILE`, even while the main task is stuck inside a poll: a
+/// synchronous call on a store that does not answer. The child process below is this test binary
+/// run again on one test, so the exit ends it and not the test runner.
+#[cfg(test)]
+mod audit_exit_tests {
+    use std::time::{Duration, Instant};
+
+    /// Set in the child process only.
+    const CHILD: &str = "NORA_TEST_AUDIT_EXIT_CHILD";
+    const LAST_LINE: &str = "a task the server cannot run without died, exiting";
+
+    /// The child: logging as `main` sets it up, the audit writer's exit hook as `main` hands it
+    /// out, a panic in the writer, and a main thread blocked in a synchronous call meanwhile.
+    #[test]
+    #[ignore = "the child process of audit_exit_is_immediate_while_main_is_blocked"]
+    fn audit_exit_child() {
+        let _lock = crate::test_env::env_lock();
+        if std::env::var_os(CHILD).is_none() {
+            return;
+        }
+        let (log_file, _) = crate::init_logging(false);
+        let exit = log_file.exit_hook();
+        std::thread::spawn(move || {
+            crate::supervise::blocking("audit", &exit, || panic!("a bug in the audit writer"));
+        });
+        std::thread::sleep(Duration::from_secs(60));
+        std::process::exit(3);
+    }
+
+    #[test]
+    fn audit_exit_is_immediate_while_main_is_blocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("nora-file.log");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "audit_exit_tests::audit_exit_child",
+                "--include-ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("NORA_LOG_FILE", &log)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        let file = std::fs::read_to_string(&log).unwrap_or_default();
+        assert_eq!(
+            status.and_then(|s| s.code()),
+            Some(crate::supervise::EXIT_TASK_PANICKED),
+            "the process did not end with 70 within 20 s of the audit writer's panic"
+        );
+        assert!(
+            file.contains(LAST_LINE),
+            "NORA_LOG_FILE has no {LAST_LINE:?}: {file:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod log_file_tests {
     use super::open_log_file;
@@ -5868,7 +6094,11 @@ mod cleanup_pass_tests {
         let index = RepoIndex::new();
         let before = counted(&index, &storage, "go").await;
         assert!(before >= 3, "{before}");
-        let audit = AuditLog::new(dir.path().to_str().unwrap(), audit::AuditMode::Off);
+        let audit = AuditLog::new(
+            dir.path().to_str().unwrap(),
+            audit::AuditMode::Off,
+            supervise::recorded_exit(),
+        );
         let result = retention_pass(&storage, &locks(), &index, None, &rules, false, &audit).await;
         assert_eq!(result.planned, 2);
         let after = counted(&index, &storage, "go").await;
@@ -5906,7 +6136,11 @@ mod cleanup_pass_tests {
         dry_run: bool,
         audit_dir: &Path,
     ) -> Vec<String> {
-        let audit = AuditLog::new(audit_dir.to_str().unwrap(), audit::AuditMode::File);
+        let audit = AuditLog::new(
+            audit_dir.to_str().unwrap(),
+            audit::AuditMode::File,
+            supervise::recorded_exit(),
+        );
         let result = retention_pass(
             storage,
             &locks(),

@@ -25,7 +25,6 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tracing-appender.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
 # Docker tokens (#1226). hmac 0.12 speaks digest 0.10, so it is paired with sha2 0.10, not the
@@ -69,7 +68,7 @@ hyper-util = { version = "0.1", features = ["http1", "http2", "server-graceful",
 tower = { version = "0.5", features = ["util"] }
 percent-encoding = "2"
 subtle = "2"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["rt"] }
 arc-swap = "1"
 memchr = "2"
 quick-xml = "0.41"
