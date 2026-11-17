@@ -307,6 +307,25 @@ impl UpstreamMiss {
         }
     }
 
+    /// Whether an upstream failed to answer a listing, so the listing may be missing its tags.
+    /// A 4xx is an answer (the upstream does not hold the name); a failure is not.
+    pub(crate) fn listing_failed(&self) -> bool {
+        self.failed || self.refused || self.open.is_some() || self.limited.is_some()
+    }
+
+    /// The same miss without its "not found" answers, for a listing that failed on one upstream
+    /// while another said 404: the failure decides the response, never a 404 that would name
+    /// the repository as absent.
+    pub(crate) fn for_listing(&self) -> UpstreamMiss {
+        UpstreamMiss {
+            not_found: false,
+            failed: self.failed,
+            refused: self.refused,
+            open: self.open.clone(),
+            limited: self.limited.clone(),
+        }
+    }
+
     /// The status for the miss: 429 when an upstream rate-limited NORA; otherwise 404 when an
     /// upstream said "not found" or none was asked; otherwise 503 when one was skipped for its
     /// open breaker, 502 when every one failed or refused NORA's credentials.
