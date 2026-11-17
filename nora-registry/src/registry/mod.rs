@@ -39,6 +39,7 @@ pub use deb::routes as deb_routes;
 pub use docker::routes as docker_routes;
 pub use docker_auth::DockerAuth;
 pub use gems::routes as gems_routes;
+pub(crate) use go::is_canonical_go_version;
 pub use go::routes as go_routes;
 pub use hf::routes as hf_routes;
 pub use maven::routes as maven_routes;

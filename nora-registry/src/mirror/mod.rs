@@ -6,6 +6,7 @@
 mod cargo;
 mod deb;
 mod docker;
+mod go;
 mod npm;
 mod pip;
 mod rpm;
@@ -86,6 +87,16 @@ pub enum MirrorFormat {
         /// Path to file with image references (one per line)
         #[arg(long, conflicts_with = "images")]
         images_file: Option<PathBuf>,
+    },
+    /// Mirror Go modules: what `go mod download` reads offline, from go.mod and go.sum
+    Go {
+        /// Path to go.mod: each required module (after `replace`) is fetched in full
+        #[arg(long)]
+        modfile: PathBuf,
+        /// Path to go.sum (default: the go.sum beside go.mod, if any): each version it lists is
+        /// fetched in full, or only its go.mod for a `/go.mod` line
+        #[arg(long)]
+        sumfile: Option<PathBuf>,
     },
 }
 
@@ -234,6 +245,13 @@ pub async fn run_mirror(
                 registry
             );
             docker::run_docker_mirror(client, registry, &image_refs, concurrency).await?
+        }
+        MirrorFormat::Go { modfile, sumfile } => {
+            // The command's error is the message `nora mirror` prints: the typed error ends here.
+            match go::run_go_mirror(client, registry, &modfile, sumfile, concurrency).await {
+                Ok(result) => result,
+                Err(e) => return Err(e.to_string()),
+            }
         }
     };
 
