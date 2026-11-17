@@ -424,6 +424,11 @@ pub struct AppState {
     pub(crate) proxy_coalesce: proxy_coalesce::InflightMap<Bytes>,
     /// Docker blob fills in flight, shared by every request for the blob (#1003).
     pub(crate) blob_flights: proxy_coalesce::InflightMap<registry::docker::SpoolShare>,
+    /// Docker manifest misses in flight: concurrent requests for a tag no upstream has share one
+    /// round of upstream requests (#1192). In-memory and rebuildable.
+    pub(crate) manifest_flights: proxy_coalesce::InflightMap<registry::docker::ManifestShare>,
+    /// Docker tags no upstream has, for `[docker] miss_ttl` seconds (#1192).
+    pub(crate) manifest_misses: Arc<registry::docker::MissCache>,
     pub digest_store: Arc<digest_quarantine::DigestStore>,
     /// Repository index signer (rpm/deb). `None` = indexes are unsigned.
     pub signer: Option<Arc<signing::RepoSigner>>,
@@ -3683,6 +3688,8 @@ async fn run_server(
         circuit_breaker: Arc::new(circuit_breaker::CircuitBreakerRegistry::new(cb_config)),
         proxy_coalesce: proxy_coalesce::InflightMap::new(),
         blob_flights: proxy_coalesce::InflightMap::new(),
+        manifest_flights: proxy_coalesce::InflightMap::new(),
+        manifest_misses: Arc::new(registry::docker::MissCache::default()),
         digest_store,
         signer,
         leak_finders,

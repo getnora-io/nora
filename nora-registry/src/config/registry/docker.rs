@@ -39,6 +39,10 @@ pub struct DockerConfig {
     pub read_timeout: u64,
     #[serde(default = "default_docker_metadata_ttl")]
     pub metadata_ttl: i64,
+    /// Seconds a tag that no upstream has is answered as missing without asking the upstreams
+    /// again (#1192); `0` disables that. A push of the tag is answered at once regardless.
+    #[serde(default = "default_docker_miss_ttl")]
+    pub miss_ttl: u64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
     /// What to do with a name that no `prefix`, `namespaces` or registry host routes.
@@ -205,6 +209,11 @@ fn default_docker_metadata_ttl() -> i64 {
     -1
 }
 
+/// Default `miss_ttl`: 30 seconds (#1192).
+fn default_docker_miss_ttl() -> u64 {
+    30
+}
+
 /// Default Docker upstream. Single source for the serde field-default and the
 /// `Default` impl so a present-but-empty `[docker]` table keeps the upstream
 /// instead of silently going local-only (the npm/pypi `#[serde(default)]`
@@ -227,6 +236,7 @@ impl Default for DockerConfig {
             proxy_timeout: 300,
             read_timeout: 60,
             metadata_ttl: -1,
+            miss_ttl: default_docker_miss_ttl(),
             serve_stale: true,
             default_action: DefaultAction::default(),
             upstreams: default_docker_upstreams(),
@@ -343,6 +353,9 @@ impl DockerConfig {
         }
         if let Ok(val) = env::var("NORA_DOCKER_METADATA_TTL") {
             super::super::parse_env_warn("NORA_DOCKER_METADATA_TTL", &val, &mut self.metadata_ttl);
+        }
+        if let Ok(val) = env::var("NORA_DOCKER_MISS_TTL") {
+            super::super::parse_env_warn("NORA_DOCKER_MISS_TTL", &val, &mut self.miss_ttl);
         }
         if let Ok(val) = env::var("NORA_DOCKER_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");

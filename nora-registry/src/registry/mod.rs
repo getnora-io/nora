@@ -353,6 +353,17 @@ impl UpstreamMiss {
             && self.limited.is_none()
     }
 
+    /// Whether every upstream asked said "not found", and none failed, was skipped for its open
+    /// breaker, refused NORA's credentials or rate-limited it: a miss that is safe to remember,
+    /// since no upstream that may hold the artifact went unasked or unanswered (#1192).
+    pub(crate) fn all_not_found(&self) -> bool {
+        self.not_found
+            && !self.failed
+            && !self.refused
+            && self.open.is_none()
+            && self.limited.is_none()
+    }
+
     /// The breaker key of the first upstream skipped for its open breaker, when that made the
     /// miss a 503.
     pub(crate) fn open_key(&self) -> Option<&str> {
