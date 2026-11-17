@@ -1193,6 +1193,7 @@ mod tests {
             crate::config::MavenProxyEntry::Simple("https://nora.example/maven2".into()),
         ];
         config.docker.upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".into(),
             auth: None,
             namespace: None,
@@ -1561,6 +1562,7 @@ mod integration_tests {
             cfg.circuit_breaker.failure_threshold = 1;
             cfg.circuit_breaker.reset_timeout = 3600;
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: None,

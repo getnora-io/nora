@@ -798,6 +798,7 @@ mod hosts_tests {
                 namespace: None,
                 prefix: None,
                 namespaces: Vec::new(),
+                metadata_ttl: None,
             };
             assert!(
                 !upstream.serves_host("ci-bot"),

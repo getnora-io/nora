@@ -307,6 +307,25 @@ impl UpstreamMiss {
         }
     }
 
+    /// Whether an upstream failed to answer a listing, so the listing may be missing its tags.
+    /// A 4xx is an answer (the upstream does not hold the name); a failure is not.
+    pub(crate) fn listing_failed(&self) -> bool {
+        self.failed || self.refused || self.open.is_some() || self.limited.is_some()
+    }
+
+    /// The same miss without its "not found" answers, for a listing that failed on one upstream
+    /// while another said 404: the failure decides the response, never a 404 that would name
+    /// the repository as absent.
+    pub(crate) fn for_listing(&self) -> UpstreamMiss {
+        UpstreamMiss {
+            not_found: false,
+            failed: self.failed,
+            refused: self.refused,
+            open: self.open.clone(),
+            limited: self.limited.clone(),
+        }
+    }
+
     /// The status for the miss: 429 when an upstream rate-limited NORA; otherwise 404 when an
     /// upstream said "not found" or none was asked; otherwise 503 when one was skipped for its
     /// open breaker, 502 when every one failed or refused NORA's credentials.
@@ -2476,6 +2495,7 @@ mod first_download_integrity {
             "/v2/corp/app/manifests/1.0",
             |c, u| {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
+                    metadata_ttl: None,
                     url: u,
                     auth: None,
                     namespace: None,
@@ -2571,6 +2591,7 @@ mod first_download_integrity {
             "/v2/app/manifests/1.0",
             |c, u| {
                 c.docker.upstreams = vec![crate::config::DockerUpstream {
+                    metadata_ttl: None,
                     url: u,
                     auth: None,
                     namespace: None,
@@ -3694,6 +3715,7 @@ mod upstream_failure_matrix {
         cfg.docker.upstreams = urls
             .into_iter()
             .map(|url| DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: None,

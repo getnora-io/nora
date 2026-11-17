@@ -114,10 +114,12 @@ pub(super) fn default_maintenance_stall_secs() -> u64 {
     300
 }
 
-/// TLS configuration for outbound connections to upstream registries.
+/// TLS configuration for NORA's outbound connections: upstream registries, import, and the S3 or
+/// GCS storage client.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TlsConfig {
-    /// Path to PEM-encoded CA certificate bundle (appended to system CAs)
+    /// Path to a PEM-encoded CA certificate bundle, trusted in addition to the system CAs by the
+    /// upstream and import clients and by the S3/GCS storage client (#1186)
     #[serde(default)]
     pub ca_cert: Option<String>,
 }

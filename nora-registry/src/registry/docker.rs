@@ -809,10 +809,36 @@ fn manifest_unknown_response(name: &str, reference: &str) -> Response {
         .into_response()
 }
 
+/// A 404 `NAME_UNKNOWN` for a repository no upstream or local copy names (distribution-spec,
+/// "Listing Tags"), used when a tags listing that failed to answer is refused as not found.
+fn name_unknown_response(name: &str) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "errors": [{
+                "code": "NAME_UNKNOWN",
+                "message": "repository name not known to registry",
+                "detail": { "name": name }
+            }]
+        })),
+    )
+        .into_response()
+}
+
 /// What a Docker miss was asked for, to name it in the OCI error.
 enum Missed<'a> {
-    Manifest { name: &'a str, reference: &'a str },
-    Blob { name: &'a str, digest: &'a str },
+    Manifest {
+        name: &'a str,
+        reference: &'a str,
+    },
+    Blob {
+        name: &'a str,
+        digest: &'a str,
+    },
+    /// A tags listing that some upstream failed to answer (#1218).
+    Tags {
+        name: &'a str,
+    },
 }
 
 /// The answer to a Docker miss once every upstream was asked ([`UpstreamMiss::response`] decides
@@ -826,6 +852,7 @@ fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
     let path = match missed {
         Missed::Manifest { name, reference } => format!("{name}:{reference}"),
         Missed::Blob { name, digest } => format!("{name}@{digest}"),
+        Missed::Tags { name } => name.to_string(),
     };
     let response = miss.response("docker", &path);
     let status = response.status();
@@ -845,6 +872,7 @@ fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
         return match missed {
             Missed::Manifest { name, reference } => manifest_unknown_response(name, reference),
             Missed::Blob { digest, .. } => blob_unknown_response(digest),
+            Missed::Tags { name } => name_unknown_response(name),
         };
     } else if let Some(key) = miss.open_key() {
         (
@@ -1169,7 +1197,15 @@ async fn docker_v2_dispatch(
             return (StatusCode::BAD_REQUEST, "Invalid image name").into_response();
         }
         return match method {
-            Method::GET => list_tags(state, Path(name.to_string())).await,
+            Method::GET => {
+                list_tags(
+                    state,
+                    headers,
+                    Path(name.to_string()),
+                    parse_query_string(uri.query()),
+                )
+                .await
+            }
             _ => method_not_allowed("GET"),
         };
     }
@@ -2466,6 +2502,22 @@ fn manifest_cache_fresh(
             .unwrap_or(false)
 }
 
+/// The staleness window of the tag copies stored under `namespace` (#1222): the `metadata_ttl` of
+/// the upstream whose storage namespace it is (the first one with that namespace, in config
+/// order), else the global `[docker] metadata_ttl`. A copy from a fallback chain is stored under
+/// its first upstream's namespace, so it takes that upstream's window.
+fn docker_metadata_ttl(config: &crate::config::DockerConfig, namespace: Option<&str>) -> i64 {
+    namespace
+        .and_then(|ns| {
+            config
+                .upstreams
+                .iter()
+                .find(|u| u.resolved_namespace() == ns)
+        })
+        .and_then(|u| u.metadata_ttl)
+        .unwrap_or(config.metadata_ttl)
+}
+
 async fn get_manifest(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -2604,7 +2656,7 @@ async fn get_manifest(
         manifest_cache_fresh(
             is_digest,
             revalidate,
-            state.config.docker.metadata_ttl,
+            docker_metadata_ttl(&state.config.docker, ns.as_deref()),
             modified,
         )
     } else {
@@ -3004,16 +3056,52 @@ async fn put_manifest(
         .into_response()
 }
 
-async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let c = canonicalize(&name, &state.config.docker);
+/// The tags listing of a repository (`GET /v2/<name>/tags/list`, #1218): the local copies merged
+/// with the tags of the upstreams the name routes to, in ASCIIbetical order, paged by `n` and
+/// `last` with a `Link` header when more follow (distribution-spec "Listing Tags"). The listing
+/// answers the names `manifests/<tag>` resolves: curation refuses the name before anything is read
+/// or asked, and an internal-namespace name is never asked of an upstream.
+async fn list_tags(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Path(requested): Path<String>,
+    params: HashMap<String, String>,
+) -> Response {
+    let c = canonicalize(&requested, &state.config.docker);
     if let Some(r) = c.denied_response() {
         return r;
     }
+    let upstreams_to_try = c.upstreams_to_try(&state.config.docker.upstreams);
     let ns = c.namespace;
     let name = c.name;
     let local = c.local;
     if let Err(e) = validate_docker_name(&name) {
         return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
+    }
+    let n = match params.get("n").map(|v| v.parse::<usize>()) {
+        None => None,
+        Some(Ok(n)) => Some(n),
+        Some(Err(_)) => {
+            return (StatusCode::BAD_REQUEST, "n must be a non-negative integer").into_response();
+        }
+    };
+    let internal = crate::curation::is_internal_namespace(
+        &state.curation().curation_engine,
+        crate::curation::RegistryType::Docker,
+        &name,
+    );
+    if !internal {
+        if let Some(response) = crate::curation::check_download(
+            &state.curation().curation_engine,
+            state.bypass_token().as_deref(),
+            &headers,
+            crate::curation::RegistryType::Docker,
+            &name,
+            crate::curation::RequestVersion::Unspecified,
+            None,
+        ) {
+            return response;
+        }
     }
     let legacy_prefix = manifest_prefix(None, &local);
     let prefix = ns.as_deref().map_or_else(
@@ -3027,20 +3115,34 @@ async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> R
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    // Also include legacy non-namespaced keys during migration
-    if prefix != legacy_prefix {
+    // The bare keys hold this registry's own pushes (`put_manifest` writes them there, and
+    // `get_manifest` reads that layout as hosted). A name with one is hosted: its listing is
+    // answered from local storage alone, so the upstream is not asked. The legacy keys are
+    // listed here whether or not a namespace separates them, and a failure to list them is a
+    // failure to know whether the name is hosted, so it answers 503 as the namespaced list does.
+    let legacy_keys = if prefix != legacy_prefix {
         match state.storage.list(&legacy_prefix).await {
-            Ok(legacy_keys) => {
-                keys.extend(legacy_keys);
-                keys.sort();
-                keys.dedup();
-            }
+            Ok(legacy_keys) => legacy_keys,
             Err(e) => {
-                tracing::warn!(error = ?e, "docker: failed to list legacy manifests, continuing with namespaced only");
+                tracing::error!(error = ?e, "docker: failed to list legacy manifests for tags");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
         }
+    } else {
+        keys.clone()
+    };
+    let hosted = legacy_keys.iter().any(|k| {
+        k.strip_prefix(&legacy_prefix)
+            .and_then(tag_from_manifest_file)
+            .is_some()
+    });
+    // Also include legacy non-namespaced keys during migration
+    if prefix != legacy_prefix {
+        keys.extend(legacy_keys);
+        keys.sort();
+        keys.dedup();
     }
-    let tags: Vec<String> = keys
+    let mut tags: Vec<String> = keys
         .iter()
         .filter_map(|k| {
             k.strip_prefix(&prefix)
@@ -3049,7 +3151,125 @@ async fn list_tags(State(state): State<AppState>, Path(name): Path<String>) -> R
                 .map(String::from)
         })
         .collect();
-    (StatusCode::OK, Json(json!({"name": name, "tags": tags}))).into_response()
+    let mut miss = UpstreamMiss::default();
+    let remote = if internal || hosted {
+        Vec::new()
+    } else {
+        list_upstream_tags(&state, &upstreams_to_try, &name, &mut miss).await
+    };
+    let mut stale = false;
+    if miss.listing_failed() {
+        // A listing without a failed upstream's tags is served only as stale, and only when there
+        // is something to serve: the same rule a stale manifest follows (serve_stale).
+        if !(state.config.docker.serve_stale && (!tags.is_empty() || !remote.is_empty())) {
+            return docker_miss_response(&miss.for_listing(), Missed::Tags { name: &name });
+        }
+        tracing::warn!(registry = "docker", name = %name, "Upstream failed, serving the tags listing as stale");
+        stale = true;
+    }
+    tags.extend(remote);
+    tags.sort();
+    tags.dedup();
+
+    // `last` starts the page after that tag and `n` caps it; a `Link` names the next page.
+    let after = params.get("last").map_or(0, |last| {
+        tags.partition_point(|t| t.as_str() <= last.as_str())
+    });
+    let rest = &tags[after..];
+    let take = n.map_or(rest.len(), |n| n.min(rest.len()));
+    let page = &rest[..take];
+    let more = n.is_some_and(|n| n > 0 && rest.len() > n);
+
+    let mut response = (StatusCode::OK, Json(json!({"name": name, "tags": page}))).into_response();
+    if let (true, Some(last_tag)) = (more, page.last()) {
+        let link = format!(
+            "</v2/{requested}/tags/list?n={}&last={last_tag}>; rel=\"next\"",
+            n.unwrap_or(0)
+        );
+        if let Ok(value) = axum::http::HeaderValue::from_str(&link) {
+            response
+                .headers_mut()
+                .insert(axum::http::header::LINK, value);
+        }
+    }
+    if stale {
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-nora-stale"),
+            axum::http::header::HeaderValue::from_static("true"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::header::HeaderValue::from_static("public, max-age=0, must-revalidate"),
+        );
+    }
+    response
+}
+
+/// The tags each upstream lists for a name, merged. An upstream that failed to answer is recorded
+/// in `miss`; one that said "not found" is an answer, not a failure.
+async fn list_upstream_tags(
+    state: &AppState,
+    upstreams: &[&crate::config::DockerUpstream],
+    name: &str,
+    miss: &mut UpstreamMiss,
+) -> Vec<String> {
+    let mut tags = Vec::new();
+    for upstream in upstreams {
+        match tags_from_upstream(state, upstream, name).await {
+            Ok(listed) => tags.extend(listed),
+            Err(e) => {
+                tracing::debug!(error = ?e, upstream = %upstream.url, name = %name, "Docker tag list failed for upstream");
+                miss.record(&e);
+            }
+        }
+    }
+    tags
+}
+
+/// One upstream's tags for a name. A short name is also the official image of Docker Hub, and a
+/// manifest resolves a tag the name lacks through `library/<name>`, so the listing carries the
+/// tags of both (#1218). A failure under either name decides the answer: a 4xx under one says
+/// nothing about the other, while an upstream that failed to answer may have held more tags.
+async fn tags_from_upstream(
+    state: &AppState,
+    upstream: &crate::config::DockerUpstream,
+    name: &str,
+) -> Result<Vec<String>, ProxyError> {
+    let listing = TagListing {
+        client: &state.http_client,
+        upstream_url: &upstream.url,
+        name,
+        docker_auth: &state.docker_auth,
+        timeout: state.config.docker.proxy_timeout,
+        basic_auth: expose_opt(&upstream.auth),
+        cb: &state.circuit_breaker,
+    };
+    let own = fetch_tags_from_upstream(listing).await;
+    if name.contains('/') {
+        return own;
+    }
+    let official = format!("library/{name}");
+    let official = fetch_tags_from_upstream(TagListing {
+        name: &official,
+        ..listing
+    })
+    .await;
+    match (own, official) {
+        (Err(e), _) if is_upstream_failure(&e) => Err(e),
+        (_, Err(e)) if is_upstream_failure(&e) => Err(e),
+        (Ok(mut tags), Ok(more)) => {
+            tags.extend(more);
+            Ok(tags)
+        }
+        (Ok(tags), Err(_)) | (Err(_), Ok(tags)) => Ok(tags),
+        (Err(e), Err(_)) => Err(e),
+    }
+}
+
+/// Whether an upstream's answer to a listing is a failure to answer, rather than an answer
+/// ("not found" or a 4xx): only a failure makes the listing incomplete.
+fn is_upstream_failure(e: &ProxyError) -> bool {
+    !matches!(e, ProxyError::NotFound | ProxyError::Upstream(400..=499))
 }
 
 // ============================================================================
@@ -4605,6 +4825,228 @@ pub async fn fetch_manifest_from_upstream(
     Ok((bytes.to_vec(), content_type))
 }
 
+/// The most pages of an upstream's tag list one listing reads. A longer list is refused as an
+/// upstream failure: a listing that stopped early would look complete (#1218).
+const MAX_UPSTREAM_TAG_PAGES: usize = 200;
+
+/// What one upstream's tag listing of a repository needs: its client, the upstream and its
+/// credentials, and its breaker. Copied into each page of the listing.
+#[derive(Clone, Copy)]
+struct TagListing<'a> {
+    client: &'a reqwest::Client,
+    upstream_url: &'a str,
+    name: &'a str,
+    docker_auth: &'a DockerAuth,
+    timeout: u64,
+    basic_auth: Option<&'a str>,
+    cb: &'a CircuitBreakerRegistry,
+}
+
+/// The tags an upstream lists for a repository, every page of them. The `Link: rel="next"`
+/// header (RFC 5988, distribution-spec "Listing Tags") names the next page; it must stay on the
+/// upstream's origin, so the upstream's credentials never reach another host. Tags NORA would not
+/// resolve are dropped. The breaker, the rate limit and the token of a 401 challenge are those of
+/// [`fetch_manifest_from_upstream`] (#1218).
+async fn fetch_tags_from_upstream(listing: TagListing<'_>) -> Result<Vec<String>, ProxyError> {
+    let mut url = format!(
+        "{}/v2/{}/tags/list",
+        listing.upstream_url.trim_end_matches('/'),
+        listing.name
+    );
+    let mut tags = Vec::new();
+    for _ in 0..MAX_UPSTREAM_TAG_PAGES {
+        let (page, next) = fetch_tags_page(listing, &url).await?;
+        tags.extend(page);
+        match next {
+            Some(next) => url = next,
+            None => return Ok(tags),
+        }
+    }
+    tracing::warn!(upstream = %listing.upstream_url, name = %listing.name, "upstream tag list is longer than the pages NORA reads, refusing it");
+    Err(ProxyError::Upstream(502))
+}
+
+/// One page of an upstream's tag list: its listable tags and the URL of the next page, if any.
+async fn fetch_tags_page(
+    listing: TagListing<'_>,
+    url: &str,
+) -> Result<(Vec<String>, Option<String>), ProxyError> {
+    let TagListing {
+        client,
+        upstream_url,
+        name,
+        docker_auth,
+        timeout,
+        basic_auth,
+        cb,
+    } = listing;
+    let cb_key = upstream_key(
+        crate::registry_type::RegistryType::Docker.as_str(),
+        upstream_url,
+    );
+    cb.rate_limits().check(&cb_key)?;
+    let probe = cb.check(&cb_key)?;
+
+    tracing::debug!(url = %url, "Fetching tag list from upstream");
+
+    let mut request = client
+        .get(url)
+        .timeout(Duration::from_secs(timeout))
+        .header("Accept", "application/json");
+    if let Some(credentials) = basic_auth {
+        request = request.header("Authorization", basic_auth_header(credentials));
+    }
+    let response = request.send().await.map_err(|e| {
+        tracing::error!(error = %e, url = %url, "Failed to send tag list request to upstream");
+        cb.record_failure(&cb_key, probe);
+        ProxyError::Network(e.to_string())
+    })?;
+
+    let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let www_auth = response
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        match docker_auth
+            .get_token(upstream_url, name, www_auth.as_deref(), basic_auth)
+            .await
+        {
+            Ok(token) => client
+                .get(url)
+                .timeout(Duration::from_secs(timeout))
+                .header("Accept", "application/json")
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "Failed to send authenticated tag list request");
+                    cb.record_failure(&cb_key, probe);
+                    ProxyError::Network(e.to_string())
+                })?,
+            // The registry answered (401) and gave no token: an auth issue, not the registry down.
+            Err(e) => {
+                cb.record_alive(&cb_key, probe);
+                return Err(token_error(e, upstream_url, name, basic_auth));
+            }
+        }
+    } else {
+        response
+    };
+
+    if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        // Alive and refusing for a while: not a failure for the breaker (#1191).
+        cb.record_alive(&cb_key, probe);
+        let retry_after = response.headers().get(reqwest::header::RETRY_AFTER);
+        return Err(cb
+            .rate_limits()
+            .limited(&cb_key, retry_after.map(|v| v.as_bytes())));
+    }
+
+    if response.status() == reqwest::StatusCode::FORBIDDEN {
+        // The registry will not list this repository for NORA: a refusal, not an absent name, so
+        // it must not read as "no tags" (#1218). A persistent 401 is left as absent (accepted).
+        cb.record_alive(&cb_key, probe);
+        tracing::warn!(url = %url, "upstream refused NORA the tag list of a repository (403)");
+        return Err(ProxyError::CredentialsRefused);
+    }
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        tracing::warn!(status = %response.status(), url = %url, "Upstream returned non-success status for the tag list");
+        if (400..500).contains(&status) {
+            cb.record_alive(&cb_key, probe);
+        } else {
+            cb.record_failure(&cb_key, probe);
+        }
+        return Err(ProxyError::Upstream(status));
+    }
+
+    // RFC 8288 §B.1: a `Link` may come in several header fields; the next page is named in any.
+    let next_target = response
+        .headers()
+        .get_all(reqwest::header::LINK)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find_map(|link| next_link_target(link).map(String::from));
+    let next = match next_target {
+        None => None,
+        Some(target) => match same_origin_url(url, &target) {
+            Some(next) => Some(next),
+            None => {
+                tracing::warn!(upstream = %upstream_url, "upstream's next tag page leaves its origin, refusing the list");
+                cb.record_failure(&cb_key, probe);
+                return Err(ProxyError::Upstream(502));
+            }
+        },
+    };
+
+    let bytes = response.bytes().await.map_err(|e| {
+        cb.record_failure(&cb_key, probe);
+        ProxyError::Network(e.to_string())
+    })?;
+    let body: serde_json::Value = match serde_json::from_slice(&bytes) {
+        Ok(body) => body,
+        Err(_) => {
+            tracing::warn!(url = %url, "upstream tag list is not JSON");
+            cb.record_failure(&cb_key, probe);
+            return Err(ProxyError::Upstream(502));
+        }
+    };
+    let tags = match body.get("tags") {
+        None | Some(serde_json::Value::Null) => Vec::new(),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .filter_map(|t| t.as_str())
+            .filter(|t| is_listable_tag(t))
+            .map(String::from)
+            .collect(),
+        Some(_) => {
+            tracing::warn!(url = %url, "upstream tag list has no array of tags");
+            cb.record_failure(&cb_key, probe);
+            return Err(ProxyError::Upstream(502));
+        }
+    };
+
+    cb.record_success(&cb_key, probe);
+    Ok((tags, next))
+}
+
+/// Whether a tag NORA lists would resolve through `manifests/<tag>`: a valid reference that is
+/// not a digest (the rule [`tag_from_manifest_file`] applies to the local copies).
+fn is_listable_tag(tag: &str) -> bool {
+    validate_docker_reference(tag).is_ok() && !tag.contains(':')
+}
+
+/// The target of the `rel="next"` relation of a `Link` header value (RFC 5988), if it has one.
+fn next_link_target(link: &str) -> Option<&str> {
+    link.split(',').find_map(|entry| {
+        let (target, params) = entry.trim().strip_prefix('<')?.split_once('>')?;
+        // `rel` is a list of relation types separated by spaces, compared without case.
+        let is_next = params.split(';').any(|p| {
+            let p = p.trim();
+            p.get(..4)
+                .is_some_and(|key| key.eq_ignore_ascii_case("rel="))
+                && p[4..]
+                    .trim_matches('"')
+                    .split_whitespace()
+                    .any(|rel| rel.eq_ignore_ascii_case("next"))
+        });
+        is_next.then_some(target)
+    })
+}
+
+/// `target` resolved against the URL it was read from, if it stays on that URL's origin (scheme,
+/// host and port): the upstream's credentials are sent only there.
+fn same_origin_url(base: &str, target: &str) -> Option<String> {
+    let base = reqwest::Url::parse(base).ok()?;
+    let next = base.join(target).ok()?;
+    let same_origin = next.scheme() == base.scheme()
+        && next.host_str() == base.host_str()
+        && next.port_or_known_default() == base.port_or_known_default();
+    same_origin.then(|| next.to_string())
+}
+
 /// Detect manifest media type from its JSON content
 /// Build a standard Docker manifest response with Content-Type and Docker-Content-Digest headers.
 fn manifest_response(data: impl Into<Bytes>, content_type: String, digest: String) -> Response {
@@ -5681,6 +6123,7 @@ mod integration_tests {
                 cfg.docker.upstreams = entries
                     .into_iter()
                     .map(|url| DockerUpstream {
+                        metadata_ttl: None,
                         url,
                         auth: None,
                         namespace: None,
@@ -5758,6 +6201,7 @@ mod integration_tests {
             };
             for harbor_first in [true, false] {
                 let bound = DockerUpstream {
+                    metadata_ttl: None,
                     url: harbor_url.clone(),
                     auth: None,
                     namespace: None,
@@ -5765,6 +6209,7 @@ mod integration_tests {
                     namespaces: vec!["team-*".to_string()],
                 };
                 let hub = DockerUpstream {
+                    metadata_ttl: None,
                     url: squatter.uri(),
                     auth: None,
                     namespace: None,
@@ -5837,6 +6282,7 @@ mod integration_tests {
             cfg.docker.default_action = DefaultAction::Deny;
             cfg.docker.upstreams = vec![
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: hub_url,
                     auth: None,
                     namespace: Some("docker.io".to_string()),
@@ -5844,6 +6290,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                 },
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: harbor_url,
                     auth: None,
                     namespace: Some("harbor.example".to_string()),
@@ -5924,6 +6371,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: hub_url,
                     auth: None,
                     namespace: Some("docker.io".to_string()),
@@ -5931,6 +6379,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                 },
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: harbor_url,
                     auth: None,
                     namespace: Some("harbor.example".to_string()),
@@ -6006,6 +6455,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.serve_stale = false;
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: harbor_url,
                 auth: None,
                 namespace: None,
@@ -6064,6 +6514,843 @@ mod integration_tests {
         assert!(harbor.received_requests().await.unwrap().is_empty());
     }
 
+    // ── #1218: tags/list of a name that routes to an upstream ─────────────────────────────
+    //
+    // A tags list answers the tags a client can resolve: the local copies merged with what the
+    // upstream lists, in ASCIIbetical order, paged by `n`/`last` and `Link` (distribution-spec,
+    // "Listing Tags"). Before #1218 a routed name listed its local keys only and never asked
+    // the upstream, so each test below fails on that behaviour.
+
+    async fn seed_local_tag(state: &crate::AppState, ns: &str, name: &str, tag: &str) {
+        state
+            .storage
+            .put(&format!("docker/{ns}/{name}/manifests/{tag}.json"), b"{}")
+            .await
+            .unwrap();
+    }
+
+    /// The `tags` of a tags/list answer.
+    async fn listed_tags(resp: axum::http::Response<Body>) -> Vec<String> {
+        let body = body_bytes(resp).await;
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+        v["tags"]
+            .as_array()
+            .map(|t| {
+                t.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// An upstream that is asked under the storage namespace `docker.io`, as Docker Hub is.
+    fn routed_to(url: String) -> crate::config::DockerUpstream {
+        crate::config::DockerUpstream {
+            url,
+            auth: None,
+            namespace: Some("docker.io".to_string()),
+            prefix: None,
+            namespaces: Vec::new(),
+            metadata_ttl: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn tags_list_of_a_routed_name_merges_the_upstreams_tags() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "library/alpine",
+                "tags": ["3.18", "3.19", "3.20", "not a tag"]
+            })))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+        seed_local_tag(&ctx.state, "docker.io", "library/alpine", "3.19").await;
+        seed_local_tag(&ctx.state, "docker.io", "library/alpine", "dev").await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The upstream's three tags and the local `dev`; the tag that is no tag is dropped, and
+        // `3.19` held both places once.
+        assert_eq!(listed_tags(resp).await, vec!["3.18", "3.19", "3.20", "dev"]);
+    }
+
+    #[tokio::test]
+    async fn tags_list_of_a_blocked_name_is_refused_before_the_upstream_is_asked() {
+        use crate::config::CurationMode;
+        use crate::secrets::ProtectedString;
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "library/test", "tags": ["1.0"]
+            })))
+            .mount(&hub)
+            .await;
+        let dir = tempfile::TempDir::new().unwrap();
+        let blocklist = dir.path().join("blocklist.json");
+        std::fs::write(
+            &blocklist,
+            r#"{"version": 1, "rules": [{"registry": "docker", "name": "library/test", "version": "*", "reason": "blocked"}]}"#,
+        )
+        .unwrap();
+        let bl = blocklist.to_str().unwrap().to_string();
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.curation.mode = CurationMode::Enforce;
+            cfg.curation.blocklist_path = Some(bl);
+            cfg.curation.bypass_token = Some(ProtectedString::from("unused"));
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/test/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        assert!(
+            hub.received_requests().await.unwrap().is_empty(),
+            "a blocked name's tags were asked of the upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_list_of_an_internal_namespace_is_never_asked_of_upstream() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "corp-tools", "tags": ["9.9"]
+            })))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.curation.internal_namespaces = vec!["corp-*".to_string()];
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+        seed_local_tag(&ctx.state, "docker.io", "corp-tools", "1.0").await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/corp-tools/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["1.0"]);
+        assert!(
+            hub.received_requests().await.unwrap().is_empty(),
+            "an internal name was sent to the upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_list_serves_the_local_tags_marked_stale_when_the_upstream_fails() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+        seed_local_tag(&ctx.state, "docker.io", "library/alpine", "dev").await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-nora-stale")
+                .and_then(|v| v.to_str().ok()),
+            Some("true"),
+            "a list that may be missing upstream's tags is not marked stale"
+        );
+        assert_eq!(listed_tags(resp).await, vec!["dev"]);
+    }
+
+    #[tokio::test]
+    async fn tags_list_with_no_tags_and_a_failing_upstream_is_an_outage_not_an_empty_list() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        // A client that reads an empty list as "no such tags" must not learn it from an outage.
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_bytes(resp).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("UNAVAILABLE"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_list_fails_closed_when_serve_stale_is_off() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.serve_stale = false;
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+        seed_local_tag(&ctx.state, "docker.io", "library/alpine", "dev").await;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        // Like a stale manifest, the local tags answer only when serve_stale allows it.
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn tags_list_pages_the_merged_sorted_list() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "library/alpine", "tags": ["b", "c", "f"]
+            })))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+        for tag in ["a", "d", "e"] {
+            seed_local_tag(&ctx.state, "docker.io", "library/alpine", tag).await;
+        }
+        let uri = "/v2/library/alpine/tags/list";
+
+        // Merged and sorted: a b c d e f.
+        let resp = send(&ctx.app, Method::GET, &format!("{uri}?n=2"), Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let link = resp
+            .headers()
+            .get(axum::http::header::LINK)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(listed_tags(resp).await, vec!["a", "b"]);
+        assert!(
+            link.contains("last=b") && link.contains("rel=\"next\""),
+            "Link: {link}"
+        );
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("{uri}?n=2&last=b"),
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(listed_tags(resp).await, vec!["c", "d"]);
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("{uri}?n=2&last=d"),
+            Body::empty(),
+        )
+        .await;
+        let no_link = resp.headers().get(axum::http::header::LINK).is_none();
+        assert_eq!(listed_tags(resp).await, vec!["e", "f"]);
+        assert!(no_link, "the last page carries a Link header");
+
+        let resp = send(&ctx.app, Method::GET, &format!("{uri}?n=0"), Body::empty()).await;
+        assert!(resp.headers().get(axum::http::header::LINK).is_none());
+        assert!(listed_tags(resp).await.is_empty());
+
+        let resp = send(&ctx.app, Method::GET, &format!("{uri}?n=x"), Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn tags_list_follows_the_upstreams_link_header_to_every_page() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .and(query_param_is_missing("last"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "Link",
+                        "</v2/library/alpine/tags/list?last=3.18>; rel=\"next\"",
+                    )
+                    .set_body_json(serde_json::json!({"name": "library/alpine", "tags": ["3.18"]})),
+            )
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .and(query_param("last", "3.18"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"name": "library/alpine", "tags": ["3.19", "3.20"]}),
+            ))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["3.18", "3.19", "3.20"]);
+    }
+
+    #[tokio::test]
+    async fn tags_list_refuses_a_next_page_that_leaves_the_upstream_origin() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        let elsewhere = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "Link",
+                        format!(
+                            "<{}/v2/library/alpine/tags/list?last=3.18>; rel=\"next\"",
+                            elsewhere.uri()
+                        ),
+                    )
+                    .set_body_json(serde_json::json!({"name": "library/alpine", "tags": ["3.18"]})),
+            )
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        // The upstream's credentials are sent to its own origin only: the next page elsewhere
+        // is never requested, and a listing that cannot be completed is an outage.
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            elsewhere.received_requests().await.unwrap().is_empty(),
+            "the next tag page was requested from another origin"
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_list_refuses_an_upstream_list_longer_than_the_pages_it_reads() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A next page that always names the same next page: the listing never ends.
+        let hub = MockServer::start().await;
+        let next = format!("{}/v2/library/alpine/tags/list?last=x", hub.uri());
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Link", format!("<{next}>; rel=\"next\""))
+                    .set_body_json(serde_json::json!({"name": "library/alpine", "tags": ["x"]})),
+            )
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        // A cut-off list would look complete: it is refused, not answered with its first pages.
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn tags_list_with_one_upstream_not_found_and_one_failing_is_an_outage_not_a_404() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The first upstream says the name is absent; the second cannot say, since it fails. A
+        // 404 would tell the client the repository does not exist.
+        let absent = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&absent)
+            .await;
+        let failing = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&failing)
+            .await;
+        let (first, second) = (absent.uri(), failing.uri());
+        let ctx = create_test_context_with_config(move |cfg| {
+            let mut other = routed_to(second);
+            other.namespace = Some("other.example".to_string());
+            cfg.docker.upstreams = vec![routed_to(first), other];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn tags_list_of_an_official_image_falls_to_its_library_name() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/alpine/tags/list"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "library/alpine", "tags": ["3.19", "3.20"]
+            })))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(&ctx.app, Method::GET, "/v2/alpine/tags/list", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["3.19", "3.20"]);
+    }
+
+    /// A name with a local push is hosted: its listing is answered from local storage, so an
+    /// outage of the upstream cannot turn it into a 502, and the upstream's tags are not mixed in.
+    #[tokio::test]
+    async fn tags_list_of_a_hosted_name_is_answered_from_local_storage_only() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.serve_stale = false;
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+        // `put_manifest` stores a push under the bare key, without the upstream namespace.
+        ctx.state
+            .storage
+            .put("docker/team/app/manifests/v1.json", b"{}")
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/app/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["v1"]);
+        assert!(
+            hub.received_requests().await.unwrap().is_empty(),
+            "a hosted name was asked of the upstream"
+        );
+    }
+
+    #[tokio::test]
+    async fn tags_list_of_a_hosted_name_does_not_merge_the_upstreams_tags() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "team/app", "tags": ["x9"]
+            })))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+        ctx.state
+            .storage
+            .put("docker/team/app/manifests/v1.json", b"{}")
+            .await
+            .unwrap();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/app/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(listed_tags(resp).await, vec!["v1"]);
+        assert!(hub.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tags_list_refused_with_403_is_a_refusal_not_an_empty_list() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/private/tags/list",
+            Body::empty(),
+        )
+        .await;
+        // The registry said NORA may not list this repository: that is not "no tags".
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = body_bytes(resp).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("DENIED"),
+            "{}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    /// The upstream's own tags are not the whole list while its official ones cannot be read:
+    /// the listing is an outage, not the partial answer `foo:edge` alone would be.
+    #[tokio::test]
+    async fn tags_list_of_a_short_name_is_an_outage_when_its_official_tags_fail() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/foo/tags/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "foo", "tags": ["edge"]
+            })))
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/foo/tags/list"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(&ctx.app, Method::GET, "/v2/foo/tags/list", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[tokio::test]
+    async fn tags_list_of_a_short_name_also_lists_its_official_tags() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // `foo:edge` is the upstream's own repository; `library/foo:stable` is the official one,
+        // which `/v2/foo/manifests/stable` resolves through the fallback.
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/foo/tags/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "foo", "tags": ["edge"]
+            })))
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/foo/tags/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "library/foo", "tags": ["stable"]
+            })))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(&ctx.app, Method::GET, "/v2/foo/tags/list", Body::empty()).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["edge", "stable"]);
+    }
+
+    #[tokio::test]
+    async fn tags_list_follows_a_next_link_given_in_a_second_link_field() {
+        use wiremock::matchers::{method, path, query_param, query_param_is_missing};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .and(query_param_is_missing("last"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header(
+                        "Link",
+                        "</v2/library/alpine/tags/list?last=3.18>; rel=\"next\"",
+                    )
+                    .set_body_json(serde_json::json!({"name": "library/alpine", "tags": ["3.18"]})),
+            )
+            .mount(&hub)
+            .await;
+        // The second page names its previous page and then its next one, each in its own field.
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .and(query_param("last", "3.18"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header(
+                        "Link",
+                        "</v2/library/alpine/tags/list?last=3.17>; rel=\"prev\"",
+                    )
+                    .append_header(
+                        "Link",
+                        "</v2/library/alpine/tags/list?last=3.19>; rel=\"next\"",
+                    )
+                    .set_body_json(serde_json::json!({"name": "library/alpine", "tags": ["3.19"]})),
+            )
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .and(query_param("last", "3.19"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({"name": "library/alpine", "tags": ["3.20"]})),
+            )
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["3.18", "3.19", "3.20"]);
+    }
+
+    /// A persistent 401 after a token is "absent" for a listing too (the accepted rule for a
+    /// persistent 401, measured on Docker Hub: a missing repository and one without access answer
+    /// the same way), so the listing answers as an empty repository, not an outage. Pinned here
+    /// so that a change of that rule is a change of this test.
+    #[tokio::test]
+    async fn tags_list_answered_401_after_a_token_is_absent_not_an_outage() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        let realm = format!("{}/token", hub.uri());
+        Mock::given(method("GET"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"token": "t"})),
+            )
+            .mount(&hub)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/team/gone/tags/list"))
+            .respond_with(ResponseTemplate::new(401).append_header(
+                "WWW-Authenticate",
+                format!(
+                    "Bearer realm=\"{realm}\",service=\"hub\",scope=\"repository:team/gone:pull\""
+                ),
+            ))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.docker.upstreams = vec![routed_to(url)];
+        });
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/v2/team/gone/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(listed_tags(resp).await.is_empty());
+    }
+
+    /// The legacy keys of a routed name are listed too, since they hold this registry's own
+    /// pushes. A failure to list them is a failure to know whether the name is hosted, so the
+    /// listing answers 503 and asks no upstream, as the namespaced listing does (#1218). The
+    /// healthy request first shows that the same name is listed from the upstream.
+    #[tokio::test]
+    async fn tags_list_of_a_routed_name_is_503_when_its_legacy_keys_cannot_be_read() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/library/alpine/tags/list"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "name": "library/alpine",
+                "tags": ["3.19"]
+            })))
+            .mount(&hub)
+            .await;
+        let url = hub.uri();
+
+        let healthy = create_test_context_with_config({
+            let url = url.clone();
+            move |cfg| {
+                cfg.docker.upstreams = vec![routed_to(url)];
+            }
+        });
+        let resp = send(
+            &healthy.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(listed_tags(resp).await, vec!["3.19"]);
+        let asked = hub.received_requests().await.unwrap().len();
+
+        // The legacy prefix of `library/alpine` fails to list; the namespaced one lists fine.
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage =
+            crate::storage::Storage::from_backend(std::sync::Arc::new(FailingPrefixBackend {
+                inner: crate::storage::LocalStorage::new(dir.path().to_str().unwrap()),
+                fail_prefix: "docker/library/alpine/manifests/".to_string(),
+            }));
+        let broken =
+            crate::test_helpers::create_test_context_with_storage_and_config(storage, move |cfg| {
+                cfg.docker.upstreams = vec![routed_to(url)];
+            });
+        let resp = send(
+            &broken.app,
+            Method::GET,
+            "/v2/library/alpine/tags/list",
+            Body::empty(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            hub.received_requests().await.unwrap().len(),
+            asked,
+            "a name whose legacy keys could not be read was asked of the upstream"
+        );
+    }
+
+    #[test]
+    fn next_link_target_reads_a_rel_list_and_skips_other_relations() {
+        assert_eq!(
+            super::next_link_target("</a?last=1>; rel=\"prev next\""),
+            Some("/a?last=1")
+        );
+        assert_eq!(
+            super::next_link_target("</a>; rel=\"prev\", </b>; rel=\"NEXT\""),
+            Some("/b")
+        );
+        assert_eq!(super::next_link_target("</a>; rel=\"prev\""), None);
+    }
+
     /// #1195: a name behind a registry host no upstream serves is not answered by another
     /// registry. Docker Hub here holds every name — whoever registered `library/alpine` and
     /// `project1/service1` there — and is asked for none of them under `quay.io/…`, nor is its
@@ -6102,6 +7389,7 @@ mod integration_tests {
         let hub_url = hub.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: hub_url,
                 auth: None,
                 namespace: Some("docker.io".to_string()),
@@ -6290,6 +7578,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: url.clone(),
                     auth: None,
                     namespace: Some("docker.io".to_string()),
@@ -6297,6 +7586,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                 },
                 DockerUpstream {
+                    metadata_ttl: None,
                     url,
                     auth: None,
                     namespace: Some("hubmirror".to_string()),
@@ -6465,6 +7755,7 @@ mod integration_tests {
         let url = quay.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: Some("quay.io".to_string()),
@@ -6627,6 +7918,7 @@ mod integration_tests {
                 cfg.circuit_breaker.enabled = true;
                 cfg.circuit_breaker.failure_threshold = 3;
                 cfg.docker.upstreams = vec![DockerUpstream {
+                    metadata_ttl: None,
                     url: registry_url,
                     auth: credential.then(|| "robot:secret".to_string().into()),
                     namespace: None,
@@ -6698,6 +7990,7 @@ mod integration_tests {
                 cfg.docker.upstreams = [first, second]
                     .into_iter()
                     .map(|url| DockerUpstream {
+                        metadata_ttl: None,
                         url,
                         auth: Some("robot:secret".to_string().into()),
                         namespace: None,
@@ -6716,6 +8009,7 @@ mod integration_tests {
         entries
             .into_iter()
             .map(|(url, namespaces)| crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: None,
@@ -7582,6 +8876,7 @@ mod integration_tests {
                 cfg.circuit_breaker.reset_timeout = 3600;
                 cfg.docker.proxy_timeout = 1;
                 cfg.docker.upstreams = vec![crate::config::DockerUpstream {
+                    metadata_ttl: None,
                     url,
                     auth: None,
                     namespace: None,
@@ -7944,6 +9239,7 @@ mod integration_tests {
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.serve_stale = false;
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: None,
@@ -8079,6 +9375,7 @@ mod integration_tests {
                 .set_body_bytes(body.to_vec())
         };
         let upstream = |url: String, prefix: Option<&str>| DockerUpstream {
+            metadata_ttl: None,
             url,
             auth: None,
             namespace: None,
@@ -8207,6 +9504,7 @@ mod integration_tests {
             .mount(&server)
             .await;
         let upstream = DockerUpstream {
+            metadata_ttl: None,
             url: server.uri(),
             auth: None,
             namespace: None,
@@ -8324,6 +9622,7 @@ mod integration_tests {
         let uri = server.uri();
         let ctx = create_test_context_with_config(move |cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: uri,
                 auth: None,
                 namespace: None,
@@ -8426,6 +9725,7 @@ mod integration_tests {
             .mount(&server)
             .await;
         let upstream = DockerUpstream {
+            metadata_ttl: None,
             url: server.uri(),
             auth: None,
             namespace: None,
@@ -8513,6 +9813,7 @@ mod integration_tests {
         use crate::config::DockerUpstream;
         let (storage, ops) = crate::test_helpers::op_counting_storage();
         let upstream = DockerUpstream {
+            metadata_ttl: None,
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
             namespace: None,
@@ -8548,6 +9849,7 @@ mod integration_tests {
         use sha2::Digest;
         let (storage, ops) = crate::test_helpers::op_counting_storage();
         let upstream = DockerUpstream {
+            metadata_ttl: None,
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
             namespace: None,
@@ -8822,6 +10124,7 @@ mod integration_tests {
                 .mount(&server)
                 .await;
             let upstream = DockerUpstream {
+                metadata_ttl: None,
                 url: server.uri(),
                 auth: None,
                 namespace: None,
@@ -9299,6 +10602,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -9772,6 +11076,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -9854,6 +11159,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -11188,6 +12494,7 @@ mod integration_tests {
             cfg.circuit_breaker.reset_timeout = 3600;
             // Unreachable upstream
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: None,
@@ -11440,6 +12747,7 @@ mod integration_tests {
             cfg.circuit_breaker.reset_timeout = 3600;
             cfg.docker.upstreams = vec![
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: "http://127.0.0.1:1".into(), // upstream A (will be tripped)
                     auth: None,
                     namespace: None,
@@ -11447,6 +12755,7 @@ mod integration_tests {
                     namespaces: Vec::new(),
                 },
                 DockerUpstream {
+                    metadata_ttl: None,
                     url: "http://127.0.0.1:2".into(), // upstream B (stays closed)
                     auth: None,
                     namespace: None,
@@ -11588,6 +12897,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_prefix_routing() {
         let upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             namespace: Some("docker.io".to_string()),
@@ -11606,6 +12916,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_hostname_detection() {
         let upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             namespace: Some("docker.io".to_string()),
@@ -11632,6 +12943,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_fallback() {
         let upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             namespace: Some("docker.io".to_string()),
@@ -11703,6 +13015,7 @@ mod integration_tests {
     fn test_canonicalize_multi_upstream() {
         let upstreams = vec![
             crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
                 namespace: Some("docker.io".to_string()),
@@ -11710,6 +13023,7 @@ mod integration_tests {
                 namespaces: Vec::new(),
             },
             crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: "https://ghcr.io".to_string(),
                 auth: None,
                 namespace: Some("ghcr.io".to_string()),
@@ -11739,6 +13053,7 @@ mod integration_tests {
     fn test_canonicalize_deny_mode_blocks_unmatched() {
         let upstreams = vec![
             crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: "https://registry-1.docker.io".to_string(),
                 auth: None,
                 namespace: Some("docker.io".to_string()),
@@ -11746,6 +13061,7 @@ mod integration_tests {
                 namespaces: Vec::new(),
             },
             crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: "https://ghcr.io".to_string(),
                 auth: None,
                 namespace: Some("ghcr.io".to_string()),
@@ -11777,6 +13093,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_deny_mode_allows_known_hostname() {
         let upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             namespace: Some("docker.io".to_string()),
@@ -11797,6 +13114,7 @@ mod integration_tests {
     fn bound_upstreams() -> Vec<crate::config::DockerUpstream> {
         let entry = |url: &str, ns: &str, prefix: Option<&str>, masks: &[&str]| {
             crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: url.to_string(),
                 auth: None,
                 namespace: Some(ns.to_string()),
@@ -11902,6 +13220,7 @@ mod integration_tests {
     #[test]
     fn test_canonicalize_registry_host_decision_table() {
         let entry = |url: &str, ns: Option<&str>, masks: &[&str]| crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: url.to_string(),
             auth: None,
             namespace: ns.map(str::to_string),
@@ -11998,6 +13317,7 @@ mod integration_tests {
     #[test]
     fn test_denied_response_format() {
         let upstreams = vec![crate::config::DockerUpstream {
+            metadata_ttl: None,
             url: "https://registry-1.docker.io".to_string(),
             auth: None,
             namespace: Some("docker.io".to_string()),
@@ -12050,6 +13370,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream.uri(),
                 auth: None,
                 namespace: None,
@@ -12135,6 +13456,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream.uri(),
                 auth: None,
                 namespace: None,
@@ -12191,6 +13513,7 @@ mod integration_tests {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream.uri(),
                 auth: None,
                 namespace: None,
@@ -12312,6 +13635,7 @@ mod integration_tests {
 
     fn unreachable_upstream() -> crate::config::DockerUpstream {
         crate::config::DockerUpstream {
+            metadata_ttl: None,
             // Reserved port on localhost — connect fails fast, no real network.
             url: "http://127.0.0.1:9".to_string(),
             auth: None,
@@ -12399,6 +13723,247 @@ mod integration_tests {
         );
         let body = body_bytes(resp).await;
         assert_eq!(body.as_ref(), b"{\"legacy\":true}");
+    }
+
+    const WINDOW_MANIFEST: &[u8] = br#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","size":0,"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"layers":[]}"#;
+
+    /// `[docker] metadata_ttl = 3600` with two upstreams. `/v2/a/…` is asked of `up-a`, whose own
+    /// window is 60 seconds; `/v2/b/…` of `up-b`, which has none and follows the global one.
+    fn window_config(url: String) -> impl FnOnce(&mut crate::config::Config) {
+        move |cfg| {
+            cfg.docker.metadata_ttl = 3600;
+            cfg.docker.upstreams = vec![
+                crate::config::DockerUpstream {
+                    url: url.clone(),
+                    auth: None,
+                    namespace: Some("up-a".to_string()),
+                    prefix: Some("a".to_string()),
+                    namespaces: Vec::new(),
+                    metadata_ttl: Some(60),
+                },
+                crate::config::DockerUpstream {
+                    url,
+                    auth: None,
+                    namespace: Some("up-b".to_string()),
+                    prefix: Some("b".to_string()),
+                    namespaces: Vec::new(),
+                    metadata_ttl: None,
+                },
+            ];
+        }
+    }
+
+    async fn hub_serving_app() -> wiremock::MockServer {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let hub = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                WINDOW_MANIFEST,
+                "application/vnd.docker.distribution.manifest.v2+json",
+            ))
+            .mount(&hub)
+            .await;
+        hub
+    }
+
+    /// The copy of `app:v1` that an upstream's namespace stores.
+    fn window_key(namespace: &str) -> String {
+        super::manifest_key(Some(namespace), "app", "v1")
+    }
+
+    /// Both upstreams' copies of `app:v1`, stored as an earlier pull left them.
+    async fn seed_window_copies(storage: &crate::storage::Storage) {
+        for namespace in ["up-a", "up-b"] {
+            storage
+                .put(&window_key(namespace), WINDOW_MANIFEST)
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Pull `app:v1` through the path of one upstream. Returns the status, and how many requests
+    /// the hub has received so far.
+    async fn pull_through(
+        ctx: &crate::test_helpers::TestContext,
+        hub: &wiremock::MockServer,
+        prefix: &str,
+    ) -> (StatusCode, usize) {
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/v2/{prefix}/app/manifests/v1"),
+            Body::empty(),
+        )
+        .await;
+        let asked = hub.received_requests().await.unwrap().len();
+        (resp.status(), asked)
+    }
+
+    /// A context on local storage whose copies are `age_a` and `age_b` seconds old (#1222).
+    async fn window_ctx_local(
+        hub: &wiremock::MockServer,
+        age_a: u64,
+        age_b: u64,
+    ) -> crate::test_helpers::TestContext {
+        let ctx = create_test_context_with_config(window_config(hub.uri()));
+        seed_window_copies(&ctx.state.storage).await;
+        let root = std::path::Path::new(&ctx.state.config.storage.path).to_path_buf();
+        for (namespace, age) in [("up-a", age_a), ("up-b", age_b)] {
+            let then = std::time::SystemTime::now() - std::time::Duration::from_secs(age);
+            std::fs::File::options()
+                .write(true)
+                .open(root.join(window_key(namespace)))
+                .unwrap()
+                .set_modified(then)
+                .unwrap();
+        }
+        ctx
+    }
+
+    /// The object store stamps every object with the time it was written, which a test cannot
+    /// set. This stands in for an object store whose objects are `age` seconds old: a key takes
+    /// the age of the first fragment it contains (#1222).
+    struct AgedObjects {
+        inner: crate::storage::ObjectStorage,
+        ages: Vec<(&'static str, u64)>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for AgedObjects {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(key, data, sha256).await
+        }
+        async fn get(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            self.inner.get(key).await
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+        async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
+            let mut meta = self.inner.stat(key).await?;
+            let age = self
+                .ages
+                .iter()
+                .find(|(fragment, _)| key.contains(fragment))
+                .map_or(0, |(_, age)| *age);
+            meta.modified = meta.modified.saturating_sub(age);
+            Some(meta)
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "aged-objects-test"
+        }
+        async fn copy(
+            &self,
+            src: &str,
+            dst: &str,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+    }
+
+    /// A context on an object store whose copies are `age_a` and `age_b` seconds old (#1222).
+    async fn window_ctx_objects(
+        hub: &wiremock::MockServer,
+        age_a: u64,
+        age_b: u64,
+    ) -> crate::test_helpers::TestContext {
+        let storage = crate::storage::Storage::from_backend(std::sync::Arc::new(AgedObjects {
+            inner: crate::storage::ObjectStorage::in_memory(),
+            ages: vec![("/up-a/", age_a), ("/up-b/", age_b)],
+        }));
+        let ctx = crate::test_helpers::create_test_context_with_storage_and_config(
+            storage,
+            window_config(hub.uri()),
+        );
+        seed_window_copies(&ctx.state.storage).await;
+        ctx
+    }
+
+    /// A copy inside its upstream's own window is served from cache, and so is a copy of the other
+    /// upstream inside the global window (#1222). Local storage.
+    #[tokio::test]
+    async fn docker_upstream_window_serves_a_copy_inside_it_local() {
+        let hub = hub_serving_app().await;
+        let ctx = window_ctx_local(&hub, 30, 120).await;
+        assert_eq!(pull_through(&ctx, &hub, "a").await, (StatusCode::OK, 0));
+        assert_eq!(pull_through(&ctx, &hub, "b").await, (StatusCode::OK, 0));
+    }
+
+    /// A copy past its upstream's own window is revalidated, though the global window would still
+    /// serve it; a copy past the global window is revalidated as before (#1222). Local storage.
+    #[tokio::test]
+    async fn docker_upstream_window_revalidates_a_copy_past_it_local() {
+        let hub = hub_serving_app().await;
+        let ctx = window_ctx_local(&hub, 120, 7200).await;
+        assert_eq!(pull_through(&ctx, &hub, "a").await, (StatusCode::OK, 1));
+        assert_eq!(pull_through(&ctx, &hub, "b").await, (StatusCode::OK, 2));
+    }
+
+    /// The same as `docker_upstream_window_serves_a_copy_inside_it_local`, on an object store (#1222).
+    #[tokio::test]
+    async fn docker_upstream_window_serves_a_copy_inside_it_objects() {
+        let hub = hub_serving_app().await;
+        let ctx = window_ctx_objects(&hub, 30, 120).await;
+        assert_eq!(pull_through(&ctx, &hub, "a").await, (StatusCode::OK, 0));
+        assert_eq!(pull_through(&ctx, &hub, "b").await, (StatusCode::OK, 0));
+    }
+
+    /// The same as `docker_upstream_window_revalidates_a_copy_past_it_local`, on an object store
+    /// (#1222).
+    #[tokio::test]
+    async fn docker_upstream_window_revalidates_a_copy_past_it_objects() {
+        let hub = hub_serving_app().await;
+        let ctx = window_ctx_objects(&hub, 120, 7200).await;
+        assert_eq!(pull_through(&ctx, &hub, "a").await, (StatusCode::OK, 1));
+        assert_eq!(pull_through(&ctx, &hub, "b").await, (StatusCode::OK, 2));
+    }
+
+    /// `metadata_ttl` is optional on an upstream: set, it is read; unset, the upstream follows the
+    /// global window (#1222).
+    #[test]
+    fn docker_upstream_metadata_ttl_is_optional() {
+        let parsed: crate::config::DockerConfig = toml::from_str(
+            "[[upstreams]]\nurl = \"https://registry-1.docker.io\"\nmetadata_ttl = 60\n\n[[upstreams]]\nurl = \"https://private.example\"\n",
+        )
+        .unwrap();
+        assert_eq!(parsed.upstreams[0].metadata_ttl, Some(60));
+        assert_eq!(parsed.upstreams[1].metadata_ttl, None);
     }
 }
 
@@ -12530,6 +14095,7 @@ mod stream_spool_tests {
         use crate::config::DockerUpstream;
         create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream,
                 auth: None,
                 namespace: None,
@@ -12925,6 +14491,7 @@ mod stream_spool_tests {
         let upstream = slow_blob_upstream(blob.clone(), 2, Duration::from_millis(50)).await;
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream,
                 auth: None,
                 namespace: None,
@@ -13172,6 +14739,7 @@ mod upstream_resume_tests {
         create_test_context_with_config(move |cfg| {
             cfg.docker.proxy_timeout = proxy_timeout;
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: None,
@@ -13459,6 +15027,7 @@ mod upstream_resume_tests {
             cfg.circuit_breaker.failure_threshold = 1;
             cfg.docker.proxy_timeout = 5;
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: upstream_url,
                 auth: None,
                 namespace: None,
@@ -13542,6 +15111,7 @@ mod upstream_resume_tests {
             cfg.circuit_breaker.reset_timeout = 3600;
             cfg.docker.proxy_timeout = 5;
             cfg.docker.upstreams = vec![crate::config::DockerUpstream {
+                metadata_ttl: None,
                 url: upstream_url,
                 auth: None,
                 namespace: None,
@@ -13877,6 +15447,7 @@ mod blob_single_flight_tests {
             cfg.curation.blocklist_path = Some(bl);
             cfg.curation.bypass_token = Some(ProtectedString::from("let-me-in"));
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url,
                 auth: None,
                 namespace: None,
@@ -14265,6 +15836,7 @@ mod upstream_failure_cases {
             let url = flip.uri();
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
+                    metadata_ttl: None,
                     url,
                     auth: None,
                     namespace: None,
@@ -14309,6 +15881,7 @@ mod upstream_failure_edge_cases {
             let url = bad.uri();
             let ctx = create_test_context_with_config(move |cfg| {
                 cfg.docker.upstreams = vec![DockerUpstream {
+                    metadata_ttl: None,
                     url,
                     auth: None,
                     namespace: None,
@@ -14409,6 +15982,7 @@ mod hosted_pull_stats_and_re_push {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -14527,6 +16101,7 @@ mod hosted_pull_stats_and_re_push {
 
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -14716,6 +16291,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
         use sha2::Digest as _;
         let ctx = create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -14989,6 +16565,7 @@ mod hosted_pull_stats_after_a_delete {
     fn ctx() -> crate::test_helpers::TestContext {
         crate::test_helpers::create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = vec![DockerUpstream {
+                metadata_ttl: None,
                 url: "http://127.0.0.1:1".into(),
                 auth: None,
                 namespace: Some("docker.io".into()),
@@ -15184,6 +16761,7 @@ mod manifest_before_metadata_one_lock_order {
         let ctx = crate::test_helpers::create_test_context_with_config(|cfg| {
             cfg.docker.upstreams = if upstream_ns {
                 vec![DockerUpstream {
+                    metadata_ttl: None,
                     url: "http://127.0.0.1:1".into(),
                     auth: None,
                     namespace: Some("docker.io".into()),

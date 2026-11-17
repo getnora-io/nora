@@ -4061,6 +4061,7 @@ proxies = [
             .iter()
             .enumerate()
             .map(|(i, (prefix, masks))| DockerUpstream {
+                metadata_ttl: None,
                 url: format!("https://r{i}.example"),
                 auth: None,
                 namespace: None,
@@ -4140,6 +4141,7 @@ proxies = [
         let _lock = crate::test_env::env_lock();
         let mut config = Config::default();
         config.docker.upstreams = vec![DockerUpstream {
+            metadata_ttl: None,
             url: "https://r0.example".to_string(),
             auth: None,
             namespace: Some("_".to_string()),

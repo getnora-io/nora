@@ -656,6 +656,20 @@ async fn registration_index(
                 .inc_by(body.len() as u64);
             state.metrics.record_download("nuget");
             state.metrics.record_cache_hit("nuget");
+            // Before the bump below rewrites the copy: a version it lists keeps the time NORA
+            // first saw it, and a copy from before the ledger starts at its own write time.
+            let replaced_at = state
+                .storage
+                .stat(&storage_key)
+                .await
+                .map(|m| m.modified as i64);
+            record_registration_first_seen(
+                &state,
+                &id_lower,
+                &body,
+                replaced_at.map(|at| (&body[..], at)),
+            )
+            .await;
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
             let bump = body.clone();
@@ -682,6 +696,19 @@ async fn registration_index(
                 .log(AuditEntry::new("proxy_fetch", "proxy", "", "nuget", ""));
 
             let raw = Bytes::from(body);
+            // Before the write below replaces the copy (#1146): see the 304 path.
+            let replaced_at = state
+                .storage
+                .stat(&storage_key)
+                .await
+                .map(|m| m.modified as i64);
+            record_registration_first_seen(
+                &state,
+                &id_lower,
+                &raw,
+                cached_data.as_deref().zip(replaced_at),
+            )
+            .await;
             let storage = state.storage.clone();
             let key_clone = storage_key.clone();
             let raw_for_cache = raw.clone();
@@ -826,6 +853,19 @@ async fn registration_page(
                 "PROXY",
             ));
 
+            // Before the cache write below replaces the copy (#1146): see the registration index.
+            let replaced_at = state
+                .storage
+                .stat(&storage_key)
+                .await
+                .map(|m| m.modified as i64);
+            record_registration_first_seen(
+                &state,
+                &id_lower,
+                text.as_bytes(),
+                cached_data.as_deref().zip(replaced_at),
+            )
+            .await;
             state.spawn_cache("nuget", storage_key, Bytes::from(text.clone()));
             let rewritten = rewrite_registration_urls(&text, &upstream, &base_url);
             with_json_gzip(rewritten.into_bytes())
@@ -1512,12 +1552,137 @@ fn registered(doc: &[u8], version: &str) -> Registered {
     Registered::Absent
 }
 
+/// The versions a registration document (index or page) lists directly, under its `items`.
+fn registration_versions(doc: &[u8]) -> Vec<String> {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(doc) else {
+        return Vec::new();
+    };
+    let Some(items) = json.get("items").and_then(|i| i.as_array()) else {
+        return Vec::new();
+    };
+    let mut versions = Vec::new();
+    let mut take = |leaves: &[serde_json::Value]| {
+        for leaf in leaves {
+            if let Some(v) = leaf
+                .get("catalogEntry")
+                .and_then(|e| e.get("version"))
+                .and_then(|v| v.as_str())
+            {
+                versions.push(v.to_string());
+            }
+        }
+    };
+    if items.iter().any(|item| item.get("catalogEntry").is_some()) {
+        take(items);
+    }
+    for page in items {
+        if let Some(inline) = page.get("items").and_then(|i| i.as_array()) {
+            take(inline);
+        }
+    }
+    versions
+}
+
+/// The first-seen ledger of a package's registration: version → Unix time NORA first saw it
+/// listed. It sits under npm's first-seen prefix, so backup and migrate carry it (#1140).
+fn registration_ledger_key(id: &str) -> String {
+    crate::registry::npm::first_seen_key(&format!("nuget/registration/{id}/index.json"))
+}
+
+/// Whether release ages come from the ledger: upstream dates are not trusted and curation runs.
+fn registration_ledger_tracked(state: &AppState) -> bool {
+    !state.config.server.trust_upstream_dates && state.curation().curation_engine.is_active()
+}
+
+/// Record when NORA first saw each version `doc` lists (#1146, as #1140 does for npm). A version
+/// keeps the time it was first recorded, so a refetch, 200 or 304, does not make it younger; a
+/// version the upstream adds later starts now.
+///
+/// `replaced`: the copy this document overwrites and its write time. A registration cached before
+/// the ledger starts the versions it lists at that time, never later. Awaited before the overwrite,
+/// so the overwrite cannot be what starts a clock.
+async fn record_registration_first_seen(
+    state: &AppState,
+    id: &str,
+    doc: &[u8],
+    replaced: Option<(&[u8], i64)>,
+) {
+    use crate::storage::StorageError;
+    if !registration_ledger_tracked(state) {
+        return;
+    }
+    let versions = registration_versions(doc);
+    if versions.is_empty() {
+        return;
+    }
+    let key = registration_ledger_key(id);
+    // LOCK-SAFE: the tokio mutex on this ledger key; it serializes the read-modify-write of the
+    // ledger and nothing else is locked under it.
+    let lock = state.publish_lock(&key);
+    let _guard = lock.lock().await;
+    let (mut ledger, existed): (std::collections::BTreeMap<String, i64>, bool) =
+        match state.storage.get(&key).await {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(ledger) => (ledger, true),
+                Err(e) => {
+                    tracing::warn!(key = %key, error = %e, "nuget: unreadable first-seen ledger");
+                    (Default::default(), false)
+                }
+            },
+            Err(StorageError::NotFound) => {
+                let seeded = replaced.map_or_else(Default::default, |(bytes, at)| {
+                    registration_versions(bytes)
+                        .into_iter()
+                        .map(|v| (v, at))
+                        .collect()
+                });
+                (seeded, false)
+            }
+            // A ledger that fails its pin is known bad: rewritten from now on. Every release then
+            // starts young again, which holds more, never less.
+            Err(StorageError::IntegrityViolation) => {
+                tracing::warn!(key = %key, "nuget: first-seen ledger failed its pin; rewritten");
+                (Default::default(), false)
+            }
+            Err(e) => {
+                // Not written over a ledger that may exist: a later refetch records the rest.
+                tracing::warn!(key = %key, error = ?e, "nuget: first-seen ledger unreadable");
+                return;
+            }
+        };
+    let now = chrono::Utc::now().timestamp();
+    let known = ledger.len();
+    for version in versions {
+        ledger.entry(version).or_insert(now);
+    }
+    if existed && ledger.len() == known {
+        return;
+    }
+    match serde_json::to_vec(&ledger) {
+        Ok(bytes) => {
+            if let Err(e) = state.storage.put(&key, &bytes).await {
+                tracing::warn!(key = %key, error = ?e, "nuget: failed to record first-seen times");
+            }
+        }
+        Err(e) => tracing::warn!(key = %key, error = %e, "nuget: first-seen ledger not encoded"),
+    }
+}
+
+/// When NORA first saw `version` of `id` listed, from the ledger.
+async fn registration_first_seen(storage: &crate::Storage, id: &str, version: &str) -> Option<i64> {
+    let bytes = storage.get(&registration_ledger_key(id)).await.ok()?;
+    let ledger: std::collections::BTreeMap<String, i64> = serde_json::from_slice(&bytes).ok()?;
+    ledger.get(version).copied()
+}
+
 /// When `version` of `id` was published: its release age, and with trusted dates the quarantine's
 /// first-seen too.
 ///
-/// Without trusted upstream dates (#513) a version is as old as the cached registration that
-/// lists it — NORA held it listed since that document was written — and undated when no cached
-/// one lists it: a version published after the index was cached was not seen by NORA then.
+/// Without trusted upstream dates (#513) a version is as old as NORA first saw it listed (#1146):
+/// the first-seen ledger holds that time, and a refetch of the registration keeps it. Only a
+/// version the ledger does not hold yet is dated by the cached document that lists it — NORA held
+/// it listed since that document was written — and undated when no cached one lists it: a version
+/// published after the index was cached was not seen by NORA then.
 ///
 /// With trusted dates a version is as old as its `published`. One the cached registration does
 /// not date is looked up upstream when `ask_upstream`: a `dotnet restore` reads only the flat
@@ -1533,7 +1698,10 @@ async fn nuget_publish_date(
     let dated = |key: String, published: Option<i64>| async move {
         match trust {
             true => published,
-            false => storage.stat(&key).await.map(|m| m.modified as i64),
+            false => match registration_first_seen(storage, id, version).await {
+                Some(seen) => Some(seen),
+                None => storage.stat(&key).await.map(|m| m.modified as i64),
+            },
         }
     };
     let index_key = format!("nuget/registration/{}/index.json", id);
@@ -5284,6 +5452,195 @@ mod nuget_release_dates {
             registration_requests(&up).await,
             0,
             "nothing asked upstream"
+        );
+    }
+
+    /// Waits until the copy at `key` was written within the last minute and reads back: the
+    /// registration handlers write a refetched document in the background, and between the file
+    /// write and its pin a read is an integrity failure, not a copy.
+    async fn wait_for_fresh_copy(ctx: &TestContext, key: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let fresh = ctx
+                .state
+                .storage
+                .stat(key)
+                .await
+                .is_some_and(|m| m.modified as i64 >= chrono::Utc::now().timestamp() - 60);
+            if fresh && ctx.state.storage.get(key).await.is_ok() {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{key} was not rewritten"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A refetch that rewrites a cached registration does not restart the age of a release that
+    /// registration already listed (#1146). Without trusted dates a version's age is when NORA
+    /// first saw it listed, as npm's is (#1140); a version the refetch adds starts at zero.
+    #[tokio::test]
+    async fn a_refetch_does_not_restart_the_age_of_a_listed_release() {
+        let up = upstream().await;
+        let cached = registration(vec![inline_page(
+            "1.2.3",
+            "1.2.3",
+            vec![leaf("1.2.3", "2019-01-01T00:00:00Z")],
+        )]);
+        let fetched = registration(vec![inline_page(
+            "1.2.3",
+            "1.2.4",
+            vec![
+                leaf("1.2.3", "2019-01-01T00:00:00Z"),
+                leaf("1.2.4", "2019-02-01T00:00:00Z"),
+            ],
+        )]);
+        serve_registration(
+            &up,
+            &format!("/v3/registration5-gz-semver2/{ID}/index.json"),
+            fetched,
+        )
+        .await;
+        let ctx = context(&up, false, quarantine_7d);
+        cached_registration(&ctx, &cached, 30).await;
+        let month_ago = chrono::Utc::now().timestamp() - 30 * 86400;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/nuget/v3/registration/{ID}/index.json"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        wait_for_fresh_copy(&ctx, &format!("nuget/registration/{ID}/index.json")).await;
+
+        let kept = super::nuget_publish_date(&ctx.state, ID, "1.2.3", true).await;
+        assert!(
+            kept.is_some_and(|d| (d - month_ago).abs() < 60),
+            "a listed release restarted its age at the refetch: {kept:?}"
+        );
+        let added = super::nuget_publish_date(&ctx.state, ID, "1.2.4", true).await;
+        assert!(
+            added.is_some_and(|d| (chrono::Utc::now().timestamp() - d).abs() < 60),
+            "a release the refetch added starts at zero: {added:?}"
+        );
+        // The ledger sits under the internal prefix, which backup and migrate carry (#1140).
+        let internal = ctx
+            .state
+            .storage
+            .list_internal(crate::registry::npm::FIRST_SEEN_PREFIX)
+            .await
+            .unwrap();
+        assert!(
+            internal.contains(&format!(
+                "{}nuget/registration/{ID}/index.json",
+                crate::registry::npm::FIRST_SEEN_PREFIX
+            )),
+            "the ledger is not under the internal prefix: {internal:?}"
+        );
+    }
+
+    /// The same on the revalidation path: a 304 rewrites the cached copy, and the age of a release
+    /// it lists stays the age NORA first saw it with (#1146).
+    #[tokio::test]
+    async fn a_304_revalidation_does_not_restart_the_age_of_a_listed_release() {
+        use crate::registry::{write_validators, Validators};
+        use wiremock::matchers::header_exists;
+
+        let up = upstream().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v3/registration5-gz-semver2/{ID}/index.json"
+            )))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&up)
+            .await;
+        let cached = registration(vec![inline_page(
+            "1.2.3",
+            "1.2.3",
+            vec![leaf("1.2.3", "2019-01-01T00:00:00Z")],
+        )]);
+        let ctx = context(&up, false, quarantine_7d);
+        let key = format!("nuget/registration/{ID}/index.json");
+        cached_registration(&ctx, &cached, 30).await;
+        write_validators(
+            &ctx.state.storage,
+            &key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+            },
+        )
+        .await;
+        let month_ago = chrono::Utc::now().timestamp() - 30 * 86400;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/nuget/v3/registration/{ID}/index.json"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(registration_requests(&up).await, 1, "revalidated upstream");
+        wait_for_fresh_copy(&ctx, &key).await;
+
+        let kept = super::nuget_publish_date(&ctx.state, ID, "1.2.3", true).await;
+        assert!(
+            kept.is_some_and(|d| (d - month_ago).abs() < 60),
+            "a 304 restarted the age of a listed release: {kept:?}"
+        );
+    }
+
+    /// A refetched registration page keeps the age of a release it lists (#1146): the index names
+    /// the page by its bounds only, so the release's age is the page's, and it is when NORA first
+    /// saw the release listed, not when the page was last written.
+    #[tokio::test]
+    async fn a_refetched_registration_page_keeps_the_age_of_a_listed_release() {
+        let up = upstream().await;
+        let page_path = format!("/v3/registration5-gz-semver2/{ID}/page/1.2.3/1.2.4.json");
+        let fetched = serde_json::json!({"count": 2, "items": [
+            leaf("1.2.3", "2019-01-01T00:00:00Z"),
+            leaf("1.2.4", "2019-02-01T00:00:00Z"),
+        ]})
+        .to_string();
+        serve_registration(&up, &page_path, fetched).await;
+        let ctx = context(&up, false, quarantine_7d);
+        let index = registration(vec![
+            serde_json::json!({"lower": "1.2.3", "upper": "1.2.4", "count": 2}),
+        ]);
+        cached_registration(&ctx, &index, 1).await;
+        let cached_page = serde_json::json!({"count": 1, "items": [
+            leaf("1.2.3", "2019-01-01T00:00:00Z"),
+        ]})
+        .to_string();
+        let page_key = format!("nuget/registration/{ID}/page/1.2.3/1.2.4.json");
+        put_written_days_ago(&ctx, &page_key, cached_page.as_bytes(), 30).await;
+        let month_ago = chrono::Utc::now().timestamp() - 30 * 86400;
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            &format!("/nuget/v3/registration/{ID}/page/1.2.3/1.2.4.json"),
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        wait_for_fresh_copy(&ctx, &page_key).await;
+
+        let kept = super::nuget_publish_date(&ctx.state, ID, "1.2.3", true).await;
+        assert!(
+            kept.is_some_and(|d| (d - month_ago).abs() < 60),
+            "a refetched page restarted the age of a listed release: {kept:?}"
+        );
+        let added = super::nuget_publish_date(&ctx.state, ID, "1.2.4", true).await;
+        assert!(
+            added.is_some_and(|d| (chrono::Utc::now().timestamp() - d).abs() < 60),
+            "a release the refetched page added starts at zero: {added:?}"
         );
     }
 
