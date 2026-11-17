@@ -454,20 +454,40 @@ pub fn render_registry_list_paginated(
     layout_dark(title, &content, Some(registry_type), "", lang, auth_enabled)
 }
 
-/// Renders Docker image detail page
+/// Renders Docker image detail page: its pull command and its tags. `filter` keeps the tags whose
+/// name holds it as a substring, whatever the case (#855); an empty filter keeps them all.
 pub fn render_docker_detail(
     name: &str,
     detail: &DockerDetail,
+    filter: &str,
     lang: Lang,
     base_url: &str,
     auth_enabled: bool,
 ) -> String {
     let _t = get_translations(lang);
-    let tags_rows = if detail.tags.is_empty() {
-        r##"<tr><td colspan="3" class="px-6 py-8 text-center text-slate-500">No tags found</td></tr>"##.to_string()
+    let filter = filter.trim();
+    let needle = filter.to_ascii_lowercase();
+    let shown: Vec<_> = detail
+        .tags
+        .iter()
+        .filter(|tag| tag.name.to_ascii_lowercase().contains(&needle))
+        .collect();
+    let tags_heading = if filter.is_empty() {
+        format!("Tags ({} total)", detail.tags.len())
     } else {
-        detail
-            .tags
+        format!("Tags ({} of {} total)", shown.len(), detail.tags.len())
+    };
+    let tags_rows = if shown.is_empty() {
+        if filter.is_empty() {
+            r##"<tr><td colspan="3" class="px-6 py-8 text-center text-slate-500">No tags found</td></tr>"##.to_string()
+        } else {
+            format!(
+                r##"<tr><td colspan="3" class="px-6 py-8 text-center text-slate-500">No tags match &quot;{}&quot;</td></tr>"##,
+                html_escape(filter)
+            )
+        }
+    } else {
+        shown
             .iter()
             .map(|tag| {
                 format!(
@@ -492,6 +512,7 @@ pub fn render_docker_detail(
     let registry_host = base_url
         .trim_start_matches("https://")
         .trim_start_matches("http://");
+    // #855: the filter form carries the page's language, so submitting it keeps it.
     let pull_cmd = format!("docker pull {}/{}", registry_host, name);
 
     let content = format!(
@@ -521,8 +542,13 @@ pub fn render_docker_detail(
         </div>
 
         <div class="bg-[#1e293b] rounded-lg shadow-sm border border-slate-700 overflow-x-auto">
-            <div class="px-3 md:px-6 py-4 border-b border-slate-700">
-                <h2 class="text-lg font-semibold text-slate-200">Tags ({} total)</h2>
+            <div class="px-3 md:px-6 py-4 border-b border-slate-700 flex items-center justify-between gap-3 flex-wrap">
+                <h2 class="text-lg font-semibold text-slate-200">{}</h2>
+                <form method="get" class="w-full md:w-auto">
+                    <input type="hidden" name="lang" value="{}">
+                    <input type="text" name="q" value="{}" placeholder="Filter tags…"
+                        class="w-full md:w-64 px-3 py-2 bg-slate-800 border border-slate-600 text-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent">
+                </form>
             </div>
             <table class="w-full">
                 <thead class="bg-slate-800 border-b border-slate-700">
@@ -543,7 +569,9 @@ pub fn render_docker_detail(
         html_escape(name),
         html_escape(&pull_cmd),
         html_escape(&pull_cmd),
-        detail.tags.len(),
+        tags_heading,
+        lang.code(),
+        html_escape(filter),
         tags_rows
     );
 
@@ -2286,6 +2314,7 @@ mod tests {
                 render_docker_detail(
                     &format!("lib/{H}"),
                     &DockerDetail { tags: vec![tag] },
+                    "",
                     Lang::En,
                     "http://nora",
                     false,
@@ -2531,6 +2560,7 @@ mod tests {
         let html = render_docker_detail(
             "myapp",
             &detail,
+            "",
             Lang::En,
             "https://registry.example.com",
             false,
@@ -2544,7 +2574,14 @@ mod tests {
             "Docker pull must not include scheme"
         );
 
-        let html = render_docker_detail("myapp", &detail, Lang::En, "http://localhost:4000", false);
+        let html = render_docker_detail(
+            "myapp",
+            &detail,
+            "",
+            Lang::En,
+            "http://localhost:4000",
+            false,
+        );
         assert!(
             html.contains("docker pull localhost:4000/myapp"),
             "Docker pull must strip http:// scheme"
@@ -2677,7 +2714,7 @@ mod tests {
 
         // Docker detail
         let docker_detail = super::super::api::DockerDetail { tags: vec![] };
-        let html = render_docker_detail(xss_payload, &docker_detail, Lang::En, base_url, false);
+        let html = render_docker_detail(xss_payload, &docker_detail, "", Lang::En, base_url, false);
         assert!(
             !html.contains("<script>alert(1)</script>"),
             "XSS payload must be escaped in docker pull command"
@@ -2689,7 +2726,8 @@ mod tests {
 
         // Docker: quote-based injection via data-cmd (defence-in-depth)
         let quote_payload = "img');alert(document.cookie);//";
-        let html = render_docker_detail(quote_payload, &docker_detail, Lang::En, base_url, false);
+        let html =
+            render_docker_detail(quote_payload, &docker_detail, "", Lang::En, base_url, false);
         // Single quotes must be escaped as &#39; in data-cmd attribute
         assert!(
             html.contains("&#39;"),
