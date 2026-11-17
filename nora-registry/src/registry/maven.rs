@@ -879,10 +879,8 @@ async fn upload(
             // Lock on metadata key to serialize all uploads for the same artifact.
             // This prevents TOCTOU races on both immutability checks and
             // maven-metadata.xml generation (read-list-generate-write cycle).
-            let metadata_lock_key = format!(
-                "maven/{}/{}/maven-metadata.xml",
-                coords.group_path, coords.artifact_id
-            );
+            let metadata_lock_key =
+                artifact_metadata_lock_key(&coords.group_path, &coords.artifact_id);
             let lock = state.publish_lock(&metadata_lock_key);
             let _guard = lock.lock().await;
 
@@ -928,7 +926,22 @@ async fn upload(
             StatusCode::CREATED.into_response()
         }
 
-        MavenPathKind::ArtifactMeta { filename, .. } => {
+        MavenPathKind::ArtifactMeta {
+            filename,
+            group_path,
+            artifact_id,
+        } => {
+            // A version-level document (`g/a/1.0-SNAPSHOT/maven-metadata.xml`) is deployed under
+            // the lock of its artifact's document: retention reconciles it under that same lock
+            // (#1281), so a deploy and the removal of a retired version's document never interleave.
+            let owner_lock =
+                version_document_owner(&group_path, &artifact_id).map(|(group, artifact)| {
+                    state.publish_lock(&artifact_metadata_lock_key(group, artifact))
+                });
+            let _owner_guard = match &owner_lock {
+                Some(lock) => Some(lock.lock().await),
+                None => None,
+            };
             let server_managed = if filename == "maven-metadata.xml" {
                 classify_metadata_level(&body) == Some(MavenMetadataLevel::Artifact)
             } else if let Some(metadata_key) = metadata_document_key(&key) {
@@ -1095,8 +1108,17 @@ async fn stored_artifact_versions(
     group_path: &str,
     artifact_id: &str,
 ) -> Result<BTreeSet<String>, StorageError> {
+    stored_versions(&state.storage, group_path, artifact_id).await
+}
+
+/// The version directories of an artifact that hold at least one key.
+async fn stored_versions(
+    storage: &crate::storage::Storage,
+    group_path: &str,
+    artifact_id: &str,
+) -> Result<BTreeSet<String>, StorageError> {
     let prefix = format!("maven/{}/{}/", group_path, artifact_id);
-    let keys = state.storage.list(&prefix).await?;
+    let keys = storage.list(&prefix).await?;
     let mut versions = BTreeSet::new();
 
     for key in &keys {
@@ -1237,6 +1259,181 @@ async fn merge_and_cache_proxy_metadata(
     }
 
     data
+}
+
+/// The key of an artifact's `maven-metadata.xml`: the lock every write of the artifact takes
+/// (its file deploys, its document's deploy, retention's reconciliation of it).
+pub(crate) fn artifact_metadata_lock_key(group_path: &str, artifact_id: &str) -> String {
+    format!("maven/{group_path}/{artifact_id}/maven-metadata.xml")
+}
+
+/// The artifact a version-level `maven-metadata.xml` belongs to: a path `g/a/1.0-SNAPSHOT/`
+/// reads as artifact `g/a` (the `ArtifactMeta` of a version has `artifact_id` = its version).
+/// Only a SNAPSHOT has a version-level document, so any other path has no owner.
+fn version_document_owner<'a>(
+    group_path: &'a str,
+    artifact_id: &str,
+) -> Option<(&'a str, &'a str)> {
+    if is_snapshot(artifact_id) {
+        group_path.rsplit_once('/')
+    } else {
+        None
+    }
+}
+
+/// The `<version>` a document declares as its own, read from the top level only: an artifact's
+/// document lists versions under `<versioning>`, and has no `<version>` of its own.
+fn top_level_version(data: &[u8]) -> Option<String> {
+    if classify_metadata_level(data) != Some(MavenMetadataLevel::Version) {
+        return None;
+    }
+    let mut reader = Reader::from_reader(data);
+    reader.config_mut().trim_text(true);
+    let mut depth = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(element)) => {
+                if depth == 1 && element.local_name().as_ref() == b"version" {
+                    let text = reader.read_text(element.name()).ok()?.decode().ok()?;
+                    return quick_xml::escape::unescape(&text)
+                        .ok()
+                        .map(|v| v.into_owned());
+                }
+                depth += 1;
+            }
+            Ok(Event::End(_)) => depth = depth.saturating_sub(1),
+            Ok(Event::Eof) | Err(_) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// Remove a retired SNAPSHOT's version-level `maven-metadata.xml` and its checksums (#1281).
+///
+/// The document is part of the version only when retention has taken the version's files and
+/// nothing deployed since keeps a file in the version directory, and when its own `<version>` is
+/// that version: a directory of an artifact-level document of another artifact (`g:a` and
+/// `g.a:1.0-SNAPSHOT` share one) keeps it. A file in a nested directory belongs to another
+/// coordinate and does not count. Nothing is removed for a non-SNAPSHOT version.
+///
+/// The caller holds the artifact's `publish_lock` (see [`artifact_metadata_lock_key`]), the lock
+/// a deploy of this document takes, so the directory check and the removal see no deploy between.
+pub(crate) async fn reconcile_version_metadata_after_retention(
+    storage: &crate::storage::Storage,
+    group_path: &str,
+    artifact_id: &str,
+    version: &str,
+) -> Result<(), MetadataReconcileError> {
+    if !is_snapshot(version) {
+        return Ok(());
+    }
+    let dir = format!("maven/{group_path}/{artifact_id}/{version}/");
+    let keys = storage.list(&dir).await?;
+    let direct: Vec<&String> = keys
+        .iter()
+        .filter(|key| {
+            key.strip_prefix(&dir)
+                .is_some_and(|rest| !rest.contains('/'))
+        })
+        .collect();
+    let is_document = |key: &str| {
+        key.rsplit('/')
+            .next()
+            .is_some_and(|name| name.starts_with("maven-metadata"))
+    };
+    if direct.iter().any(|key| !is_document(key)) {
+        return Ok(());
+    }
+    let document_key = format!("{dir}maven-metadata.xml");
+    let current = match storage.get(&document_key).await {
+        Ok(data) => data,
+        Err(StorageError::NotFound) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if top_level_version(&current).as_deref() != Some(version) {
+        return Ok(());
+    }
+    for key in direct {
+        match storage.delete(key).await {
+            Ok(()) | Err(StorageError::NotFound) => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+/// Why retention could not bring an artifact's `maven-metadata.xml` back in line with storage.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum MetadataReconcileError {
+    #[error("storage: {0}")]
+    Storage(#[from] StorageError),
+    #[error("the stored document is not artifact-level maven-metadata.xml")]
+    NotArtifactMetadata,
+}
+
+/// Remove from an artifact's stored `maven-metadata.xml` the `retired` versions retention
+/// deleted (#1281). Every other version stays, including those a hosted+proxy read merged in
+/// from an upstream (#885): rebuilding the document from storage alone would drop them.
+///
+/// A retired version that holds a key again (deployed between the deletion and this call)
+/// stays listed. A `<latest>` or `<release>` that named a removed version is re-pointed at the
+/// highest version left (`<release>`: the highest that is not a SNAPSHOT). A document left
+/// with no version is deleted together with its checksums. Nothing is written when no listed
+/// version was removed.
+///
+/// The caller holds the `publish_lock` of the document key, the lock uploads and proxy merges
+/// of this artifact take.
+pub(crate) async fn reconcile_metadata_after_retention(
+    storage: &crate::storage::Storage,
+    group_path: &str,
+    artifact_id: &str,
+    retired: &BTreeSet<String>,
+) -> Result<(), MetadataReconcileError> {
+    let key = format!("maven/{group_path}/{artifact_id}/maven-metadata.xml");
+    let current = match storage.get(&key).await {
+        Ok(data) => data,
+        Err(StorageError::NotFound) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut metadata =
+        parse_artifact_metadata(&current).ok_or(MetadataReconcileError::NotArtifactMetadata)?;
+    let stored = stored_versions(storage, group_path, artifact_id).await?;
+    let removed = |version: &String| retired.contains(version) && !stored.contains(version);
+    if !metadata.versions.iter().any(removed) {
+        return Ok(());
+    }
+    metadata.versions.retain(|version| !removed(version));
+
+    if metadata.versions.is_empty() {
+        for suffix in ["", ".md5", ".sha1", ".sha256", ".sha512"] {
+            match storage.delete(&format!("{key}{suffix}")).await {
+                Ok(()) | Err(StorageError::NotFound) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        return Ok(());
+    }
+
+    let mut sorted = metadata.versions.clone();
+    sort_maven_versions(&mut sorted);
+    if metadata.latest.as_ref().is_none_or(removed) {
+        metadata.latest = sorted.last().cloned();
+    }
+    if metadata.release.as_ref().is_none_or(removed) {
+        metadata.release = sorted.iter().rev().find(|v| !is_snapshot(v)).cloned();
+    }
+    let last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let xml = generate_metadata_xml_with_versioning(
+        &group_path.replace('/', "."),
+        artifact_id,
+        &metadata.versions,
+        metadata.latest.as_deref().unwrap_or(""),
+        metadata.release.as_deref().unwrap_or(""),
+        Some(&last_updated),
+    );
+    storage.put(&key, xml.as_bytes()).await?;
+    compute_and_store_checksums(storage, &key, xml.as_bytes()).await;
+    Ok(())
 }
 
 async fn update_artifact_metadata(state: &AppState, group_path: &str, artifact_id: &str) {
@@ -1714,6 +1911,42 @@ mod tests {
                 .unwrap();
         assert!(merged.contains("<latest>2.0.0</latest>"));
         assert!(merged.contains("<release>2.0.0</release>"));
+    }
+
+    /// Retention reconciles the document under the artifact's publish lock, after the
+    /// deletions. A retired version deployed again in between holds keys and stays listed;
+    /// a version the document does not list changes nothing, not even `lastUpdated`.
+    #[tokio::test]
+    async fn test_reconcile_after_retention_keeps_a_version_stored_again() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().to_str().unwrap());
+        let doc = generate_metadata_xml_with_versioning(
+            "com.example",
+            "lib",
+            &["1.0.0".to_string(), "2.0.0".to_string()],
+            "2.0.0",
+            "2.0.0",
+            Some("20260101000000"),
+        );
+        let key = "maven/com/example/lib/maven-metadata.xml";
+        storage.put(key, doc.as_bytes()).await.unwrap();
+        for v in ["1.0.0", "2.0.0"] {
+            storage
+                .put(&format!("maven/com/example/lib/{v}/lib-{v}.jar"), b"jar")
+                .await
+                .unwrap();
+        }
+        for retired in ["2.0.0", "3.0.0"] {
+            reconcile_metadata_after_retention(
+                &storage,
+                "com/example",
+                "lib",
+                &BTreeSet::from([retired.to_string()]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(storage.get(key).await.unwrap().as_ref(), doc.as_bytes());
+        }
     }
 
     #[test]
