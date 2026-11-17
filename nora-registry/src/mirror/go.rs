@@ -761,7 +761,12 @@ mod offline_seed_tests {
             Ok(cli) => cli,
             Err(e) => return Some(e.to_string()),
         };
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        // A test client for a NORA on 127.0.0.1: no TLS to configure, and no_proxy keeps a proxy
+        // from the environment out of the way.
+        let client = reqwest::Client::builder() // nosemgrep: reqwest-client-bypass
+            .no_proxy()
+            .build()
+            .unwrap();
         run_mirror(cli.format, url, 4, false, &client).await.err()
     }
 
