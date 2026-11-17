@@ -20,6 +20,13 @@ ignore = [
     # crypto-bigint never runs on a secret. Remove when pgp and jsonwebtoken
     # move to crypto-bigint >=0.7.6.
     "RUSTSEC-2026-0387",
+    # chrono and humantime are marked unmaintained (informational, no
+    # vulnerability, no patched version). chrono is a direct dependency and
+    # also comes in through object_store; humantime comes in only through
+    # object_store. NORA's own date code moves to a maintained crate in #1282;
+    # remove these when object_store no longer pulls them in.
+    "RUSTSEC-2026-0543",
+    "RUSTSEC-2026-0542",
 ]
 
 [licenses]
