@@ -102,7 +102,7 @@ mod tests {
     }
 
     fn s3(store: &MockServer, answer: Option<Duration>) -> Storage {
-        let storage = Storage::new_s3(&store.uri(), "b", "us-east-1", None, None, false);
+        let storage = Storage::new_s3(&store.uri(), "b", "us-east-1", None, None, false, &[]);
         storage.set_answer_timeout(answer);
         storage
     }
