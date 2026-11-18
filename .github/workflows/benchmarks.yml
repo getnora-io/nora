@@ -83,7 +83,15 @@ jobs:
           echo "Idle VmRSS: ${VMRSS} kB"
 
       - name: Run criterion benchmarks
-        run: cargo bench --locked -p nora-registry -- --output-format bencher 2>/dev/null | tee /tmp/criterion-results.txt || true
+        # Only the criterion target: with `-p` alone cargo also runs the library's unit-test
+        # harness, which rejects `--output-format` and used to leave the results empty (#1309).
+        run: |
+          set -o pipefail
+          cargo bench --locked -p nora-registry --bench parsing -- --output-format bencher | tee /tmp/criterion-results.txt
+          if ! grep -q 'bench:' /tmp/criterion-results.txt; then
+            echo "::error::criterion produced no results"
+            exit 1
+          fi
 
       - name: Generate summary report
         id: report
@@ -141,13 +149,20 @@ jobs:
       - name: Upload report to release (waits for the release to exist)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # This job has no checkout, so gh needs the repository named (#1309).
+          GH_REPO: ${{ github.repository }}
           RUN_TAG: ${{ github.ref_name }}
         run: |
           for i in $(seq 1 120); do
-            if gh release view "$RUN_TAG" > /dev/null 2>&1; then
+            if err=$(gh release view "$RUN_TAG" 2>&1 > /dev/null); then
               gh release upload "$RUN_TAG" bench-out/nora-bench-report.json --clobber
               exit 0
             fi
+            # Only a missing release is worth waiting for; any other error is final.
+            case "$err" in
+              *"release not found"*) ;;
+              *) echo "::error::gh release view $RUN_TAG failed: $err"; exit 1 ;;
+            esac
             echo "release $RUN_TAG not published yet (attempt $i/120), retrying in 30s"
             sleep 30
           done
