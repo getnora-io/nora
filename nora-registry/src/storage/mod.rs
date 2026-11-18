@@ -112,6 +112,21 @@ fn sha256_hex(data: &[u8]) -> String {
     hex::encode(Sha256::digest(data))
 }
 
+/// Whether another NORA server is running on this storage, as a maintenance command run
+/// beside it can tell (#988). The command's deletions take its own publish locks, not the
+/// server's, so they are not serialized with that server's publishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerPresence {
+    /// Another process holds a server's instance lock on this storage.
+    Running,
+    /// No other process holds one: no server is running, or only dead ones left their
+    /// staging behind.
+    NotRunning,
+    /// The backend cannot tell: an object store keeps no instance lock, and a local lock
+    /// that cannot be tested says nothing either way.
+    Unknown,
+}
+
 /// Outcome of [`Storage::repin`] — an operator integrity-recovery action (#601).
 #[derive(Debug, PartialEq, Eq)]
 pub enum RepinOutcome {
@@ -192,6 +207,12 @@ pub trait StorageBackend: Send + Sync {
     /// instance's staging directory and removes what dead instances left there; a
     /// no-op for backends without local staging.
     async fn prepare(&self) {}
+    /// Whether another server is running on this storage (#988). The local backend tests
+    /// the instance lock each server holds on its staging directory from start to exit;
+    /// backends without one cannot tell.
+    async fn server_presence(&self) -> ServerPresence {
+        ServerPresence::Unknown
+    }
     /// Move or copy a file from `src` into storage under `key`, pinned to
     /// `sha256` when the caller computed one (streaming paths do; legacy
     /// callers that verified integrity separately pass `None`, leaving the
@@ -620,6 +641,12 @@ impl Storage {
     /// Startup housekeeping, see [`StorageBackend::prepare`].
     pub async fn prepare(&self) {
         self.inner.prepare().await
+    }
+
+    /// Whether another server is running on this storage, see
+    /// [`StorageBackend::server_presence`].
+    pub async fn server_presence(&self) -> ServerPresence {
+        self.inner.server_presence().await
     }
 
     pub async fn health_check(&self) -> bool {
