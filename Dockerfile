@@ -28,6 +28,14 @@ COPY nora-registry/ nora-registry/
 # the workspace intact so --locked holds; `-p nora-registry` never builds them.
 COPY fuzz/ fuzz/
 
+# Two builds of one commit give the same binary, byte for byte. The only input that
+# differed was the wall clock: libmimalloc-sys compiles mimalloc's C code, which embeds
+# __DATE__ and __TIME__ (options.c), and the GNU build ID is a hash of the output, so it
+# moved with them. GCC takes both macros from SOURCE_DATE_EPOCH when it is set; a fixed
+# value means a binary built from a tag matches the release asset without knowing when
+# the release was built. Paths do not vary (WORKDIR /build, CARGO_HOME /usr/local/cargo).
+ARG SOURCE_DATE_EPOCH=0
+
 # The binary shipped carries no fault injection route (`/__fi/`, src/fault_injection.rs),
 # whatever features or build inputs this build was given: grep refuses it.
 ARG CARGO_FEATURES=""
@@ -62,7 +70,9 @@ COPY Cargo.toml Cargo.lock ./
 COPY nora-registry/ nora-registry/
 COPY fuzz/ fuzz/
 
-# As for amd64: no fault injection route in the binary shipped.
+# As for amd64: a fixed clock for mimalloc's __DATE__/__TIME__, and no fault
+# injection route in the binary shipped.
+ARG SOURCE_DATE_EPOCH=0
 ARG CARGO_FEATURES=""
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
