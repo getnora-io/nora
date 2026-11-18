@@ -896,7 +896,16 @@ async fn fetch_upstream_tarball(
     let mut decided = step(None);
     if matches!(decided, TarballStep::Refetch) {
         let key = upstream_packument_key(ask.package());
-        let refetched = match refetch_metadata(state, ask.package(), &key, &key, true, false).await
+        let refetched = match refetch_metadata(
+            state,
+            ask.package(),
+            &key,
+            (key.as_str(), None),
+            true,
+            false,
+            None,
+        )
+        .await
         {
             Ok(doc) => Refetched::Packument(npm_links::listed_link(&doc, ask.version())),
             Err(ProxyError::NotFound) => Refetched::NoPackument,
@@ -1116,7 +1125,12 @@ fn packument_versions(body: &[u8]) -> Option<Vec<String>> {
 /// ledger existed starts the versions it lists at its file time, when NORA last wrote it —
 /// never earlier than NORA saw them. Awaited before the packument is served, so a client
 /// cannot ask for a version the ledger does not hold yet.
-async fn record_first_seen(state: &AppState, key: &str, body: &[u8], seed_from: Option<&str>) {
+async fn record_first_seen(
+    state: &AppState,
+    key: &str,
+    body: &[u8],
+    seed_from: Option<(&str, Option<&[u8]>)>,
+) {
     if !first_seen_tracked(state) {
         return;
     }
@@ -1140,7 +1154,21 @@ async fn record_first_seen(state: &AppState, key: &str, body: &[u8], seed_from: 
         // No ledger yet: a cached packument (this key's, or what an older release cached)
         // starts its versions at its own write time.
         Err(crate::storage::StorageError::NotFound) => match seed_from {
-            Some(seed) => (cached_first_seen(&state.storage, seed).await, false),
+            Some((seed_key, seed_body)) => {
+                // Read here, and only here, when the caller did not hold the copy (#1064).
+                let read;
+                let body: &[u8] = match seed_body {
+                    Some(body) => body,
+                    None => {
+                        read = state.storage.get(seed_key).await.unwrap_or_default();
+                        &read
+                    }
+                };
+                (
+                    cached_first_seen(&state.storage, seed_key, body).await,
+                    false,
+                )
+            }
             None => (FirstSeen::new(), false),
         },
         // The bytes do not match their pin: the ledger is known bad, not merely unread.
@@ -1176,17 +1204,66 @@ async fn record_first_seen(state: &AppState, key: &str, body: &[u8], seed_from: 
     }
 }
 
-/// First-seen times of a packument cached before the ledger: every version it lists at its
-/// file time. The body is read before the time, so a write landing in between can only make
-/// the time later.
-async fn cached_first_seen(storage: &crate::Storage, key: &str) -> FirstSeen {
-    let Ok(body) = storage.get(key).await else {
+/// What the validator sidecar of a copy says about the copy's confirmation (#1064).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarState {
+    /// No sidecar: a copy from before sidecars. Its body's write time is its date, as on main.
+    Absent,
+    /// A sidecar that exists and cannot be read or parsed: the confirmation it held is unknown.
+    Unreadable,
+    /// A sidecar emptied to `{}` by a 304 that could not confirm: the confirmation it held is gone.
+    Emptied,
+    /// Validators without a confirmation time: a sidecar from before `checked`.
+    Unchecked,
+    /// The time the copy was last confirmed upstream.
+    Checked(u64),
+}
+
+/// The date of a copy, in Unix seconds, from its sidecar state, its body's write time and now.
+/// Pure: the one rule that dates a copy for the ledger's seed, curation's fallback date and the
+/// release-age gate. It is never older than the body's write time, and a lost confirmation dates
+/// the copy now: information that is missing makes a release younger, never older.
+fn copy_date(state: SidecarState, written: u64, now: u64) -> u64 {
+    match state {
+        SidecarState::Absent | SidecarState::Unchecked => written,
+        SidecarState::Checked(at) => at.max(written),
+        SidecarState::Emptied | SidecarState::Unreadable => now.max(written),
+    }
+}
+
+/// The state of the sidecar at `key`: [`read_validators`] reads absent, emptied and unreadable alike.
+async fn sidecar_state(storage: &crate::Storage, key: &str) -> SidecarState {
+    match storage.get(&validators_key(key)).await {
+        Ok(data) => match serde_json::from_slice::<Validators>(&data) {
+            Ok(validators) => match (validators.checked, validators.is_some()) {
+                (Some(at), _) => SidecarState::Checked(at),
+                (None, true) => SidecarState::Unchecked,
+                (None, false) => SidecarState::Emptied,
+            },
+            Err(_) => SidecarState::Unreadable,
+        },
+        Err(crate::storage::StorageError::NotFound) => SidecarState::Absent,
+        Err(_) => SidecarState::Unreadable,
+    }
+}
+
+/// When the copy at `key` was last written or confirmed upstream, in Unix seconds: [`copy_date`]
+/// of its body's write time and its sidecar (#1064). Curation's fallback dates and the ledger's
+/// seed use it.
+async fn copy_time(storage: &crate::Storage, key: &str) -> Option<i64> {
+    let written = storage.stat(key).await?.modified;
+    let state = sidecar_state(storage, key).await;
+    Some(copy_date(state, written, crate::cache_ttl::now_unix()) as i64)
+}
+
+/// First-seen times of a packument cached before the ledger: every version `body` lists, which
+/// the caller has already read, at the copy's file time. The body was read before the time, so a
+/// write landing in between can only make the time later (#1064: no second read of the object).
+async fn cached_first_seen(storage: &crate::Storage, key: &str, body: &[u8]) -> FirstSeen {
+    let Some(written) = copy_time(storage, key).await else {
         return FirstSeen::new();
     };
-    let Some(written) = storage.stat(key).await.map(|m| m.modified as i64) else {
-        return FirstSeen::new();
-    };
-    packument_versions(&body)
+    packument_versions(body)
         .unwrap_or_default()
         .into_iter()
         .map(|version| (version, written))
@@ -1282,6 +1359,12 @@ async fn cached_copy_trusted(
     npm_links::copy_is_owners(recorded.as_deref(), pin.as_deref(), owner.url)
 }
 
+/// Whether two validator sets name the same copy: the ETag and Last-Modified. `checked` records
+/// when the copy was last confirmed, which a 304 moves without changing the copy (#1064).
+fn same_copy(a: &Validators, b: &Validators) -> bool {
+    a.etag == b.etag && a.last_modified == b.last_modified
+}
+
 /// Refetch metadata from upstream, rewrite URLs, update cache. An error says why there is no
 /// document: `NotFound` for one the upstream does not have or NORA does not serve, the
 /// upstream's failure otherwise (a caller with a cached copy serves it stale).
@@ -1290,14 +1373,18 @@ async fn cached_copy_trusted(
 /// older release cached), from which a missing first-seen ledger starts. `ledger` says whether
 /// the document is a packument, whose versions the ledger records. `conditional` says whether the
 /// cached copy may be kept on a 304: not one holding a link past NORA.
+/// `held` is the body of `key` when the caller has read it already: a 304 serves that body
+/// and does not read the object a second time (#1064).
 async fn refetch_metadata(
     state: &AppState,
     path: &str,
     key: &str,
-    seed_key: &str,
+    seed: (&str, Option<Bytes>),
     ledger: bool,
     conditional: bool,
+    held: Option<(Bytes, Validators)>,
 ) -> Result<Vec<u8>, ProxyError> {
+    let (seed_key, seed_body) = seed;
     let upstream = state.config.npm.route(path).ok_or(ProxyError::NotFound)?;
     let proxy_url = upstream.url;
     let url = format!("{}/{}", proxy_url.trim_end_matches('/'), path);
@@ -1305,10 +1392,15 @@ async fn refetch_metadata(
     // Revalidate with a conditional request when enabled and we have stored
     // validators. Empty validators ⇒ no conditional headers ⇒ always a 200,
     // which is also how the first fetch captures validators for next time (#596).
+    // The validators the held body was read with are the ones asked with: a write since then
+    // must not be confirmed by an answer about the older copy (#1064).
     let validators = if state.config.npm.revalidate && conditional {
-        read_validators(&state.storage, key)
-            .await
-            .unwrap_or_default()
+        match &held {
+            Some((_, read_with)) => read_with.clone(),
+            None => read_validators(&state.storage, key)
+                .await
+                .unwrap_or_default(),
+        }
     } else {
         Validators::default()
     };
@@ -1329,7 +1421,65 @@ async fn refetch_metadata(
         // refresh its freshness so we don't revalidate again until the next TTL
         // window. No body was downloaded.
         Ok(Revalidation::NotModified) => {
-            match state.storage.get(key).await {
+            // The validators now stored. Unchanged: the 304 is about the copy held, and that
+            // body is served and confirmed. Changed since the request: a write landed meanwhile,
+            // so the 304 says nothing about it; its copy is served as stored, unconfirmed by this
+            // request, and keeps its own record (#1064).
+            let current = read_validators(&state.storage, key)
+                .await
+                .unwrap_or_default();
+            let unchanged = same_copy(&current, &validators);
+            let origin = origin_of(proxy_url);
+            // The body held is served without a read of the store: that is checked below.
+            let held_served = unchanged && held.is_some();
+            let mut cached = match held {
+                Some((body, _)) if unchanged => Ok(body),
+                _ => state.storage.get(key).await,
+            };
+            // Confirmed only while the record of the stored bytes names the body served: a writer
+            // that replaced the body before its validators leaves a record for other bytes, and a
+            // 304 neither confirms that body nor overwrites the record (#1064). Then the stored
+            // copy is read and served as it is.
+            let confirm = unchanged
+                && match &cached {
+                    // No record names any bytes (a copy from before provenance): nothing contradicts.
+                    Ok(body) => match state.storage.get(&origin_key(key)).await {
+                        Ok(record) => {
+                            record.as_ref() == provenance_record(&origin, body).as_bytes()
+                        }
+                        Err(crate::storage::StorageError::NotFound) => true,
+                        Err(_) => false,
+                    },
+                    Err(_) => false,
+                };
+            // A held body the store no longer has is not confirmed: the read that finds nothing is
+            // what clears its validators (#867), so the store is asked whether the object is there.
+            if held_served && confirm && state.storage.stat(key).await.is_none() {
+                cached = Err(crate::storage::StorageError::NotFound);
+            }
+            if unchanged && !confirm {
+                // The record names other bytes than this body (a provenance write that was lost,
+                // or a writer between its body and its record): the sidecar is emptied to `{}`,
+                // which names no copy, so the next request is unconditional and writes the copy
+                // whole. Only while it still names the copy this 304 was asked with: a newer
+                // writer's sidecar stays (#1064).
+                let storage = state.storage.clone();
+                let key_clone = key.to_string();
+                let asked_with = validators.clone();
+                state.cache_writes.spawn("npm", async move {
+                    if same_copy(
+                        &read_validators(&storage, &key_clone)
+                            .await
+                            .unwrap_or_default(),
+                        &asked_with,
+                    ) {
+                        // The empty sidecar: `write_validators` would skip it, so it is written as is.
+                        let _ = storage.put(&validators_key(&key_clone), b"{}").await;
+                    }
+                });
+                cached = state.storage.get(key).await;
+            }
+            match cached {
                 Ok(cached) => {
                     crate::metrics::PROXY_UPSTREAM_304_TOTAL
                         .with_label_values(&["npm"])
@@ -1337,19 +1487,41 @@ async fn refetch_metadata(
                     crate::metrics::PROXY_REVALIDATION_BYTES_SAVED_TOTAL
                         .with_label_values(&["npm"])
                         .inc_by(cached.len() as u64);
-                    // Re-put bumps the file mtime (the freshness source) without an
-                    // upstream download. The release ages are not in it: before the re-put,
-                    // the ledger takes over a cache from before it existed.
+                    // The release ages are not in the confirmation: before it, the ledger takes
+                    // over a cache from before it existed.
                     if ledger {
-                        record_first_seen(state, key, &cached, Some(seed_key)).await;
+                        record_first_seen(
+                            state,
+                            key,
+                            &cached,
+                            Some((seed_key, seed_body.as_deref())),
+                        )
+                        .await;
                     }
-                    let storage = state.storage.clone();
-                    let key_clone = key.to_string();
-                    let body = cached.clone();
-                    let origin = origin_of(proxy_url);
-                    state.cache_writes.spawn("npm", async move {
-                        let _ = put_with_origin(&storage, &key_clone, &body, &origin).await;
-                    });
+                    if confirm {
+                        // The body is not written again (#1064): the upstream confirmed it, and the
+                        // time of that confirmation goes to the validator sidecar, which the freshness
+                        // check reads. Its record already names these bytes, so only the sidecar is
+                        // written, and only if it still holds what the 304 was asked with.
+                        let confirmed = Validators {
+                            checked: Some(crate::cache_ttl::now_unix()),
+                            ..validators.clone()
+                        };
+                        let storage = state.storage.clone();
+                        let key_clone = key.to_string();
+                        let asked_with = validators.clone();
+                        state.cache_writes.spawn("npm", async move {
+                            if !same_copy(
+                                &read_validators(&storage, &key_clone)
+                                    .await
+                                    .unwrap_or_default(),
+                                &asked_with,
+                            ) {
+                                return;
+                            }
+                            write_validators(&storage, &key_clone, &confirmed).await;
+                        });
+                    }
                     Ok(cached.to_vec())
                 }
                 Err(_) => {
@@ -1374,7 +1546,13 @@ async fn refetch_metadata(
 
             // Before the cached copy is replaced: it may be the one a ledger starts from.
             if ledger {
-                record_first_seen(state, key, &rewritten, Some(seed_key)).await;
+                record_first_seen(
+                    state,
+                    key,
+                    &rewritten,
+                    Some((seed_key, seed_body.as_deref())),
+                )
+                .await;
             }
             let storage = state.storage.clone();
             let key_clone = key.to_string();
@@ -1387,7 +1565,17 @@ async fn refetch_metadata(
                     tracing::warn!(key = %key_clone, error = ?e, "npm proxy: failed to cache metadata");
                     return;
                 }
-                write_validators(&storage, &key_clone, &validators).await;
+                // The confirmation is this body's write (#1064). With no validators from the
+                // upstream there is no sidecar to keep: an old one would confirm the new body.
+                let confirmed = Validators {
+                    checked: Some(crate::cache_ttl::now_unix()),
+                    ..validators
+                };
+                if confirmed.is_some() {
+                    write_validators(&storage, &key_clone, &confirmed).await;
+                } else {
+                    let _ = storage.delete(&validators_key(&key_clone)).await;
+                }
             });
 
             Ok(rewritten)
@@ -2151,6 +2339,25 @@ fn served_metadata(
     }
 }
 
+/// Whether a cached packument is within the metadata TTL. Its freshness is the last upstream
+/// confirmation, which a 304 records in the validator sidecar: a 304 does not write the body again
+/// (#1064). A copy with no confirmation, or whose body was written after the last one, takes the
+/// body's write time, as it always did.
+async fn packument_fresh(state: &AppState, key: &str) -> bool {
+    let ttl = state.config.npm.metadata_ttl;
+    let confirmed = read_validators(&state.storage, key)
+        .await
+        .and_then(|validators| validators.checked);
+    if confirmed.is_some_and(|at| crate::cache_ttl::is_within_ttl(at, ttl)) {
+        return true;
+    }
+    state
+        .storage
+        .stat(key)
+        .await
+        .is_some_and(|meta| crate::cache_ttl::is_within_ttl(meta.modified, ttl))
+}
+
 /// A packument or version manifest of a package NORA has not published: from its cache under
 /// `npm/<name>/upstream/` (or, until that is written, what an older release cached), revalidated
 /// after the metadata TTL, else fetched from the upstream and cached. A packument's versions are
@@ -2164,6 +2371,11 @@ async fn upstream_metadata(
     document: Document,
 ) -> Response {
     let legacy_key = legacy_cache_key(path);
+    // The validators are read before the body: a 304 is asked with these, and the body held is
+    // confirmed only while they still describe the stored copy (#1064).
+    let read_with = read_validators(&state.storage, cache_key)
+        .await
+        .unwrap_or_default();
     let mut cached = None;
     let mut read_failure = None;
     for key in [cache_key, legacy_key.as_str()] {
@@ -2190,11 +2402,11 @@ async fn upstream_metadata(
         // A copy holding a link past NORA (cached by a release that kept one) is served placed
         // again, and refetched in full whatever its age: a 304 would keep it as it is.
         let claims = store_claims(state, path, name, &data).await;
+        // The body already read: a 304 serves it, rather than reading the same object again (#1064).
+        let seed_body = data.clone();
+        let held = (from_key == cache_key).then(|| (data.clone(), read_with.clone()));
         let (served, past_nora) = served_copy(state, path, data, &|file: &str| claims.holds(file));
-        let fresh = !past_nora
-            && state.storage.stat(&from_key).await.is_some_and(|meta| {
-                crate::cache_ttl::is_within_ttl(meta.modified, state.config.npm.metadata_ttl)
-            });
+        let fresh = !past_nora && packument_fresh(state, &from_key).await;
         // #68 namespace isolation: an internal-namespace package is never revalidated upstream.
         if fresh
             || crate::curation::is_internal_namespace(
@@ -2214,9 +2426,10 @@ async fn upstream_metadata(
                 state,
                 path,
                 cache_key,
-                &from_key,
+                (from_key.as_str(), Some(seed_body.clone())),
                 document == Document::Packument,
                 !past_nora,
+                held.clone(),
             )
             .await
             .ok()
@@ -3172,7 +3385,7 @@ async fn extract_npm_publish_date(
     // cache mtime instead of the (spoofable) upstream metadata date. Never fall
     // back to the upstream date here — that would reopen the spoof vector.
     if !trust_upstream {
-        return crate::curation::extract_mtime_as_publish_date(storage, metadata_key).await;
+        return copy_time(storage, metadata_key).await;
     }
     let data = storage.get(metadata_key).await.ok()?;
     let json: serde_json::Value = serde_json::from_slice(&data).ok()?;
@@ -5476,6 +5689,7 @@ mod spec_conformance_tests {
             &Validators {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
+                checked: None,
             },
         )
         .await;
@@ -5493,6 +5707,299 @@ mod spec_conformance_tests {
             .with_label_values(&["npm"])
             .get();
         assert!(after > before, "a 304 revalidation must be recorded");
+    }
+
+    /// #1064: a 304 does not write the packument body again. Its write time stays where the 200
+    /// put it; the revalidation moves to the validator sidecar. The body is a day old, so the
+    /// request is a revalidation, and the 304 must leave its mtime alone.
+    #[tokio::test]
+    async fn a_304_revalidation_does_not_rewrite_the_packument_body() {
+        use crate::registry::{write_validators, Validators};
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use std::time::{Duration, SystemTime};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 300;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+        let key = "npm/testpkg/upstream/packument.json";
+        ctx.state
+            .storage
+            .put(key, b"CACHED-PACKUMENT")
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                checked: None,
+            },
+        )
+        .await;
+        let body_file = ctx._tempdir.path().join(key);
+        let written = SystemTime::now() - Duration::from_secs(86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&body_file)
+            .unwrap()
+            .set_modified(written)
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"CACHED-PACKUMENT");
+        ctx.state.cache_writes.finish(Duration::from_secs(5)).await;
+
+        let mtime = std::fs::metadata(&body_file).unwrap().modified().unwrap();
+        assert_eq!(mtime, written, "a 304 must not write the body again");
+    }
+
+    /// #1064: freshness is the last upstream confirmation. A body written a day ago, confirmed by
+    /// a 304 a moment ago, is within the TTL: served from cache, the upstream not asked.
+    #[tokio::test]
+    async fn a_packument_confirmed_recently_is_fresh_whatever_its_body_age() {
+        use crate::registry::validators_key;
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use std::time::{Duration, SystemTime};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UPSTREAM"))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 300;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+        let key = "npm/testpkg/upstream/packument.json";
+        ctx.state
+            .storage
+            .put(key, b"CACHED-PACKUMENT")
+            .await
+            .unwrap();
+        // The sidecar a 304 leaves: validators, and the time of the confirmation.
+        let sidecar = format!(
+            r#"{{"etag":"\"v1\"","checked":{}}}"#,
+            crate::cache_ttl::now_unix()
+        );
+        ctx.state
+            .storage
+            .put(&validators_key(key), sidecar.as_bytes())
+            .await
+            .unwrap();
+        let body_file = ctx._tempdir.path().join(key);
+        std::fs::File::options()
+            .write(true)
+            .open(&body_file)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(86_400))
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"CACHED-PACKUMENT");
+    }
+
+    /// #1064: a 304 confirms the copy in the sidecar, with the time of the confirmation, and keeps
+    /// the validators the upstream was asked with.
+    #[tokio::test]
+    async fn a_304_records_its_confirmation_in_the_sidecar() {
+        use crate::registry::{read_validators, write_validators, Validators};
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use std::time::Duration;
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0; // always stale → always revalidate
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+        let key = "npm/testpkg/upstream/packument.json";
+        ctx.state
+            .storage
+            .put(key, b"CACHED-PACKUMENT")
+            .await
+            .unwrap();
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                checked: None,
+            },
+        )
+        .await;
+
+        let before = crate::cache_ttl::now_unix();
+        let resp = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        ctx.state.cache_writes.finish(Duration::from_secs(5)).await;
+
+        let sidecar = read_validators(&ctx.state.storage, key).await.unwrap();
+        let confirmed = sidecar.checked.expect("a 304 must confirm the copy");
+        assert!(
+            confirmed + 2 >= before && confirmed <= crate::cache_ttl::now_unix() + 2,
+            "confirmed at {confirmed}, request began at {before}"
+        );
+        assert_eq!(sidecar.etag.as_deref(), Some("\"v1\""), "validators kept");
+    }
+
+    /// Pin (#1064): a packument with no sidecar keeps the freshness it had, its body's write time.
+    #[tokio::test]
+    async fn a_packument_without_a_sidecar_keeps_its_body_age_as_freshness() {
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UPSTREAM"))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 300;
+            cfg.npm.revalidate = true;
+        });
+        let key = "npm/testpkg/upstream/packument.json";
+        ctx.state
+            .storage
+            .put(key, b"CACHED-PACKUMENT")
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"CACHED-PACKUMENT");
+    }
+
+    /// Pin (#1064): a body written a moment ago is fresh even when its sidecar's confirmation is
+    /// older: a copy replaced after its last confirmation is no staler than its write, as before.
+    #[tokio::test]
+    async fn a_fresh_body_is_fresh_though_its_sidecar_is_old() {
+        use crate::registry::validators_key;
+        use crate::test_helpers::{body_bytes, create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"UPSTREAM"))
+            .expect(0)
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 300;
+            cfg.npm.revalidate = true;
+        });
+        let key = "npm/testpkg/upstream/packument.json";
+        ctx.state
+            .storage
+            .put(key, b"CACHED-PACKUMENT")
+            .await
+            .unwrap();
+        let sidecar = format!(
+            r#"{{"etag":"\"v1\"","checked":{}}}"#,
+            crate::cache_ttl::now_unix() - 86_400
+        );
+        ctx.state
+            .storage
+            .put(&validators_key(key), sidecar.as_bytes())
+            .await
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"CACHED-PACKUMENT");
+    }
+
+    /// #1064: an upstream that stops sending validators leaves no sidecar behind to keep a
+    /// confirmation alive: after its 200, the copy's freshness is its body's write time again.
+    #[tokio::test]
+    async fn an_upstream_without_validators_leaves_no_sidecar() {
+        use crate::registry::validators_key;
+        use crate::test_helpers::{create_test_context_with_config, send};
+        use axum::http::{Method, StatusCode};
+        use std::time::{Duration, SystemTime};
+        use wiremock::matchers::{header_exists, method};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"NEW-PACKUMENT"))
+            .mount(&upstream)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 300;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+        let key = "npm/testpkg/upstream/packument.json";
+        ctx.state
+            .storage
+            .put(key, b"CACHED-PACKUMENT")
+            .await
+            .unwrap();
+        let sidecar = format!(
+            r#"{{"etag":"\"v1\"","checked":{}}}"#,
+            crate::cache_ttl::now_unix() - 86_400
+        );
+        ctx.state
+            .storage
+            .put(&validators_key(key), sidecar.as_bytes())
+            .await
+            .unwrap();
+        let body_file = ctx._tempdir.path().join(key);
+        std::fs::File::options()
+            .write(true)
+            .open(&body_file)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(86_400))
+            .unwrap();
+
+        let resp = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        ctx.state.cache_writes.finish(Duration::from_secs(5)).await;
+
+        assert!(
+            ctx.state.storage.get(&validators_key(key)).await.is_err(),
+            "a 200 without validators must not leave the old sidecar confirming the copy"
+        );
     }
 
     /// #595: a thundering herd of concurrent requests for the same expired
@@ -5944,6 +6451,7 @@ mod spec_conformance_tests {
             &Validators {
                 etag: Some("\"stale-etag\"".to_string()),
                 last_modified: None,
+                checked: None,
             },
         )
         .await;
@@ -5961,7 +6469,16 @@ mod spec_conformance_tests {
         // Call refetch_metadata directly — simulates the race where the handler
         // entered the cache-hit path (body was present at get_verified), TTL
         // expired, but GC deleted the body before refetch_metadata re-reads it.
-        let result = refetch_metadata(&ctx.state, "ghost-pkg", key, key, true, true).await;
+        let result = refetch_metadata(
+            &ctx.state,
+            "ghost-pkg",
+            key,
+            (key, Some(axum::body::Bytes::new())),
+            true,
+            true,
+            None,
+        )
+        .await;
         assert!(result.is_err(), "must fail when body is missing on 304");
 
         // The critical assertion: .meta must be gone after the 304 body-miss.
@@ -7780,6 +8297,7 @@ mod release_age_first_seen {
             &Validators {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
+                checked: None,
             },
         )
         .await;
@@ -7791,18 +8309,24 @@ mod release_age_first_seen {
         backend.age_packument(2 * HOUR);
     }
 
-    /// Ask for the packument and wait until the refetch has rewritten it — the write that
-    /// used to reset the age.
+    /// Ask for the packument and wait until the refetch has written its result: the body on a
+    /// 200, and on a 304 the confirmation in the validator sidecar, as the body is not written
+    /// again (#1064). The write that used to reset the age is one of the two.
     async fn refetch(ctx: &TestContext, storage: &Storage) {
         let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
         assert_eq!(resp.status(), StatusCode::OK, "packument");
         ctx.state.cache_writes.settled().await;
+        let body_fresh = storage
+            .stat(KEY)
+            .await
+            .is_some_and(|m| now() - (m.modified as i64) < 60);
+        let confirmed = crate::registry::read_validators(storage, KEY)
+            .await
+            .and_then(|v| v.checked)
+            .is_some_and(|at| now() - (at as i64) < 60);
         assert!(
-            storage
-                .stat(KEY)
-                .await
-                .is_some_and(|m| now() - (m.modified as i64) < 60),
-            "the refetch never rewrote the packument"
+            body_fresh || confirmed,
+            "the refetch wrote neither the packument nor its confirmation"
         );
     }
 
@@ -7861,6 +8385,337 @@ mod release_age_first_seen {
             let (status, body) = tarball(&ctx, "1.0.0").await;
             assert_eq!(status, StatusCode::OK, "{}: {body}", backend.name());
         }
+    }
+
+    /// A backend that counts the reads of one key and, when a landing is set, writes a newer copy
+    /// (body, validators, provenance) right after its next read of that key: the write that lands
+    /// between a request's body read and its refetch, without a sleep (#1064).
+    struct Racing {
+        inner: std::sync::Arc<dyn crate::storage::StorageBackend>,
+        key: String,
+        reads: std::sync::atomic::AtomicUsize,
+        landing: std::sync::Mutex<Option<Landing>>,
+    }
+
+    struct Landing {
+        body: Vec<u8>,
+        validators: Validators,
+        provenance: Option<String>,
+    }
+
+    impl Racing {
+        fn new(inner: std::sync::Arc<dyn crate::storage::StorageBackend>, key: &str) -> Self {
+            Self {
+                inner,
+                key: key.to_string(),
+                reads: std::sync::atomic::AtomicUsize::new(0),
+                landing: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn sha(data: &[u8]) -> String {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(data))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::StorageBackend for Racing {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> crate::storage::Result<()> {
+            self.inner.put(key, data, sha256).await
+        }
+
+        async fn get(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(axum::body::Bytes, Option<String>)> {
+            let got = self.inner.get(key).await;
+            if key == self.key {
+                self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let landing = self.landing.lock().unwrap().take();
+                if let Some(l) = landing {
+                    let validators = serde_json::to_vec(&l.validators).unwrap();
+                    self.inner
+                        .put(key, &l.body, &Self::sha(&l.body))
+                        .await
+                        .unwrap();
+                    let origin = super::origin_key(key);
+                    if let Some(record) = &l.provenance {
+                        self.inner
+                            .put(&origin, record.as_bytes(), &Self::sha(record.as_bytes()))
+                            .await
+                            .unwrap();
+                    }
+                    let sidecar = super::validators_key(key);
+                    self.inner
+                        .put(&sidecar, &validators, &Self::sha(&validators))
+                        .await
+                        .unwrap();
+                }
+            }
+            got
+        }
+
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+
+        async fn delete(&self, key: &str) -> crate::storage::Result<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> crate::storage::Result<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn stat(&self, key: &str) -> Option<crate::storage::FileMeta> {
+            self.inner.stat(key).await
+        }
+
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+
+        fn backend_name(&self) -> &'static str {
+            self.inner.backend_name()
+        }
+
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &std::path::Path,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+
+        async fn copy(
+            &self,
+            src: &str,
+            dst: &str,
+            sha256: Option<&str>,
+        ) -> crate::storage::Result<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            start: u64,
+            end: u64,
+        ) -> crate::storage::Result<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_range(key, start, end).await
+        }
+    }
+
+    /// A packument of the upstream's listing (`1.0.0`) carrying `marker`, so a test can tell
+    /// which copy it was served.
+    fn marked_packument(upstream: &MockServer, marker: &str) -> Vec<u8> {
+        let mut doc: serde_json::Value =
+            serde_json::from_str(&packument(&upstream.uri(), &["1.0.0"])).unwrap();
+        doc["marker"] = marker.into();
+        doc.to_string().into_bytes()
+    }
+
+    /// A 304 for a packument whose ledger is missing reads the packument once: the body the
+    /// request read seeds the ledger, as it does on a 200 (#1064).
+    #[tokio::test]
+    async fn a_304_without_a_ledger_reads_the_packument_once() {
+        let racing = std::sync::Arc::new(Racing::new(
+            std::sync::Arc::new(crate::storage::ObjectStorage::in_memory()),
+            KEY,
+        ));
+        let storage = Storage::from_backend(racing.clone());
+        let upstream = upstream(&["1.0.0"], true).await;
+        seen_two_hours_ago(&Backend::Object, &storage, &upstream).await;
+        storage.delete(&first_seen_key(KEY)).await.unwrap();
+        racing.reads.store(0, std::sync::atomic::Ordering::SeqCst);
+        let ctx = context(&upstream, storage.clone());
+
+        let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "packument");
+        ctx.state.cache_writes.settled().await;
+
+        assert_eq!(
+            racing.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the 304 read the packument body more than once"
+        );
+    }
+
+    /// A copy written between the request's body read and its refetch is not confirmed by a 304
+    /// that answers about the earlier validators: the 304 serves the copy it was asked about only
+    /// if that copy is still the stored one, and the newer copy keeps its own record (#1064).
+    #[tokio::test]
+    async fn a_304_does_not_confirm_a_copy_written_while_it_was_read() {
+        let upstream = upstream(&["1.0.0"], true).await;
+        let racing = std::sync::Arc::new(Racing::new(
+            std::sync::Arc::new(crate::storage::ObjectStorage::in_memory()),
+            KEY,
+        ));
+        let storage = Storage::from_backend(racing.clone());
+        seen_two_hours_ago(&Backend::Object, &storage, &upstream).await;
+        storage
+            .put(KEY, &marked_packument(&upstream, "V1"))
+            .await
+            .unwrap();
+        let newer = marked_packument(&upstream, "V2");
+        let origin = super::origin_of(&upstream.uri());
+        *racing.landing.lock().unwrap() = Some(Landing {
+            provenance: Some(super::provenance_record(&origin, &newer)),
+            body: newer,
+            validators: Validators {
+                etag: Some("\"v2\"".to_string()),
+                last_modified: None,
+                checked: None,
+            },
+        });
+        let ctx = context(&upstream, storage.clone());
+
+        let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "packument");
+        let served = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        ctx.state.cache_writes.settled().await;
+
+        assert!(
+            served.contains("V2"),
+            "served the body the 304 did not confirm: {served}"
+        );
+        let sidecar = crate::registry::read_validators(&storage, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            sidecar.etag.as_deref(),
+            Some("\"v2\""),
+            "the sidecar was replaced"
+        );
+        assert_eq!(
+            sidecar.checked, None,
+            "the newer copy was confirmed by a 304 it did not get"
+        );
+        let record = storage.get(&super::origin_key(KEY)).await.unwrap();
+        assert_eq!(
+            record.as_ref(),
+            super::provenance_record(&origin, &marked_packument(&upstream, "V2")).as_bytes(),
+            "provenance does not describe the stored bytes"
+        );
+    }
+
+    /// A writer that replaces the body before its validators leaves the validators as they were.
+    /// A 304 for those validators must not confirm the body it held, nor overwrite the record of
+    /// the bytes now stored: it serves the stored copy, whose record names it (#1064).
+    #[tokio::test]
+    async fn a_304_does_not_overwrite_the_record_of_bytes_it_did_not_hold() {
+        let upstream = upstream(&["1.0.0"], true).await;
+        let racing = std::sync::Arc::new(Racing::new(
+            std::sync::Arc::new(crate::storage::ObjectStorage::in_memory()),
+            KEY,
+        ));
+        let storage = Storage::from_backend(racing.clone());
+        seen_two_hours_ago(&Backend::Object, &storage, &upstream).await;
+        storage
+            .put(KEY, &marked_packument(&upstream, "V1"))
+            .await
+            .unwrap();
+        let newer = marked_packument(&upstream, "V2");
+        let origin = super::origin_of(&upstream.uri());
+        *racing.landing.lock().unwrap() = Some(Landing {
+            provenance: Some(super::provenance_record(&origin, &newer)),
+            body: newer,
+            validators: Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                checked: None,
+            },
+        });
+        let ctx = context(&upstream, storage.clone());
+
+        let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "packument");
+        let served = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        ctx.state.cache_writes.settled().await;
+
+        assert!(
+            served.contains("V2"),
+            "served bytes its record does not name: {served}"
+        );
+        let record = storage.get(&super::origin_key(KEY)).await.unwrap();
+        assert_eq!(
+            record.as_ref(),
+            super::provenance_record(&origin, &marked_packument(&upstream, "V2")).as_bytes(),
+            "the record of the stored bytes was overwritten"
+        );
+        let sidecar = crate::registry::read_validators(&storage, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            sidecar.checked, None,
+            "the stored copy was confirmed by a 304 it did not answer"
+        );
+    }
+
+    /// A writer that replaced the body and the validators, with no provenance record (a copy from
+    /// before records): the 304 was asked with the validators it held, which no longer describe the
+    /// stored copy, so it confirms nothing and the stored copy is served (#1064).
+    #[tokio::test]
+    async fn a_304_does_not_confirm_a_moved_copy_that_has_no_record() {
+        let upstream = upstream(&["1.0.0"], true).await;
+        let racing = std::sync::Arc::new(Racing::new(
+            std::sync::Arc::new(crate::storage::ObjectStorage::in_memory()),
+            KEY,
+        ));
+        let storage = Storage::from_backend(racing.clone());
+        seen_two_hours_ago(&Backend::Object, &storage, &upstream).await;
+        storage
+            .put(KEY, &marked_packument(&upstream, "V1"))
+            .await
+            .unwrap();
+        *racing.landing.lock().unwrap() = Some(Landing {
+            body: marked_packument(&upstream, "V2"),
+            validators: Validators {
+                etag: Some("\"v2\"".to_string()),
+                last_modified: None,
+                checked: None,
+            },
+            provenance: None,
+        });
+        let ctx = context(&upstream, storage.clone());
+
+        let resp = send(&ctx.app, Method::GET, "/npm/agepkg", "").await;
+        assert_eq!(resp.status(), StatusCode::OK, "packument");
+        let served = String::from_utf8_lossy(&body_bytes(resp).await).into_owned();
+        ctx.state.cache_writes.settled().await;
+
+        assert!(
+            served.contains("V2"),
+            "served the held body the 304 did not confirm: {served}"
+        );
+        let sidecar = crate::registry::read_validators(&storage, KEY)
+            .await
+            .unwrap();
+        assert_eq!(
+            sidecar.checked, None,
+            "the moved copy was confirmed by a 304 it did not get"
+        );
     }
 
     /// A ledger whose bytes no longer match their pin is rewritten at the next refetch, so it
@@ -7948,6 +8803,7 @@ mod release_age_first_seen {
             &Validators {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
+                checked: None,
             },
         )
         .await;
@@ -9592,6 +10448,117 @@ mod quarantine_first_seen {
             .any(|p| p.ends_with(".tgz")));
     }
 
+    /// #1064: a 304 no longer writes the body, so the body's write time stops moving at each
+    /// confirmation. Curation dates a version the ledger does not list by the copy's time, which a
+    /// 304 used to move to the confirmation: after a 304 the date stays at the confirmation, not
+    /// at the body's month-old write.
+    #[tokio::test]
+    async fn a_304_confirmation_keeps_the_fallback_date_at_the_confirmation() {
+        use crate::registry::{write_validators, Validators};
+        use std::time::{Duration, SystemTime};
+        use wiremock::matchers::header_exists;
+
+        let up = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&up)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(up.uri());
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+        let key = "npm/oldpkg/upstream/packument.json";
+        put_written_days_ago(&ctx, key, &packument(&up), 30).await;
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                checked: None,
+            },
+        )
+        .await;
+
+        assert_eq!(status(&ctx, "/npm/oldpkg").await, StatusCode::OK);
+        ctx.state.cache_writes.finish(Duration::from_secs(5)).await;
+
+        let date = super::extract_npm_publish_date(&ctx.state.storage, key, "1.0.0", false)
+            .await
+            .unwrap();
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        assert!(
+            now - date < 3600,
+            "a release the ledger lacks is dated {} s back after a 304, not at the confirmation",
+            now - date
+        );
+    }
+
+    /// #1064: the first-seen ledger of a cache that predates it starts its versions at the copy's
+    /// time, which a 304 keeps current. A copy a 304 confirmed a day ago starts them a day ago, not
+    /// at its month-old write.
+    #[tokio::test]
+    async fn a_ledger_seeded_from_a_confirmed_copy_starts_at_the_confirmation() {
+        use crate::registry::{write_validators, Validators};
+        use std::time::{Duration, SystemTime};
+        use wiremock::matchers::header_exists;
+
+        let up = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&up)
+            .await;
+        let ctx = create_test_context_with_config(|cfg| {
+            cfg.npm.proxy = Some(up.uri());
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+            cfg.server.trust_upstream_dates = false;
+            quarantine_7d(cfg);
+        });
+        let key = "npm/oldpkg/upstream/packument.json";
+        put_written_days_ago(&ctx, key, &packument(&up), 30).await;
+        let day_ago = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 86_400;
+        write_validators(
+            &ctx.state.storage,
+            key,
+            &Validators {
+                etag: Some("\"v1\"".to_string()),
+                last_modified: None,
+                checked: Some(day_ago),
+            },
+        )
+        .await;
+
+        assert_eq!(status(&ctx, "/npm/oldpkg").await, StatusCode::OK);
+        ctx.state.cache_writes.finish(Duration::from_secs(5)).await;
+
+        let ledger = ctx
+            .state
+            .storage
+            .get(&super::first_seen_key(key))
+            .await
+            .unwrap();
+        let seeded: serde_json::Value = serde_json::from_slice(&ledger).unwrap();
+        let seeded = seeded["1.0.0"].as_u64().unwrap();
+        assert!(
+            seeded.abs_diff(day_ago) < 3600,
+            "seeded {} s after the confirmation, not at it",
+            seeded as i64 - day_ago as i64
+        );
+    }
+
     #[tokio::test]
     async fn with_trusted_dates_an_old_release_matures_in_the_quarantine() {
         let up = upstream().await;
@@ -11091,6 +12058,7 @@ mod own_links_follow_the_serving_instance {
                     &Validators {
                         etag: Some("\"v1\"".to_string()),
                         last_modified: None,
+                        checked: None,
                     },
                 )
                 .await;
@@ -12159,6 +13127,7 @@ mod off_upstream_versions {
             let validators = Validators {
                 etag: Some("\"v1\"".to_string()),
                 last_modified: None,
+                checked: None,
             };
             write_validators(&ctx.state.storage, key, &validators).await;
             let resp = send(&ctx.app, Method::GET, "/npm/pkg", "").await;
@@ -14189,5 +15158,804 @@ mod url_fold {
             refused.is_empty(),
             "legitimate versions refused: {refused:?}"
         );
+    }
+}
+
+/// #1064 round 3: the reads of one packument object, and the convergence of its cache after a
+/// partial write. The counting backend sits over the in-memory object store.
+#[cfg(test)]
+mod revalidation_1064_round3 {
+    use super::*;
+    use crate::registry::{read_validators, write_validators, Validators};
+    use crate::storage::{FileMeta, Result as StoreResult, StorageBackend, StorageError};
+    use crate::test_helpers::{body_bytes, create_test_context_with_storage_and_config, send};
+    use async_trait::async_trait;
+    use axum::http::{Method, StatusCode};
+    use std::path::Path;
+    use std::sync::Mutex;
+    use wiremock::matchers::header_exists;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const PACKUMENT: &str = "npm/testpkg/upstream/packument.json";
+
+    /// The in-memory object store, counting the reads of [`PACKUMENT`] and refusing one write of
+    /// `refuse_once` (an exact key) when it is armed.
+    struct Observed {
+        inner: Arc<dyn StorageBackend>,
+        reads: Mutex<usize>,
+        refuse_once: Mutex<Option<String>>,
+        /// `(key, data, skip)`: stored before the read of `key` that follows `skip` reads of it, once.
+        inject: Mutex<Option<(String, Vec<u8>, usize)>>,
+        /// Reads of this key fail, as an unreachable store would.
+        fail_get: Mutex<Option<String>>,
+        /// `(key, modified)`: `stat` of the key reports this time.
+        modified: Mutex<Option<(String, u64)>>,
+        /// `(trigger, target)`: reading `trigger` first deletes `target`, once.
+        delete_on_read: Mutex<Option<(String, String)>>,
+    }
+
+    impl Observed {
+        fn reads(&self) -> usize {
+            *self.reads.lock().unwrap()
+        }
+        fn count(&self, key: &str) {
+            if key == PACKUMENT {
+                *self.reads.lock().unwrap() += 1;
+            }
+        }
+        /// Applies the armed failure and deletion for a read of `key`; `Err` refuses the read.
+        async fn before_read(&self, key: &str) -> StoreResult<()> {
+            let doomed = {
+                let mut armed = self.delete_on_read.lock().unwrap();
+                match armed.as_ref() {
+                    Some((trigger, _)) if trigger == key => armed.take().map(|(_, t)| t),
+                    _ => None,
+                }
+            };
+            if let Some(target) = doomed {
+                self.inner.delete(&target).await.unwrap();
+            }
+            if self.fail_get.lock().unwrap().as_deref() == Some(key) {
+                return Err(StorageError::Network("store unreachable".into()));
+            }
+            Ok(())
+        }
+        /// Stores the armed object for `key` if it is the one armed, before the read goes on.
+        async fn inject_before_read(&self, key: &str) {
+            let armed = {
+                let mut slot = self.inject.lock().unwrap();
+                let fire = match slot.as_mut() {
+                    Some((k, _, skip)) if k == key => {
+                        if *skip == 0 {
+                            true
+                        } else {
+                            *skip -= 1;
+                            false
+                        }
+                    }
+                    _ => false,
+                };
+                if fire {
+                    slot.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((k, data, _)) = armed {
+                let sha = hex::encode(sha2::Sha256::digest(&data));
+                self.inner.put(&k, &data, &sha).await.unwrap();
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for Observed {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> StoreResult<()> {
+            let refuse = {
+                let mut armed = self.refuse_once.lock().unwrap();
+                if armed.as_deref() == Some(key) {
+                    armed.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            if refuse {
+                return Err(StorageError::Network("provenance write refused".into()));
+            }
+            self.inner.put(key, data, sha256).await
+        }
+        async fn get(&self, key: &str) -> StoreResult<(axum::body::Bytes, Option<String>)> {
+            self.before_read(key).await?;
+            self.inject_before_read(key).await;
+            self.count(key);
+            self.inner.get(key).await
+        }
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> StoreResult<(
+            u64,
+            Option<String>,
+            std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.before_read(key).await?;
+            self.inject_before_read(key).await;
+            self.count(key);
+            self.inner.get_reader(key).await
+        }
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+        async fn delete(&self, key: &str) -> StoreResult<()> {
+            self.inner.delete(key).await
+        }
+        async fn list(&self, prefix: &str) -> StoreResult<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+        async fn stat(&self, key: &str) -> Option<FileMeta> {
+            let meta = self.inner.stat(key).await?;
+            match self.modified.lock().unwrap().as_ref() {
+                Some((k, modified)) if k == key => Some(FileMeta {
+                    size: meta.size,
+                    modified: *modified,
+                }),
+                _ => Some(meta),
+            }
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+        fn backend_name(&self) -> &'static str {
+            "observed-1064"
+        }
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &Path,
+            sha256: Option<&str>,
+        ) -> StoreResult<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+        async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> StoreResult<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+    }
+
+    fn observed(refuse_once: Option<&str>) -> Arc<Observed> {
+        Arc::new(Observed {
+            inner: Arc::new(crate::storage::ObjectStorage::in_memory()),
+            reads: Mutex::new(0),
+            refuse_once: Mutex::new(refuse_once.map(str::to_string)),
+            inject: Mutex::new(None),
+            fail_get: Mutex::new(None),
+            modified: Mutex::new(None),
+            delete_on_read: Mutex::new(None),
+        })
+    }
+
+    fn store_of(obs: &Arc<Observed>) -> crate::Storage {
+        let dynamic: Arc<dyn StorageBackend> = obs.clone();
+        crate::Storage::from_backend(dynamic)
+    }
+
+    /// A packument listing `versions` (each with its tarball under `server`).
+    fn listing(server: &MockServer, versions: &[&str]) -> Vec<u8> {
+        let files: Vec<(&str, String)> = versions
+            .iter()
+            .map(|v| (*v, format!("testpkg/-/testpkg-{v}.tgz")))
+            .collect();
+        let entries: serde_json::Map<String, serde_json::Value> = files
+            .iter()
+            .map(|(v, at)| {
+                (
+                    v.to_string(),
+                    serde_json::json!({"name": "testpkg", "version": v,
+                        "dist": {"tarball": format!("{}/{at}", server.uri())}}),
+                )
+            })
+            .collect();
+        serde_json::to_vec(&serde_json::json!({"name": "testpkg", "versions": entries})).unwrap()
+    }
+
+    /// Lead 4: a tarball of a version the cached packument does not list costs the packument one
+    /// read (the trusted copy's), as on main: the refetch does not read the object again.
+    #[tokio::test]
+    async fn tarball_of_an_unlisted_version_reads_the_packument_as_main_does() {
+        let upstream = MockServer::start().await;
+        mount_listing_for(&upstream, &[("1.0.0", "testpkg/-/testpkg-1.0.0.tgz")]).await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg/-/testpkg-1.0.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let obs = observed(None);
+        let ctx = create_test_context_with_storage_and_config(store_of(&obs), |cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+        });
+        // The cached packument lists 0.9.0 only: 1.0.0 is not in it, so the tarball refetches.
+        let old = serde_json::json!({"name": "testpkg", "versions": {"0.9.0": {"name": "testpkg",
+            "version": "0.9.0", "dist": {"tarball": "http://nora.test/npm/testpkg/-/testpkg-0.9.0.tgz"}}}});
+        ctx.state
+            .storage
+            .put(PACKUMENT, &serde_json::to_vec(&old).unwrap())
+            .await
+            .unwrap();
+        // The first-seen ledger exists, so the refetch has no reason to read the packument.
+        ctx.state
+            .storage
+            .put(
+                &first_seen_key(PACKUMENT),
+                &serde_json::to_vec(&FirstSeen::new()).unwrap(),
+            )
+            .await
+            .unwrap();
+        ctx.state.cache_writes.settled().await;
+        let before = obs.reads();
+
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/testpkg/-/testpkg-1.0.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(&body_bytes(resp).await[..], b"TGZ");
+        ctx.state.cache_writes.settled().await;
+
+        // Measured on github/main (c5350aa) with this test: 3 reads of the packument object.
+        assert_eq!(
+            obs.reads() - before,
+            3,
+            "the packument is read as often as on main (3, measured on github/main c5350aa)"
+        );
+    }
+
+    async fn mount_listing_for(server: &MockServer, files: &[(&str, &str)]) {
+        let versions: Vec<&str> = files.iter().map(|(v, _)| *v).collect();
+        let body = listing(server, &versions);
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(body))
+            .mount(server)
+            .await;
+    }
+
+    /// Lead 3: two 304s (proxy_coalesce off) on the same held body and validators. The second
+    /// finds the sidecar's `checked` moved by the first and must not read the body again: a 304
+    /// about the same copy changes nothing but the time of confirmation.
+    #[tokio::test]
+    async fn a_304_after_another_304_on_the_same_copy_does_not_read_the_packument_again() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .and(header("if-none-match", "\"e1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+
+        let obs = observed(None);
+        let ctx = create_test_context_with_storage_and_config(store_of(&obs), |cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.revalidate = true;
+        });
+        let body = listing(&upstream, &["1.0.0"]);
+        let state = &ctx.state;
+        state.storage.put(PACKUMENT, &body).await.unwrap();
+        put_with_origin(
+            &state.storage,
+            PACKUMENT,
+            &body,
+            &origin_of(&upstream.uri()),
+        )
+        .await
+        .unwrap();
+        let asked = Validators {
+            etag: Some("\"e1\"".to_string()),
+            last_modified: None,
+            checked: Some(10),
+        };
+        write_validators(&state.storage, PACKUMENT, &asked).await;
+        // Both requests read the copy and its validators before either writes.
+        let held = Some((axum::body::Bytes::from(body.clone()), asked.clone()));
+
+        let first = refetch_metadata(
+            state,
+            "testpkg",
+            PACKUMENT,
+            (PACKUMENT, Some(axum::body::Bytes::from(body.clone()))),
+            false,
+            true,
+            held.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first, body);
+        state.cache_writes.settled().await;
+
+        let before = obs.reads();
+        let second = refetch_metadata(
+            state,
+            "testpkg",
+            PACKUMENT,
+            (PACKUMENT, Some(axum::body::Bytes::from(body.clone()))),
+            false,
+            true,
+            held,
+        )
+        .await
+        .unwrap();
+        assert_eq!(second, body, "the same copy is served");
+        assert_eq!(
+            obs.reads() - before,
+            0,
+            "the held body is confirmed again: no second read of the packument"
+        );
+    }
+
+    /// Lead 2, over HTTP: a 200 whose provenance write fails leaves the body with a record for the
+    /// bytes before it. Each later 304 must converge: at most one extra read, then the stored state
+    /// is complete again and the 304 path stops reading the body twice.
+    #[tokio::test]
+    async fn a_200_that_lost_its_provenance_converges_to_a_confirmed_copy() {
+        let upstream = MockServer::start().await;
+        let b1 = listing(&upstream, &["1.0.0"]);
+        let b2 = listing(&upstream, &["1.0.0", "1.1.0"]);
+        // The asked validators decide the answer: E1 gets the new body, E2 is confirmed, and a
+        // request without validators gets the new body with a fresh ETag.
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .and(header("if-none-match", "\"e1\""))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"e2\"")
+                    .set_body_bytes(b2.clone()),
+            )
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .and(header("if-none-match", "\"e2\""))
+            .respond_with(ResponseTemplate::new(304))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("etag", "\"e3\"")
+                    .set_body_bytes(b2.clone()),
+            )
+            .with_priority(5)
+            .mount(&upstream)
+            .await;
+
+        let obs = observed(None);
+        let ctx = create_test_context_with_storage_and_config(store_of(&obs), |cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0; // stale on every request
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+        let state = &ctx.state;
+        state.storage.put(PACKUMENT, &b1).await.unwrap();
+        put_with_origin(&state.storage, PACKUMENT, &b1, &origin_of(&upstream.uri()))
+            .await
+            .unwrap();
+        write_validators(
+            &state.storage,
+            PACKUMENT,
+            &Validators {
+                etag: Some("\"e1\"".to_string()),
+                last_modified: None,
+                checked: Some(1),
+            },
+        )
+        .await;
+
+        // The next provenance write of the packument refuses: the 200 below loses it.
+        *obs.refuse_once.lock().unwrap() = Some(origin_key(PACKUMENT));
+        // Per request: the reads beyond the one that serves the cached copy.
+        let mut extra = Vec::new();
+        for _ in 0..4 {
+            let before = obs.reads();
+            let resp = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            ctx.state.cache_writes.settled().await;
+            extra.push(obs.reads() - before);
+        }
+        let reads_beyond_serve: Vec<usize> = extra.iter().map(|r| r.saturating_sub(1)).collect();
+        assert_eq!(
+            reads_beyond_serve,
+            vec![0, 1, 0, 0],
+            "request 1 is the 200 with the lost provenance; request 2 is the 304 that rereads once; \
+             request 3 is the unconditional 200 that rewrites the copy whole; request 4 is confirmed"
+        );
+    }
+
+    /// Lead 2 guard, deterministic: the sidecar is emptied only while it still names the copy the
+    /// 304 was asked with. A sidecar a newer writer put meanwhile is not touched.
+    #[tokio::test]
+    async fn a_304_empties_the_sidecar_only_while_it_still_names_the_asked_copy() {
+        for newer_writer in [false, true] {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/testpkg"))
+                .and(header("if-none-match", "\"e1\""))
+                .respond_with(ResponseTemplate::new(304))
+                .mount(&upstream)
+                .await;
+            let obs = observed(None);
+            let ctx = create_test_context_with_storage_and_config(store_of(&obs), |cfg| {
+                cfg.npm.proxy = Some(upstream.uri());
+                cfg.npm.revalidate = true;
+            });
+            let state = &ctx.state;
+            let body = listing(&upstream, &["1.0.0"]);
+            let other = listing(&upstream, &["2.0.0"]);
+            state.storage.put(PACKUMENT, &body).await.unwrap();
+            // The record names other bytes: the 304 confirms nothing and takes the drop path.
+            let record = provenance_record(&origin_of(&upstream.uri()), &other);
+            state
+                .storage
+                .put(&origin_key(PACKUMENT), record.as_bytes())
+                .await
+                .unwrap();
+            let asked = Validators {
+                etag: Some("\"e1\"".to_string()),
+                last_modified: None,
+                checked: Some(1),
+            };
+            write_validators(&state.storage, PACKUMENT, &asked).await;
+            if newer_writer {
+                // A newer writer's sidecar lands between the 304's decision (its first read of the
+                // sidecar) and the cleanup's read of it (the second): the cleanup finds that copy.
+                let newer = Validators {
+                    etag: Some("\"e2\"".to_string()),
+                    last_modified: None,
+                    checked: Some(2),
+                };
+                *obs.inject.lock().unwrap() = Some((
+                    validators_key(PACKUMENT),
+                    serde_json::to_vec(&newer).unwrap(),
+                    1,
+                ));
+            }
+            let served = refetch_metadata(
+                state,
+                "testpkg",
+                PACKUMENT,
+                (PACKUMENT, Some(axum::body::Bytes::from(body.clone()))),
+                false,
+                true,
+                Some((axum::body::Bytes::from(body.clone()), asked.clone())),
+            )
+            .await
+            .unwrap();
+            assert_eq!(served, body);
+            state.cache_writes.settled().await;
+            // Read past the observed store: its armed injection belongs to the cleanup's read only.
+            let sidecar: Validators = match obs.inner.get(&validators_key(PACKUMENT)).await {
+                Ok((data, _)) => serde_json::from_slice(&data).unwrap(),
+                Err(_) => Validators::default(),
+            };
+            if newer_writer {
+                assert_eq!(
+                    sidecar.etag.as_deref(),
+                    Some("\"e2\""),
+                    "a newer writer's sidecar is not emptied"
+                );
+            } else {
+                assert!(
+                    sidecar.etag.is_none() && sidecar.checked.is_none(),
+                    "the sidecar of the asked copy is emptied: {sidecar:?}"
+                );
+            }
+        }
+    }
+
+    /// Lead 1: a sidecar that cannot be read dates the copy no older than its write. The date feeds
+    /// the ledger's seed and curation's fallback: an old date would let a fresh release pass the
+    /// minimum age. A sidecar that is absent keeps the body's own time.
+    #[tokio::test]
+    async fn an_unreadable_sidecar_dates_the_copy_no_older_than_its_write() {
+        let obs = observed(None);
+        let store = store_of(&obs);
+        store.put(PACKUMENT, b"{\"versions\":{}}").await.unwrap();
+        // The body was written long ago: its file time is the epoch.
+        *obs.modified.lock().unwrap() = Some((PACKUMENT.to_string(), 1));
+        write_validators(
+            &store,
+            PACKUMENT,
+            &Validators {
+                etag: Some("\"e1\"".to_string()),
+                last_modified: None,
+                checked: Some(1),
+            },
+        )
+        .await;
+        let now = crate::cache_ttl::now_unix() as i64;
+
+        *obs.fail_get.lock().unwrap() = Some(validators_key(PACKUMENT));
+        let dated = copy_time(&store, PACKUMENT).await.unwrap();
+        assert!(
+            dated >= now - 60,
+            "an unreadable sidecar dated the copy {dated}s; it must not be older than now"
+        );
+
+        // Control: no sidecar at all keeps the body's own time.
+        *obs.fail_get.lock().unwrap() = None;
+        store.delete(&validators_key(PACKUMENT)).await.unwrap();
+        assert_eq!(copy_time(&store, PACKUMENT).await, Some(1));
+    }
+
+    /// Lead 2, through the handler: the held body's object is removed while the 304 is in flight.
+    /// The 304 must not confirm a body the store no longer has: the validators are cleared (#867).
+    #[tokio::test]
+    async fn a_304_for_a_held_body_removed_meanwhile_clears_its_validators() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        let obs = observed(None);
+        let ctx = create_test_context_with_storage_and_config(store_of(&obs), |cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+        let state = &ctx.state;
+        let body = listing(&upstream, &["1.0.0"]);
+        state.storage.put(PACKUMENT, &body).await.unwrap();
+        put_with_origin(
+            &state.storage,
+            PACKUMENT,
+            &body,
+            &origin_of(&upstream.uri()),
+        )
+        .await
+        .unwrap();
+        write_validators(
+            &state.storage,
+            PACKUMENT,
+            &Validators {
+                etag: Some("\"e1\"".to_string()),
+                last_modified: None,
+                checked: Some(1),
+            },
+        )
+        .await;
+        // The body goes while the 304 is being handled: its provenance is read right after it.
+        *obs.delete_on_read.lock().unwrap() = Some((origin_key(PACKUMENT), PACKUMENT.to_string()));
+
+        let _ = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        state.cache_writes.settled().await;
+
+        assert!(
+            read_validators(&state.storage, PACKUMENT).await.is_none(),
+            "the 304 confirmed a body the store no longer has, and kept its validators"
+        );
+    }
+
+    /// The date a copy takes from its sidecar and its body, by every state the sidecar can be in.
+    /// Information lost (an emptied or unreadable sidecar) dates the copy now: it never makes the
+    /// copy older. An absent sidecar keeps the body's own time, as on main (#1064).
+    #[tokio::test]
+    async fn copy_time_by_sidecar_state_and_body_time() {
+        let now = crate::cache_ttl::now_unix();
+        let old = 1u64;
+        let recent = now - 100;
+        let checked = now - 600;
+        let validators = |etag: Option<&str>, checked: Option<u64>| {
+            serde_json::to_vec(&Validators {
+                etag: etag.map(str::to_string),
+                last_modified: None,
+                checked,
+            })
+            .unwrap()
+        };
+        // (state, sidecar bytes, body's write time, expected date: Some(at) exact, None = now)
+        let rows: Vec<(&str, Option<Vec<u8>>, u64, Option<u64>)> = vec![
+            (
+                "checked, body old",
+                Some(validators(Some("\"e1\""), Some(checked))),
+                old,
+                Some(checked),
+            ),
+            (
+                "checked, body recent",
+                Some(validators(Some("\"e1\""), Some(checked))),
+                recent,
+                Some(recent),
+            ),
+            (
+                "checked without validators, body old",
+                Some(validators(None, Some(checked))),
+                old,
+                Some(checked),
+            ),
+            (
+                "validators without checked, body old",
+                Some(validators(Some("\"e1\""), None)),
+                old,
+                Some(old),
+            ),
+            (
+                "validators without checked, body recent",
+                Some(validators(Some("\"e1\""), None)),
+                recent,
+                Some(recent),
+            ),
+            ("absent, body old", None, old, Some(old)),
+            ("absent, body recent", None, recent, Some(recent)),
+            ("emptied to {}, body old", Some(b"{}".to_vec()), old, None),
+            (
+                "emptied to {}, body recent",
+                Some(b"{}".to_vec()),
+                recent,
+                None,
+            ),
+            (
+                "unreadable, body old",
+                Some(b"not json".to_vec()),
+                old,
+                None,
+            ),
+            (
+                "unreadable, body recent",
+                Some(b"not json".to_vec()),
+                recent,
+                None,
+            ),
+        ];
+        for (name, sidecar, body_time, expect) in rows {
+            let obs = observed(None);
+            let store = store_of(&obs);
+            store.put(PACKUMENT, b"{}").await.unwrap();
+            *obs.modified.lock().unwrap() = Some((PACKUMENT.to_string(), body_time));
+            if let Some(bytes) = sidecar {
+                store.put(&validators_key(PACKUMENT), &bytes).await.unwrap();
+            }
+            let before = crate::cache_ttl::now_unix() as i64;
+            let dated = copy_time(&store, PACKUMENT).await.unwrap();
+            let after = crate::cache_ttl::now_unix() as i64;
+            match expect {
+                Some(at) => assert_eq!(dated, at as i64, "{name}"),
+                None => assert!(
+                    dated >= before && dated <= after,
+                    "{name}: dated {dated}, but now is {before}..{after}"
+                ),
+            }
+        }
+    }
+
+    /// Codex r4 (P1), through the handler: a 304 whose provenance read fails empties the sidecar,
+    /// which held the confirmation of a copy whose body is a month old. With trusted dates off and
+    /// curation enforced, a release missing from the ledger is dated by the copy. Dated by its old
+    /// body it would pass the 7d gate; dated now, it is held (#1064).
+    #[tokio::test]
+    async fn a_release_of_a_copy_whose_confirmation_was_emptied_is_held_by_the_age_gate() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .and(header("if-none-match", "\"e1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(listing(&upstream, &["1.0.0", "1.1.0"])),
+            )
+            .with_priority(5)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg/-/testpkg-1.1.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let obs = observed(None);
+        let ctx = create_test_context_with_storage_and_config(store_of(&obs), |cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+            cfg.server.trust_upstream_dates = false;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        let state = &ctx.state;
+        let body = listing(&upstream, &["1.0.0"]);
+        state.storage.put(PACKUMENT, &body).await.unwrap();
+        put_with_origin(
+            &state.storage,
+            PACKUMENT,
+            &body,
+            &origin_of(&upstream.uri()),
+        )
+        .await
+        .unwrap();
+        let now = crate::cache_ttl::now_unix();
+        // The body was written a month ago; the copy was confirmed ten minutes ago.
+        *obs.modified.lock().unwrap() = Some((PACKUMENT.to_string(), now - 30 * 86400));
+        write_validators(
+            &state.storage,
+            PACKUMENT,
+            &Validators {
+                etag: Some("\"e1\"".to_string()),
+                last_modified: None,
+                checked: Some(now - 600),
+            },
+        )
+        .await;
+
+        // The provenance read fails during the 304: the 304 confirms nothing and empties the sidecar.
+        *obs.fail_get.lock().unwrap() = Some(origin_key(PACKUMENT));
+        let served = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        assert_eq!(served.status(), StatusCode::OK, "the cached copy is served");
+        state.cache_writes.settled().await;
+        *obs.fail_get.lock().unwrap() = None;
+
+        // 1.1.0 is not in the ledger: its release is dated by the copy, which must not be old.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/testpkg/-/testpkg-1.1.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a release dated by an emptied sidecar's old body passed the 7d gate"
+        );
+    }
+
+    /// The pure rule, row by row: every sidecar state against an old, a recent and a future body
+    /// time. Lost information dates the copy now (#1064).
+    #[test]
+    fn copy_date_by_state_against_the_body_time() {
+        let now = 1_000_000u64;
+        let old = 1u64;
+        let recent = now - 100;
+        let future = now + 50;
+        let checked = now - 600;
+        // (state, body time, expected date)
+        let rows = [
+            (SidecarState::Checked(checked), old, checked),
+            (SidecarState::Checked(checked), recent, recent),
+            (SidecarState::Checked(checked), future, future),
+            (SidecarState::Unchecked, old, old),
+            (SidecarState::Unchecked, recent, recent),
+            (SidecarState::Absent, old, old),
+            (SidecarState::Absent, recent, recent),
+            (SidecarState::Emptied, old, now),
+            (SidecarState::Emptied, recent, now),
+            (SidecarState::Emptied, future, future),
+            (SidecarState::Unreadable, old, now),
+            (SidecarState::Unreadable, recent, now),
+            (SidecarState::Unreadable, future, future),
+        ];
+        for (state, written, expect) in rows {
+            assert_eq!(
+                copy_date(state, written, now),
+                expect,
+                "{state:?} at body time {written}"
+            );
+        }
     }
 }
