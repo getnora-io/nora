@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-use super::{FileMeta, Result, StorageBackend, StorageError};
+use super::{FileMeta, Result, ServerPresence, StorageBackend, StorageError};
 use crate::hash_pin_store::HashPinStore;
 
 /// The hash-pin sidecar is backend bookkeeping, not a stored artifact: it is
@@ -214,6 +214,74 @@ fn remove_dead_staging(staging_root: &Path) {
     if removed > 0 {
         tracing::info!(removed, dir = %staging_root.display(), "Removed the staging directories of dead instances");
     }
+}
+
+/// Whether a process other than this one holds the lock of a staging directory under
+/// `root` (#988). Every server holds its own from start to exit (see [`Staging`]) and the
+/// kernel drops it with the process, so a server killed by SIGKILL leaves a directory whose
+/// lock anyone can take: a dead server never reads as running, and no heartbeat can go
+/// stale. `own` is this process's staging directory, whose lock it holds itself.
+///
+/// The probe takes a shared lock and drops it at once; it never removes anything. `.new-*`
+/// directories are skipped: one belongs to a server between creating its lock file and
+/// locking it, and a probe holding that lock then would make the server start without
+/// staging. A starting server's sweep can find a dead directory's lock held by a probe for
+/// that instant and leave the directory for its next start. A lock that cannot be tested
+/// makes the answer [`ServerPresence::Unknown`] unless another one is held.
+#[cfg(unix)]
+fn staging_presence(root: &Path, own: Option<&Path>) -> ServerPresence {
+    use rustix::fs::{flock, FlockOperation};
+    let entries = match std::fs::read_dir(root.join(crate::validation::STAGING_DIR)) {
+        Ok(entries) => entries,
+        // No staging at all: no server started here. A staging path that is not a directory
+        // says nothing: a server whose staging failed runs without one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ServerPresence::NotRunning,
+        Err(_) => return ServerPresence::Unknown,
+    };
+    let mut presence = ServerPresence::NotRunning;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            presence = ServerPresence::Unknown;
+            continue;
+        };
+        // `DirEntry::metadata` does not follow symlinks.
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            // Removed since the listing: a dead owner's (see [`Staging`]).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                presence = ServerPresence::Unknown;
+                continue;
+            }
+        };
+        let dir = entry.path();
+        if !meta.is_dir()
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(STAGING_NEW_PREFIX)
+            || own == Some(dir.as_path())
+        {
+            continue;
+        }
+        match std::fs::File::open(dir.join(STAGING_LOCK_FILE)) {
+            Ok(lock) => match flock(&lock, FlockOperation::NonBlockingLockShared) {
+                // A dead owner's; dropping `lock` releases it.
+                Ok(()) => {}
+                Err(e) if e == rustix::io::Errno::WOULDBLOCK => return ServerPresence::Running,
+                Err(_) => presence = ServerPresence::Unknown,
+            },
+            // Being removed: a dead owner's (see [`Staging`]).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => presence = ServerPresence::Unknown,
+        }
+    }
+    presence
+}
+
+#[cfg(not(unix))]
+fn staging_presence(_root: &Path, _own: Option<&Path>) -> ServerPresence {
+    ServerPresence::Unknown
 }
 
 /// This instance's staging directory, opening it on first use.
@@ -1030,6 +1098,20 @@ impl StorageBackend for LocalStorage {
         {
             tracing::warn!(error = %e, "Opening the staging directory failed");
         }
+    }
+
+    async fn server_presence(&self) -> ServerPresence {
+        let cell = Arc::clone(&self.staging);
+        let root = self.base_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let own = cell
+                .get()
+                .and_then(Option::as_ref)
+                .map(|staging| staging.dir.as_path());
+            staging_presence(&root, own)
+        })
+        .await
+        .unwrap_or(ServerPresence::Unknown)
     }
 
     async fn put_from_path(&self, key: &str, src: &Path, sha256: Option<&str>) -> Result<()> {
@@ -1927,6 +2009,157 @@ mod tests {
         assert!(
             young.exists(),
             "a directory still being created was removed"
+        );
+    }
+
+    /// #988: another instance on the store reads as running from start to exit, without a
+    /// write; an instance never counts itself; a dead one's staging, left behind with its
+    /// lock file, reads as not running, and the probe removes nothing.
+    #[test]
+    fn a_live_instance_reads_as_running_and_a_dead_one_does_not() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let server = LocalStorage::new(root);
+        rt.block_on(server.prepare());
+        let server_dir = server.staging_dir().unwrap().to_path_buf();
+        let command = LocalStorage::new(root);
+        assert_eq!(
+            rt.block_on(command.server_presence()),
+            ServerPresence::Running
+        );
+        assert_eq!(
+            rt.block_on(server.server_presence()),
+            ServerPresence::NotRunning,
+            "an instance counted its own staging lock"
+        );
+
+        drop(server);
+        assert_eq!(
+            rt.block_on(command.server_presence()),
+            ServerPresence::NotRunning
+        );
+        assert!(
+            server_dir.join(STAGING_LOCK_FILE).exists(),
+            "the dead instance's staging is gone: the probe removed it, or the test proves nothing"
+        );
+    }
+
+    /// A store no server ever started on has no staging: not running.
+    #[test]
+    fn a_store_without_staging_reads_as_not_running() {
+        let dir = TempDir::new().unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            rt.block_on(storage.server_presence()),
+            ServerPresence::NotRunning
+        );
+    }
+
+    /// A staging path the probe cannot read whole says nothing either way: a `.nora-staging`
+    /// that is a file, and one whose entries cannot be examined, read as unknown, never as
+    /// not running (#988).
+    #[test]
+    fn a_staging_the_probe_cannot_read_reads_as_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(crate::validation::STAGING_DIR), b"").unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        assert_eq!(
+            rt.block_on(storage.server_presence()),
+            ServerPresence::Unknown,
+            "a staging path that is a file"
+        );
+
+        // Readable but not searchable: the entries are listed, their metadata is not.
+        let dir = TempDir::new().unwrap();
+        let server = LocalStorage::new(dir.path().to_str().unwrap());
+        rt.block_on(server.prepare());
+        let staging = dir.path().join(crate::validation::STAGING_DIR);
+        let own = server.staging_dir().unwrap().to_path_buf();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if std::fs::symlink_metadata(&own).is_ok() {
+            // Root searches it anyway: the case cannot be built here.
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let command = LocalStorage::new(dir.path().to_str().unwrap());
+        let presence = rt.block_on(command.server_presence());
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            presence,
+            ServerPresence::Unknown,
+            "a staging without search permission"
+        );
+    }
+
+    /// A `.new-*` directory is not probed: its lock file exists unlocked for an instant
+    /// before its server locks it, and a probe holding it then would cost that server its
+    /// staging. Its lock held here stands for that server.
+    #[test]
+    fn a_half_created_staging_directory_is_not_probed() {
+        let dir = TempDir::new().unwrap();
+        let new = dir
+            .path()
+            .join(crate::validation::STAGING_DIR)
+            .join(format!("{STAGING_NEW_PREFIX}0123456789abcdef"));
+        std::fs::create_dir_all(&new).unwrap();
+        let lock = std::fs::File::create(new.join(STAGING_LOCK_FILE)).unwrap();
+        assert!(try_lock_exclusive(&lock).unwrap());
+
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert_eq!(
+            rt.block_on(storage.server_presence()),
+            ServerPresence::NotRunning
+        );
+    }
+
+    /// A lock file that cannot be opened (here a symlink loop) says nothing either way:
+    /// unknown, unless another instance's lock is held.
+    #[test]
+    fn an_untestable_lock_reads_as_unknown_unless_another_is_held() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path().to_str().unwrap();
+        let odd = dir
+            .path()
+            .join(crate::validation::STAGING_DIR)
+            .join("0123456789abcdef");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::os::unix::fs::symlink(STAGING_LOCK_FILE, odd.join(STAGING_LOCK_FILE)).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let command = LocalStorage::new(root);
+        assert_eq!(
+            rt.block_on(command.server_presence()),
+            ServerPresence::Unknown
+        );
+
+        // A lock path that runs through a file (`ENOTDIR`) cannot be tested either; only a
+        // lock that is gone (`ENOENT`, a dead owner's directory being removed) is skipped.
+        let other = TempDir::new().unwrap();
+        let odd = other
+            .path()
+            .join(crate::validation::STAGING_DIR)
+            .join("fedcba9876543210");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join("plain"), b"").unwrap();
+        std::os::unix::fs::symlink("plain/child", odd.join(STAGING_LOCK_FILE)).unwrap();
+        assert_eq!(
+            rt.block_on(LocalStorage::new(other.path().to_str().unwrap()).server_presence()),
+            ServerPresence::Unknown,
+            "a lock path through a file"
+        );
+
+        let server = LocalStorage::new(root);
+        rt.block_on(server.prepare());
+        assert_eq!(
+            rt.block_on(command.server_presence()),
+            ServerPresence::Running
         );
     }
 

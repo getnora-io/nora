@@ -2278,6 +2278,9 @@ async fn run(
         }
         Some(Commands::Gc { apply }) => {
             let dry_run = !apply;
+            if apply {
+                warn_if_server_running(&storage, "gc --apply", "[gc] enabled = true").await;
+            }
             let cli_publish_locks: PublishLocks = Arc::new(parking_lot::Mutex::new(HashMap::new()));
             // Grace applies to manual GC too: `nora gc --apply` is often run while
             // traffic is live, when in-flight pushes are most likely (#584).
@@ -2402,6 +2405,12 @@ async fn run(
                 }
                 print_retention_coverage(&storage, &config.retention.rules).await;
             } else {
+                warn_if_server_running(
+                    &storage,
+                    "retention-apply --yes",
+                    "[retention] enabled = true",
+                )
+                .await;
                 // Real deletions rebuild rpm/deb indexes — sign them with the
                 // same key the server would, or clients start failing
                 // verification after a CLI retention pass.
@@ -5492,6 +5501,69 @@ fn registry_routes(enabled: &HashSet<RegistryType>) -> Router<AppState> {
         axum::http::header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("sandbox"),
     ))
+}
+
+/// The warning a deleting maintenance command prints before it runs (#988), or `None` when
+/// no server is running on the storage. The command takes its own, empty publish-lock map,
+/// so its deletions are not serialized with a server's publishes: a publish racing a
+/// deletion of the same artifact can lose files. `Unknown` warns too: a server the command
+/// cannot see is as much of a risk as one it can. A warning, not a refusal: a stale answer
+/// costs one line on stderr.
+fn live_server_warning(
+    command: &str,
+    schedule: &str,
+    presence: storage::ServerPresence,
+) -> Option<String> {
+    let safely = format!(
+        "Run it while the server is stopped, or leave it to the server's schedule ({schedule})."
+    );
+    match presence {
+        storage::ServerPresence::NotRunning => None,
+        storage::ServerPresence::Running => Some(format!(
+            "warning: a NORA server is running on this storage; the deletions of `nora {command}` \
+             are not serialized with the server's publishes. {safely}"
+        )),
+        storage::ServerPresence::Unknown => Some(format!(
+            "warning: `nora {command}` cannot tell whether a NORA server is running on this \
+             storage; if one is, its deletions are not serialized with the server's publishes. \
+             {safely}"
+        )),
+    }
+}
+
+/// Print [`live_server_warning`] to stderr, in one line.
+async fn warn_if_server_running(storage: &Storage, command: &str, schedule: &str) {
+    if let Some(warning) = live_server_warning(command, schedule, storage.server_presence().await) {
+        eprintln!("{warning}");
+    }
+}
+
+#[cfg(test)]
+mod live_server_warning_tests {
+    use super::live_server_warning;
+    use crate::storage::ServerPresence;
+
+    /// #988: no server, no warning; a running server and one the command cannot see both
+    /// warn in one line that names the command and the server's schedule.
+    #[test]
+    fn warns_in_one_line_unless_no_server_runs() {
+        assert_eq!(
+            live_server_warning(
+                "gc --apply",
+                "[gc] enabled = true",
+                ServerPresence::NotRunning
+            ),
+            None
+        );
+        for presence in [ServerPresence::Running, ServerPresence::Unknown] {
+            let warning = live_server_warning("gc --apply", "[gc] enabled = true", presence)
+                .unwrap_or_else(|| panic!("{presence:?}: no warning"));
+            assert!(!warning.contains('\n'), "{warning}");
+            assert!(warning.contains("`nora gc --apply`"), "{warning}");
+            assert!(warning.contains("[gc] enabled = true"), "{warning}");
+            assert!(warning.contains("server is stopped"), "{warning}");
+        }
+    }
 }
 
 /// Print note about registries that have data but no retention rules configured.
