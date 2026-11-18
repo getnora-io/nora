@@ -2336,7 +2336,7 @@ dependencies = [
 
 [[package]]
 name = "nora-registry"
-version = "1.4.6"
+version = "1.4.7"
 dependencies = [
  "allocation-counter",
  "ar",
