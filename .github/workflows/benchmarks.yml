@@ -1,8 +1,13 @@
 name: Benchmarks
 
+# Runs on every release tag push, alongside the Release workflow. Releases are
+# created by release.yml with the default GITHUB_TOKEN, and GitHub does not start
+# workflows for events created by GITHUB_TOKEN, so `on: release` stopped firing
+# after v1.2.2. Release tags (v*) are protected, so a tag push is a trusted
+# trigger for a job that builds and runs the code.
 on:
-  release:
-    types: [published]
+  push:
+    tags: ['v*']
   workflow_dispatch:
 
 permissions: read-all
@@ -44,8 +49,11 @@ jobs:
         id: start
         run: |
           mkdir -p /tmp/nora-bench-data
+          # A public URL is required when binding the wildcard address (config/mod.rs).
+          # The .invalid host is deliberate: nothing in the benchmark resolves it.
           NORA_HOST=0.0.0.0 \
           NORA_PORT=4000 \
+          NORA_PUBLIC_URL=http://nora-benchmark.invalid:4000 \
           NORA_STORAGE_PATH=/tmp/nora-bench-data \
           NORA_RATE_LIMIT_ENABLED=false \
           NORA_AUTH_ENABLED=false \
@@ -79,9 +87,11 @@ jobs:
 
       - name: Generate summary report
         id: report
+        env:
+          RUN_TAG: ${{ github.ref_name }}
         run: |
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-          VERSION="${GITHUB_REF_NAME:-dev}"
+          VERSION="${RUN_TAG:-dev}"
 
           cat > /tmp/nora-bench-report.json << EOF
           {
@@ -108,11 +118,38 @@ jobs:
             /tmp/criterion-results.txt
           retention-days: 90
 
-      - name: Upload to release
-        if: github.event_name == 'release'
+  # Separate job so that only this step holds a write token; the build above
+  # runs with read-only permissions. It waits for the Release workflow to create
+  # the release, since this run starts in parallel with it.
+  publish:
+    name: Attach results to release
+    needs: benchmarks
+    if: github.event_name == 'push' && needs.benchmarks.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      actions: read   # download the artifact of this run
+      contents: write # gh release upload
+
+    steps:
+      - name: Download benchmark results
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: bench-results-${{ github.sha }}
+          path: bench-out
+
+      - name: Upload report to release (waits for the release to exist)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_TAG: ${{ github.ref_name }}
         run: |
-          gh release upload "${{ github.event.release.tag_name }}" \
-            /tmp/nora-bench-report.json \
-            --clobber || true
+          for i in $(seq 1 120); do
+            if gh release view "$RUN_TAG" > /dev/null 2>&1; then
+              gh release upload "$RUN_TAG" bench-out/nora-bench-report.json --clobber
+              exit 0
+            fi
+            echo "release $RUN_TAG not published yet (attempt $i/120), retrying in 30s"
+            sleep 30
+          done
+          echo "::error::release $RUN_TAG was not published within 60 minutes"
+          exit 1
