@@ -645,12 +645,9 @@ fn raw_upload_temp_dir(data_dir: &str) -> std::path::PathBuf {
 
 /// Format a Unix timestamp as an HTTP-date (RFC 7231 §7.1.1.1).
 fn format_http_date(timestamp: u64) -> String {
-    use chrono::{TimeZone, Utc};
-    let dt = Utc.timestamp_opt(timestamp as i64, 0).single();
-    match dt {
-        Some(dt) => dt.format("%a, %d %b %Y %H:%M:%S GMT").to_string(),
-        None => String::new(),
-    }
+    crate::datetime::UtcTime::from_unix(timestamp as i64, 0)
+        .map(crate::datetime::UtcTime::http_date)
+        .unwrap_or_default()
 }
 
 /// Headers that make a raw download safe to serve: the browser saves the file
@@ -701,6 +698,23 @@ fn guess_content_type(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Last-Modified` of a raw file, as NORA 1.4.5 wrote it (#1282); no header value for a
+    /// date past the calendar.
+    #[test]
+    fn last_modified_is_the_http_date_it_was() {
+        assert_eq!(format_http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(
+            format_http_date(1_700_000_000),
+            "Tue, 14 Nov 2023 22:13:20 GMT"
+        );
+        assert_eq!(
+            format_http_date(253_402_300_800),
+            "Sat, 01 Jan +10000 00:00:00 GMT"
+        );
+        assert_eq!(format_http_date(8_210_266_876_800), "");
+        assert_eq!(format_http_date(u64::MAX), "Wed, 31 Dec 1969 23:59:59 GMT");
+    }
 
     /// A streamed upload orphaned by a crash is reaped once idle past the bound; a
     /// file still being written is kept (#1055: a SIGKILL mid-PUT left them

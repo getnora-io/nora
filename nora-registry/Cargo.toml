@@ -48,12 +48,13 @@ uuid = { version = "1", features = ["v4"] }
 bcrypt = "0.19"
 base64 = "0.22"
 prometheus = "0.14"
-utoipa = { version = "5", features = ["axum_extras", "chrono"] }
+utoipa = { version = "5", features = ["axum_extras"] }
 clap = { version = "4", features = ["derive"] }
 tar = "0.4"
 flate2 = "1.1"
 indicatif = "0.18"
-chrono = { version = "0.4", features = ["serde"] }
+# Calendar math for NORA's dates (src/datetime.rs); years up to ±262143, as before #1282.
+time = { version = "0.3", default-features = false, features = ["std", "large-dates"] }
 thiserror = "2"
 tower_governor = "0.8"
 governor = "0.10"

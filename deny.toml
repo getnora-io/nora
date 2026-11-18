@@ -21,10 +21,11 @@ ignore = [
     # move to crypto-bigint >=0.7.6.
     "RUSTSEC-2026-0387",
     # chrono and humantime are marked unmaintained (informational, no
-    # vulnerability, no patched version). chrono is a direct dependency and
-    # also comes in through object_store; humantime comes in only through
-    # object_store. NORA's own date code moves to a maintained crate in #1282;
-    # remove these when object_store no longer pulls them in.
+    # vulnerability, no patched version). Both come in only through
+    # object_store: NORA's own dates are on the time crate since #1282
+    # (src/datetime.rs), and nora-registry does not depend on chrono itself
+    # (datetime_golden.rs: nora_does_not_depend_on_chrono_itself). Remove
+    # these when object_store no longer pulls them in.
     "RUSTSEC-2026-0543",
     "RUSTSEC-2026-0542",
 ]

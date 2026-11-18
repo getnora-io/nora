@@ -1156,7 +1156,7 @@ async fn record_first_seen(state: &AppState, key: &str, body: &[u8], seed_from: 
             return;
         }
     };
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::datetime::now_unix();
     let known = ledger.len();
     for version in versions {
         ledger.entry(version).or_insert(now);
@@ -7196,9 +7196,7 @@ mod multi_upstream_tests {
     async fn release_age_reads_the_owners_date_not_a_foreign_copy() {
         let public = public_upstream().await;
         let private = MockServer::start().await;
-        let now = chrono::Utc::now()
-            .format("%Y-%m-%dT%H:%M:%S.000Z")
-            .to_string();
+        let now = crate::datetime::ago(0).rfc3339_secs().replace('Z', ".000Z");
         let owner_packument = serde_json::json!({
             "name": "@vendor/a",
             "versions": { "1.0.0": { "dist": {
@@ -7709,7 +7707,7 @@ mod release_age_first_seen {
     }
 
     fn now() -> i64 {
-        chrono::Utc::now().timestamp()
+        crate::datetime::now_unix()
     }
 
     fn packument(upstream: &str, versions: &[&str]) -> String {
@@ -8557,7 +8555,7 @@ mod published_and_upstream_keys {
             "time": { "1.0.0": "2020-01-01T00:00:00.000Z" } });
         let squatted = serde_json::json!({ "name": "corp-lib",
             "versions": { "1.0.0": { "name": "corp-lib", "version": "1.0.0" } },
-            "time": { "1.0.0": chrono::Utc::now().to_rfc3339() } });
+            "time": { "1.0.0": crate::datetime::UtcTime::now().rfc3339() } });
         for (key, body) in [
             ("npm/corp-lib/metadata.json", own.to_string()),
             ("npm/corp-lib/upstream/packument.json", squatted.to_string()),
@@ -13806,8 +13804,9 @@ mod upstream_dates_gate {
     /// An upstream listing `agepkg` 1.0.0, released in 2020, and 2.0.0, released an hour ago.
     async fn upstream() -> MockServer {
         let server = MockServer::start().await;
-        let fresh = (chrono::Utc::now() - chrono::Duration::hours(1))
-            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+        let fresh = crate::datetime::ago(3600)
+            .rfc3339_secs()
+            .replace('Z', ".000Z");
         let link = |v: &str| format!("{}/agepkg/-/agepkg-{v}.tgz", server.uri());
         let doc = serde_json::json!({
             "name": "agepkg",

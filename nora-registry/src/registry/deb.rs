@@ -408,9 +408,7 @@ fn extract_record(
 
 /// RFC 1123 date as apt expects in Release (`Thu, 10 Jul 2026 12:00:00 UTC`).
 fn release_date() -> String {
-    chrono::Utc::now()
-        .format("%a, %d %b %Y %H:%M:%S UTC")
-        .to_string()
+    crate::datetime::UtcTime::now().apt_release_date()
 }
 
 fn hash_entry(data: &[u8], name: &str, hasher: fn(&[u8]) -> String) -> String {
@@ -1093,6 +1091,20 @@ fn content_type(path: &str) -> &'static str {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+
+    /// A Release file's `Date:`, as NORA always wrote it: an RFC 1123 date in UTC (#1282).
+    #[test]
+    fn a_release_is_dated_as_before() {
+        let release = generate_release(b"", b"", "main");
+        let date = release
+            .lines()
+            .find_map(|l| l.strip_prefix("Date: "))
+            .unwrap();
+        let unix = crate::datetime::parse_rfc2822_to_unix(&date.replace(" UTC", " GMT")).unwrap();
+        let at = crate::datetime::UtcTime::from_unix(unix, 0).unwrap();
+        assert_eq!(date, at.apt_release_date(), "{release}");
+        assert!((crate::datetime::now_unix() - unix).abs() < 60, "{date}");
+    }
 
     #[test]
     fn test_validate_package_path() {

@@ -1,8 +1,8 @@
 // Copyright (c) 2026 The NORA Authors
 // SPDX-License-Identifier: MIT
 
+use crate::datetime::UtcTime;
 use crate::registry_type::RegistryType;
-use chrono::{DateTime, Utc};
 use parking_lot::RwLock;
 use serde::Serialize;
 use std::collections::VecDeque;
@@ -31,7 +31,8 @@ impl std::fmt::Display for ActionType {
 /// A single activity log entry
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ActivityEntry {
-    pub timestamp: DateTime<Utc>,
+    #[schema(value_type = String, format = DateTime)]
+    pub timestamp: UtcTime,
     pub action: ActionType,
     pub artifact: String,
     pub registry: String,
@@ -41,7 +42,7 @@ pub struct ActivityEntry {
 impl ActivityEntry {
     pub fn new(action: ActionType, artifact: String, registry: RegistryType, source: &str) -> Self {
         Self {
-            timestamp: Utc::now(),
+            timestamp: UtcTime::now(),
             action,
             artifact,
             registry: registry.as_str().to_string(),
@@ -132,6 +133,23 @@ mod tests {
         assert_eq!(entry.artifact, "nginx:latest");
         assert_eq!(entry.registry, "docker");
         assert_eq!(entry.source, "LOCAL");
+    }
+
+    /// The JSON the dashboard and `/api/ui/dashboard` serve, as NORA 1.4.5 wrote it (#1282;
+    /// the other date goldens are in `datetime_golden.rs`).
+    #[test]
+    fn an_entry_keeps_its_json() {
+        let mut entry = ActivityEntry::new(
+            ActionType::Pull,
+            "nginx:latest".to_string(),
+            crate::registry_type::RegistryType::Docker,
+            "LOCAL",
+        );
+        entry.timestamp = UtcTime::from_unix(1_700_000_000, 120_000_000).unwrap();
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"{"timestamp":"2023-11-14T22:13:20.120Z","action":"Pull","artifact":"nginx:latest","registry":"docker","source":"LOCAL"}"#
+        );
     }
 
     #[test]

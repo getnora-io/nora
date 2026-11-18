@@ -818,9 +818,7 @@ async fn a_version_rule_holds_for_every_spelling_of_the_version() {
 #[tokio::test]
 async fn a_release_younger_than_the_minimum_age_is_refused() {
     let up = MockServer::start().await;
-    let now = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S+00:00")
-        .to_string();
+    let now = crate::datetime::UtcTime::now().composer_time();
     Mock::given(wm_path("/p2/acme/fresh.json"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"packages": {"acme/fresh": [
             {"name": "acme/fresh", "version": "1.0.0", "time": now,
@@ -934,6 +932,10 @@ async fn an_uploaded_package_is_listed_and_downloads_with_its_sha1() {
     assert_eq!(v1["require"]["php"], ">=8.1");
     assert_eq!(v1["dist"]["shasum"], sha1);
     assert_eq!(v1["dist"]["type"], "zip");
+    // The release time NORA gives an upload, spelled as it always was (#1282).
+    let time = v1["time"].as_str().unwrap();
+    let at = crate::datetime::parse_rfc3339_relaxed(time).unwrap();
+    assert_eq!(time, at.composer_time(), "{time}");
     let url = v1["dist"]["url"].as_str().unwrap();
     assert_eq!(created["dist"]["url"], url);
     let path = url.strip_prefix(&base(&ctx)).unwrap().to_string();
@@ -3033,9 +3035,7 @@ async fn mount_dated_branch(up: &MockServer, reference: &str, time: &str, bytes:
 /// is served.
 #[tokio::test]
 async fn a_held_archive_keeps_its_release_age() {
-    let now = chrono::Utc::now()
-        .format("%Y-%m-%dT%H:%M:%S+00:00")
-        .to_string();
+    let now = crate::datetime::UtcTime::now().composer_time();
     for (released, expected) in [
         (now.as_str(), StatusCode::FORBIDDEN),
         ("2020-01-01T00:00:00+00:00", StatusCode::OK),
@@ -3349,4 +3349,43 @@ async fn metadata_naming_no_package_is_not_a_failure() {
             "{failure}: {asked:?}"
         );
     }
+}
+
+/// The `Last-Modified` NORA gives a Composer document, as 1.4.5 wrote it (#1282); the epoch for
+/// a date past the calendar. An upstream's own date is kept only when it reads as RFC 2822.
+#[test]
+fn composer_dates_are_the_http_dates_they_were() {
+    assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
+    assert_eq!(http_date(1_700_000_000), "Tue, 14 Nov 2023 22:13:20 GMT");
+    assert_eq!(
+        http_date(8_210_266_876_800),
+        "Thu, 01 Jan 1970 00:00:00 GMT"
+    );
+    assert_eq!(http_date(u64::MAX), "Wed, 31 Dec 1969 23:59:59 GMT");
+    let served = |upstream: &str, since: i64| {
+        metadata_response(
+            &HeaderMap::new(),
+            b"{}".to_vec(),
+            Some(upstream.to_string()),
+            false,
+            since,
+        )
+        .headers()
+        .get(header::LAST_MODIFIED)
+        .map(|v| v.to_str().unwrap().to_string())
+    };
+    let upstream = "Tue, 14 Nov 2023 22:13:20 GMT";
+    assert_eq!(served(upstream, 1_700_000_000).as_deref(), Some(upstream));
+    assert_eq!(
+        served(upstream, 1_700_000_001).as_deref(),
+        Some("Tue, 14 Nov 2023 22:13:21 GMT")
+    );
+    assert_eq!(
+        served("tue, 14 nov 23 23:13:20 +0100", 1_700_000_000).as_deref(),
+        Some("tue, 14 nov 23 23:13:20 +0100")
+    );
+    assert_eq!(
+        served("2023-11-14T22:13:20Z", 0).as_deref(),
+        Some("Thu, 01 Jan 1970 00:00:00 GMT")
+    );
 }

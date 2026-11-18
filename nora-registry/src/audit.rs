@@ -13,7 +13,7 @@
 //! Uses a bounded mpsc channel with a single writer task (#543) to avoid
 //! per-entry `spawn_blocking` + Mutex contention under load.
 
-use chrono::{DateTime, Utc};
+use crate::datetime::UtcTime;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -68,7 +68,7 @@ impl std::str::FromStr for AuditMode {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
-    pub ts: DateTime<Utc>,
+    pub ts: UtcTime,
     pub action: String,
     pub actor: String,
     pub artifact: String,
@@ -99,7 +99,7 @@ impl AuditEntry {
 
     pub fn new(action: &str, actor: &str, artifact: &str, registry: &str, detail: &str) -> Self {
         Self {
-            ts: Utc::now(),
+            ts: UtcTime::now(),
             action: action.to_string(),
             actor: actor.to_string(),
             artifact: artifact.to_string(),

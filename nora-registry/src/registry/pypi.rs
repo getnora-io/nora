@@ -4690,7 +4690,7 @@ mod release_age_without_the_json_index {
     }
 
     fn hour_ago() -> String {
-        (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339()
+        crate::datetime::ago(3600).rfc3339()
     }
 
     #[tokio::test]

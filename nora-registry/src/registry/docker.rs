@@ -755,7 +755,7 @@ fn quarantine_forbidden(
         crate::digest_quarantine::QuarantineStatus::Pending { remaining_secs } => *remaining_secs,
         crate::digest_quarantine::QuarantineStatus::Mature => 0,
     };
-    let quarantine_until = chrono::Utc::now().timestamp() + remaining;
+    let quarantine_until = crate::datetime::now_unix() + remaining;
 
     let body = json!({
         "errors": [{

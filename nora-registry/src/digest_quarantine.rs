@@ -11,8 +11,8 @@
 //! Persistence: append-only JSONL file, compacted on startup via atomic rewrite.
 //! Fail-open: corrupt or missing JSONL → empty store, all pulls pass.
 
+use crate::datetime::now_unix;
 use crate::log_redact::RecordedUrl;
-use chrono::Utc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -139,7 +139,7 @@ impl DigestStore {
             match File::open(&path) {
                 Ok(file) => {
                     let reader = BufReader::new(file);
-                    let now = Utc::now().timestamp();
+                    let now = now_unix();
                     let cutoff = now - PRUNE_TTL_SECS;
                     let mut skipped = 0u32;
 
@@ -242,7 +242,7 @@ impl DigestStore {
         let entry = DigestEntry {
             registry: registry.to_string(),
             digest: digest.to_string(),
-            first_seen: first_seen.unwrap_or_else(|| Utc::now().timestamp()),
+            first_seen: first_seen.unwrap_or_else(now_unix),
             upstream: RecordedUrl::new(upstream),
         };
 
@@ -267,7 +267,7 @@ impl DigestStore {
         match entries.get(&key) {
             None => QuarantineStatus::New,
             Some(entry) => {
-                let age = Utc::now().timestamp() - entry.first_seen;
+                let age = now_unix() - entry.first_seen;
                 if age >= quarantine_secs {
                     QuarantineStatus::Mature
                 } else {
@@ -423,7 +423,7 @@ fn quarantine_forbidden(
         QuarantineStatus::Pending { remaining_secs } => *remaining_secs,
         QuarantineStatus::Mature => 0,
     };
-    let quarantine_until = Utc::now().timestamp() + remaining;
+    let quarantine_until = now_unix() + remaining;
     let body = serde_json::json!({
         "error": "quarantine",
         "message": format!(
@@ -702,7 +702,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let ledger = tmp.path().join("quarantine.jsonl");
         let line = serde_json::json!({
-            "registry": "npm", "digest": "sha256:abc", "first_seen": Utc::now().timestamp(),
+            "registry": "npm", "digest": "sha256:abc", "first_seen": now_unix(),
             "upstream": "https://ci-user:s3cret@npm.example/pkg/-/pkg-1.0.0.tgz",
         });
         std::fs::write(&ledger, format!("{line}\n")).unwrap();
@@ -737,7 +737,7 @@ mod tests {
         // Mature (served), not held as "new to this mirror".
         let tmp = TempDir::new().unwrap();
         let store = DigestStore::empty(tmp.path().to_str().unwrap());
-        let two_years_ago = Utc::now().timestamp() - 2 * 365 * 86400;
+        let two_years_ago = now_unix() - 2 * 365 * 86400;
 
         store.record(
             "pypi",
@@ -756,7 +756,7 @@ mod tests {
             "pypi",
             "sha256:fresh",
             "files.pythonhosted.org",
-            Some(Utc::now().timestamp()),
+            Some(now_unix()),
         );
         assert!(matches!(
             store.check("pypi", "sha256:fresh", 14 * 86400),
@@ -773,7 +773,7 @@ mod tests {
         let jsonl_path = tmp.path().join("quarantine.jsonl");
 
         // Write JSONL directly (bypass async spawn_blocking in record())
-        let now = Utc::now().timestamp();
+        let now = now_unix();
         let entries = [
             DigestEntry {
                 registry: "docker".into(),
@@ -815,7 +815,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("quarantine.jsonl");
 
-        let now = Utc::now().timestamp();
+        let now = now_unix();
         let valid = serde_json::json!({
             "registry": "docker",
             "digest": "sha256:good",
@@ -833,7 +833,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("quarantine.jsonl");
 
-        let now = Utc::now().timestamp();
+        let now = now_unix();
         let old_ts = now - (91 * 24 * 3600); // 91 days — stale
         let fresh_ts = now - (10 * 24 * 3600); // 10 days — kept
 
@@ -878,7 +878,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("quarantine.jsonl");
 
-        let now = Utc::now().timestamp();
+        let now = now_unix();
         let entry = serde_json::json!({
             "registry": "docker", "digest": "sha256:dup",
             "first_seen": now, "upstream": "up"
@@ -922,7 +922,7 @@ mod tests {
     fn every_credential_already_in_the_ledger_is_masked_on_load() {
         let tmp = TempDir::new().unwrap();
         let ledger = tmp.path().join("quarantine.jsonl");
-        let now = Utc::now().timestamp();
+        let now = now_unix();
         let mut text = String::new();
         for (digest, user) in [("sha256:aaa", "first-user"), ("sha256:bbb", "second-user")] {
             let line = serde_json::json!({
@@ -972,7 +972,7 @@ mod tests {
             ),
         ];
         let secrets = ["s3cret", "ci-user", "p@ss", "w0rd", "only-user", "second"];
-        let now = Utc::now().timestamp();
+        let now = now_unix();
         for reversed in [false, true] {
             let mut lines: Vec<_> = rows.iter().collect();
             if reversed {
