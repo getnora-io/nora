@@ -233,14 +233,26 @@ fn staging_presence(root: &Path, own: Option<&Path>) -> ServerPresence {
     use rustix::fs::{flock, FlockOperation};
     let entries = match std::fs::read_dir(root.join(crate::validation::STAGING_DIR)) {
         Ok(entries) => entries,
-        Err(e) if is_missing(&e) => return ServerPresence::NotRunning,
+        // No staging at all: no server started here. A staging path that is not a directory
+        // says nothing: a server whose staging failed runs without one.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return ServerPresence::NotRunning,
         Err(_) => return ServerPresence::Unknown,
     };
     let mut presence = ServerPresence::NotRunning;
-    for entry in entries.flatten() {
-        // `DirEntry::metadata` does not follow symlinks.
-        let Ok(meta) = entry.metadata() else {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            presence = ServerPresence::Unknown;
             continue;
+        };
+        // `DirEntry::metadata` does not follow symlinks.
+        let meta = match entry.metadata() {
+            Ok(meta) => meta,
+            // Removed since the listing: a dead owner's (see [`Staging`]).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                presence = ServerPresence::Unknown;
+                continue;
+            }
         };
         let dir = entry.path();
         if !meta.is_dir()
@@ -2043,6 +2055,45 @@ mod tests {
         assert_eq!(
             rt.block_on(storage.server_presence()),
             ServerPresence::NotRunning
+        );
+    }
+
+    /// A staging path the probe cannot read whole says nothing either way: a `.nora-staging`
+    /// that is a file, and one whose entries cannot be examined, read as unknown, never as
+    /// not running (#988).
+    #[test]
+    fn a_staging_the_probe_cannot_read_reads_as_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join(crate::validation::STAGING_DIR), b"").unwrap();
+        let storage = LocalStorage::new(dir.path().to_str().unwrap());
+        assert_eq!(
+            rt.block_on(storage.server_presence()),
+            ServerPresence::Unknown,
+            "a staging path that is a file"
+        );
+
+        // Readable but not searchable: the entries are listed, their metadata is not.
+        let dir = TempDir::new().unwrap();
+        let server = LocalStorage::new(dir.path().to_str().unwrap());
+        rt.block_on(server.prepare());
+        let staging = dir.path().join(crate::validation::STAGING_DIR);
+        let own = server.staging_dir().unwrap().to_path_buf();
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if std::fs::symlink_metadata(&own).is_ok() {
+            // Root searches it anyway: the case cannot be built here.
+            std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let command = LocalStorage::new(dir.path().to_str().unwrap());
+        let presence = rt.block_on(command.server_presence());
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            presence,
+            ServerPresence::Unknown,
+            "a staging without search permission"
         );
     }
 

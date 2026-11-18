@@ -120,7 +120,8 @@ pub enum ServerPresence {
     /// Another process holds a server's instance lock on this storage.
     Running,
     /// No other process holds one: no server is running, or only dead ones left their
-    /// staging behind.
+    /// staging behind. A server that started without a staging directory holds none and
+    /// reads as this too (its log says so at start).
     NotRunning,
     /// The backend cannot tell: an object store keeps no instance lock, and a local lock
     /// that cannot be tested says nothing either way.
