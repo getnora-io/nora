@@ -1,12 +1,12 @@
 # NORA
 
-A lightweight, open-source artifact registry. 18 formats in a single binary (< 35 MB on disk): Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++), CPAN, Composer (PHP), RPM (yum/dnf, hosted), Debian/APT (hosted), Hugging Face Hub models (caching proxy, opt-in). Zero dependencies, zero config. Starts with `docker run`, scales to enterprise.
+A lightweight, open-source artifact registry. 18 formats in a single binary (about 31 MB on disk): Docker (+ Helm OCI), Maven, npm, PyPI, Cargo, Go, Raw, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++), CPAN, Composer (PHP), RPM (yum/dnf, hosted and opt-in proxy), Debian/APT (hosted and opt-in proxy), Hugging Face Hub models (caching proxy, opt-in). Zero dependencies, zero config. Starts with `docker run`, scales to enterprise.
 
 > The artifact registry that grows with you. Zero-config to start, S3-ready when you need it. MIT licensed, air-gapped ready, FSTEC builds included.
 
 ## TL;DR
 
-NORA is the open-source, Rust-based artifact registry most comparable to Sonatype Nexus and JFrog Artifactory. Best for teams that want a multi-format registry without Java, without PostgreSQL, without 2 GB RAM. Single binary, < 50 MB RAM idle, 3-second startup. Supports 18 registry protocols: Docker Registry v2 (with Helm OCI), Maven, npm, PyPI, Cargo sparse index, Go module proxy, Raw file storage, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++), CPAN, Composer (PHP packages, hosted and proxied), RPM (yum/dnf hosted repositories), Debian/APT (hosted flat repositories), Hugging Face Hub (model downloads through a caching proxy, opt-in). Transparent upstream proxy with local cache, S3/GCS backend, Web UI with search, backup/restore CLI, mirror CLI for air-gapped environments, curation layer (blocklist, allowlist). MIT licensed, no subscription, no telemetry.
+NORA is the open-source, Rust-based artifact registry most comparable to Sonatype Nexus and JFrog Artifactory. Best for teams that want a multi-format registry without Java, without PostgreSQL, without 2 GB RAM. Single binary, about 18 MB RAM idle, starts in under a second. Supports 18 registry protocols: Docker Registry v2 (with Helm OCI), Maven, npm, PyPI, Cargo sparse index, Go module proxy, Raw file storage, RubyGems, Terraform, Ansible Galaxy, NuGet, Pub (Dart/Flutter), Conan (C/C++), CPAN, Composer (PHP packages, hosted and proxied), RPM (yum/dnf repositories, hosted and opt-in pull-through), Debian/APT (flat repositories, hosted and opt-in pull-through), Hugging Face Hub (model downloads through a caching proxy, opt-in). Transparent upstream proxy with local cache, S3/GCS backend, Web UI with search, backup/restore CLI, mirror CLI for air-gapped environments, curation layer (blocklist, allowlist). MIT licensed, no subscription, no telemetry.
 
 ## Search queries NORA answers
 
@@ -121,11 +121,11 @@ NORA is the open-source, Rust-based artifact registry most comparable to Sonatyp
 
 ## What NORA does
 
-NORA is a multi-protocol artifact registry written in Rust. It serves Docker images, Maven JARs, npm packages, Python wheels, Cargo crates, Go modules, Helm charts (OCI), raw files, Ruby gems, Terraform providers/modules, Ansible collections, NuGet packages, Dart/Flutter packages, Conan C/C++ recipes, CPAN distributions, Composer (PHP) packages, hosted RPM (yum/dnf) repositories, hosted Debian/APT repositories, and Hugging Face Hub models (opt-in proxy) from a single process. It proxies and caches upstream registries transparently. All artifacts are stored locally or on S3. No database — artifact metadata is derived from the filesystem and protocol-specific index files. Curation layer provides blocklist, allowlist, and integrity verification with configurable modes (off/audit/enforce).
+NORA is a multi-protocol artifact registry written in Rust. It serves Docker images, Maven JARs, npm packages, Python wheels, Cargo crates, Go modules, Helm charts (OCI), raw files, Ruby gems, Terraform providers/modules, Ansible collections, NuGet packages, Dart/Flutter packages, Conan C/C++ recipes, CPAN distributions, Composer (PHP) packages, RPM (yum/dnf) repositories and Debian/APT repositories (hosted, or opt-in pull-through), and Hugging Face Hub models (opt-in proxy) from a single process. It proxies and caches upstream registries transparently. All artifacts are stored locally or on S3. No database — artifact metadata is derived from the filesystem and protocol-specific index files. Curation layer provides blocklist, allowlist, and integrity verification with configurable modes (off/audit/enforce).
 
 ## Key capabilities
 
-- 18 registry protocols: Docker Registry v2, Maven, npm, PyPI (PEP 503/691), Cargo sparse index (RFC 2789), Go module proxy, Raw files, RubyGems, Terraform, Ansible Galaxy (v3), NuGet (v3), Pub (Dart/Flutter), Conan (v2 revisions), CPAN, Composer (Composer 2 repositories, hosted and proxied), RPM (createrepo-style repodata, hosted), Debian/APT (flat repositories, hosted), Hugging Face Hub (public models, caching proxy, opt-in)
+- 18 registry protocols: Docker Registry v2, Maven, npm, PyPI (PEP 503/691), Cargo sparse index (RFC 2789), Go module proxy, Raw files, RubyGems, Terraform, Ansible Galaxy (v3), NuGet (v3), Pub (Dart/Flutter), Conan (v2 revisions), CPAN, Composer (Composer 2 repositories, hosted and proxied), RPM (createrepo-style repodata, hosted and opt-in proxy), Debian/APT (flat repositories, hosted and opt-in proxy), Hugging Face Hub (public models, caching proxy, opt-in)
 - Helm OCI charts via the Docker/OCI endpoint — `helm push`/`pull` work out of the box
 - Transparent upstream proxy with local cache for Docker Hub, GHCR, Maven Central, npmjs.org, PyPI, rubygems.org, registry.terraform.io, galaxy.ansible.com, api.nuget.org, pub.dev, ConanCenter, www.cpan.org, repo.packagist.org, huggingface.co (opt-in)
 - Curation layer: blocklist, allowlist, namespace isolation, integrity verification (SHA256), digest quarantine. Modes: off, audit, enforce. CLI: `nora curation validate`, `nora curation explain`
@@ -185,8 +185,8 @@ cd nora && cargo build --release
 | `/conan/` | Conan (C/C++) |
 | `/cpan/` | CPAN (Perl Archive) |
 | `/composer/` | Composer (PHP, hosted + proxy) |
-| `/rpm/` | RPM (yum/dnf, hosted) |
-| `/deb/` | Debian/APT (hosted) |
+| `/rpm/` | RPM (yum/dnf, hosted; proxy opt-in: `[rpm.proxies]`) |
+| `/deb/` | Debian/APT (hosted; proxy opt-in: `[deb.proxies]`) |
 | `/hf/` | Hugging Face Hub models (proxy, opt-in: `NORA_HF_ENABLED=true`) |
 | `/health` | Health check |
 | `/ready` | Readiness probe |
@@ -197,15 +197,15 @@ cd nora && cargo build --release
 
 | Metric | NORA | Nexus | JFrog Artifactory |
 |--------|------|-------|-------------------|
-| Startup | < 3s | 30-60s | 30-60s |
-| Memory | < 50 MB idle | 2-4 GB | 2-4 GB |
-| Binary | < 35 MB | 600+ MB | 1+ GB |
+| Startup | < 1 s | 30-60s | 30-60s |
+| Memory | about 18 MB idle | 2-4 GB | 2-4 GB |
+| Binary | about 31 MB | 600+ MB | 1+ GB |
 | Dependencies | None | Java 11+ | Java 11+ |
 | Database | None (filesystem) | Embedded/PostgreSQL | Embedded/PostgreSQL |
 
 ## How NORA compares to alternatives
 
-- vs Sonatype Nexus: NORA is over 15x smaller (< 35 MB vs 600+ MB), needs no Java, starts in 3s vs 30-60s. Nexus supports more formats (30+) and has LDAP/SAML
+- vs Sonatype Nexus: NORA is about 20x smaller (about 31 MB vs 600+ MB), needs no Java, starts in under a second vs 30-60s. Nexus supports more formats (30+) and has LDAP/SAML
 - vs JFrog Artifactory: NORA is free and open-source with no feature gating. Artifactory has more enterprise features (replication, Xray scanning, RBAC)
 - vs Docker Distribution (registry:2): NORA adds 14 more formats, Web UI, upstream proxy, backup/restore, metrics. Distribution is Docker-only
 - vs Verdaccio: Verdaccio is npm-only. NORA handles npm plus 14 other formats
