@@ -1204,39 +1204,56 @@ async fn record_first_seen(
     }
 }
 
-/// When the copy at `key` was last written or confirmed upstream, in Unix seconds: its body's write
-/// time, or a later 304 that confirmed it (#1064). A 304 no longer writes the body, so the write time
-/// alone would date a month-old copy's releases a month back; this is the time the copy had before a
-/// 304 rewrote it. Curation's fallback dates and the ledger's seed use it.
-async fn copy_time(storage: &crate::Storage, key: &str) -> Option<i64> {
-    let written = storage.stat(key).await?.modified as i64;
-    let confirmed = match sidecar_of(storage, key).await {
-        Sidecar::Read(validators) => validators.checked.map(|at| at as i64),
-        Sidecar::Absent => None,
-        // A sidecar that exists but cannot be read may hold a later confirmation. The copy is dated
-        // now, so its releases stay young rather than passing a minimum age on the body's old time.
-        Sidecar::Unreadable => return Some(crate::cache_ttl::now_unix() as i64),
-    };
-    Some(confirmed.map_or(written, |at| at.max(written)))
-}
-
-/// What the validator sidecar of a key holds: no sidecar, its validators, or a sidecar that exists
-/// and cannot be read or parsed. [`read_validators`] reads the last two alike (#1064).
-enum Sidecar {
+/// What the validator sidecar of a copy says about the copy's confirmation (#1064).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarState {
+    /// No sidecar: a copy from before sidecars. Its body's write time is its date, as on main.
     Absent,
-    Read(Validators),
+    /// A sidecar that exists and cannot be read or parsed: the confirmation it held is unknown.
     Unreadable,
+    /// A sidecar emptied to `{}` by a 304 that could not confirm: the confirmation it held is gone.
+    Emptied,
+    /// Validators without a confirmation time: a sidecar from before `checked`.
+    Unchecked,
+    /// The time the copy was last confirmed upstream.
+    Checked(u64),
 }
 
-async fn sidecar_of(storage: &crate::Storage, key: &str) -> Sidecar {
+/// The date of a copy, in Unix seconds, from its sidecar state, its body's write time and now.
+/// Pure: the one rule that dates a copy for the ledger's seed, curation's fallback date and the
+/// release-age gate. It is never older than the body's write time, and a lost confirmation dates
+/// the copy now: information that is missing makes a release younger, never older.
+fn copy_date(state: SidecarState, written: u64, now: u64) -> u64 {
+    match state {
+        SidecarState::Absent | SidecarState::Unchecked => written,
+        SidecarState::Checked(at) => at.max(written),
+        SidecarState::Emptied | SidecarState::Unreadable => now.max(written),
+    }
+}
+
+/// The state of the sidecar at `key`: [`read_validators`] reads absent, emptied and unreadable alike.
+async fn sidecar_state(storage: &crate::Storage, key: &str) -> SidecarState {
     match storage.get(&validators_key(key)).await {
         Ok(data) => match serde_json::from_slice::<Validators>(&data) {
-            Ok(validators) => Sidecar::Read(validators),
-            Err(_) => Sidecar::Unreadable,
+            Ok(validators) => match (validators.checked, validators.is_some()) {
+                (Some(at), _) => SidecarState::Checked(at),
+                (None, true) => SidecarState::Unchecked,
+                (None, false) => SidecarState::Emptied,
+            },
+            Err(_) => SidecarState::Unreadable,
         },
-        Err(crate::storage::StorageError::NotFound) => Sidecar::Absent,
-        Err(_) => Sidecar::Unreadable,
+        Err(crate::storage::StorageError::NotFound) => SidecarState::Absent,
+        Err(_) => SidecarState::Unreadable,
     }
+}
+
+/// When the copy at `key` was last written or confirmed upstream, in Unix seconds: [`copy_date`]
+/// of its body's write time and its sidecar (#1064). Curation's fallback dates and the ledger's
+/// seed use it.
+async fn copy_time(storage: &crate::Storage, key: &str) -> Option<i64> {
+    let written = storage.stat(key).await?.modified;
+    let state = sidecar_state(storage, key).await;
+    Some(copy_date(state, written, crate::cache_ttl::now_unix()) as i64)
 }
 
 /// First-seen times of a packument cached before the ledger: every version `body` lists, which
@@ -15730,5 +15747,216 @@ mod revalidation_1064_round3 {
             read_validators(&state.storage, PACKUMENT).await.is_none(),
             "the 304 confirmed a body the store no longer has, and kept its validators"
         );
+    }
+
+    /// The date a copy takes from its sidecar and its body, by every state the sidecar can be in.
+    /// Information lost (an emptied or unreadable sidecar) dates the copy now: it never makes the
+    /// copy older. An absent sidecar keeps the body's own time, as on main (#1064).
+    #[tokio::test]
+    async fn copy_time_by_sidecar_state_and_body_time() {
+        let now = crate::cache_ttl::now_unix();
+        let old = 1u64;
+        let recent = now - 100;
+        let checked = now - 600;
+        let validators = |etag: Option<&str>, checked: Option<u64>| {
+            serde_json::to_vec(&Validators {
+                etag: etag.map(str::to_string),
+                last_modified: None,
+                checked,
+            })
+            .unwrap()
+        };
+        // (state, sidecar bytes, body's write time, expected date: Some(at) exact, None = now)
+        let rows: Vec<(&str, Option<Vec<u8>>, u64, Option<u64>)> = vec![
+            (
+                "checked, body old",
+                Some(validators(Some("\"e1\""), Some(checked))),
+                old,
+                Some(checked),
+            ),
+            (
+                "checked, body recent",
+                Some(validators(Some("\"e1\""), Some(checked))),
+                recent,
+                Some(recent),
+            ),
+            (
+                "checked without validators, body old",
+                Some(validators(None, Some(checked))),
+                old,
+                Some(checked),
+            ),
+            (
+                "validators without checked, body old",
+                Some(validators(Some("\"e1\""), None)),
+                old,
+                Some(old),
+            ),
+            (
+                "validators without checked, body recent",
+                Some(validators(Some("\"e1\""), None)),
+                recent,
+                Some(recent),
+            ),
+            ("absent, body old", None, old, Some(old)),
+            ("absent, body recent", None, recent, Some(recent)),
+            ("emptied to {}, body old", Some(b"{}".to_vec()), old, None),
+            (
+                "emptied to {}, body recent",
+                Some(b"{}".to_vec()),
+                recent,
+                None,
+            ),
+            (
+                "unreadable, body old",
+                Some(b"not json".to_vec()),
+                old,
+                None,
+            ),
+            (
+                "unreadable, body recent",
+                Some(b"not json".to_vec()),
+                recent,
+                None,
+            ),
+        ];
+        for (name, sidecar, body_time, expect) in rows {
+            let obs = observed(None);
+            let store = store_of(&obs);
+            store.put(PACKUMENT, b"{}").await.unwrap();
+            *obs.modified.lock().unwrap() = Some((PACKUMENT.to_string(), body_time));
+            if let Some(bytes) = sidecar {
+                store.put(&validators_key(PACKUMENT), &bytes).await.unwrap();
+            }
+            let before = crate::cache_ttl::now_unix() as i64;
+            let dated = copy_time(&store, PACKUMENT).await.unwrap();
+            let after = crate::cache_ttl::now_unix() as i64;
+            match expect {
+                Some(at) => assert_eq!(dated, at as i64, "{name}"),
+                None => assert!(
+                    dated >= before && dated <= after,
+                    "{name}: dated {dated}, but now is {before}..{after}"
+                ),
+            }
+        }
+    }
+
+    /// Codex r4 (P1), through the handler: a 304 whose provenance read fails empties the sidecar,
+    /// which held the confirmation of a copy whose body is a month old. With trusted dates off and
+    /// curation enforced, a release missing from the ledger is dated by the copy. Dated by its old
+    /// body it would pass the 7d gate; dated now, it is held (#1064).
+    #[tokio::test]
+    async fn a_release_of_a_copy_whose_confirmation_was_emptied_is_held_by_the_age_gate() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .and(header("if-none-match", "\"e1\""))
+            .respond_with(ResponseTemplate::new(304))
+            .with_priority(1)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(listing(&upstream, &["1.0.0", "1.1.0"])),
+            )
+            .with_priority(5)
+            .mount(&upstream)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg/-/testpkg-1.1.0.tgz"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"TGZ".to_vec()))
+            .mount(&upstream)
+            .await;
+
+        let obs = observed(None);
+        let ctx = create_test_context_with_storage_and_config(store_of(&obs), |cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+            cfg.server.trust_upstream_dates = false;
+            cfg.curation.mode = crate::config::CurationMode::Enforce;
+            cfg.curation.min_release_age = Some("7d".to_string());
+        });
+        let state = &ctx.state;
+        let body = listing(&upstream, &["1.0.0"]);
+        state.storage.put(PACKUMENT, &body).await.unwrap();
+        put_with_origin(
+            &state.storage,
+            PACKUMENT,
+            &body,
+            &origin_of(&upstream.uri()),
+        )
+        .await
+        .unwrap();
+        let now = crate::cache_ttl::now_unix();
+        // The body was written a month ago; the copy was confirmed ten minutes ago.
+        *obs.modified.lock().unwrap() = Some((PACKUMENT.to_string(), now - 30 * 86400));
+        write_validators(
+            &state.storage,
+            PACKUMENT,
+            &Validators {
+                etag: Some("\"e1\"".to_string()),
+                last_modified: None,
+                checked: Some(now - 600),
+            },
+        )
+        .await;
+
+        // The provenance read fails during the 304: the 304 confirms nothing and empties the sidecar.
+        *obs.fail_get.lock().unwrap() = Some(origin_key(PACKUMENT));
+        let served = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        assert_eq!(served.status(), StatusCode::OK, "the cached copy is served");
+        state.cache_writes.settled().await;
+        *obs.fail_get.lock().unwrap() = None;
+
+        // 1.1.0 is not in the ledger: its release is dated by the copy, which must not be old.
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/npm/testpkg/-/testpkg-1.1.0.tgz",
+            "",
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "a release dated by an emptied sidecar's old body passed the 7d gate"
+        );
+    }
+
+    /// The pure rule, row by row: every sidecar state against an old, a recent and a future body
+    /// time. Lost information dates the copy now (#1064).
+    #[test]
+    fn copy_date_by_state_against_the_body_time() {
+        let now = 1_000_000u64;
+        let old = 1u64;
+        let recent = now - 100;
+        let future = now + 50;
+        let checked = now - 600;
+        // (state, body time, expected date)
+        let rows = [
+            (SidecarState::Checked(checked), old, checked),
+            (SidecarState::Checked(checked), recent, recent),
+            (SidecarState::Checked(checked), future, future),
+            (SidecarState::Unchecked, old, old),
+            (SidecarState::Unchecked, recent, recent),
+            (SidecarState::Absent, old, old),
+            (SidecarState::Absent, recent, recent),
+            (SidecarState::Emptied, old, now),
+            (SidecarState::Emptied, recent, now),
+            (SidecarState::Emptied, future, future),
+            (SidecarState::Unreadable, old, now),
+            (SidecarState::Unreadable, recent, now),
+            (SidecarState::Unreadable, future, future),
+        ];
+        for (state, written, expect) in rows {
+            assert_eq!(
+                copy_date(state, written, now),
+                expect,
+                "{state:?} at body time {written}"
+            );
+        }
     }
 }
