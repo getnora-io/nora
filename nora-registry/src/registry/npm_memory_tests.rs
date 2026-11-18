@@ -511,6 +511,23 @@ fn odd_documents() -> Vec<Vec<u8>> {
         r#"{"name":"n","versions":{"1":{"unpackedSize":-1e400}}}"#.into(),
         r#"{"name":"n","versions":{"1":{"dist":{"size":1e400}}}}"#.into(),
         r#"{"name":"n","versions":{"1":{"description":tru}}}"#.into(),
+        // An object whose first key is serde_json's raw-value token: the tree reads the string
+        // after it as JSON text in place of the object, refuses anything else there and any key
+        // after it. In a dropped field, a kept field, `versions`, a manifest and the document.
+        r#"{"name":"n","readme":{"$serde_json::private::RawValue":false},"versions":{}}"#.into(),
+        r#"{"name":"n","readme":{"$serde_json::private::RawValue":"[1,{\"a\":2}]"},"versions":{}}"#.into(),
+        r#"{"name":"n","readme":{"$serde_json::private::RawValue":"[1"},"versions":{}}"#.into(),
+        r#"{"name":"n","readme":{"$serde_json::private::RawValue":"1","x":2},"versions":{}}"#.into(),
+        r#"{"name":"n","readme":{"x":2,"$serde_json::private::RawValue":"1"},"versions":{}}"#.into(),
+        r#"{"name":{"$serde_json::private::RawValue":"\"m\""},"versions":{}}"#.into(),
+        r#"{"name":"n","versions":{"$serde_json::private::RawValue":"{\"1\":{\"name\":\"x\",\"readme\":\"r\"}}"}}"#.into(),
+        r#"{"name":"n","versions":{"$serde_json::private::RawValue":7}}"#.into(),
+        r#"{"name":"n","versions":{"1":{"$serde_json::private::RawValue":"{\"name\":\"x\",\"readme\":\"r\"}"}}}"#.into(),
+        r#"{"name":"n","versions":{"1":{"$serde_json::private::RawValue":"7"}}}"#.into(),
+        r#"{"name":"n","versions":{"1":{"name":"x","$serde_json::private::RawValue":"7"}}}"#.into(),
+        r#"{"$serde_json::private::RawValue":"{\"name\":\"n\",\"versions\":{\"1\":{\"name\":\"n\"}}}"}"#.into(),
+        r#"{"$serde_json::private::RawValue":"[]"}"#.into(),
+        r#"{"$serde_json::private::RawValue":"{}","name":"n"}"#.into(),
     ];
     // Nesting just below and past the parser's depth limit, in a kept and a dropped field.
     for depth in [120, 127, 128, 129, 200] {

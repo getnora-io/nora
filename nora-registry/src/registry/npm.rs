@@ -3525,6 +3525,21 @@ mod install_v1 {
     use std::collections::BTreeMap;
     use std::fmt;
 
+    /// serde_json's raw-value token. With its `raw_value` feature (on in this build), `Value`
+    /// reads an object whose first key is this token as the JSON text in that key's string, in
+    /// place of the object, and refuses any other value there or any key after it. Every object
+    /// read here is read the same way, so the projection accepts what the tree accepted.
+    const RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+
+    /// The object whose first key was [`RAW_VALUE_TOKEN`], read from the text in its value. The
+    /// object's further keys are left unread: the parser then refuses them, as the tree does.
+    fn from_raw_value_text<'de, A: MapAccess<'de>, T: de::DeserializeOwned>(
+        map: &mut A,
+    ) -> Result<T, A::Error> {
+        let text: String = map.next_value()?;
+        serde_json::from_str(&text).map_err(de::Error::custom)
+    }
+
     /// A packument's abbreviated form, still in parts: the kept top-level fields, and each
     /// version's kept fields already written (`None`: the version is no object, and is left out).
     /// Both in key order, as the tree projection writes them.
@@ -3591,7 +3606,11 @@ mod install_v1 {
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Packument, A::Error> {
             let mut top = BTreeMap::new();
             let mut versions = BTreeMap::new();
-            while let Some(key) = map.next_key_seed(TopKey)? {
+            let mut next = match map.next_key::<String>()? {
+                Some(first) if first == RAW_VALUE_TOKEN => return from_raw_value_text(&mut map),
+                first => first.map(|key| TopKey::classify(&key)),
+            };
+            while let Some(key) = next {
                 match key {
                     Top::Kept(field) => {
                         top.insert(field, map.next_value::<serde_json::Value>()?);
@@ -3602,6 +3621,7 @@ mod install_v1 {
                         map.next_value::<Skipped>()?;
                     }
                 }
+                next = map.next_key_seed(TopKey)?;
             }
             Ok(Packument { top, versions })
         }
@@ -3615,6 +3635,19 @@ mod install_v1 {
 
     /// A top-level key, told apart without being kept.
     struct TopKey;
+
+    impl TopKey {
+        fn classify(key: &str) -> Top {
+            if key == "versions" {
+                Top::Versions
+            } else {
+                INSTALL_V1_TOP_FIELDS
+                    .iter()
+                    .find(|field| **field == key)
+                    .map_or(Top::Dropped, |field| Top::Kept(field))
+            }
+        }
+    }
 
     impl<'de> DeserializeSeed<'de> for TopKey {
         type Value = Top;
@@ -3632,14 +3665,7 @@ mod install_v1 {
         }
 
         fn visit_str<E: de::Error>(self, key: &str) -> Result<Top, E> {
-            Ok(if key == "versions" {
-                Top::Versions
-            } else {
-                INSTALL_V1_TOP_FIELDS
-                    .iter()
-                    .find(|field| **field == key)
-                    .map_or(Top::Dropped, |field| Top::Kept(field))
-            })
+            Ok(TopKey::classify(key))
         }
     }
 
@@ -3663,8 +3689,13 @@ mod install_v1 {
 
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Versions, A::Error> {
             let mut versions = BTreeMap::new();
-            while let Some(version) = map.next_key::<String>()? {
+            let mut next = map.next_key::<String>()?;
+            if next.as_deref() == Some(RAW_VALUE_TOKEN) {
+                return from_raw_value_text(&mut map);
+            }
+            while let Some(version) = next {
                 versions.insert(version, map.next_value::<Manifest>()?.0);
+                next = map.next_key::<String>()?;
             }
             Ok(Versions(versions))
         }
@@ -3719,7 +3750,11 @@ mod install_v1 {
 
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Manifest, A::Error> {
             let mut kept = serde_json::Map::new();
-            while let Some(field) = map.next_key_seed(VersionKey)? {
+            let mut next = match map.next_key::<String>()? {
+                Some(first) if first == RAW_VALUE_TOKEN => return from_raw_value_text(&mut map),
+                first => first.map(|key| VersionKey::classify(&key)),
+            };
+            while let Some(field) = next {
                 match field {
                     Some(field) => {
                         kept.insert(field.to_string(), map.next_value()?);
@@ -3728,6 +3763,7 @@ mod install_v1 {
                         map.next_value::<Skipped>()?;
                     }
                 }
+                next = map.next_key_seed(VersionKey)?;
             }
             let mut written = serde_json::to_vec(&kept).map_err(de::Error::custom)?;
             written.shrink_to_fit();
@@ -3766,6 +3802,15 @@ mod install_v1 {
     /// A key of a version's manifest: the kept field it names, if any.
     struct VersionKey;
 
+    impl VersionKey {
+        fn classify(key: &str) -> Option<&'static str> {
+            INSTALL_V1_VERSION_FIELDS
+                .iter()
+                .find(|field| **field == key)
+                .copied()
+        }
+    }
+
     impl<'de> DeserializeSeed<'de> for VersionKey {
         type Value = Option<&'static str>;
 
@@ -3785,10 +3830,7 @@ mod install_v1 {
         }
 
         fn visit_str<E: de::Error>(self, key: &str) -> Result<Self::Value, E> {
-            Ok(INSTALL_V1_VERSION_FIELDS
-                .iter()
-                .find(|field| **field == key)
-                .copied())
+            Ok(VersionKey::classify(key))
         }
     }
 
@@ -3820,6 +3862,11 @@ mod install_v1 {
         }
 
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Skipped, A::Error> {
+            match map.next_key::<String>()? {
+                None => return Ok(Skipped),
+                Some(first) if first == RAW_VALUE_TOKEN => return from_raw_value_text(&mut map),
+                Some(_) => map.next_value::<Skipped>()?,
+            };
             while map.next_entry::<Skipped, Skipped>()?.is_some() {}
             Ok(Skipped)
         }
