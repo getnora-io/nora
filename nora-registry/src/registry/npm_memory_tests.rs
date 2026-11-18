@@ -33,6 +33,10 @@ const LARGE: usize = 16 * 1024 * 1024;
 /// stored document: the document read, the abbreviated form written, and what the projection
 /// holds of one version at a time.
 const PEAK_FACTOR: u64 = 3;
+/// The same bound for the full form, in tenths of the stored document: it is served as it is
+/// stored, so one read of it and no copy, with room for the rest of the request.
+const FULL_PEAK_TENTHS: u64 = 15;
+
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -200,6 +204,20 @@ async fn get_packument(ctx: &TestContext, accept: Option<&str>) -> Served {
     }
 }
 
+/// One request measured: what it answered, and the peak and total bytes the test thread
+/// allocated while it ran (the body read to its end included).
+fn measured(
+    rt: &tokio::runtime::Runtime,
+    ctx: &TestContext,
+    accept: Option<&str>,
+) -> (Served, allocation_counter::AllocationInfo) {
+    let mut served = None;
+    let info = allocation_counter::measure(|| {
+        served = Some(rt.block_on(get_packument(ctx, accept)));
+    });
+    (served.unwrap(), info)
+}
+
 fn hex_digest(bytes: &[u8]) -> String {
     hex::encode(sha2::Sha256::digest(bytes))
 }
@@ -218,6 +236,57 @@ fn the_measure_sees_a_document_tree() {
         "a tree of {} bytes measured at a peak of {}",
         doc.len(),
         info.bytes_max
+    );
+}
+
+/// The peak of one request for a cached 16 MB packument stays within three times the stored
+/// document for the abbreviated form and one and a half times for the full one, on the local
+/// store and on an object store.
+#[test]
+fn a_cached_packument_is_served_within_three_times_its_size() {
+    let doc = synthetic_packument(LARGE);
+    let mut over = Vec::new();
+    for store in [Store::Local, Store::Object] {
+        let rt = runtime();
+        let ctx = rt.block_on(async { context(store) });
+        let stored = rt.block_on(cache_as_fetched(&ctx, &doc));
+        let size = stored.len() as u64;
+        for accept in [None, Some(INSTALL_V1)] {
+            // Once outside the measure: the first request of a context sets up what every later
+            // one shares (metric families, lazily built clients).
+            let warm = rt.block_on(get_packument(&ctx, accept));
+            assert_eq!(warm.status, StatusCode::OK);
+            let (served, info) = measured(&rt, &ctx, accept);
+            assert_eq!(served.status, StatusCode::OK, "{store:?} {accept:?}");
+            assert_eq!(served.body, warm.body, "{store:?} {accept:?}");
+            if matches!(store, Store::Local) {
+                // The read of the document ran on this thread: the measure saw it.
+                assert!(
+                    info.bytes_total >= size,
+                    "{store:?} {accept:?}: {} bytes allocated, the document is {size}",
+                    info.bytes_total
+                );
+            }
+            let line = format!(
+                "{store:?} {:<10} document {size} B, peak {} B = {:.2}x",
+                accept.map_or("full", |_| "install-v1"),
+                info.bytes_max,
+                info.bytes_max as f64 / size as f64
+            );
+            eprintln!("{line}");
+            let bound = match accept {
+                None => FULL_PEAK_TENTHS * size / 10,
+                Some(_) => PEAK_FACTOR * size,
+            };
+            if info.bytes_max > bound {
+                over.push(format!("{line} > {bound} B"));
+            }
+        }
+    }
+    assert!(
+        over.is_empty(),
+        "one request held more than its bound (full {FULL_PEAK_TENTHS}/10, install-v1 {PEAK_FACTOR}x):\n{}",
+        over.join("\n")
     );
 }
 
@@ -438,6 +507,9 @@ fn odd_documents() -> Vec<Vec<u8>> {
         r#"{"name":"n","versions":{"1":{"readme":"\x"}}}"#.into(),
         r#"{"name":"n","readme":"unterminated}"#.into(),
         r#"{"name":"n","time":{"1":01}}"#.into(),
+        r#"{"name":"n","time":{"1":1e400}}"#.into(),
+        r#"{"name":"n","versions":{"1":{"unpackedSize":-1e400}}}"#.into(),
+        r#"{"name":"n","versions":{"1":{"dist":{"size":1e400}}}}"#.into(),
         r#"{"name":"n","versions":{"1":{"description":tru}}}"#.into(),
     ];
     // Nesting just below and past the parser's depth limit, in a kept and a dropped field.
