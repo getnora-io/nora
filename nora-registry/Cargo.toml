@@ -106,6 +106,10 @@ insta = { version = "1", features = ["json"] }
 # Reads `impl Storage` for the list test of the UI storage boundary, and every `cfg` of the
 # sources for the test that no shipped build compiles fault-injection (already in the lock).
 syn = { version = "2", default-features = false, features = ["full", "parsing", "visit"] }
+# Counts the allocations of the current thread: the peak memory of one npm metadata request
+# (#1305). Its GlobalAlloc impl lives in the crate, so `#![forbid(unsafe_code)]` holds; it is the
+# global allocator of the unit-test binary only (mimalloc is left out under `cfg(test)`).
+allocation-counter = "0.8"
 
 [[bench]]
 name = "parsing"

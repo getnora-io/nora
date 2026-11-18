@@ -1,0 +1,6 @@
+---
+source: nora-registry/src/registry/npm_memory_tests.rs
+expression: "lines.join(\"\\n\")"
+---
+full application/json 4351069 5940a9ec7ce34c16fc2adb5f19283fdf47e3dc33dad5bb3407013f0a117f56d8
+install-v1 application/vnd.npm.install-v1+json 2947823 db185d4cc0b94cf52731db2a4ed12d41a143058b3e6d9602e735853b1185b39d

@@ -15959,3 +15959,7 @@ mod revalidation_1064_round3 {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "npm_memory_tests.rs"]
+mod memory_tests;

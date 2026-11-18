@@ -1,0 +1,6 @@
+---
+source: nora-registry/src/registry/npm_memory_tests.rs
+expression: "seen.join(\"\\n\")"
+---
+full: {"get": 4, "list": 1, "stat": 1}
+install-v1: {"get": 4, "list": 1, "stat": 1}
