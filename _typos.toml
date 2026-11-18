@@ -23,4 +23,6 @@ dokcer = "dokcer"
 # nora-registry/src/ui/static/swagger-ui/: Swagger UI release files, minified, kept byte for byte (pinned in openapi.rs).
 # nora-registry/testdata/**/*.tsv: corpora written by the formats' own tools (each file names the
 # script that regenerates it); their names and versions are data (`Crypt-SecurID`, fuzzed inputs).
-extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js", "nora-registry/src/ui/static/swagger-ui/*.js", "nora-registry/src/ui/static/swagger-ui/*.css", "nora-registry/testdata/**/*.tsv"]
+# nora-registry/testdata/datetime/parse-corpus.jsonl: date strings the parsers must accept or refuse,
+# misspelled month and day names among them on purpose.
+extend-exclude = ["vendor/", "*.lock", "target/", "fuzz/corpus/", "nora-registry/src/ui/static/*.js", "nora-registry/src/ui/static/swagger-ui/*.js", "nora-registry/src/ui/static/swagger-ui/*.css", "nora-registry/testdata/**/*.tsv", "nora-registry/testdata/datetime/parse-corpus.jsonl"]
