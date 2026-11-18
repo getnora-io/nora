@@ -1210,11 +1210,33 @@ async fn record_first_seen(
 /// 304 rewrote it. Curation's fallback dates and the ledger's seed use it.
 async fn copy_time(storage: &crate::Storage, key: &str) -> Option<i64> {
     let written = storage.stat(key).await?.modified as i64;
-    let confirmed = read_validators(storage, key)
-        .await
-        .and_then(|validators| validators.checked)
-        .map(|at| at as i64);
+    let confirmed = match sidecar_of(storage, key).await {
+        Sidecar::Read(validators) => validators.checked.map(|at| at as i64),
+        Sidecar::Absent => None,
+        // A sidecar that exists but cannot be read may hold a later confirmation. The copy is dated
+        // now, so its releases stay young rather than passing a minimum age on the body's old time.
+        Sidecar::Unreadable => return Some(crate::cache_ttl::now_unix() as i64),
+    };
     Some(confirmed.map_or(written, |at| at.max(written)))
+}
+
+/// What the validator sidecar of a key holds: no sidecar, its validators, or a sidecar that exists
+/// and cannot be read or parsed. [`read_validators`] reads the last two alike (#1064).
+enum Sidecar {
+    Absent,
+    Read(Validators),
+    Unreadable,
+}
+
+async fn sidecar_of(storage: &crate::Storage, key: &str) -> Sidecar {
+    match storage.get(&validators_key(key)).await {
+        Ok(data) => match serde_json::from_slice::<Validators>(&data) {
+            Ok(validators) => Sidecar::Read(validators),
+            Err(_) => Sidecar::Unreadable,
+        },
+        Err(crate::storage::StorageError::NotFound) => Sidecar::Absent,
+        Err(_) => Sidecar::Unreadable,
+    }
 }
 
 /// First-seen times of a packument cached before the ledger: every version `body` lists, which
@@ -1391,6 +1413,8 @@ async fn refetch_metadata(
                 .unwrap_or_default();
             let unchanged = same_copy(&current, &validators);
             let origin = origin_of(proxy_url);
+            // The body held is served without a read of the store: that is checked below.
+            let held_served = unchanged && held.is_some();
             let mut cached = match held {
                 Some((body, _)) if unchanged => Ok(body),
                 _ => state.storage.get(key).await,
@@ -1411,6 +1435,11 @@ async fn refetch_metadata(
                     },
                     Err(_) => false,
                 };
+            // A held body the store no longer has is not confirmed: the read that finds nothing is
+            // what clears its validators (#867), so the store is asked whether the object is there.
+            if held_served && confirm && state.storage.stat(key).await.is_none() {
+                cached = Err(crate::storage::StorageError::NotFound);
+            }
             if unchanged && !confirm {
                 // The record names other bytes than this body (a provenance write that was lost,
                 // or a writer between its body and its record): the sidecar is emptied to `{}`,
@@ -15121,13 +15150,14 @@ mod url_fold {
 #[cfg(test)]
 mod revalidation_1064_round3 {
     use super::*;
-    use crate::registry::{write_validators, Validators};
+    use crate::registry::{read_validators, write_validators, Validators};
     use crate::storage::{FileMeta, Result as StoreResult, StorageBackend, StorageError};
     use crate::test_helpers::{body_bytes, create_test_context_with_storage_and_config, send};
     use async_trait::async_trait;
     use axum::http::{Method, StatusCode};
     use std::path::Path;
     use std::sync::Mutex;
+    use wiremock::matchers::header_exists;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -15141,6 +15171,12 @@ mod revalidation_1064_round3 {
         refuse_once: Mutex<Option<String>>,
         /// `(key, data, skip)`: stored before the read of `key` that follows `skip` reads of it, once.
         inject: Mutex<Option<(String, Vec<u8>, usize)>>,
+        /// Reads of this key fail, as an unreachable store would.
+        fail_get: Mutex<Option<String>>,
+        /// `(key, modified)`: `stat` of the key reports this time.
+        modified: Mutex<Option<(String, u64)>>,
+        /// `(trigger, target)`: reading `trigger` first deletes `target`, once.
+        delete_on_read: Mutex<Option<(String, String)>>,
     }
 
     impl Observed {
@@ -15151,6 +15187,23 @@ mod revalidation_1064_round3 {
             if key == PACKUMENT {
                 *self.reads.lock().unwrap() += 1;
             }
+        }
+        /// Applies the armed failure and deletion for a read of `key`; `Err` refuses the read.
+        async fn before_read(&self, key: &str) -> StoreResult<()> {
+            let doomed = {
+                let mut armed = self.delete_on_read.lock().unwrap();
+                match armed.as_ref() {
+                    Some((trigger, _)) if trigger == key => armed.take().map(|(_, t)| t),
+                    _ => None,
+                }
+            };
+            if let Some(target) = doomed {
+                self.inner.delete(&target).await.unwrap();
+            }
+            if self.fail_get.lock().unwrap().as_deref() == Some(key) {
+                return Err(StorageError::Network("store unreachable".into()));
+            }
+            Ok(())
         }
         /// Stores the armed object for `key` if it is the one armed, before the read goes on.
         async fn inject_before_read(&self, key: &str) {
@@ -15198,6 +15251,7 @@ mod revalidation_1064_round3 {
             self.inner.put(key, data, sha256).await
         }
         async fn get(&self, key: &str) -> StoreResult<(axum::body::Bytes, Option<String>)> {
+            self.before_read(key).await?;
             self.inject_before_read(key).await;
             self.count(key);
             self.inner.get(key).await
@@ -15210,6 +15264,7 @@ mod revalidation_1064_round3 {
             Option<String>,
             std::pin::Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
         )> {
+            self.before_read(key).await?;
             self.inject_before_read(key).await;
             self.count(key);
             self.inner.get_reader(key).await
@@ -15224,7 +15279,14 @@ mod revalidation_1064_round3 {
             self.inner.list(prefix).await
         }
         async fn stat(&self, key: &str) -> Option<FileMeta> {
-            self.inner.stat(key).await
+            let meta = self.inner.stat(key).await?;
+            match self.modified.lock().unwrap().as_ref() {
+                Some((k, modified)) if k == key => Some(FileMeta {
+                    size: meta.size,
+                    modified: *modified,
+                }),
+                _ => Some(meta),
+            }
         }
         async fn health_check(&self) -> bool {
             self.inner.health_check().await
@@ -15254,6 +15316,9 @@ mod revalidation_1064_round3 {
             reads: Mutex::new(0),
             refuse_once: Mutex::new(refuse_once.map(str::to_string)),
             inject: Mutex::new(None),
+            fail_get: Mutex::new(None),
+            modified: Mutex::new(None),
+            delete_on_read: Mutex::new(None),
         })
     }
 
@@ -15579,5 +15644,91 @@ mod revalidation_1064_round3 {
                 );
             }
         }
+    }
+
+    /// Lead 1: a sidecar that cannot be read dates the copy no older than its write. The date feeds
+    /// the ledger's seed and curation's fallback: an old date would let a fresh release pass the
+    /// minimum age. A sidecar that is absent keeps the body's own time.
+    #[tokio::test]
+    async fn an_unreadable_sidecar_dates_the_copy_no_older_than_its_write() {
+        let obs = observed(None);
+        let store = store_of(&obs);
+        store.put(PACKUMENT, b"{\"versions\":{}}").await.unwrap();
+        // The body was written long ago: its file time is the epoch.
+        *obs.modified.lock().unwrap() = Some((PACKUMENT.to_string(), 1));
+        write_validators(
+            &store,
+            PACKUMENT,
+            &Validators {
+                etag: Some("\"e1\"".to_string()),
+                last_modified: None,
+                checked: Some(1),
+            },
+        )
+        .await;
+        let now = crate::cache_ttl::now_unix() as i64;
+
+        *obs.fail_get.lock().unwrap() = Some(validators_key(PACKUMENT));
+        let dated = copy_time(&store, PACKUMENT).await.unwrap();
+        assert!(
+            dated >= now - 60,
+            "an unreadable sidecar dated the copy {dated}s; it must not be older than now"
+        );
+
+        // Control: no sidecar at all keeps the body's own time.
+        *obs.fail_get.lock().unwrap() = None;
+        store.delete(&validators_key(PACKUMENT)).await.unwrap();
+        assert_eq!(copy_time(&store, PACKUMENT).await, Some(1));
+    }
+
+    /// Lead 2, through the handler: the held body's object is removed while the 304 is in flight.
+    /// The 304 must not confirm a body the store no longer has: the validators are cleared (#867).
+    #[tokio::test]
+    async fn a_304_for_a_held_body_removed_meanwhile_clears_its_validators() {
+        let upstream = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/testpkg"))
+            .and(header_exists("if-none-match"))
+            .respond_with(ResponseTemplate::new(304))
+            .mount(&upstream)
+            .await;
+        let obs = observed(None);
+        let ctx = create_test_context_with_storage_and_config(store_of(&obs), |cfg| {
+            cfg.npm.proxy = Some(upstream.uri());
+            cfg.npm.metadata_ttl = 0;
+            cfg.npm.revalidate = true;
+            cfg.npm.serve_stale = false;
+        });
+        let state = &ctx.state;
+        let body = listing(&upstream, &["1.0.0"]);
+        state.storage.put(PACKUMENT, &body).await.unwrap();
+        put_with_origin(
+            &state.storage,
+            PACKUMENT,
+            &body,
+            &origin_of(&upstream.uri()),
+        )
+        .await
+        .unwrap();
+        write_validators(
+            &state.storage,
+            PACKUMENT,
+            &Validators {
+                etag: Some("\"e1\"".to_string()),
+                last_modified: None,
+                checked: Some(1),
+            },
+        )
+        .await;
+        // The body goes while the 304 is being handled: its provenance is read right after it.
+        *obs.delete_on_read.lock().unwrap() = Some((origin_key(PACKUMENT), PACKUMENT.to_string()));
+
+        let _ = send(&ctx.app, Method::GET, "/npm/testpkg", "").await;
+        state.cache_writes.settled().await;
+
+        assert!(
+            read_validators(&state.storage, PACKUMENT).await.is_none(),
+            "the 304 confirmed a body the store no longer has, and kept its validators"
+        );
     }
 }
