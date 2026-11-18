@@ -2008,7 +2008,7 @@ mod integration_tests {
             cfg.curation.min_release_age = Some("3d".to_string());
         });
         let wheel = "corppkg-1.0.0-py3-none-any.whl";
-        let hour_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let hour_ago = crate::datetime::ago(3600).rfc3339();
         ctx.state
             .storage
             .put(

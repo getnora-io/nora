@@ -1480,7 +1480,7 @@ pub(crate) async fn reconcile_metadata_after_retention(
     if metadata.release.as_ref().is_none_or(removed) {
         metadata.release = sorted.iter().rev().find(|v| !is_snapshot(v)).cloned();
     }
-    let last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let last_updated = crate::datetime::UtcTime::now().maven_last_updated();
     let xml = generate_metadata_xml_with_versioning(
         &group_path.replace('/', "."),
         artifact_id,
@@ -1511,7 +1511,7 @@ async fn update_artifact_metadata(state: &AppState, group_path: &str, artifact_i
     let metadata_key = format!("{}maven-metadata.xml", prefix);
     let current = state.storage.get(&metadata_key).await.ok();
     let group_id_dotted = group_path.replace('/', ".");
-    let last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+    let last_updated = crate::datetime::UtcTime::now().maven_last_updated();
     let xml = merge_artifact_metadata(
         &group_id_dotted,
         artifact_id,
@@ -1605,7 +1605,7 @@ fn generate_metadata_xml_with_versioning(
     let last_updated = match last_updated {
         Some(last_updated) => last_updated,
         None => {
-            generated_last_updated = chrono::Utc::now().format("%Y%m%d%H%M%S").to_string();
+            generated_last_updated = crate::datetime::UtcTime::now().maven_last_updated();
             &generated_last_updated
         }
     };
@@ -1922,7 +1922,17 @@ mod tests {
         assert!(xml.contains("<release>1.0.0</release>"));
         assert!(xml.contains("<version>0.9.0</version>"));
         assert!(xml.contains("<version>1.0.0</version>"));
-        assert!(xml.contains("<lastUpdated>"));
+        // `yyyyMMddHHmmss`, as NORA always wrote it (#1282).
+        let last_updated = xml
+            .split("<lastUpdated>")
+            .nth(1)
+            .and_then(|rest| rest.split("</lastUpdated>").next())
+            .unwrap();
+        assert_eq!(last_updated.len(), 14, "{last_updated}");
+        assert!(
+            last_updated.bytes().all(|b| b.is_ascii_digit()),
+            "{last_updated}"
+        );
     }
 
     #[test]
@@ -2005,6 +2015,51 @@ mod tests {
             .unwrap();
             assert_eq!(storage.get(key).await.unwrap().as_ref(), doc.as_bytes());
         }
+    }
+
+    /// The document retention rewrites carries `lastUpdated` as NORA always wrote it,
+    /// `yyyyMMddHHmmss` at the time of the rewrite (#1282).
+    #[tokio::test]
+    async fn test_reconcile_after_retention_dates_the_document_as_before() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let storage = crate::storage::Storage::new_local(dir.path().to_str().unwrap());
+        let doc = generate_metadata_xml_with_versioning(
+            "com.example",
+            "lib",
+            &["1.0.0".to_string(), "2.0.0".to_string()],
+            "2.0.0",
+            "2.0.0",
+            Some("20260101000000"),
+        );
+        let key = "maven/com/example/lib/maven-metadata.xml";
+        storage.put(key, doc.as_bytes()).await.unwrap();
+        storage
+            .put("maven/com/example/lib/1.0.0/lib-1.0.0.jar", b"jar")
+            .await
+            .unwrap();
+        let before = crate::datetime::UtcTime::now().maven_last_updated();
+        reconcile_metadata_after_retention(
+            &storage,
+            "com/example",
+            "lib",
+            &BTreeSet::from(["2.0.0".to_string()]),
+        )
+        .await
+        .unwrap();
+        let after = crate::datetime::UtcTime::now().maven_last_updated();
+        let xml = String::from_utf8(storage.get(key).await.unwrap().to_vec()).unwrap();
+        assert!(!xml.contains("<version>2.0.0</version>"), "{xml}");
+        let last_updated = xml
+            .split("<lastUpdated>")
+            .nth(1)
+            .and_then(|rest| rest.split("</lastUpdated>").next())
+            .unwrap();
+        assert_eq!(last_updated.len(), 14, "{xml}");
+        assert!(last_updated.bytes().all(|b| b.is_ascii_digit()), "{xml}");
+        assert!(
+            before.as_str() <= last_updated && last_updated <= after.as_str(),
+            "{before} <= {last_updated} <= {after}"
+        );
     }
 
     #[test]
@@ -2153,6 +2208,45 @@ mod integration_tests {
         assert_eq!(get.status(), StatusCode::OK);
         let body = body_bytes(get).await;
         assert_eq!(&body[..], jar_data);
+    }
+
+    /// A deploy rewrites the artifact's `maven-metadata.xml` with `lastUpdated` as NORA always
+    /// wrote it, `yyyyMMddHHmmss` at the time of the deploy; the second deploy merges into the
+    /// stored document (#1282).
+    #[tokio::test]
+    async fn test_maven_deploy_dates_the_metadata_as_before() {
+        let ctx = create_test_context();
+        for v in ["1.0", "2.0"] {
+            let before = crate::datetime::UtcTime::now().maven_last_updated();
+            let put = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/maven2/com/example/dated/{v}/dated-{v}.jar"),
+                Body::from("jar"),
+            )
+            .await;
+            assert_eq!(put.status(), StatusCode::CREATED);
+            let after = crate::datetime::UtcTime::now().maven_last_updated();
+            let xml = ctx
+                .state
+                .storage
+                .get("maven/com/example/dated/maven-metadata.xml")
+                .await
+                .unwrap();
+            let xml = String::from_utf8(xml.to_vec()).unwrap();
+            assert!(xml.contains(&format!("<version>{v}</version>")), "{xml}");
+            let last_updated = xml
+                .split("<lastUpdated>")
+                .nth(1)
+                .and_then(|rest| rest.split("</lastUpdated>").next())
+                .unwrap();
+            assert_eq!(last_updated.len(), 14, "{xml}");
+            assert!(last_updated.bytes().all(|b| b.is_ascii_digit()), "{xml}");
+            assert!(
+                before.as_str() <= last_updated && last_updated <= after.as_str(),
+                "{v}: {before} <= {last_updated} <= {after}"
+            );
+        }
     }
 
     #[tokio::test]

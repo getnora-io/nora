@@ -645,10 +645,9 @@ fn internal_refused(state: &AppState, name: &str) -> Response {
 // ============================================================================
 
 fn http_date(unix: u64) -> String {
-    chrono::DateTime::from_timestamp(unix as i64, 0)
-        .unwrap_or_default()
-        .format("%a, %d %b %Y %H:%M:%S GMT")
-        .to_string()
+    crate::datetime::UtcTime::from_unix(unix as i64, 0)
+        .unwrap_or(crate::datetime::UtcTime::EPOCH)
+        .http_date()
 }
 
 /// A metadata document, or 304 when the client's copy is the one NORA serves now. The
@@ -664,8 +663,8 @@ fn metadata_response(
     stale: bool,
     since: i64,
 ) -> Response {
-    let last_modified = last_modified.map(|lm| match chrono::DateTime::parse_from_rfc2822(&lm) {
-        Ok(date) if date.timestamp() >= since => lm,
+    let last_modified = last_modified.map(|lm| match crate::datetime::parse_rfc2822_to_unix(&lm) {
+        Some(date) if date >= since => lm,
         _ => http_date(since.max(0) as u64),
     });
     let etag = format!("\"{}\"", &hex::encode(sha2::Sha256::digest(&body))[..32]);
@@ -1038,7 +1037,7 @@ async fn record_first_seen(
             return;
         }
     };
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::datetime::now_unix();
     let known = ledger.len();
     for version in listed_versions(body, name) {
         ledger.entry(version).or_insert(now);
@@ -1092,7 +1091,7 @@ async fn release_first_seen(
             }
         }
     }
-    chrono::Utc::now().timestamp()
+    crate::datetime::now_unix()
 }
 
 /// Whether two spellings of an upstream URL name the same upstream (`…/` is `…`).
@@ -1340,7 +1339,7 @@ async fn upstream_document(
                 let last_modified = validators
                     .last_modified
                     .clone()
-                    .or_else(|| Some(http_date(chrono::Utc::now().timestamp() as u64)));
+                    .or_else(|| Some(http_date(crate::datetime::now_unix() as u64)));
                 return Ok(UpstreamDocument {
                     body: Bytes::from(body),
                     origin: up.url().to_string(),
@@ -1612,7 +1611,7 @@ async fn hosted_metadata(
     // leaves it unchanged, and a client revalidating with it would get a 304 for a listing it
     // does not have (Composer revalidates with `If-Modified-Since` alone). Without a date it
     // asks for the listing again; the next answer, a second on, has one.
-    let now = chrono::Utc::now().timestamp().max(0) as u64;
+    let now = crate::datetime::now_unix().max(0) as u64;
     let last_modified = state
         .storage
         .stat(&key)
@@ -1929,7 +1928,7 @@ async fn download_dist(
         Some(
             held_date(&state, &key)
                 .await
-                .unwrap_or_else(|| chrono::Utc::now().timestamp()),
+                .unwrap_or_else(crate::datetime::now_unix),
         )
     } else if state.config.server.trust_upstream_dates {
         listed
@@ -2635,11 +2634,7 @@ async fn upload(
     if !doc.contains_key("time") {
         doc.insert(
             "time".into(),
-            Value::String(
-                chrono::Utc::now()
-                    .format("%Y-%m-%dT%H:%M:%S+00:00")
-                    .to_string(),
-            ),
+            Value::String(crate::datetime::UtcTime::now().composer_time()),
         );
     }
     let Ok(version_doc) = serde_json::to_vec(&Value::Object(doc)) else {

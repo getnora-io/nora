@@ -4425,9 +4425,7 @@ mod crate_name_every_decision_on_the_lowercase_name {
             cfg.cargo.proxy = Some(uri);
         });
         // Released an hour ago: the 7-day gate holds it, whatever the spelling.
-        let created = (chrono::Utc::now() - chrono::Duration::hours(1))
-            .format("%Y-%m-%dT%H:%M:%SZ")
-            .to_string();
+        let created = crate::datetime::ago(3600).rfc3339_secs();
         let meta = serde_json::json!({"versions": [
             {"num": "0.11.4", "created_at": created}
         ]});

@@ -23,6 +23,7 @@
 //! as for any other credential, and it is honoured on the Docker paths only.
 
 use super::{authenticate_basic, too_many_failed_attempts, BasicDecision};
+use crate::datetime::UtcTime;
 use crate::tokens::Role;
 use crate::AppState;
 use axum::{
@@ -470,9 +471,9 @@ async fn issue(
     };
     let now = now_secs();
     let token = tokens.mint(&grant, now);
-    let issued_at = chrono::DateTime::from_timestamp(now as i64, 0)
-        .unwrap_or_default()
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let issued_at = UtcTime::from_unix(now as i64, 0)
+        .unwrap_or(UtcTime::EPOCH)
+        .rfc3339_secs();
     (
         [(header::CACHE_CONTROL, "no-store")],
         Json(TokenResponse {
@@ -546,6 +547,14 @@ mod tests {
         if status == StatusCode::OK {
             assert_eq!(body["token"], body["access_token"], "{body}");
             assert!(body["expires_in"].as_u64().unwrap_or(0) > 0, "{body}");
+            // RFC 3339 to the second, with `Z` (#1282).
+            let issued = body["issued_at"].as_str().unwrap_or_default();
+            let at = crate::datetime::parse_rfc3339_relaxed(issued).expect("issued_at is a date");
+            assert_eq!(issued, at.rfc3339_secs(), "{body}");
+            assert!(
+                (crate::datetime::now_unix() - at.unix()).abs() < 60,
+                "{body}"
+            );
         }
         (status, body["token"].as_str().map(str::to_owned))
     }

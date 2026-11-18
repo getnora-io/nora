@@ -24,6 +24,7 @@ use subtle::ConstantTimeEq;
 // Registry Type (re-export from shared module)
 // ============================================================================
 
+pub use crate::datetime::parse_iso8601_to_unix;
 pub use crate::registry_type::RegistryType;
 pub use nora_registry::pypi_files::{parse_pypi_version, pep503_normalize};
 
@@ -492,43 +493,6 @@ pub async fn extract_mtime_as_publish_date(
     key: &str,
 ) -> Option<i64> {
     storage.stat(key).await.map(|m| m.modified as i64)
-}
-
-/// Parse an ISO 8601 / RFC 3339 date string to a Unix timestamp (seconds).
-///
-/// Handles common formats from registry metadata:
-/// - `2024-01-15T10:30:00Z` (Go .info `Time` field)
-/// - `2024-01-15T10:30:00.123Z` (npm `time` field)
-/// - `2024-01-15T10:30:00+00:00` (PyPI `upload_time_iso_8601`)
-/// - `2024-01-15T10:30:00.000+0000` (Conan `time` field — non-standard tz offset)
-///
-/// Returns `None` if the string is not parseable.
-pub fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
-    use chrono::{DateTime, FixedOffset, NaiveDateTime};
-
-    // Try RFC 3339 / ISO 8601 with timezone
-    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(s) {
-        return Some(dt.timestamp());
-    }
-
-    // Try without timezone (assume UTC) — some registries omit the Z
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
-        return Some(ndt.and_utc().timestamp());
-    }
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
-        return Some(ndt.and_utc().timestamp());
-    }
-
-    // Try non-standard offset format without colon: +0000, +0530
-    // (Conan center uses this format)
-    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f%z") {
-        return Some(dt.timestamp());
-    }
-    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%z") {
-        return Some(dt.timestamp());
-    }
-
-    None
 }
 
 /// Whether a check of this artifact's bytes could refuse them: in enforce mode, the filter chain

@@ -1650,7 +1650,7 @@ async fn record_registration_first_seen(
                 return;
             }
         };
-    let now = chrono::Utc::now().timestamp();
+    let now = crate::datetime::now_unix();
     let known = ledger.len();
     for version in versions {
         ledger.entry(version).or_insert(now);
@@ -5240,7 +5240,7 @@ mod nuget_release_dates {
     const UNLISTED: &str = "1900-01-01T00:00:00+00:00";
 
     fn minutes_ago(minutes: i64) -> String {
-        (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339()
+        crate::datetime::ago(minutes * 60).rfc3339()
     }
 
     fn leaf(version: &str, published: &str) -> serde_json::Value {
@@ -5438,7 +5438,7 @@ mod nuget_release_dates {
             vec![leaf("1.2.3", "2019-01-01T00:00:00Z")],
         )]);
         cached_registration(&ctx, &listed, 30).await;
-        let month_ago = chrono::Utc::now().timestamp() - 30 * 86400;
+        let month_ago = crate::datetime::now_unix() - 30 * 86400;
         let listed = super::nuget_publish_date(&ctx.state, ID, "1.2.3", true).await;
         assert!(
             listed.is_some_and(|date| (date - month_ago).abs() < 60),
@@ -5466,7 +5466,7 @@ mod nuget_release_dates {
                 .storage
                 .stat(key)
                 .await
-                .is_some_and(|m| m.modified as i64 >= chrono::Utc::now().timestamp() - 60);
+                .is_some_and(|m| m.modified as i64 >= crate::datetime::now_unix() - 60);
             if fresh && ctx.state.storage.get(key).await.is_ok() {
                 return;
             }
@@ -5505,7 +5505,7 @@ mod nuget_release_dates {
         .await;
         let ctx = context(&up, false, quarantine_7d);
         cached_registration(&ctx, &cached, 30).await;
-        let month_ago = chrono::Utc::now().timestamp() - 30 * 86400;
+        let month_ago = crate::datetime::now_unix() - 30 * 86400;
 
         let resp = send(
             &ctx.app,
@@ -5524,7 +5524,7 @@ mod nuget_release_dates {
         );
         let added = super::nuget_publish_date(&ctx.state, ID, "1.2.4", true).await;
         assert!(
-            added.is_some_and(|d| (chrono::Utc::now().timestamp() - d).abs() < 60),
+            added.is_some_and(|d| (crate::datetime::now_unix() - d).abs() < 60),
             "a release the refetch added starts at zero: {added:?}"
         );
         // The ledger sits under the internal prefix, which backup and migrate carry (#1140).
@@ -5576,7 +5576,7 @@ mod nuget_release_dates {
             },
         )
         .await;
-        let month_ago = chrono::Utc::now().timestamp() - 30 * 86400;
+        let month_ago = crate::datetime::now_unix() - 30 * 86400;
 
         let resp = send(
             &ctx.app,
@@ -5620,7 +5620,7 @@ mod nuget_release_dates {
         .to_string();
         let page_key = format!("nuget/registration/{ID}/page/1.2.3/1.2.4.json");
         put_written_days_ago(&ctx, &page_key, cached_page.as_bytes(), 30).await;
-        let month_ago = chrono::Utc::now().timestamp() - 30 * 86400;
+        let month_ago = crate::datetime::now_unix() - 30 * 86400;
 
         let resp = send(
             &ctx.app,
@@ -5639,7 +5639,7 @@ mod nuget_release_dates {
         );
         let added = super::nuget_publish_date(&ctx.state, ID, "1.2.4", true).await;
         assert!(
-            added.is_some_and(|d| (chrono::Utc::now().timestamp() - d).abs() < 60),
+            added.is_some_and(|d| (crate::datetime::now_unix() - d).abs() < 60),
             "a release the refetched page added starts at zero: {added:?}"
         );
     }

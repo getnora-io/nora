@@ -5,8 +5,8 @@
 //!
 //! Exports all artifacts to a tar.gz file and restores from backups.
 
+use crate::datetime::UtcTime;
 use crate::storage::Storage;
-use chrono::{DateTime, Utc};
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
@@ -21,7 +21,7 @@ use tar::{Archive, Builder, Header};
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BackupMetadata {
     pub version: String,
-    pub created_at: DateTime<Utc>,
+    pub created_at: UtcTime,
     pub artifact_count: usize,
     pub total_bytes: u64,
     pub storage_backend: String,
@@ -135,7 +135,7 @@ pub async fn create_backup(storage: &Storage, output: &Path) -> Result<BackupSta
     // Add metadata.json
     let metadata = BackupMetadata {
         version: env!("CARGO_PKG_VERSION").to_string(),
-        created_at: Utc::now(),
+        created_at: UtcTime::now(),
         artifact_count,
         total_bytes,
         storage_backend: storage.backend_name().to_string(),
@@ -332,7 +332,7 @@ mod tests {
     fn test_backup_metadata_serialization() {
         let meta = BackupMetadata {
             version: "0.3.0".to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: UtcTime::now(),
             artifact_count: 42,
             total_bytes: 1024000,
             storage_backend: "local".to_string(),
@@ -363,7 +363,7 @@ mod tests {
     fn test_backup_metadata_roundtrip() {
         let meta = BackupMetadata {
             version: "1.0.0".to_string(),
-            created_at: chrono::Utc::now(),
+            created_at: UtcTime::now(),
             artifact_count: 100,
             total_bytes: 999999,
             storage_backend: "local".to_string(),

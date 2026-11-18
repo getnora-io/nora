@@ -2691,7 +2691,7 @@ mod gem_file_every_reading_counts {
         use crate::digest_quarantine::QuarantineMode;
         use wiremock::matchers::path;
         let upstream = MockServer::start().await;
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = crate::datetime::UtcTime::now().rfc3339();
         let old = "2020-01-01T00:00:00.000Z";
         let versions = [
             (

@@ -43,6 +43,7 @@ mod cleanup;
 mod config;
 mod curation;
 mod dashboard_metrics;
+mod datetime;
 mod digest_quarantine;
 mod docker_key_migration;
 #[cfg(feature = "fault-injection")]
@@ -3654,7 +3655,7 @@ async fn run_server(
     let reloadable = Arc::new(ArcSwap::from_pointee(ReloadableConfig {
         curation_engine,
         bypass_token,
-        loaded_at: chrono::Utc::now().timestamp(),
+        loaded_at: crate::datetime::now_unix(),
     }));
 
     let leak_finders = metrics::LeakFinders::new(config.upstream_hostnames());
@@ -5347,9 +5348,7 @@ fn reload_curation(
 
     // Strictly later than the configuration it replaces, even within the same second: a
     // client's copy dated by the old one is then never current.
-    let loaded_at = chrono::Utc::now()
-        .timestamp()
-        .max(slot.load().loaded_at + 1);
+    let loaded_at = crate::datetime::now_unix().max(slot.load().loaded_at + 1);
     slot.store(Arc::new(ReloadableConfig {
         curation_engine: engine,
         bypass_token: config.curation.bypass_token,

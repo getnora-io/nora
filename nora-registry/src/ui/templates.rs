@@ -6,6 +6,7 @@ use super::api::{
 };
 use super::components::*;
 use super::i18n::{get_translations, Lang};
+use crate::datetime::UtcTime;
 use crate::registry_type::RegistryType;
 use crate::repo_index::RepoInfo;
 use crate::tokens::TokenListEntry;
@@ -191,20 +192,24 @@ pub fn render_dashboard(
 }
 
 /// Format timestamp as relative time (e.g., "2 min ago")
-fn format_relative_time(timestamp: &chrono::DateTime<chrono::Utc>) -> String {
-    let now = chrono::Utc::now();
-    let diff = now.signed_duration_since(*timestamp);
+fn format_relative_time(timestamp: &UtcTime) -> String {
+    relative_time(*timestamp, UtcTime::now())
+}
 
-    if diff.num_seconds() < 60 {
+/// How long before `now` an event at `timestamp` was, in the dashboard's words.
+pub(crate) fn relative_time(timestamp: UtcTime, now: UtcTime) -> String {
+    let secs = timestamp.seconds_until(now);
+
+    if secs < 60 {
         "just now".to_string()
-    } else if diff.num_minutes() < 60 {
-        let mins = diff.num_minutes();
+    } else if secs / 60 < 60 {
+        let mins = secs / 60;
         format!("{} min{} ago", mins, if mins == 1 { "" } else { "s" })
-    } else if diff.num_hours() < 24 {
-        let hours = diff.num_hours();
+    } else if secs / 3600 < 24 {
+        let hours = secs / 3600;
         format!("{} hour{} ago", hours, if hours == 1 { "" } else { "s" })
     } else {
-        let days = diff.num_days();
+        let days = secs / 86_400;
         format!("{} day{} ago", days, if days == 1 { "" } else { "s" })
     }
 }
@@ -2213,6 +2218,27 @@ pub fn encode_uri_component(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ui::api::PackageDetail;
+
+    /// The dashboard's "time ago", as NORA 1.4.5 worded it (#1282).
+    #[test]
+    fn activity_is_aged_as_before() {
+        let at = |s, n| UtcTime::from_unix(s, n).unwrap();
+        let event = at(1_700_000_000, 500_000_000);
+        for (now, expected) in [
+            (at(1_700_000_000, 0), "just now"),
+            (at(1_699_000_000, 0), "just now"),
+            (at(1_700_000_060, 499_999_999), "just now"),
+            (at(1_700_000_060, 500_000_000), "1 min ago"),
+            (at(1_700_000_120, 500_000_000), "2 mins ago"),
+            (at(1_700_003_600, 499_999_999), "59 mins ago"),
+            (at(1_700_003_600, 500_000_000), "1 hour ago"),
+            (at(1_700_007_200, 500_000_000), "2 hours ago"),
+            (at(1_700_086_400, 500_000_000), "1 day ago"),
+            (at(1_700_172_800, 500_000_000), "2 days ago"),
+        ] {
+            assert_eq!(relative_time(event, now), expected, "{event} .. {now}");
+        }
+    }
 
     /// Every name the UI renders — a path segment, an entry, a file, a tag, a version, package
     /// metadata — reaches the page escaped, in attributes as in text: no quote or angle bracket
