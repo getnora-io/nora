@@ -24,7 +24,7 @@ Open [http://localhost:4000/ui/](http://localhost:4000/ui/): the registry is rea
 
 ## Why NORA
 
-- **Small and quick to start.** A static binary of about 23 MB with no database and no runtime to install; it answers in under a second and idles at about 15 MB of memory ([BENCHMARKS.md](BENCHMARKS.md)).
+- **Small and quick to start.** A static binary of about 31 MB with no database and no runtime to install; it answers in under a second and idles at about 18 MB of memory ([BENCHMARKS.md](BENCHMARKS.md)).
 - **Eighteen formats, hosted and proxied.** One registry for containers, language packages, OS packages and Hugging Face models, on local disk, S3-compatible storage or Google Cloud Storage.
 - **What you publish stays yours.** A package, crate or image published to NORA is never replaced by an upstream package of the same name. Curation — allowlist, blocklist, minimum release age, quarantine of new versions, internal namespaces — decides what reaches your builds.
 - **Ready to operate.** A web UI in English, Russian and Chinese, API tokens with read, write and admin roles, keyless publishing from GitHub Actions and GitLab CI with OIDC, rate limits, an audit log and Prometheus metrics.

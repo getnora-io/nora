@@ -8,18 +8,19 @@ Reproducible performance figures for NORA.
 > load — are **not yet measured**: the k6 load harness is not implemented (tracked
 > in #693). The rows under "Targets" are goals, not measurements, until then.
 
-## Measured (v1.4.0)
+## Measured (v1.4.6)
 
-| Metric | Value |
-|--------|-------|
-| Binary size (`nora-linux-amd64`) | 23.4 MB |
-| Cold start (process start to `/health` 200) | 55–90 ms |
-| RAM (idle, 10 s after start) | about 15 MB (RSS) |
+| Metric | v1.4.6 | v1.4.0 |
+|--------|--------|--------|
+| Binary size (`nora-linux-amd64`) | 30.8 MB | 23.4 MB |
+| Cold start (process start to `/health` 200) | 62–69 ms | 329–554 ms |
+| RAM (idle, 10 s after start) | about 18 MB (RSS) | about 15 MB (RSS) |
 
-> The release binary of v1.4.0, three runs, empty local storage, `NORA_CURATION_MODE=off`, on a
-> 20-core Linux 5.15 host. A store with packages starts later: the first start of 1.4.0 on a store
-> with 3,000 Cargo crates writes their name records before it accepts requests, about 4 s on local
-> disk and 2 s on S3; later starts skip it.
+> The release binaries, three runs each, empty local storage, `NORA_CURATION_MODE=off`, on a
+> 20-core Linux 5.15 host. v1.4.6 measured 17.8–18.1 MB RSS; v1.4.0, re-run the same way for
+> comparison, 14.8–15.5 MB. A store with packages starts later: the
+> first start of 1.4.0 on a store with 3,000 Cargo crates writes their name records before it
+> accepts requests, about 4 s on local disk and 2 s on S3; later starts skip it.
 >
 > Earlier figure, for comparison: v0.9.0 measured in CI on GitHub Actions (`ubuntu-latest`,
 > 2 vCPU, 4 GB RAM) at under 3 s cold start, under 50 MB idle and about 23 MB of binary.
@@ -36,7 +37,8 @@ These need the k6 load harness, which does not exist yet:
 
 ## Methodology
 
-On each release, the `benchmarks.yml` workflow measures:
+The `benchmarks.yml` workflow measures the following. It last ran on a release for v1.2.2; the
+figures above for v1.4.0 and v1.4.6 were measured by hand the same way.
 
 - **Cold start** — wall-clock from `nora serve` to the first successful `/health` response.
 - **Idle memory** — `VmRSS` from `/proc/PID/status` after startup, with no requests.
