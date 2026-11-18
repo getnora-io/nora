@@ -272,7 +272,7 @@ fn staging_presence(root: &Path, own: Option<&Path>) -> ServerPresence {
                 Err(_) => presence = ServerPresence::Unknown,
             },
             // Being removed: a dead owner's (see [`Staging`]).
-            Err(e) if is_missing(&e) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(_) => presence = ServerPresence::Unknown,
         }
     }
@@ -2138,6 +2138,23 @@ mod tests {
             rt.block_on(command.server_presence()),
             ServerPresence::Unknown
         );
+
+        // A lock path that runs through a file (`ENOTDIR`) cannot be tested either; only a
+        // lock that is gone (`ENOENT`, a dead owner's directory being removed) is skipped.
+        let other = TempDir::new().unwrap();
+        let odd = other
+            .path()
+            .join(crate::validation::STAGING_DIR)
+            .join("fedcba9876543210");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join("plain"), b"").unwrap();
+        std::os::unix::fs::symlink("plain/child", odd.join(STAGING_LOCK_FILE)).unwrap();
+        assert_eq!(
+            rt.block_on(LocalStorage::new(other.path().to_str().unwrap()).server_presence()),
+            ServerPresence::Unknown,
+            "a lock path through a file"
+        );
+
         let server = LocalStorage::new(root);
         rt.block_on(server.prepare());
         assert_eq!(
