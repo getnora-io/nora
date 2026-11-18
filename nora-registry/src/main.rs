@@ -26,8 +26,10 @@
 // futex contention under many async workers; mimalloc's per-thread heaps avoid it. Feature
 // `mimalloc` is on by default; `--no-default-features` falls back to the system allocator.
 // Declaring the static needs no unsafe here (the GlobalAlloc impl lives in the crate), so
-// `#![forbid(unsafe_code)]` still holds.
+// `#![forbid(unsafe_code)]` still holds. The unit tests count allocations instead (the
+// `allocation-counter` dev-dependency is their global allocator, #1305).
 #[cfg(feature = "mimalloc")]
+#[cfg(not(test))]
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 

@@ -18,6 +18,9 @@ enabeld = "enabeld"
 unknwon = "unknwon"
 # intentional typo: an unknown registry name next to a real one in the enable-list tests (config/mod.rs)
 dokcer = "dokcer"
+# npm_memory_tests.rs (#1305): `caf\u00e9` is "café" with its accent escaped, `tru` an invalid JSON literal on purpose
+caf = "caf"
+tru = "tru"
 
 [files]
 # nora-registry/src/ui/static/swagger-ui/: Swagger UI release files, minified, kept byte for byte (pinned in openapi.rs).

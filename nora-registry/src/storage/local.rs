@@ -932,9 +932,12 @@ impl StorageBackend for LocalStorage {
     async fn get(&self, key: &str) -> Result<(Bytes, Option<String>)> {
         let path = self.key_to_path(key);
 
-        let (mut file, _) = open_object(&path).await?;
+        let (mut file, meta) = open_object(&path).await?;
 
-        let mut buffer = Vec::new();
+        // Sized from the file at hand (a write replaces it by a rename, so its length holds):
+        // read to its end, the buffer is the file once, not grown by doubling to twice its
+        // size, and goes on as the body without a copy (#1305).
+        let mut buffer = Vec::with_capacity(usize::try_from(meta.len()).unwrap_or(0));
         file.read_to_end(&mut buffer).await?;
 
         Ok((Bytes::from(buffer), self.pins.get(key)))

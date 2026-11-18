@@ -2150,8 +2150,15 @@ impl StoreClaims {
 
 /// The store's claims for the copy `data` of `path` (see [`StoreClaims`]). The copy is placed once
 /// with nothing held, to see which of its links ask the store, and only those files are listed.
-async fn store_claims(state: &AppState, path: &str, package: &str, data: &[u8]) -> StoreClaims {
-    if links_on_nora(data, &nora_base_url(state), package) {
+/// `on_nora` is [`copy_on_nora`] of the copy: a copy whose links are all NORA's asks nothing.
+async fn store_claims(
+    state: &AppState,
+    path: &str,
+    package: &str,
+    data: &[u8],
+    on_nora: bool,
+) -> StoreClaims {
+    if on_nora {
         return StoreClaims::default();
     }
     let upstream = state
@@ -2191,21 +2198,30 @@ async fn held_tarballs(state: &AppState, package: &str) -> std::collections::Has
         .collect()
 }
 
-/// What NORA serves of an upstream document it cached: the document itself when every tarball
-/// link in it is NORA's, else the document placed again, as a fresh one is — the versions whose
-/// tarball lies outside the upstream left out. `None` for a version manifest whose tarball does.
-/// The flag says whether the copy held such a link (cached by a release that kept one).
-fn served_copy(
-    state: &AppState,
-    path: &str,
-    data: Bytes,
-    held: &dyn Fn(&str) -> bool,
-) -> (Option<Bytes>, bool) {
+/// Whether every tarball link of the cached copy `data` of `path` is NORA's ([`links_on_nora`]).
+/// Read once per copy and handed to [`store_claims`] and [`served_copy`]: on a large packument the
+/// read walks every version (#1305).
+fn copy_on_nora(state: &AppState, path: &str, data: &[u8]) -> bool {
     let package = match classify_metadata_path(path) {
         MetadataPath::Packument { name } | MetadataPath::VersionManifest { name, .. } => name,
         MetadataPath::Other => "",
     };
-    if links_on_nora(&data, &nora_base_url(state), package) {
+    links_on_nora(data, &nora_base_url(state), package)
+}
+
+/// What NORA serves of an upstream document it cached: the document itself when every tarball
+/// link in it is NORA's (`on_nora`, [`copy_on_nora`] of `data`), else the document placed again,
+/// as a fresh one is — the versions whose tarball lies outside the upstream left out. `None` for a
+/// version manifest whose tarball does. The flag says whether the copy held such a link (cached by
+/// a release that kept one).
+fn served_copy(
+    state: &AppState,
+    path: &str,
+    data: Bytes,
+    on_nora: bool,
+    held: &dyn Fn(&str) -> bool,
+) -> (Option<Bytes>, bool) {
+    if on_nora {
         // The copy's record is kept by the copy, not served: taken out of the bytes (#1180).
         return (Some(without_record_bytes(data)), false);
     }
@@ -2223,7 +2239,26 @@ fn served_copy(
 
 /// A stored copy's bytes with its record taken out, for serving (#1180). A copy without a
 /// record is served as it is.
+///
+/// The record is the document's first member, so the document goes on after it at the comma
+/// that ends it: that comma becomes the opening brace, in place, when the bytes are this
+/// request's alone (as a read of the store hands them over), and the bytes before it are left
+/// out of view. Bytes shared with another holder are copied, as before (#1305).
 fn without_record_bytes(data: Bytes) -> Bytes {
+    let Some((_, end)) = npm_links::split_record(&data) else {
+        return data;
+    };
+    let data = if data.get(end) == Some(&b',') {
+        match data.try_into_mut() {
+            Ok(mut document) => {
+                document[end] = b'{';
+                return document.split_off(end).freeze();
+            }
+            Err(shared) => shared,
+        }
+    } else {
+        data
+    };
     match npm_links::without_record(&data) {
         Some(plain) => Bytes::from(plain),
         None => data,
@@ -2331,9 +2366,10 @@ fn served_metadata(
     path: &str,
     document: Document,
     data: Bytes,
+    on_nora: bool,
     held: &dyn Fn(&str) -> bool,
 ) -> Response {
-    match served_copy(state, path, data, held) {
+    match served_copy(state, path, data, on_nora, held) {
         (Some(data), _) => metadata_response(headers, document, data),
         (None, _) => StatusCode::NOT_FOUND.into_response(),
     }
@@ -2401,20 +2437,34 @@ async fn upstream_metadata(
     if let Some((data, from_key)) = cached {
         // A copy holding a link past NORA (cached by a release that kept one) is served placed
         // again, and refetched in full whatever its age: a 304 would keep it as it is.
-        let claims = store_claims(state, path, name, &data).await;
+        let on_nora = copy_on_nora(state, path, &data);
+        let claims = store_claims(state, path, name, &data, on_nora).await;
+        // #68 namespace isolation: an internal-namespace package is never revalidated upstream.
+        let internal = crate::curation::is_internal_namespace(
+            &state.curation().curation_engine,
+            crate::curation::RegistryType::Npm,
+            name,
+        );
+        // A copy whose links are all NORA's leaves nothing out, so its age alone says whether it
+        // is served as it is. Served before a revalidation takes a second handle on its bytes, the
+        // record is cut off them in place rather than the document copied (#1305).
+        let fresh_on_nora = on_nora && packument_fresh(state, &from_key).await;
+        if fresh_on_nora || (on_nora && internal) {
+            let (served, _) =
+                served_copy(state, path, data, on_nora, &|file: &str| claims.holds(file));
+            return match served {
+                Some(data) => metadata_response(headers, document, data),
+                None => StatusCode::NOT_FOUND.into_response(),
+            };
+        }
         // The body already read: a 304 serves it, rather than reading the same object again (#1064).
         let seed_body = data.clone();
         let held = (from_key == cache_key).then(|| (data.clone(), read_with.clone()));
-        let (served, past_nora) = served_copy(state, path, data, &|file: &str| claims.holds(file));
-        let fresh = !past_nora && packument_fresh(state, &from_key).await;
-        // #68 namespace isolation: an internal-namespace package is never revalidated upstream.
-        if fresh
-            || crate::curation::is_internal_namespace(
-                &state.curation().curation_engine,
-                crate::curation::RegistryType::Npm,
-                name,
-            )
-        {
+        let (served, past_nora) =
+            served_copy(state, path, data, on_nora, &|file: &str| claims.holds(file));
+        // A copy of NORA's links was found stale above; any other is fresh only placed whole.
+        let fresh = !on_nora && !past_nora && packument_fresh(state, &from_key).await;
+        if fresh || internal {
             return match served {
                 Some(data) => metadata_response(headers, document, data),
                 None => StatusCode::NOT_FOUND.into_response(),
@@ -2447,10 +2497,17 @@ async fn upstream_metadata(
         if let Some(refreshed) = refreshed {
             // A 304 hands back the stored copy, which names the store's own tarballs: they are
             // held, so the copy is placed with them (#1180).
-            let claims = store_claims(state, path, name, &refreshed).await;
-            return served_metadata(state, headers, path, document, refreshed, &|file: &str| {
-                claims.holds(file)
-            });
+            let on_nora = copy_on_nora(state, path, &refreshed);
+            let claims = store_claims(state, path, name, &refreshed, on_nora).await;
+            return served_metadata(
+                state,
+                headers,
+                path,
+                document,
+                refreshed,
+                on_nora,
+                &|file: &str| claims.holds(file),
+            );
         }
         if state.config.npm.serve_stale {
             tracing::warn!(registry = "npm", path = %path, "npm upstream unavailable, serving stale metadata");
@@ -2512,6 +2569,9 @@ async fn upstream_metadata(
             if document == Document::Packument {
                 record_first_seen(state, cache_key, &rewritten, None).await;
             }
+            // One body for the cache write and the answer, shared rather than copied (#1305).
+            let rewritten = Bytes::from(rewritten);
+            let on_nora = copy_on_nora(state, path, &rewritten);
             let storage = state.storage.clone();
             let key = cache_key.to_string();
             let body = rewritten.clone();
@@ -2527,7 +2587,8 @@ async fn upstream_metadata(
                 headers,
                 path,
                 document,
-                Bytes::from(rewritten),
+                rewritten,
+                on_nora,
                 &|_: &str| false,
             )
         }
@@ -3439,35 +3500,405 @@ fn wants_install_v1(headers: &HeaderMap) -> bool {
 
 /// Project a full packument down to the abbreviated form. `None` when the body
 /// is not a packument we can parse — the caller then serves it unchanged.
+///
+/// The document is read once, in order, and never built as a whole (#1305): the kept fields are
+/// built one at a time, each version's are written out as soon as its manifest ends, and the rest
+/// is read through without being kept. A tree of a whole packument holds several times the
+/// document (typescript's 16 MB took ~150 MiB per request), so this holds the document, the
+/// abbreviated form and one version at a time. What it accepts and the bytes it writes are the
+/// tree projection's: duplicate keys keep the last, the output is in key order, and a body the
+/// tree would refuse (a number out of range, a string that is no UTF-8, nesting past the parser's
+/// limit, anywhere in the document) is refused.
 fn abbreviate_packument(full: &[u8]) -> Option<Vec<u8>> {
-    let doc: serde_json::Value = serde_json::from_slice(full).ok()?;
-    let obj = doc.as_object()?;
+    use serde::Deserialize;
+    let mut de = serde_json::Deserializer::from_slice(full);
+    let projection = install_v1::Packument::deserialize(&mut de).ok()?;
+    de.end().ok()?;
+    projection.into_bytes()
+}
 
-    let mut out = serde_json::Map::new();
-    for field in INSTALL_V1_TOP_FIELDS {
-        if let Some(value) = obj.get(*field) {
-            out.insert((*field).to_string(), value.clone());
-        }
+/// The streaming reader of [`abbreviate_packument`].
+mod install_v1 {
+    use super::{INSTALL_V1_TOP_FIELDS, INSTALL_V1_VERSION_FIELDS};
+    use serde::de::{self, DeserializeSeed, Deserializer, MapAccess, SeqAccess, Visitor};
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
+    use std::fmt;
+
+    /// serde_json's raw-value token. With its `raw_value` feature (on in this build), `Value`
+    /// reads an object whose first key is this token as the JSON text in that key's string, in
+    /// place of the object, and refuses any other value there or any key after it. Every object
+    /// read here is read the same way, so the projection accepts what the tree accepted.
+    const RAW_VALUE_TOKEN: &str = "$serde_json::private::RawValue";
+
+    /// The object whose first key was [`RAW_VALUE_TOKEN`], read from the text in its value. The
+    /// object's further keys are left unread: the parser then refuses them, as the tree does.
+    fn from_raw_value_text<'de, A: MapAccess<'de>, T: de::DeserializeOwned>(
+        map: &mut A,
+    ) -> Result<T, A::Error> {
+        let text: String = map.next_value()?;
+        serde_json::from_str(&text).map_err(de::Error::custom)
     }
 
-    let mut versions = serde_json::Map::new();
-    if let Some(source) = obj.get("versions").and_then(|v| v.as_object()) {
-        for (version, manifest) in source {
-            let Some(manifest) = manifest.as_object() else {
-                continue;
-            };
-            let mut kept = serde_json::Map::new();
-            for field in INSTALL_V1_VERSION_FIELDS {
-                if let Some(value) = manifest.get(*field) {
-                    kept.insert((*field).to_string(), value.clone());
-                }
+    /// A packument's abbreviated form, still in parts: the kept top-level fields, and each
+    /// version's kept fields already written (`None`: the version is no object, and is left out).
+    /// Both in key order, as the tree projection writes them.
+    pub(super) struct Packument {
+        top: BTreeMap<&'static str, serde_json::Value>,
+        versions: BTreeMap<String, Option<Vec<u8>>>,
+    }
+
+    impl Packument {
+        /// The abbreviated document. Every kept top-level field sorts before `versions`, which the
+        /// tree projection always writes, so it goes last.
+        pub(super) fn into_bytes(self) -> Option<Vec<u8>> {
+            let mut out = vec![b'{'];
+            for (field, value) in &self.top {
+                serde_json::to_writer(&mut out, field).ok()?;
+                out.push(b':');
+                serde_json::to_writer(&mut out, value).ok()?;
+                out.push(b',');
             }
-            versions.insert(version.clone(), serde_json::Value::Object(kept));
+            out.extend_from_slice(b"\"versions\":{");
+            // Room for every version at once: grown by doubling, the output would be held twice
+            // over at its last step. A version's key goes out quoted, with `:` and `,` (escapes
+            // in a key may still grow it, rarely).
+            out.reserve_exact(
+                self.versions
+                    .iter()
+                    .filter_map(|(v, m)| m.as_ref().map(|m| v.len() + m.len() + 4))
+                    .sum::<usize>()
+                    + 2,
+            );
+            let mut first = true;
+            for (version, manifest) in self.versions {
+                let Some(manifest) = manifest else {
+                    continue;
+                };
+                if !first {
+                    out.push(b',');
+                }
+                first = false;
+                serde_json::to_writer(&mut out, &version).ok()?;
+                out.push(b':');
+                out.extend_from_slice(&manifest);
+            }
+            out.extend_from_slice(b"}}");
+            Some(out)
         }
     }
-    out.insert("versions".to_string(), serde_json::Value::Object(versions));
 
-    serde_json::to_vec(&serde_json::Value::Object(out)).ok()
+    impl<'de> Deserialize<'de> for Packument {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(PackumentVisitor)
+        }
+    }
+
+    struct PackumentVisitor;
+
+    impl<'de> Visitor<'de> for PackumentVisitor {
+        type Value = Packument;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a packument object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Packument, A::Error> {
+            let mut top = BTreeMap::new();
+            let mut versions = BTreeMap::new();
+            let mut next = match map.next_key::<String>()? {
+                Some(first) if first == RAW_VALUE_TOKEN => return from_raw_value_text(&mut map),
+                first => first.map(|key| TopKey::classify(&key)),
+            };
+            while let Some(key) = next {
+                match key {
+                    Top::Kept(field) => {
+                        top.insert(field, map.next_value::<serde_json::Value>()?);
+                    }
+                    // The last `versions` is the document's, whatever came before it.
+                    Top::Versions => versions = map.next_value::<Versions>()?.0,
+                    Top::Dropped => {
+                        map.next_value::<Skipped>()?;
+                    }
+                }
+                next = map.next_key_seed(TopKey)?;
+            }
+            Ok(Packument { top, versions })
+        }
+    }
+
+    enum Top {
+        Kept(&'static str),
+        Versions,
+        Dropped,
+    }
+
+    /// A top-level key, told apart without being kept.
+    struct TopKey;
+
+    impl TopKey {
+        fn classify(key: &str) -> Top {
+            if key == "versions" {
+                Top::Versions
+            } else {
+                INSTALL_V1_TOP_FIELDS
+                    .iter()
+                    .find(|field| **field == key)
+                    .map_or(Top::Dropped, |field| Top::Kept(field))
+            }
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for TopKey {
+        type Value = Top;
+
+        fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Top, D::Error> {
+            deserializer.deserialize_str(self)
+        }
+    }
+
+    impl Visitor<'_> for TopKey {
+        type Value = Top;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a key")
+        }
+
+        fn visit_str<E: de::Error>(self, key: &str) -> Result<Top, E> {
+            Ok(TopKey::classify(key))
+        }
+    }
+
+    /// The `versions` of a packument; anything but an object lists none.
+    struct Versions(BTreeMap<String, Option<Vec<u8>>>);
+
+    impl<'de> Deserialize<'de> for Versions {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(VersionsVisitor)
+        }
+    }
+
+    struct VersionsVisitor;
+
+    impl<'de> Visitor<'de> for VersionsVisitor {
+        type Value = Versions;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("any value")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Versions, A::Error> {
+            let mut versions = BTreeMap::new();
+            let mut next = map.next_key::<String>()?;
+            if next.as_deref() == Some(RAW_VALUE_TOKEN) {
+                return from_raw_value_text(&mut map);
+            }
+            while let Some(version) = next {
+                versions.insert(version, map.next_value::<Manifest>()?.0);
+                next = map.next_key::<String>()?;
+            }
+            Ok(Versions(versions))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Versions, A::Error> {
+            Skipped::visit(seq).map(|_| Versions(BTreeMap::new()))
+        }
+
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Versions, E> {
+            Ok(Versions(BTreeMap::new()))
+        }
+
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Versions, E> {
+            Ok(Versions(BTreeMap::new()))
+        }
+
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Versions, E> {
+            Ok(Versions(BTreeMap::new()))
+        }
+
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Versions, E> {
+            Ok(Versions(BTreeMap::new()))
+        }
+
+        fn visit_str<E: de::Error>(self, _: &str) -> Result<Versions, E> {
+            Ok(Versions(BTreeMap::new()))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Versions, E> {
+            Ok(Versions(BTreeMap::new()))
+        }
+    }
+
+    /// One version's kept fields, written out in key order; `None` when the version is no
+    /// object.
+    struct Manifest(Option<Vec<u8>>);
+
+    impl<'de> Deserialize<'de> for Manifest {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(ManifestVisitor)
+        }
+    }
+
+    struct ManifestVisitor;
+
+    impl<'de> Visitor<'de> for ManifestVisitor {
+        type Value = Manifest;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("any value")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Manifest, A::Error> {
+            let mut kept = serde_json::Map::new();
+            let mut next = match map.next_key::<String>()? {
+                Some(first) if first == RAW_VALUE_TOKEN => return from_raw_value_text(&mut map),
+                first => first.map(|key| VersionKey::classify(&key)),
+            };
+            while let Some(field) = next {
+                match field {
+                    Some(field) => {
+                        kept.insert(field.to_string(), map.next_value()?);
+                    }
+                    None => {
+                        map.next_value::<Skipped>()?;
+                    }
+                }
+                next = map.next_key_seed(VersionKey)?;
+            }
+            let mut written = serde_json::to_vec(&kept).map_err(de::Error::custom)?;
+            written.shrink_to_fit();
+            Ok(Manifest(Some(written)))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Manifest, A::Error> {
+            Skipped::visit(seq).map(|_| Manifest(None))
+        }
+
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Manifest, E> {
+            Ok(Manifest(None))
+        }
+
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Manifest, E> {
+            Ok(Manifest(None))
+        }
+
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Manifest, E> {
+            Ok(Manifest(None))
+        }
+
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Manifest, E> {
+            Ok(Manifest(None))
+        }
+
+        fn visit_str<E: de::Error>(self, _: &str) -> Result<Manifest, E> {
+            Ok(Manifest(None))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Manifest, E> {
+            Ok(Manifest(None))
+        }
+    }
+
+    /// A key of a version's manifest: the kept field it names, if any.
+    struct VersionKey;
+
+    impl VersionKey {
+        fn classify(key: &str) -> Option<&'static str> {
+            INSTALL_V1_VERSION_FIELDS
+                .iter()
+                .find(|field| **field == key)
+                .copied()
+        }
+    }
+
+    impl<'de> DeserializeSeed<'de> for VersionKey {
+        type Value = Option<&'static str>;
+
+        fn deserialize<D: Deserializer<'de>>(
+            self,
+            deserializer: D,
+        ) -> Result<Self::Value, D::Error> {
+            deserializer.deserialize_str(self)
+        }
+    }
+
+    impl Visitor<'_> for VersionKey {
+        type Value = Option<&'static str>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a key")
+        }
+
+        fn visit_str<E: de::Error>(self, key: &str) -> Result<Self::Value, E> {
+            Ok(VersionKey::classify(key))
+        }
+    }
+
+    /// A value read to its end and not kept. It is read as a tree reads it (numbers in range,
+    /// strings of UTF-8 with valid escapes, nesting within the parser's limit), so a body the
+    /// tree projection refused is refused here too; `IgnoredAny` reads past all three.
+    struct Skipped;
+
+    impl Skipped {
+        fn visit<'de, A: SeqAccess<'de>>(mut seq: A) -> Result<Skipped, A::Error> {
+            while seq.next_element::<Skipped>()?.is_some() {}
+            Ok(Skipped)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Skipped {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            deserializer.deserialize_any(SkippedVisitor)
+        }
+    }
+
+    struct SkippedVisitor;
+
+    impl<'de> Visitor<'de> for SkippedVisitor {
+        type Value = Skipped;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("any value")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Skipped, A::Error> {
+            match map.next_key::<String>()? {
+                None => return Ok(Skipped),
+                Some(first) if first == RAW_VALUE_TOKEN => return from_raw_value_text(&mut map),
+                Some(_) => map.next_value::<Skipped>()?,
+            };
+            while map.next_entry::<Skipped, Skipped>()?.is_some() {}
+            Ok(Skipped)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Skipped, A::Error> {
+            Skipped::visit(seq)
+        }
+
+        fn visit_bool<E: de::Error>(self, _: bool) -> Result<Skipped, E> {
+            Ok(Skipped)
+        }
+
+        fn visit_i64<E: de::Error>(self, _: i64) -> Result<Skipped, E> {
+            Ok(Skipped)
+        }
+
+        fn visit_u64<E: de::Error>(self, _: u64) -> Result<Skipped, E> {
+            Ok(Skipped)
+        }
+
+        fn visit_f64<E: de::Error>(self, _: f64) -> Result<Skipped, E> {
+            Ok(Skipped)
+        }
+
+        fn visit_str<E: de::Error>(self, _: &str) -> Result<Skipped, E> {
+            Ok(Skipped)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Skipped, E> {
+            Ok(Skipped)
+        }
+    }
 }
 
 /// What an npm metadata response carries. Only a packument has an abbreviated form: a version
@@ -15959,3 +16390,7 @@ mod revalidation_1064_round3 {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "npm_memory_tests.rs"]
+mod memory_tests;
