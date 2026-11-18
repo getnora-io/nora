@@ -270,6 +270,65 @@ fn the_openapi_document_is_unchanged() {
     );
 }
 
+/// RUSTSEC-2026-0543: chrono is unmaintained. NORA's own dates do not depend on it; it may stay
+/// in the tree only through a dependency (object_store), which `deny.toml` names.
+///
+/// Judged on the resolved graph: `Cargo.lock` names the packages `nora-registry` depends on by
+/// their real name, whatever the manifest calls them and whichever `[target.*]` table they are
+/// in. The manifest is still read for a dependency built with its own `chrono` feature.
+#[test]
+fn nora_does_not_depend_on_chrono_itself() {
+    let lock: toml::Table = include_str!("../../Cargo.lock").parse().unwrap();
+    let nora = lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"].as_str() == Some("nora-registry"))
+        .expect("nora-registry in Cargo.lock");
+    let deps = nora["dependencies"].as_array().unwrap();
+    assert!(
+        deps.len() > 20,
+        "the dependencies are all there ({})",
+        deps.len()
+    );
+    for dep in deps {
+        let name = dep.as_str().unwrap().split(' ').next().unwrap();
+        assert_ne!(
+            name, "chrono",
+            "nora-registry depends on chrono in Cargo.lock"
+        );
+    }
+
+    let manifest: toml::Table = include_str!("../Cargo.toml").parse().unwrap();
+    let sections = |prefix: &str, t: &toml::Table| -> Vec<(String, toml::Table)> {
+        ["dependencies", "dev-dependencies", "build-dependencies"]
+            .iter()
+            .filter_map(|s| Some((format!("{prefix}{s}"), t.get(*s)?.as_table()?.clone())))
+            .collect()
+    };
+    let mut tables = sections("", &manifest);
+    if let Some(targets) = manifest.get("target").and_then(|t| t.as_table()) {
+        for (cfg, t) in targets {
+            tables.extend(sections(&format!("target.{cfg}."), t.as_table().unwrap()));
+        }
+    }
+    assert!(
+        tables.len() >= 3,
+        "dependency tables read: {}",
+        tables.len()
+    );
+    for (section, deps) in tables {
+        for (name, spec) in &deps {
+            let package = spec.get("package").and_then(|p| p.as_str()).unwrap_or(name);
+            assert_ne!(package, "chrono", "chrono in [{section}] as {name}");
+            let features = spec.get("features").and_then(|f| f.as_array());
+            assert!(
+                !features.is_some_and(|f| f.iter().any(|f| f.as_str() == Some("chrono"))),
+                "{name} in [{section}] built with its chrono feature"
+            );
+        }
+    }
+}
 /// A leap second exists only as read (`23:59:60` in a backup's `created_at`), and is written
 /// back as such.
 #[test]

@@ -43,7 +43,16 @@ fn upstream() -> String {
 }
 
 fn packument(base: &str) -> String {
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = time::OffsetDateTime::now_utc();
+    let now = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        now.year(),
+        now.month() as u8,
+        now.day(),
+        now.hour(),
+        now.minute(),
+        now.second()
+    );
     let version = |v: &str| {
         serde_json::json!({
             "name": PACKAGE, "version": v,
