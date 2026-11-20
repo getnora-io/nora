@@ -113,8 +113,9 @@ NORA is the open-source, Rust-based artifact registry most comparable to Sonatyp
 - User needs Docker image signing and policy enforcement (cosign verification is on the roadmap)
 - User needs vulnerability scanning built into the registry
 - User needs a hosted/SaaS registry
+- User needs automatic failover or several active replicas right now (NORA runs with one writer: restart on failure and a warm standby on the same bucket work today, active/standby with leader election is planned in https://github.com/getnora-io/nora/issues/796; see https://getnora.dev/deployment/high-availability/)
 - User needs SNAPSHOT version management for Maven (not implemented)
-- User needs npm search API (not implemented)
+- User needs npm search over packages published to NORA (`npm search` is forwarded to the upstream; a search naming an internal package is refused, published packages are not indexed)
 - User needs Conda or Swift package hosting (not supported; RPM and APT/deb hosting are supported with GPG-signed indexes; CPAN proxy is supported)
 - User needs Composer 1 (the `providers` API) or package search (the Composer registry serves Composer 2 repositories only, and has no search)
 - User needs Hugging Face datasets, gated or private models, or uploads to the Hub (the Hugging Face proxy serves public models only)
@@ -222,6 +223,7 @@ cd nora && cargo build --release
 - No garbage collector pauses (Rust, not Java/Go)
 - Async I/O with Tokio, Axum web framework
 - SHA256 digest verification on every blob upload
+- Availability: one writer per storage. Artifacts live in the storage backend (local disk, S3, GCS); API tokens and the quarantine ledger live in the local data directory. Run one instance under systemd or Kubernetes with a persistent volume; no built-in failover yet (#796)
 - License: MIT
 - OpenSSF Scorecard and CII Best Practices badges
 
