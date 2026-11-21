@@ -722,17 +722,17 @@ jobs:
           echo "Binary size (arm64): $(du -sh nora-linux-arm64 | cut -f1)"
           cat nora-linux-arm64.sha256
 
-      - name: Generate SBOM (SPDX)
-        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
-        with:
-          format: spdx-json
-          output-file: nora-${{ github.ref_name }}.sbom.spdx.json
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
-      - name: Generate SBOM (CycloneDX)
-        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
-        with:
-          format: cyclonedx-json
-          output-file: nora-${{ github.ref_name }}.sbom.cdx.json
+      - name: Generate SBOM (SPDX + CycloneDX) from the release crate graph
+        run: |
+          cargo install sbom-attest --version 0.4.1 --locked
+          sbom-attest generate --locked -p nora-registry --target x86_64-unknown-linux-musl \
+            --cdx nora-${{ github.ref_name }}.sbom.cdx.json \
+            --spdx nora-${{ github.ref_name }}.sbom.spdx.json
+          sbom-attest audit nora-${{ github.ref_name }}.sbom.cdx.json \
+            -p nora-registry --target x86_64-unknown-linux-musl --summary "$GITHUB_STEP_SUMMARY"
 
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3
