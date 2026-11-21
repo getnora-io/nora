@@ -318,7 +318,7 @@ jobs:
   merge-image:
     name: Promote images (alpine + RED OS + Astra) + sign + smoke
     runs-on: [self-hosted, nora]
-    needs: [build, build-image-arm64, package, provenance]
+    needs: [build, build-image-arm64, package, provenance, sbom]
     permissions:
       contents: read
       packages: write
@@ -680,10 +680,45 @@ jobs:
       upload-assets: true
       compile-generator: true
 
+  # The SBOM describes what is compiled into each release binary: cargo's resolver for
+  # that target, checksums from Cargo.lock, licenses from crate metadata (#1313). The
+  # syft scan it replaces read the checkout and listed dev and test crates, other
+  # platforms' crates and repository files, with almost no checksums or licenses.
+  # It runs before promotion: a check that fails after tags move would leave a public
+  # version without a GitHub Release.
+  sbom:
+    name: SBOM (crate graph, amd64 + arm64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      - name: Generate and check the SBOMs
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          for pair in amd64:x86_64-unknown-linux-musl arm64:aarch64-unknown-linux-musl; do
+            arch="${pair%%:*}" target="${pair#*:}"
+            base="nora-${{ github.ref_name }}.sbom.${arch}"
+            python3 scripts/sbom.py generate --target "$target" --cdx "$base.cdx.json" --spdx "$base.spdx.json"
+            python3 scripts/sbom.py check --target "$target" --cdx "$base.cdx.json" --spdx "$base.spdx.json"
+          done
+
+      - name: Upload SBOMs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: nora-sbom-${{ github.run_id }}
+          path: nora-${{ github.ref_name }}.sbom.*.json
+          if-no-files-found: error
+          retention-days: 1
+
   release:
     name: GitHub Release
     runs-on: [self-hosted, nora]
-    needs: [build, package, provenance, merge-image]
+    needs: [build, package, provenance, sbom, merge-image]
     permissions:
       contents: write
       id-token: write  # Sigstore cosign keyless signing
@@ -722,17 +757,12 @@ jobs:
           echo "Binary size (arm64): $(du -sh nora-linux-arm64 | cut -f1)"
           cat nora-linux-arm64.sha256
 
-      - name: Generate SBOM (SPDX)
-        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
+      # Built and checked by the sbom job before any tag moved; see that job.
+      - name: Download SBOMs
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
-          format: spdx-json
-          output-file: nora-${{ github.ref_name }}.sbom.spdx.json
-
-      - name: Generate SBOM (CycloneDX)
-        uses: anchore/sbom-action@57aae528053a48a3f6235f2d9461b05fbcb7366d # v0
-        with:
-          format: cyclonedx-json
-          output-file: nora-${{ github.ref_name }}.sbom.cdx.json
+          name: nora-sbom-${{ github.run_id }}
+          path: .
 
       - name: Install cosign
         uses: sigstore/cosign-installer@cad07c2e89fa2edd6e2d7bab4c1aa38e53f76003 # v3
@@ -784,8 +814,10 @@ jobs:
             nora-linux-arm64.sig
             nora-linux-arm64.cert
             nora-linux-arm64.bundle
-            nora-${{ github.ref_name }}.sbom.spdx.json
-            nora-${{ github.ref_name }}.sbom.cdx.json
+            nora-${{ github.ref_name }}.sbom.amd64.spdx.json
+            nora-${{ github.ref_name }}.sbom.amd64.cdx.json
+            nora-${{ github.ref_name }}.sbom.arm64.spdx.json
+            nora-${{ github.ref_name }}.sbom.arm64.cdx.json
             packages/nora-amd64.deb
             packages/nora-amd64.rpm
             packages/nora-arm64.deb
