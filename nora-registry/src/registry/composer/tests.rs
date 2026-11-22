@@ -756,6 +756,26 @@ fn a_leap_second_is_not_read_as_the_second_before_it() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// Only the time of day is a leap second: `:60` elsewhere (here in an RFC 2822 comment) leaves
+/// the date readable, so a later body still reaches a client holding an earlier date.
+#[test]
+fn a_60_outside_the_time_of_day_is_not_a_leap_second() {
+    let since = crate::datetime::parse_rfc2822_to_unix("Sun, 22 Nov 2026 07:00:00 GMT").unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::IF_MODIFIED_SINCE,
+        "Sun, 22 Nov 2026 07:00:00 GMT".parse().unwrap(),
+    );
+    let resp = metadata_response(
+        &headers,
+        b"{}".to_vec(),
+        Some("Sun, 22 Nov 2026 08:30:00 GMT (cache retry:60 seconds)".to_string()),
+        false,
+        since,
+    );
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 /// An upstream date NORA cannot read is replaced by the time the configuration was loaded.
 /// That date says nothing about the body, so it revalidates only the client that holds that
 /// very value, as before #1315; a client holding any other date gets the document.
