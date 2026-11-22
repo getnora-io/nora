@@ -746,14 +746,14 @@ fn a_leap_second_is_not_read_as_the_second_before_it() {
         header::IF_MODIFIED_SINCE,
         "Sat, 31 Dec 2016 23:59:59 GMT".parse().unwrap(),
     );
-    let resp = metadata_response(
-        &headers,
-        b"{}".to_vec(),
-        Some("Sat, 31 Dec 2016 23:59:60 GMT".to_string()),
-        false,
-        since,
-    );
-    assert_eq!(resp.status(), StatusCode::OK);
+    // The RFC 2822 grammar NORA reads also allows space around the colons.
+    for lm in [
+        "Sat, 31 Dec 2016 23:59:60 GMT",
+        "Sat, 31 Dec 2016 23:59 :60 GMT",
+    ] {
+        let resp = metadata_response(&headers, b"{}".to_vec(), Some(lm.to_string()), false, since);
+        assert_eq!(resp.status(), StatusCode::OK, "{lm}");
+    }
 }
 
 /// Only the time of day is a leap second: `:60` elsewhere (here in an RFC 2822 comment) leaves
@@ -765,6 +765,7 @@ fn a_60_outside_the_time_of_day_is_not_a_leap_second() {
         "Sun, 22 Nov 2026 08:30:00 GMT (cache retry:60 seconds)",
         "Sun, 22 Nov 2026 08:30:00 GMT (at xx:yy:60 seen)",
         "Sun, 22 Nov 2026 08:30:00 GMT (at 12:34:60 seen)",
+        "Sun, 22 Nov 2026 08:30 GMT (at 12:34:60 seen)",
     ] {
         let mut headers = HeaderMap::new();
         headers.insert(
