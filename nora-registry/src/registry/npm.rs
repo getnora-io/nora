@@ -1440,12 +1440,20 @@ async fn refetch_metadata(
             // that replaced the body before its validators leaves a record for other bytes, and a
             // 304 neither confirms that body nor overwrites the record (#1064). Then the stored
             // copy is read and served as it is.
+            //
+            // `held_record` is what the record of the confirmed body reads: these bytes' own, or
+            // none at all. The confirmation is written only while the record still reads so
+            // (#1295), since a writer that replaced the body left its own.
+            let mut held_record = None;
             let confirm = unchanged
                 && match &cached {
                     // No record names any bytes (a copy from before provenance): nothing contradicts.
                     Ok(body) => match state.storage.get(&origin_key(key)).await {
                         Ok(record) => {
-                            record.as_ref() == provenance_record(&origin, body).as_bytes()
+                            let expected = provenance_record(&origin, body);
+                            let names_body = record.as_ref() == expected.as_bytes();
+                            held_record = Some(expected);
+                            names_body
                         }
                         Err(crate::storage::StorageError::NotFound) => true,
                         Err(_) => false,
@@ -1466,7 +1474,11 @@ async fn refetch_metadata(
                 let storage = state.storage.clone();
                 let key_clone = key.to_string();
                 let asked_with = validators.clone();
+                let lock = state.publish_lock(key);
                 state.cache_writes.spawn("npm", async move {
+                    // LOCK-SAFE: tokio mutex, the one every write of this document holds (#1295):
+                    // the check and the write are one step. Nothing else is locked under it.
+                    let _guard = lock.lock().await;
                     if same_copy(
                         &read_validators(&storage, &key_clone)
                             .await
@@ -1507,16 +1519,35 @@ async fn refetch_metadata(
                             checked: Some(crate::cache_ttl::now_unix()),
                             ..validators.clone()
                         };
+                        //
+                        // The check and the write are one step under the document's lock (#1295):
+                        // a 200 that lands a newer body and its validators either comes before the
+                        // check, which then finds them and writes nothing, or after the write.
                         let storage = state.storage.clone();
                         let key_clone = key.to_string();
                         let asked_with = validators.clone();
+                        let lock = state.publish_lock(key);
                         state.cache_writes.spawn("npm", async move {
+                            // LOCK-SAFE: tokio mutex, the one every write of this document holds.
+                            // Nothing else is locked under it.
+                            let _guard = lock.lock().await;
                             if !same_copy(
                                 &read_validators(&storage, &key_clone)
                                     .await
                                     .unwrap_or_default(),
                                 &asked_with,
                             ) {
+                                return;
+                            }
+                            // The stored bytes are still the body confirmed: a writer that replaced
+                            // them and left the validators (a first fetch, a prefetch for a
+                            // tarball) wrote a record of its own.
+                            let record = match storage.get(&origin_key(&key_clone)).await {
+                                Ok(record) => Some(record),
+                                Err(crate::storage::StorageError::NotFound) => None,
+                                Err(_) => return,
+                            };
+                            if record.as_deref() != held_record.as_ref().map(|r| r.as_bytes()) {
                                 return;
                             }
                             write_validators(&storage, &key_clone, &confirmed).await;
@@ -1558,7 +1589,12 @@ async fn refetch_metadata(
             let key_clone = key.to_string();
             let cache_data = rewritten.clone();
             let origin = origin_of(proxy_url);
+            let lock = state.publish_lock(key);
             state.cache_writes.spawn("npm", async move {
+                // LOCK-SAFE: tokio mutex, the one every write of this document holds (#1295): the
+                // body, its record and its validators land as one, never interleaved with another
+                // request's. Nothing else is locked under it.
+                let _guard = lock.lock().await;
                 // Body first; the validator sidecar must never advertise
                 // freshness for a body that isn't there (#596).
                 if let Err(e) = put_with_origin(&storage, &key_clone, &cache_data, &origin).await {
@@ -2576,7 +2612,11 @@ async fn upstream_metadata(
             let key = cache_key.to_string();
             let body = rewritten.clone();
             let origin = origin_of(upstream.url);
+            let lock = state.publish_lock(cache_key);
             let task = async move {
+                // LOCK-SAFE: tokio mutex, the one every write of this document holds (#1295).
+                // Nothing else is locked under it.
+                let _guard = lock.lock().await;
                 if let Err(e) = put_with_origin(&storage, &key, &body, &origin).await {
                     tracing::warn!(key = %key, error = ?e, "npm proxy: failed to cache metadata");
                 }
@@ -3425,6 +3465,10 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
         if let Some(rewritten) =
             rewrite_for_nora(state, &data, proxy_url, package_name, Links::Stored)
         {
+            // LOCK-SAFE: tokio mutex, the one every write of this document holds (#1295).
+            // Nothing else is locked under it.
+            let lock = state.publish_lock(&key);
+            let _guard = lock.lock().await;
             let _ = put_with_origin(&state.storage, &key, &rewritten, &origin_of(proxy_url)).await;
         }
     }
@@ -16394,3 +16438,648 @@ mod revalidation_1064_round3 {
 #[cfg(test)]
 #[path = "npm_memory_tests.rs"]
 mod memory_tests;
+
+#[cfg(test)]
+mod meta_writes_tests {
+    //! The writes of one cached npm document — its body, its provenance record and its validator
+    //! sidecar — and the 304 that confirms it (#1295).
+    //!
+    //! Two requests for one package write at the same time: a 304 for the copy it read confirms that
+    //! copy by writing its validators again, and a 200 writes a newer body with its own validators.
+    //! Whatever the order, the stored body and its validators describe one upstream document, on the
+    //! local store and on an object store. The writes of one document wait for each other; the writes
+    //! of two packages do not.
+
+    use super::{
+        ensure_npm_metadata_cached, origin_key, origin_of, provenance_record, put_with_origin,
+        refetch_metadata,
+    };
+    use crate::registry::{read_validators, validators_key, write_validators, Validators};
+    use crate::storage::{FileMeta, Result as StoreResult, Storage, StorageBackend};
+    use crate::test_helpers::{create_test_context_with_storage_and_config, send, TestContext};
+    use axum::body::Bytes;
+    use axum::http::{Method, StatusCode};
+    use std::path::Path;
+    use std::pin::Pin;
+    use std::sync::atomic::Ordering::SeqCst;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const KEY: &str = "npm/racepkg/upstream/packument.json";
+    const OTHER: &str = "npm/otherpkg/upstream/packument.json";
+    /// How long a paused read waits for the write it lets through: far longer than a write to a
+    /// local directory or to the in-process object store takes.
+    const WAIT: Duration = Duration::from_secs(1);
+
+    /// A store of the test's own, on a directory or in process (the S3 code path).
+    enum Store {
+        Local(tempfile::TempDir),
+        Object,
+    }
+
+    impl Store {
+        fn both() -> [Store; 2] {
+            [Store::Local(tempfile::tempdir().unwrap()), Store::Object]
+        }
+
+        fn backend(&self) -> Arc<dyn StorageBackend> {
+            match self {
+                Store::Local(dir) => Arc::new(crate::storage::LocalStorage::new(
+                    dir.path().to_str().unwrap(),
+                )),
+                Store::Object => Arc::new(crate::storage::ObjectStorage::in_memory()),
+            }
+        }
+
+        fn name(&self) -> &'static str {
+            match self {
+                Store::Local(_) => "local",
+                Store::Object => "object",
+            }
+        }
+    }
+
+    /// What the store does at the next read of [`KEY`]'s validator sidecar or provenance record.
+    enum Armed {
+        /// From now on, until the sidecar is written: the `k`-th such read is answered, then held
+        /// until the sidecar is written by another task, or [`WAIT`]; and the next write of [`KEY`]'s
+        /// body waits for that read, or [`WAIT`]. Another writer lands right after the `k`-th read of a
+        /// 304's check: run for every `k`, it lands after each read the check makes, whichever order
+        /// it reads in, and so after the last one, before the write the check decided on.
+        Pause(usize),
+        /// Store these bytes and their record (the validators untouched) before the read: a writer
+        /// that replaces the body and leaves the validators, as a first fetch does.
+        Replace(Vec<u8>, String),
+    }
+
+    /// A backend over a real one that interleaves one other writer with the reads of a check.
+    struct Interleaving {
+        inner: Arc<dyn StorageBackend>,
+        armed: Mutex<Option<Armed>>,
+        /// [`Armed::Pause`] is in force, the read it holds, and the reads it has seen.
+        pausing: std::sync::atomic::AtomicBool,
+        pause_at: std::sync::atomic::AtomicUsize,
+        paused_reads: std::sync::atomic::AtomicUsize,
+        sidecar_written: tokio::sync::Notify,
+        read_seen: tokio::sync::Notify,
+    }
+
+    impl Interleaving {
+        fn new(inner: Arc<dyn StorageBackend>) -> Self {
+            Self {
+                inner,
+                armed: Mutex::new(None),
+                pausing: std::sync::atomic::AtomicBool::new(false),
+                pause_at: std::sync::atomic::AtomicUsize::new(0),
+                paused_reads: std::sync::atomic::AtomicUsize::new(0),
+                sidecar_written: tokio::sync::Notify::new(),
+                read_seen: tokio::sync::Notify::new(),
+            }
+        }
+
+        fn arm(&self, armed: Armed) {
+            if let Armed::Pause(k) = armed {
+                self.paused_reads.store(0, SeqCst);
+                self.pause_at.store(k, SeqCst);
+                self.pausing.store(true, SeqCst);
+            } else {
+                *self.armed.lock().unwrap() = Some(armed);
+            }
+        }
+
+        /// Wait until the held read has run, or [`WAIT`].
+        async fn held_read(&self) {
+            let deadline = tokio::time::Instant::now() + WAIT;
+            loop {
+                let seen = self.read_seen.notified();
+                if self.paused_reads.load(SeqCst) >= self.pause_at.load(SeqCst) {
+                    return;
+                }
+                // CANCEL-SAFETY: only waits; dropped, it leaves nothing half-done.
+                if tokio::time::timeout_at(deadline, seen).await.is_err() {
+                    return;
+                }
+            }
+        }
+
+        fn sha(data: &[u8]) -> String {
+            use sha2::Digest;
+            hex::encode(sha2::Sha256::digest(data))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for Interleaving {
+        async fn put(&self, key: &str, data: &[u8], sha256: &str) -> StoreResult<()> {
+            if key == KEY && self.pausing.load(SeqCst) {
+                self.held_read().await;
+            }
+            let put = self.inner.put(key, data, sha256).await;
+            if key == validators_key(KEY) && self.pausing.swap(false, SeqCst) {
+                self.sidecar_written.notify_waiters();
+            }
+            put
+        }
+
+        async fn get(&self, key: &str) -> StoreResult<(Bytes, Option<String>)> {
+            let watched = key == validators_key(KEY) || key == origin_key(KEY);
+            let armed = if watched {
+                self.armed.lock().unwrap().take()
+            } else {
+                None
+            };
+            if watched && self.pausing.load(SeqCst) {
+                let written = self.sidecar_written.notified();
+                let got = self.inner.get(key).await;
+                let n = self.paused_reads.fetch_add(1, SeqCst) + 1;
+                self.read_seen.notify_waiters();
+                if n == self.pause_at.load(SeqCst) {
+                    // CANCEL-SAFETY: the wait only delays the answer of a read that already ran;
+                    // dropped, it leaves nothing half-done.
+                    let _ = tokio::time::timeout(WAIT, written).await;
+                }
+                return got;
+            }
+            match armed {
+                None | Some(Armed::Pause(_)) => self.inner.get(key).await,
+                Some(Armed::Replace(body, record)) => {
+                    self.inner.put(KEY, &body, &Self::sha(&body)).await.unwrap();
+                    let record = record.into_bytes();
+                    self.inner
+                        .put(&origin_key(KEY), &record, &Self::sha(&record))
+                        .await
+                        .unwrap();
+                    self.inner.get(key).await
+                }
+            }
+        }
+
+        async fn pin(&self, key: &str) -> Option<String> {
+            self.inner.pin(key).await
+        }
+
+        async fn delete(&self, key: &str) -> StoreResult<()> {
+            self.inner.delete(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> StoreResult<Vec<String>> {
+            self.inner.list(prefix).await
+        }
+
+        async fn stat(&self, key: &str) -> Option<FileMeta> {
+            self.inner.stat(key).await
+        }
+
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+
+        async fn total_size(&self) -> u64 {
+            self.inner.total_size().await
+        }
+
+        fn backend_name(&self) -> &'static str {
+            self.inner.backend_name()
+        }
+
+        async fn put_from_path(
+            &self,
+            key: &str,
+            src: &Path,
+            sha256: Option<&str>,
+        ) -> StoreResult<()> {
+            self.inner.put_from_path(key, src, sha256).await
+        }
+
+        async fn copy(&self, src: &str, dst: &str, sha256: Option<&str>) -> StoreResult<()> {
+            self.inner.copy(src, dst, sha256).await
+        }
+
+        async fn get_reader(
+            &self,
+            key: &str,
+        ) -> StoreResult<(
+            u64,
+            Option<String>,
+            Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_reader(key).await
+        }
+
+        async fn get_range(
+            &self,
+            key: &str,
+            start: u64,
+            end: u64,
+        ) -> StoreResult<(
+            u64,
+            Option<String>,
+            Pin<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        )> {
+            self.inner.get_range(key, start, end).await
+        }
+    }
+
+    /// The upstream's packument of `name` carrying `marker`, so a test can tell the documents apart.
+    fn document(upstream: &MockServer, name: &str, marker: &str) -> Vec<u8> {
+        let uri = upstream.uri();
+        format!(
+            concat!(
+                "{{\"name\":\"{n}\",\"marker\":\"{m}\",\"dist-tags\":{{\"latest\":\"1.0.0\"}},",
+                "\"versions\":{{\"1.0.0\":{{\"name\":\"{n}\",\"version\":\"1.0.0\",",
+                "\"dist\":{{\"tarball\":\"{u}/{n}/-/{n}-1.0.0.tgz\"}}}}}}}}"
+            ),
+            n = name,
+            m = marker,
+            u = uri
+        )
+        .into_bytes()
+    }
+
+    fn etag(tag: &str) -> Validators {
+        Validators {
+            etag: Some(format!("\"{tag}\"")),
+            last_modified: None,
+            checked: Some(10),
+        }
+    }
+
+    /// A context over `backend` whose npm proxy is `upstream`, with revalidation on.
+    fn context(upstream: &MockServer, backend: Arc<dyn StorageBackend>) -> TestContext {
+        let uri = upstream.uri();
+        create_test_context_with_storage_and_config(Storage::from_backend(backend), move |cfg| {
+            cfg.npm.proxy = Some(uri);
+            cfg.npm.revalidate = true;
+        })
+    }
+
+    /// Cache `body` at `key` as a 200 with `validators` did.
+    async fn seed(
+        ctx: &TestContext,
+        upstream: &MockServer,
+        key: &str,
+        body: &[u8],
+        v: &Validators,
+    ) {
+        let storage = &ctx.state.storage;
+        put_with_origin(storage, key, body, &origin_of(&upstream.uri()))
+            .await
+            .unwrap();
+        write_validators(storage, key, v).await;
+    }
+
+    /// Revalidate `key` of package `name`, holding `body` read with `held`.
+    async fn revalidate(
+        ctx: &TestContext,
+        name: &str,
+        key: &str,
+        body: &[u8],
+        held: &Validators,
+    ) -> Vec<u8> {
+        let body = Bytes::from(body.to_vec());
+        refetch_metadata(
+            &ctx.state,
+            name,
+            key,
+            (key, Some(body.clone())),
+            false,
+            true,
+            Some((body, held.clone())),
+        )
+        .await
+        .unwrap()
+    }
+
+    /// The marker of the document stored at `key`, and the ETag its sidecar holds.
+    async fn stored(storage: &Storage, key: &str) -> (String, Option<String>) {
+        let body = storage.get(key).await.unwrap();
+        let doc: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let marker = doc["marker"].as_str().unwrap().to_string();
+        let validators = read_validators(storage, key).await.unwrap_or_default();
+        (marker, validators.etag)
+    }
+
+    /// A 304 that read the validators of the copy it confirms, and a 200 for a newer document that
+    /// lands its body, record and validators after a read of the 304's check, before the 304 writes:
+    /// the 304's write must not put the older copy's validators next to the newer body. Both requests
+    /// held the same copy. The 200 lands after the first read of the check, then after the second.
+    #[tokio::test]
+    async fn a_304_and_a_concurrent_200_leave_the_validators_of_the_stored_body() {
+        for (k, store) in [1, 2]
+            .into_iter()
+            .flat_map(|k| Store::both().map(|s| (k, s)))
+        {
+            let upstream = MockServer::start().await;
+            // The first request is answered 304 for the copy it holds; the document then changes.
+            Mock::given(method("GET"))
+                .and(path("/racepkg"))
+                .and(header("if-none-match", "\"v1\""))
+                .respond_with(ResponseTemplate::new(304))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&upstream)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/racepkg"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"v2\"")
+                        .set_body_bytes(document(&upstream, "racepkg", "V2")),
+                )
+                .mount(&upstream)
+                .await;
+            let backend = Arc::new(Interleaving::new(store.backend()));
+            let ctx = context(&upstream, backend.clone());
+            let v1 = document(&upstream, "racepkg", "V1");
+            seed(&ctx, &upstream, KEY, &v1, &etag("v1")).await;
+
+            let first = revalidate(&ctx, "racepkg", KEY, &v1, &etag("v1")).await;
+            assert_eq!(
+                first,
+                v1,
+                "{}: the 304 serves the copy it held",
+                store.name()
+            );
+            // The 304's write has not run yet: its check is held until the 200's write lands.
+            backend.arm(Armed::Pause(k));
+            let second = revalidate(&ctx, "racepkg", KEY, &v1, &etag("v1")).await;
+            assert!(
+                String::from_utf8_lossy(&second).contains("V2"),
+                "{}: the 200 serves the newer document",
+                store.name()
+            );
+            ctx.state.cache_writes.settled().await;
+
+            let (marker, tag) = stored(&ctx.state.storage, KEY).await;
+            assert_eq!(
+                (marker.as_str(), tag.as_deref()),
+                ("V2", Some("\"v2\"")),
+                "{} (after read {k}): the stored body and its validators describe two documents",
+                store.name()
+            );
+            let record = ctx.state.storage.get(&origin_key(KEY)).await.unwrap();
+            let body = ctx.state.storage.get(KEY).await.unwrap();
+            assert_eq!(
+                record.as_ref(),
+                provenance_record(&origin_of(&upstream.uri()), &body).as_bytes(),
+                "{}: the record does not name the stored bytes",
+                store.name()
+            );
+        }
+    }
+
+    /// A 304 whose copy was replaced, after it read it, by a writer that leaves the validators as they
+    /// were (a first fetch, a prefetch for a tarball): the 304 sees another stored body than the one it
+    /// confirms, and writes nothing.
+    #[tokio::test]
+    async fn a_304_that_sees_another_stored_body_writes_nothing() {
+        for store in Store::both() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/racepkg"))
+                .and(header("if-none-match", "\"v1\""))
+                .respond_with(ResponseTemplate::new(304))
+                .mount(&upstream)
+                .await;
+            let backend = Arc::new(Interleaving::new(store.backend()));
+            let ctx = context(&upstream, backend.clone());
+            let v1 = document(&upstream, "racepkg", "V1");
+            seed(&ctx, &upstream, KEY, &v1, &etag("v1")).await;
+
+            let served = revalidate(&ctx, "racepkg", KEY, &v1, &etag("v1")).await;
+            assert_eq!(
+                served,
+                v1,
+                "{}: the 304 serves the copy it held",
+                store.name()
+            );
+            let v3 = document(&upstream, "racepkg", "V3");
+            let record = provenance_record(&origin_of(&upstream.uri()), &v3);
+            backend.arm(Armed::Replace(v3.clone(), record.clone()));
+            ctx.state.cache_writes.settled().await;
+
+            let sidecar = read_validators(&ctx.state.storage, KEY).await.unwrap();
+            assert_eq!(
+                sidecar,
+                etag("v1"),
+                "{}: the 304 confirmed a body it did not see",
+                store.name()
+            );
+            assert_eq!(
+                ctx.state.storage.get(KEY).await.unwrap().as_ref(),
+                v3.as_slice(),
+                "{}: the body of the other writer was replaced",
+                store.name()
+            );
+            assert_eq!(
+                ctx.state
+                    .storage
+                    .get(&origin_key(KEY))
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                record.as_bytes(),
+                "{}: the record of the other writer was replaced",
+                store.name()
+            );
+        }
+    }
+
+    /// A 200's writes wait for the writes of the same document, and only for those: a write of
+    /// another package goes on while this one's is held (no lock over the whole cache).
+    #[tokio::test]
+    async fn the_writes_of_one_document_wait_for_each_other_and_not_for_another_package() {
+        for store in Store::both() {
+            let upstream = MockServer::start().await;
+            for name in ["racepkg", "otherpkg"] {
+                Mock::given(method("GET"))
+                    .and(path(format!("/{name}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("etag", "\"v2\"")
+                            .set_body_bytes(document(&upstream, name, "V2")),
+                    )
+                    .mount(&upstream)
+                    .await;
+            }
+            let ctx = context(&upstream, store.backend());
+            for (name, key) in [("racepkg", KEY), ("otherpkg", OTHER)] {
+                let v1 = document(&upstream, name, "V1");
+                seed(&ctx, &upstream, key, &v1, &etag("v1")).await;
+            }
+
+            // The writes of `racepkg` are held: those of `otherpkg` land.
+            let held = ctx.state.publish_lock(KEY);
+            let guard = held.lock().await;
+            let v1 = document(&upstream, "otherpkg", "V1");
+            revalidate(&ctx, "otherpkg", OTHER, &v1, &etag("v1")).await;
+            // The only write in flight is `otherpkg`'s: it ends while `racepkg`'s lock is held.
+            // CANCEL-SAFETY: `settled` only observes the writes; dropped at the deadline, they run on.
+            let other_landed =
+                tokio::time::timeout(WAIT * 10, ctx.state.cache_writes.settled()).await;
+            assert!(
+                other_landed.is_ok(),
+                "{}: the write of another package waited",
+                store.name()
+            );
+            assert_eq!(
+                stored(&ctx.state.storage, OTHER).await,
+                ("V2".to_string(), Some("\"v2\"".to_string())),
+                "{}: the write of another package did not land",
+                store.name()
+            );
+
+            // And those of `racepkg` wait until the lock is let go.
+            let v1 = document(&upstream, "racepkg", "V1");
+            revalidate(&ctx, "racepkg", KEY, &v1, &etag("v1")).await;
+            // CANCEL-SAFETY: `settled` only observes the writes; dropped at the deadline, they run on.
+            let settled = tokio::time::timeout(WAIT, ctx.state.cache_writes.settled()).await;
+            assert!(
+                settled.is_err(),
+                "{}: the 200 wrote while the document's writes were held",
+                store.name()
+            );
+            assert_eq!(
+                stored(&ctx.state.storage, KEY).await,
+                ("V1".to_string(), Some("\"v1\"".to_string())),
+                "{}: a write of the held document landed",
+                store.name()
+            );
+            drop(guard);
+            ctx.state.cache_writes.settled().await;
+            assert_eq!(
+                stored(&ctx.state.storage, KEY).await,
+                ("V2".to_string(), Some("\"v2\"".to_string())),
+                "{}: the held write did not land after the lock was let go",
+                store.name()
+            );
+        }
+    }
+
+    /// The writers that bring a body and no validators — a first fetch, and the prefetch of a
+    /// tarball request — wait for the document's other writes too: none of them lands a body between
+    /// another writer's body and its validators.
+    #[tokio::test]
+    async fn the_writers_without_validators_wait_for_the_document_too() {
+        for store in Store::both() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/racepkg"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(document(&upstream, "racepkg", "V2")),
+                )
+                .mount(&upstream)
+                .await;
+            let ctx = context(&upstream, store.backend());
+            let held = ctx.state.publish_lock(KEY);
+
+            // A first fetch is served while its write waits.
+            let guard = held.lock().await;
+            let resp = send(&ctx.app, Method::GET, "/npm/racepkg", "").await;
+            assert_eq!(
+                resp.status(),
+                StatusCode::OK,
+                "{}: first fetch",
+                store.name()
+            );
+            // CANCEL-SAFETY: `settled` only observes the writes; dropped at the deadline, they run on.
+            let settled = tokio::time::timeout(WAIT, ctx.state.cache_writes.settled()).await;
+            assert!(
+                settled.is_err(),
+                "{}: the first fetch wrote while the document's writes were held",
+                store.name()
+            );
+            assert!(
+                ctx.state.storage.stat(KEY).await.is_none(),
+                "{}: the first fetch's body landed under the held lock",
+                store.name()
+            );
+            drop(guard);
+            ctx.state.cache_writes.settled().await;
+            assert!(
+                ctx.state.storage.stat(KEY).await.is_some(),
+                "{}",
+                store.name()
+            );
+
+            // The prefetch of a tarball request writes in the request: it waits there.
+            ctx.state.storage.delete(KEY).await.unwrap();
+            let guard = held.lock().await;
+            // CANCEL-SAFETY: dropped at the deadline before its write (it waits on the lock), the
+            // prefetch leaves nothing half-written.
+            let prefetch =
+                tokio::time::timeout(WAIT, ensure_npm_metadata_cached(&ctx.state, "racepkg")).await;
+            assert!(
+                prefetch.is_err() && ctx.state.storage.stat(KEY).await.is_none(),
+                "{}: the prefetch wrote while the document's writes were held",
+                store.name()
+            );
+            drop(guard);
+            ensure_npm_metadata_cached(&ctx.state, "racepkg").await;
+            assert!(
+                ctx.state.storage.stat(KEY).await.is_some(),
+                "{}",
+                store.name()
+            );
+        }
+    }
+
+    /// A 304 whose copy's record names other bytes empties the sidecar, so that the next request is
+    /// unconditional (#1064). A 200 that lands its body and validators right after that check's read
+    /// keeps them: the sidecar is emptied before the 200's write, never over it.
+    #[tokio::test]
+    async fn a_304_that_empties_the_sidecar_does_not_empty_a_concurrent_200s() {
+        for store in Store::both() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/racepkg"))
+                .and(header("if-none-match", "\"v1\""))
+                .respond_with(ResponseTemplate::new(304))
+                .up_to_n_times(1)
+                .with_priority(1)
+                .mount(&upstream)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/racepkg"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("etag", "\"v2\"")
+                        .set_body_bytes(document(&upstream, "racepkg", "V2")),
+                )
+                .mount(&upstream)
+                .await;
+            let backend = Arc::new(Interleaving::new(store.backend()));
+            let ctx = context(&upstream, backend.clone());
+            let v1 = document(&upstream, "racepkg", "V1");
+            seed(&ctx, &upstream, KEY, &v1, &etag("v1")).await;
+            // A record of other bytes: a provenance write that was lost.
+            let other = provenance_record(&origin_of(&upstream.uri()), b"other bytes");
+            ctx.state
+                .storage
+                .put(&origin_key(KEY), other.as_bytes())
+                .await
+                .unwrap();
+
+            // This 304 reads the sidecar and the record before it decides, then reads the body again
+            // and its emptying write may run meanwhile: the read held is the third, that write's check.
+            backend.arm(Armed::Pause(3));
+            revalidate(&ctx, "racepkg", KEY, &v1, &etag("v1")).await;
+            revalidate(&ctx, "racepkg", KEY, &v1, &etag("v1")).await;
+            ctx.state.cache_writes.settled().await;
+
+            assert!(
+                backend.paused_reads.load(SeqCst) >= 3,
+                "{}: the check of the emptying write was not the read held",
+                store.name()
+            );
+            assert_eq!(
+                stored(&ctx.state.storage, KEY).await,
+                ("V2".to_string(), Some("\"v2\"".to_string())),
+                "{}: the 200's validators were emptied by a 304 about another copy",
+                store.name()
+            );
+        }
+    }
+}
