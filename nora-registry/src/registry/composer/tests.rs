@@ -764,6 +764,7 @@ fn a_60_outside_the_time_of_day_is_not_a_leap_second() {
     for lm in [
         "Sun, 22 Nov 2026 08:30:00 GMT (cache retry:60 seconds)",
         "Sun, 22 Nov 2026 08:30:00 GMT (at xx:yy:60 seen)",
+        "Sun, 22 Nov 2026 08:30:00 GMT (at 12:34:60 seen)",
     ] {
         let mut headers = HeaderMap::new();
         headers.insert(

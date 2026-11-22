@@ -668,20 +668,24 @@ fn not_modified_since(headers: &HeaderMap, last_modified: &str, now: i64) -> boo
 /// A `Last-Modified` NORA serves or an upstream sent: an HTTP-date, or the RFC 2822 forms
 /// (`+0000`) some upstreams use. The served date and the comparison read it the same way, so
 /// a new body dated in another form moves the date forward instead of back to `since`.
-/// `HH:MM:60`, a time of day in its leap second.
-fn is_leap_second_time(token: &str) -> bool {
+/// `HH:MM:SS` in ASCII digits.
+fn is_time_of_day(token: &str) -> bool {
     let b = token.as_bytes();
     b.len() == 8
         && b[2] == b':'
         && b[5] == b':'
-        && b[6..] == *b"60"
-        && [0, 1, 3, 4].iter().all(|&i| b[i].is_ascii_digit())
+        && [0, 1, 3, 4, 6, 7].iter().all(|&i| b[i].is_ascii_digit())
 }
 
 fn last_modified_to_unix(value: &str) -> Option<i64> {
     // A leap second has no Unix time of its own; RFC 2822 parsing folds it into the second
     // before, which would make a later date compare equal to an earlier one. Leave it unread.
-    if value.split_whitespace().any(is_leap_second_time) {
+    // The date's own time is its first time-shaped token; a comment comes after it.
+    if value
+        .split_whitespace()
+        .find(|t| is_time_of_day(t))
+        .is_some_and(|t| t.ends_with(":60"))
+    {
         return None;
     }
     http_date_to_unix(value).or_else(|| crate::datetime::parse_rfc2822_to_unix(value))
