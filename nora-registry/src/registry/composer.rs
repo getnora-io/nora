@@ -650,6 +650,92 @@ fn http_date(unix: u64) -> String {
         .http_date()
 }
 
+/// `If-Modified-Since` as RFC 9110 reads it (13.1.3): an HTTP-date in any of its three forms,
+/// and the document is not modified when its `Last-Modified` is at or before that date. A
+/// value that is not one date, or a date later than `now`, is ignored. A string comparison
+/// gave a 304 only to a client that sent back the exact bytes (#1315).
+fn not_modified_since(headers: &HeaderMap, last_modified: &str, now: i64) -> bool {
+    let mut values = headers.get_all(header::IF_MODIFIED_SINCE).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return false;
+    };
+    let Some(since) = value.to_str().ok().and_then(http_date_to_unix) else {
+        return false;
+    };
+    since <= now && last_modified_to_unix(last_modified).is_some_and(|modified| modified <= since)
+}
+
+/// A `Last-Modified` NORA serves or an upstream sent: an HTTP-date, or the RFC 2822 forms
+/// (`+0000`) some upstreams use. The served date and the comparison read it the same way, so
+/// a new body dated in another form moves the date forward instead of back to `since`.
+fn last_modified_to_unix(value: &str) -> Option<i64> {
+    // A leap second is left unread (httpdate refuses it; the RFC 2822 reading is asked not to fold
+    // it into the second before), so a later date never compares equal to an earlier one.
+    http_date_to_unix(value).or_else(|| crate::datetime::parse_rfc2822_to_unix_no_leap(value))
+}
+
+/// An HTTP-date in one of its three forms (RFC 9110 5.6.7), exactly: httpdate also reads some
+/// malformed values (`22-Nov-26X08:30:00`), so the value must be what that date spells in the
+/// form it was written in.
+fn http_date_to_unix(value: &str) -> Option<i64> {
+    let value = value.trim();
+    let t = httpdate::parse_http_date(value).ok()?;
+    let secs = i64::try_from(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).ok()?;
+    let imf = http_date(secs as u64);
+    let forms = [
+        Some(imf.clone()),
+        rfc850_form(&imf),
+        asctime_form(&imf),
+        asctime_zero_form(&imf),
+    ];
+    forms
+        .iter()
+        .any(|form| form.as_deref() == Some(value))
+        .then_some(secs)
+}
+
+/// `Sun, 22 Nov 2026 08:00:00 GMT` → `Sunday, 22-Nov-26 08:00:00 GMT`.
+fn rfc850_form(imf: &str) -> Option<String> {
+    let [weekday, day, month, year, time, _] = imf.split(' ').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let weekday = match weekday.strip_suffix(',')? {
+        "Mon" => "Monday",
+        "Tue" => "Tuesday",
+        "Wed" => "Wednesday",
+        "Thu" => "Thursday",
+        "Fri" => "Friday",
+        "Sat" => "Saturday",
+        "Sun" => "Sunday",
+        _ => return None,
+    };
+    let year = year.get(year.len().checked_sub(2)?..)?;
+    Some(format!("{weekday}, {day}-{month}-{year} {time} GMT"))
+}
+
+/// `Sun, 22 Nov 2026 08:00:00 GMT` → `Sun Nov 22 08:00:00 2026`, the day padded with a space.
+fn asctime_form(imf: &str) -> Option<String> {
+    let [weekday, day, month, year, time, _] = imf.split(' ').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let day: u8 = day.parse().ok()?;
+    Some(format!(
+        "{} {month} {day:>2} {time} {year}",
+        weekday.strip_suffix(',')?
+    ))
+}
+
+/// The asctime form with the day as two digits (`Wed Nov 04 …`), which date3 also allows.
+fn asctime_zero_form(imf: &str) -> Option<String> {
+    let [weekday, day, month, year, time, _] = imf.split(' ').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    Some(format!(
+        "{} {month} {day} {time} {year}",
+        weekday.strip_suffix(',')?
+    ))
+}
+
 /// A metadata document, or 304 when the client's copy is the one NORA serves now. The
 /// validators describe the served document, not the upstream's: NORA rewrites it (archive
 /// URLs, and sources under curation), so a configuration that took effect after the upstream's
@@ -663,10 +749,15 @@ fn metadata_response(
     stale: bool,
     since: i64,
 ) -> Response {
-    let last_modified = last_modified.map(|lm| match crate::datetime::parse_rfc2822_to_unix(&lm) {
-        Some(date) if date >= since => lm,
-        _ => http_date(since.max(0) as u64),
-    });
+    // `dated`: the served date is one NORA read, so a later client date covers this body. A date
+    // NORA could not read is replaced by `since`, which says nothing about the body: it then
+    // revalidates only the client holding that exact value, as before #1315.
+    let (last_modified, dated) = match last_modified.map(|lm| (last_modified_to_unix(&lm), lm)) {
+        Some((Some(date), lm)) if date >= since => (Some(lm), true),
+        Some((Some(_), _)) => (Some(http_date(since.max(0) as u64)), true),
+        Some((None, _)) => (Some(http_date(since.max(0) as u64)), false),
+        None => (None, false),
+    };
     let etag = format!("\"{}\"", &hex::encode(sha2::Sha256::digest(&body))[..32]);
     let not_modified = match headers
         .get(header::IF_NONE_MATCH)
@@ -677,10 +768,14 @@ fn metadata_response(
             .map(str::trim)
             .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag),
         None => last_modified.as_deref().is_some_and(|lm| {
-            headers
-                .get(header::IF_MODIFIED_SINCE)
-                .and_then(|v| v.to_str().ok())
-                == Some(lm)
+            if dated {
+                not_modified_since(headers, lm, crate::datetime::now_unix())
+            } else {
+                headers
+                    .get(header::IF_MODIFIED_SINCE)
+                    .and_then(|v| v.to_str().ok())
+                    == Some(lm)
+            }
         }),
     };
     let mut builder = axum::http::Response::builder()

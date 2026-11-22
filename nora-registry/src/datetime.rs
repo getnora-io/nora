@@ -134,9 +134,18 @@ pub fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
     imp::parse_iso8601_to_unix(s)
 }
 
-/// An RFC 2822 date (an upstream's `Last-Modified`) as seconds since the epoch.
+/// An RFC 2822 date as seconds since the epoch, a leap second folded into the second before, as
+/// NORA 1.4.5 read it: the golden tests hold the reading to that, and tests build dates with it.
+/// Production reads `Last-Modified` with [`parse_rfc2822_to_unix_no_leap`] (#1315).
+#[cfg(test)]
 pub fn parse_rfc2822_to_unix(s: &str) -> Option<i64> {
-    imp::parse_rfc2822_to_unix(s)
+    imp::parse_rfc2822_to_unix(s, true)
+}
+
+/// [`parse_rfc2822_to_unix`], except that a leap second (`:60`) is not read: it has no Unix
+/// second of its own, and folded into the one before, a later date would equal an earlier one.
+pub fn parse_rfc2822_to_unix_no_leap(s: &str) -> Option<i64> {
+    imp::parse_rfc2822_to_unix(s, false)
 }
 
 /// The calendar and the grammars, on the `time` crate. The spellings are written out field by
@@ -705,7 +714,14 @@ mod imp {
         None
     }
 
-    pub(super) fn parse_rfc2822_to_unix(s: &str) -> Option<i64> {
+    pub(super) fn parse_rfc2822_to_unix(s: &str, leap: bool) -> Option<i64> {
+        let read = read_rfc2822(s)?;
+        (leap || read.second != 60).then_some(())?;
+        read.instant().map(UtcTime::unix)
+    }
+
+    /// The fields of an RFC 2822 date.
+    fn read_rfc2822(s: &str) -> Option<Read> {
         let mut read = Read::default();
         let mut s = s.trim_start();
         if let Some((rest, weekday)) = short_weekday(s) {
@@ -739,7 +755,7 @@ mod imp {
             s = rest;
         }
         s.is_empty().then_some(())?;
-        read.instant().map(UtcTime::unix)
+        Some(read)
     }
 }
 
