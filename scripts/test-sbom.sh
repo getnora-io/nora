@@ -119,6 +119,20 @@ expect fail root-purl
 mutate root-purl-spdx spdx 'pkgs[0]["externalRefs"][0]["referenceLocator"] = "pkg:cargo/nora-registry@0.0.0"'
 expect fail root-purl-spdx
 
+# ── anything the generator does not write is refused, wherever it sits ─────────
+mutate spdx-nested-file spdx 'pkgs[1]["files"] = [{"fileName": ".github/workflows/ci.yml", "checksums": [{"algorithm": "SHA256", "checksumValue": "0" * 64}]}]'
+expect fail spdx-nested-file
+mutate purl-category spdx 'pkgs[1]["externalRefs"][0]["referenceCategory"] = "OTHER"'
+expect fail purl-category
+mutate cdx-services cdx 'd["services"] = [{"name": "telemetry", "endpoints": ["https://example.org"]}]'
+expect fail cdx-services
+mutate cdx-extra-field cdx 'first("required")["evidence"] = {"identity": {"field": "purl", "confidence": 0.1}}'
+expect fail cdx-extra-field
+mutate spdx-annotation spdx 'd["annotations"] = [{"annotator": "Tool: x", "annotationType": "OTHER", "annotationDate": "2026-01-01T00:00:00Z", "comment": "x"}]'
+expect fail spdx-annotation
+mutate description-changed cdx 'first("required")["description"] = "something else"'
+expect fail description-changed
+
 # ── the purl spec percent-encodes a version's build metadata: toml 1.1.4+spec-1.1.0 ──
 python3 - "$TMP/base.cdx.json" "$TMP/base.spdx.json" <<'PY' || FAILURES=$((FAILURES + 1))
 import json, sys

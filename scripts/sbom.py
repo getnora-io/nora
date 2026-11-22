@@ -26,8 +26,10 @@ Usage::
 ``check`` rebuilds the expected component list and fails when a file is
 missing a crate, lists a crate that is not compiled for the target, carries a
 checksum that differs from ``Cargo.lock``, has no license, or describes
-another version or target. The SPDX and CycloneDX files are checked
-separately, so one cannot drift from the other.
+another version or target. It then requires each file to be, up to the order
+of lists, exactly the document ``generate`` writes for that graph and the
+file's timestamp: anything else anywhere in it fails. The SPDX and CycloneDX
+files are checked separately, so one cannot drift from the other.
 
 Output is deterministic: timestamps come from ``SOURCE_DATE_EPOCH`` (the
 release commit time if unset) and identifiers from the content.
@@ -416,6 +418,50 @@ def compare(label, want_version, want_target, want, doc):
     return errs
 
 
+def canonical(value):
+    """The document with every list sorted, so order carries no meaning but nothing else is lost."""
+    if isinstance(value, dict):
+        return {k: canonical(v) for k, v in value.items()}
+    if isinstance(value, list):
+        items = [canonical(v) for v in value]
+        return sorted(items, key=lambda v: json.dumps(v, sort_keys=True))
+    return value
+
+
+def first_difference(got, want, path="$"):
+    """Where two canonical documents part, as a JSON path, or None when they are equal."""
+    if type(got) is not type(want):
+        return f"{path}: {type(got).__name__} where {type(want).__name__} is expected"
+    if isinstance(want, dict):
+        for k in sorted(set(got) | set(want)):
+            if k not in want:
+                return f"{path}.{k}: not written by the generator"
+            if k not in got:
+                return f"{path}.{k}: missing"
+            d = first_difference(got[k], want[k], f"{path}.{k}")
+            if d:
+                return d
+        return None
+    if isinstance(want, list):
+        if len(got) != len(want):
+            return f"{path}: {len(got)} entries, {len(want)} expected"
+        for i, (g, w) in enumerate(zip(got, want)):
+            d = first_difference(g, w, f"{path}[{i}]")
+            if d:
+                return d
+        return None
+    return None if got == want else f"{path}: {got!r}, expected {want!r}"
+
+
+def exact(label, path, generated):
+    """The allowlist: the file must be, up to list order, the document the generator writes for
+    this crate graph and the file's own timestamp. Field-by-field checks above say what is wrong
+    in words; this one refuses anything they do not know about."""
+    with open(path, encoding="utf-8") as f:
+        d = first_difference(canonical(json.load(f)), canonical(generated))
+    return [f"{label}: {d}"] if d else []
+
+
 def main(argv):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("mode", choices=["generate", "check"])
@@ -437,6 +483,13 @@ def main(argv):
 
     errs = compare(a.cdx, version, a.target, want, read_cdx(a.cdx))
     errs += compare(a.spdx, version, a.target, want, read_spdx(a.spdx))
+    if not errs:
+        with open(a.cdx, encoding="utf-8") as f:
+            cdx_ts = json.load(f).get("metadata", {}).get("timestamp")
+        with open(a.spdx, encoding="utf-8") as f:
+            spdx_ts = json.load(f).get("creationInfo", {}).get("created")
+        errs += exact(a.cdx, a.cdx, cyclonedx(version, a.target, want, cdx_ts))
+        errs += exact(a.spdx, a.spdx, spdx(version, a.target, want, spdx_ts))
     if errs:
         print(f"SBOM check FAILED for {a.target} ({len(errs)} problems):")
         for e in errs[:200]:
