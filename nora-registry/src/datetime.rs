@@ -134,7 +134,10 @@ pub fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
     imp::parse_iso8601_to_unix(s)
 }
 
-/// An RFC 2822 date (an upstream's `Last-Modified`) as seconds since the epoch.
+/// An RFC 2822 date as seconds since the epoch, a leap second folded into the second before, as
+/// NORA 1.4.5 read it: the golden tests hold the reading to that, and tests build dates with it.
+/// Production reads `Last-Modified` with [`parse_rfc2822_to_unix_no_leap`] (#1315).
+#[cfg(test)]
 pub fn parse_rfc2822_to_unix(s: &str) -> Option<i64> {
     imp::parse_rfc2822_to_unix(s, true)
 }
