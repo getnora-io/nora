@@ -1241,7 +1241,8 @@ async fn pypi_file_unchanged(storage: &Storage, project: &str, plan: &DeletionPl
 }
 
 /// Whether the version `plan` takes still reads as it did when it was planned, read under the
-/// lock of its `writers` the way its collector read it: same group, name, keys and `modified`. A
+/// lock of its `writers` the way its collector read it: same group, name, keys and `modified`
+/// (the keys of an rpm or deb version follow from its sidecar's, which the plan names). A
 /// writer that rewrote the version since (a re-upload of the same path) changed its `modified`;
 /// a rewrite that leaves even that equal leaves every input of the plan equal, so the plan
 /// stands.
@@ -1263,7 +1264,6 @@ async fn plan_still_current(
                 .is_some_and(|(group, entry)| {
                     group == group_name
                         && entry.name == plan.version_name
-                        && entry.keys == plan.keys
                         && entry.modified == plan.modified
                 })
         }
@@ -5786,5 +5786,68 @@ Content-Type: application/octet-stream\r\n\r\n{content}\r\n--{b}--\r\n"
     async fn pypi_file_planned_during_its_upload_is_kept_object_store() {
         let (ctx, outage, _dir) = in_memory();
         pypi_file_planned_during_its_upload_is_kept(ctx, outage).await;
+    }
+
+    /// A format whose writers hold the lock of the key they write (raw): retention deletes each
+    /// key of a version under that key's own lock, so while a writer holds it the key stays.
+    async fn a_key_is_deleted_under_its_own_lock(ctx: TestContext) {
+        let old = "raw/top/v1/file.bin";
+        ctx.state.storage.put(old, b"1").await.unwrap();
+        // Ages in whole seconds: v1 older than v2, so keep_last=1 plans v1's deletion.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        ctx.state
+            .storage
+            .put("raw/top/v2/file.bin", b"2")
+            .await
+            .unwrap();
+        let key_lock = crate::acquire_publish_lock(&ctx.state.publish_locks, old);
+        let writer_guard = key_lock.lock().await;
+        // CANCEL-SAFETY: a watchdog over the scenario: a deadlock fails the test instead of
+        // stalling the run; nothing is ordered by it.
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let (storage, locks, signer) = (
+                ctx.state.storage.clone(),
+                ctx.state.publish_locks.clone(),
+                ctx.state.signer.clone(),
+            );
+            let rules = vec![rule("raw", Some(1), None)];
+            let retention = tokio::spawn(async move {
+                run_retention(&storage, &locks, signer.as_deref(), &rules, false).await
+            });
+            // Unserialized, retention deletes the key within milliseconds; serialized, it waits
+            // for the key's lock, and this wait is spent.
+            let started = std::time::Instant::now();
+            while !retention.is_finished() && started.elapsed() < Duration::from_millis(500) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(
+                ctx.state.storage.stat(old).await.is_some(),
+                "the key was deleted while its writer held the key's lock"
+            );
+            drop(writer_guard);
+            retention.await.unwrap()
+        })
+        .await
+        .expect("retention finished");
+        assert_eq!(result.planned, 1, "{:?}", result.plans);
+        assert!(ctx.state.storage.stat(old).await.is_none(), "{old} kept");
+        assert!(ctx
+            .state
+            .storage
+            .stat("raw/top/v2/file.bin")
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn a_key_is_deleted_under_its_own_lock_local() {
+        let (ctx, _outage, _dir) = local();
+        a_key_is_deleted_under_its_own_lock(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn a_key_is_deleted_under_its_own_lock_object_store() {
+        let (ctx, _outage, _dir) = in_memory();
+        a_key_is_deleted_under_its_own_lock(ctx).await;
     }
 }
