@@ -168,7 +168,7 @@ def timestamp(root):
 def purl(name, version):
     """Package URL of a crate. The purl spec percent-encodes every character of the version
     outside A-Z a-z 0-9 . - _ ~, so build metadata reads `1.1.4%2Bspec-1.1.0`."""
-    return f"pkg:cargo/{name}@{urllib.parse.quote(version, safe='.-_~')}"
+    return f"pkg:cargo/{name}@{urllib.parse.quote(str(version), safe='.-_~')}"
 
 
 def cyclonedx(version, target, comps, ts):
@@ -307,6 +307,11 @@ def read_cdx(path):
         errs.append("not a CycloneDX document")
     meta = d.get("metadata", {})
     comp = meta.get("component", {})
+    if comp.get("components"):
+        errs.append("the described binary nests other components")
+    root_purl = purl(PACKAGE, comp.get("version"))
+    if comp.get("purl") != root_purl or comp.get("bom-ref") != root_purl:
+        errs.append(f"the described binary has purl {comp.get('purl')!r}, expected {root_purl!r}")
     props = {p.get("name"): p.get("value") for p in meta.get("properties", [])}
     got = {}
     for c in d.get("components", []):
@@ -351,6 +356,11 @@ def read_spdx(path):
         return None, None, None, {}, errs + ["the document must describe exactly one package"]
     root_id = described[0]
     root = by_id[root_id]
+    root_purls = [r.get("referenceLocator") for r in root.get("externalRefs", [])
+                  if r.get("referenceType") == "purl"]
+    if root_purls != [purl(PACKAGE, root.get("versionInfo"))]:
+        errs.append(f"the described package has purls {root_purls!r}, "
+                    f"expected [{purl(PACKAGE, root.get('versionInfo'))!r}]")
     runtime_ids = {r["relatedSpdxElement"] for r in d.get("relationships", [])
                    if r.get("spdxElementId") == root_id and r.get("relationshipType") == "DEPENDS_ON"}
     build_ids = {r["spdxElementId"] for r in d.get("relationships", [])

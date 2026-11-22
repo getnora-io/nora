@@ -111,6 +111,14 @@ expect fail purl-version-spdx
 mutate purl-second-spdx spdx 'pkgs[1]["externalRefs"].append({"referenceCategory": "PACKAGE-MANAGER", "referenceType": "purl", "referenceLocator": "pkg:cargo/criterion@0.8.2"})'
 expect fail purl-second-spdx
 
+# ── the described binary itself: nothing nested under it, its own purl ─────────
+mutate root-nested cdx 'd["metadata"]["component"]["components"] = [{"type": "library", "name": "criterion", "version": "0.8.2"}]'
+expect fail root-nested
+mutate root-purl cdx 'd["metadata"]["component"]["purl"] = "pkg:cargo/nora-registry@0.0.0"'
+expect fail root-purl
+mutate root-purl-spdx spdx 'pkgs[0]["externalRefs"][0]["referenceLocator"] = "pkg:cargo/nora-registry@0.0.0"'
+expect fail root-purl-spdx
+
 # ── the purl spec percent-encodes a version's build metadata: toml 1.1.4+spec-1.1.0 ──
 python3 - "$TMP/base.cdx.json" "$TMP/base.spdx.json" <<'PY' || FAILURES=$((FAILURES + 1))
 import json, sys
