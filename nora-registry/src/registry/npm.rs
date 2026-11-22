@@ -16816,7 +16816,9 @@ mod meta_writes_tests {
         while upstream.received_requests().await.map_or(0, |r| r.len()) < n
             && tokio::time::Instant::now() < deadline
         {
-            tokio::task::yield_now().await;
+            // A short sleep, not a yield: a spin would take a worker thread from the tests that
+            // measure liveness in the same process.
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
     }
 
