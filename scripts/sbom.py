@@ -40,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
 import uuid
 
 PACKAGE = "nora-registry"
@@ -165,7 +166,9 @@ def timestamp(root):
 
 
 def purl(name, version):
-    return f"pkg:cargo/{name}@{version}"
+    """Package URL of a crate. The purl spec percent-encodes every character of the version
+    outside A-Z a-z 0-9 . - _ ~, so build metadata reads `1.1.4%2Bspec-1.1.0`."""
+    return f"pkg:cargo/{name}@{urllib.parse.quote(version, safe='.-_~')}"
 
 
 def cyclonedx(version, target, comps, ts):

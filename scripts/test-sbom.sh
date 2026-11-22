@@ -111,6 +111,24 @@ expect fail purl-version-spdx
 mutate purl-second-spdx spdx 'pkgs[1]["externalRefs"].append({"referenceCategory": "PACKAGE-MANAGER", "referenceType": "purl", "referenceLocator": "pkg:cargo/criterion@0.8.2"})'
 expect fail purl-second-spdx
 
+# ── the purl spec percent-encodes a version's build metadata: toml 1.1.4+spec-1.1.0 ──
+python3 - "$TMP/base.cdx.json" "$TMP/base.spdx.json" <<'PY' || FAILURES=$((FAILURES + 1))
+import json, sys
+cdx, spdx = (json.load(open(p)) for p in sys.argv[1:])
+plus = [c for c in cdx["components"] if "+" in c["version"]]
+assert plus, "no crate with build metadata in the graph; pick another fixture"
+for c in plus:
+    want = "pkg:cargo/%s@%s" % (c["name"], c["version"].replace("+", "%2B"))
+    assert c["purl"] == want and c["bom-ref"] == want, (c["purl"], want)
+refs = [r["referenceLocator"] for p in spdx["packages"] for r in p.get("externalRefs", [])]
+assert not any("+" in r for r in refs), [r for r in refs if "+" in r]
+print("ok   purl: %d versions with build metadata percent-encoded" % len(plus))
+PY
+mutate purl-plus-raw cdx '
+c = next(c for c in comps if "+" in c["version"])
+c["purl"] = c["bom-ref"] = "pkg:cargo/%s@%s" % (c["name"], c["version"])'
+expect fail purl-plus-raw
+
 # ── must fail: an amd64 SBOM is not an arm64 SBOM ─────────────────────────
 cp "$TMP/base.cdx.json" "$TMP/other-target.cdx.json"; cp "$TMP/base.spdx.json" "$TMP/other-target.spdx.json"
 expect fail other-target "$OTHER"
