@@ -145,14 +145,16 @@ PY
 expect fail dup-key
 # The timestamp is the one value check takes from the file, so these are rebuilt by the
 # generator itself with that timestamp: identifiers and all agree, only the value is wrong.
-for ts in object word; do
+for ts in object word feb31 newline unicode; do
   python3 - "$SBOM" "$ROOT" "$TARGET" "$ts" "$TMP/base.cdx.json" "$TMP/base.spdx.json" "$TMP/ts-$ts" <<'PY'
 import importlib.util, json, sys
 sbom_path, root, target, kind, cdx_in, spdx_in, out = sys.argv[1:]
 spec = importlib.util.spec_from_file_location("sbom", sbom_path)
 m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
 version, want = m.expected(root, target)
-ts = {"components": [{"name": "criterion"}]} if kind == "object" else "yesterday"
+ts = {"object": {"components": [{"name": "criterion"}]}, "word": "yesterday",
+      "feb31": "2026-02-31T08:00:00Z", "newline": "2026-11-22T08:00:00Z\n",
+      "unicode": "\u0662026-11-22T08:00:00Z"}[kind]
 m.write(out + ".cdx.json", m.cyclonedx(version, target, want, ts))
 m.write(out + ".spdx.json", m.spdx(version, target, want, ts))
 PY

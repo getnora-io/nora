@@ -310,7 +310,15 @@ def load(path):
         return json.load(f, object_pairs_hook=_no_duplicates)
 
 
-TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+def is_utc_timestamp(value):
+    """A real UTC date and time in the generator's own spelling, ASCII digits, nothing after."""
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z", value):
+        return False
+    try:
+        datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return True
 
 
 def one_per_kind(entries, kind_field, value_field, label, errs):
@@ -510,7 +518,7 @@ def main(argv):
         cdx_ts = load(a.cdx).get("metadata", {}).get("timestamp")
         spdx_ts = load(a.spdx).get("creationInfo", {}).get("created")
         for label, ts in ((a.cdx, cdx_ts), (a.spdx, spdx_ts)):
-            if not (isinstance(ts, str) and TIMESTAMP.match(ts)):
+            if not is_utc_timestamp(ts):
                 errs.append(f"{label}: timestamp {ts!r} is not a UTC date like 2026-11-22T08:00:00Z")
     if not errs:
         errs += exact(a.cdx, a.cdx, cyclonedx(version, a.target, want, cdx_ts))
