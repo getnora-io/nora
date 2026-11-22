@@ -114,8 +114,10 @@ EXPECTED_ASSETS=(
     "nora-linux-amd64"
     "nora-linux-amd64.sha256"
     "nora-linux-amd64.bundle"
-    "nora-${TAG}.sbom.spdx.json"
-    "nora-${TAG}.sbom.cdx.json"
+    "nora-${TAG}.sbom.amd64.spdx.json"
+    "nora-${TAG}.sbom.amd64.cdx.json"
+    "nora-${TAG}.sbom.arm64.spdx.json"
+    "nora-${TAG}.sbom.arm64.cdx.json"
 )
 
 ACTUAL_ASSETS=$(echo "$RELEASE_JSON" | jq -r '.assets[].name')

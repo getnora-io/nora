@@ -284,6 +284,12 @@ jobs:
           command: check
           arguments: --all-features
 
+      # ── Release SBOM ────────────────────────────────────────────────────────
+      # The release job trusts sbom.py check to reject an SBOM that does not describe
+      # the binary; a check that never fails looks like one that passes (#1313).
+      - name: Release SBOM self-test
+        run: bash scripts/test-sbom.sh
+
       # ── CVE scan of source tree and Cargo.lock ──────────────────────────────
       - name: Trivy — filesystem scan (Cargo.lock + source)
         if: always()
