@@ -103,6 +103,14 @@ expect fail second-checksum
 mutate spdx-file spdx 'd["files"] = [{"SPDXID": "SPDXRef-File-ci", "fileName": ".github/workflows/ci.yml", "checksums": [{"algorithm": "SHA1", "checksumValue": "0" * 40}]}]'
 expect fail spdx-file
 
+# ── must fail: a package URL that names another version (scanners read the purl) ──
+mutate purl-version cdx 'first("required")["purl"] = "pkg:cargo/" + first("required")["name"] + "@0.0.0"'
+expect fail purl-version
+mutate purl-version-spdx spdx 'pkgs[1]["externalRefs"][0]["referenceLocator"] = "pkg:cargo/" + pkgs[1]["name"] + "@0.0.0"'
+expect fail purl-version-spdx
+mutate purl-second-spdx spdx 'pkgs[1]["externalRefs"].append({"referenceCategory": "PACKAGE-MANAGER", "referenceType": "purl", "referenceLocator": "pkg:cargo/criterion@0.8.2"})'
+expect fail purl-second-spdx
+
 # ── must fail: an amd64 SBOM is not an arm64 SBOM ─────────────────────────
 cp "$TMP/base.cdx.json" "$TMP/other-target.cdx.json"; cp "$TMP/base.spdx.json" "$TMP/other-target.spdx.json"
 expect fail other-target "$OTHER"

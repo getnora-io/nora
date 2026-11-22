@@ -315,6 +315,9 @@ def read_cdx(path):
             errs.append(f"component {key[0]} {key[1]} is listed twice")
         if c.get("components"):
             errs.append(f"component {key[0]} {key[1]} nests other components")
+        if c.get("purl") != purl(*key) or c.get("bom-ref") != purl(*key):
+            errs.append(f"component {key[0]} {key[1]} has purl {c.get('purl')!r}, "
+                        f"expected {purl(*key)!r}")
         hashes = one_per_kind(c.get("hashes", []), "alg", "content",
                               f"component {key[0]} {key[1]}", errs)
         lic = [l.get("expression") or (l.get("license") or {}).get("id")
@@ -360,6 +363,10 @@ def read_spdx(path):
             errs.append(f"package {key[0]} {key[1]} is listed twice")
         sums = one_per_kind(p.get("checksums", []), "algorithm", "checksumValue",
                             f"package {key[0]} {key[1]}", errs)
+        purls = [r.get("referenceLocator") for r in p.get("externalRefs", [])
+                 if r.get("referenceType") == "purl"]
+        if purls != [purl(*key)]:
+            errs.append(f"package {key[0]} {key[1]} has purls {purls!r}, expected [{purl(*key)!r}]")
         if pid in runtime_ids and pid in build_ids:
             scope = "both"
         elif pid in runtime_ids:
