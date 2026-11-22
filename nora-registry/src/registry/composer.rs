@@ -680,7 +680,16 @@ fn http_date_to_unix(value: &str) -> Option<i64> {
     let t = httpdate::parse_http_date(value).ok()?;
     let secs = i64::try_from(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).ok()?;
     let imf = http_date(secs as u64);
-    (value == imf || value == rfc850_form(&imf)? || value == asctime_form(&imf)?).then_some(secs)
+    let forms = [
+        Some(imf.clone()),
+        rfc850_form(&imf),
+        asctime_form(&imf),
+        asctime_zero_form(&imf),
+    ];
+    forms
+        .iter()
+        .any(|form| form.as_deref() == Some(value))
+        .then_some(secs)
 }
 
 /// `Sun, 22 Nov 2026 08:00:00 GMT` → `Sunday, 22-Nov-26 08:00:00 GMT`.
@@ -714,6 +723,17 @@ fn asctime_form(imf: &str) -> Option<String> {
     ))
 }
 
+/// The asctime form with the day as two digits (`Wed Nov 04 …`), which date3 also allows.
+fn asctime_zero_form(imf: &str) -> Option<String> {
+    let [weekday, day, month, year, time, _] = imf.split(' ').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    Some(format!(
+        "{} {month} {day} {time} {year}",
+        weekday.strip_suffix(',')?
+    ))
+}
+
 /// A metadata document, or 304 when the client's copy is the one NORA serves now. The
 /// validators describe the served document, not the upstream's: NORA rewrites it (archive
 /// URLs, and sources under curation), so a configuration that took effect after the upstream's
@@ -727,10 +747,15 @@ fn metadata_response(
     stale: bool,
     since: i64,
 ) -> Response {
-    let last_modified = last_modified.map(|lm| match last_modified_to_unix(&lm) {
-        Some(date) if date >= since => lm,
-        _ => http_date(since.max(0) as u64),
-    });
+    // `dated`: the served date is one NORA read, so a later client date covers this body. A date
+    // NORA could not read is replaced by `since`, which says nothing about the body: it then
+    // revalidates only the client holding that exact value, as before #1315.
+    let (last_modified, dated) = match last_modified.map(|lm| (last_modified_to_unix(&lm), lm)) {
+        Some((Some(date), lm)) if date >= since => (Some(lm), true),
+        Some((Some(_), _)) => (Some(http_date(since.max(0) as u64)), true),
+        Some((None, _)) => (Some(http_date(since.max(0) as u64)), false),
+        None => (None, false),
+    };
     let etag = format!("\"{}\"", &hex::encode(sha2::Sha256::digest(&body))[..32]);
     let not_modified = match headers
         .get(header::IF_NONE_MATCH)
@@ -740,9 +765,16 @@ fn metadata_response(
             .split(',')
             .map(str::trim)
             .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag),
-        None => last_modified
-            .as_deref()
-            .is_some_and(|lm| not_modified_since(headers, lm, crate::datetime::now_unix())),
+        None => last_modified.as_deref().is_some_and(|lm| {
+            if dated {
+                not_modified_since(headers, lm, crate::datetime::now_unix())
+            } else {
+                headers
+                    .get(header::IF_MODIFIED_SINCE)
+                    .and_then(|v| v.to_str().ok())
+                    == Some(lm)
+            }
+        }),
     };
     let mut builder = axum::http::Response::builder()
         .header(header::CACHE_CONTROL, "no-cache")

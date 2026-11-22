@@ -712,6 +712,61 @@ fn an_upstream_date_in_another_form_moves_last_modified_forward() {
     }
 }
 
+/// asctime writes a one-digit day as ` 4` or `04` (RFC 9110 5.6.7, date3); both are dates.
+#[test]
+fn asctime_with_a_zero_padded_day_is_a_date() {
+    let lm = "Tue, 03 Nov 2026 08:00:00 GMT";
+    let now = crate::datetime::parse_rfc2822_to_unix(lm).unwrap() + 86_400 * 3;
+    for form in ["Wed Nov 04 08:30:00 2026", "Wed Nov  4 08:30:00 2026"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_MODIFIED_SINCE, form.parse().unwrap());
+        assert!(not_modified_since(&headers, lm, now), "{form:?}");
+    }
+    // An upstream that dates a new body that way moves the served date forward.
+    let since = crate::datetime::parse_rfc2822_to_unix("Sun, 01 Nov 2026 07:00:00 GMT").unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(header::IF_MODIFIED_SINCE, lm.parse().unwrap());
+    let resp = metadata_response(
+        &headers,
+        b"{}".to_vec(),
+        Some("Wed Nov 04 08:30:00 2026".to_string()),
+        false,
+        since,
+    );
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// An upstream date NORA cannot read is replaced by the time the configuration was loaded.
+/// That date says nothing about the body, so it revalidates only the client that holds that
+/// very value, as before #1315; a client holding any other date gets the document.
+#[test]
+fn an_unreadable_upstream_date_revalidates_only_its_own_value() {
+    let since = crate::datetime::parse_rfc2822_to_unix("Sun, 01 Nov 2026 07:00:00 GMT").unwrap();
+    let respond = |ims: &str| {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_MODIFIED_SINCE, ims.parse().unwrap());
+        metadata_response(
+            &headers,
+            b"{}".to_vec(),
+            Some("not a date".to_string()),
+            false,
+            since,
+        )
+    };
+    let later = respond("Tue, 03 Nov 2026 08:00:00 GMT");
+    assert_eq!(
+        later.status(),
+        StatusCode::OK,
+        "a later client date is not this body's"
+    );
+    let own = later.headers()[header::LAST_MODIFIED]
+        .to_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(own, "Sun, 01 Nov 2026 07:00:00 GMT");
+    assert_eq!(respond(&own).status(), StatusCode::NOT_MODIFIED);
+}
+
 /// A value that only looks like an HTTP-date is not one, and is ignored.
 #[test]
 fn a_malformed_date_is_ignored() {
