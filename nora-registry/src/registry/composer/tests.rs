@@ -736,6 +736,26 @@ fn asctime_with_a_zero_padded_day_is_a_date() {
     assert_eq!(resp.status(), StatusCode::OK);
 }
 
+/// A leap second (`23:59:60`, which RFC 9110 allows) is later than `23:59:59`. NORA cannot
+/// count it, so it is not read as `23:59:59`: a client holding `23:59:59` gets the document.
+#[test]
+fn a_leap_second_is_not_read_as_the_second_before_it() {
+    let since = crate::datetime::parse_rfc2822_to_unix("Sat, 31 Dec 2016 23:58:20 GMT").unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::IF_MODIFIED_SINCE,
+        "Sat, 31 Dec 2016 23:59:59 GMT".parse().unwrap(),
+    );
+    let resp = metadata_response(
+        &headers,
+        b"{}".to_vec(),
+        Some("Sat, 31 Dec 2016 23:59:60 GMT".to_string()),
+        false,
+        since,
+    );
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 /// An upstream date NORA cannot read is replaced by the time the configuration was loaded.
 /// That date says nothing about the body, so it revalidates only the client that holds that
 /// very value, as before #1315; a client holding any other date gets the document.

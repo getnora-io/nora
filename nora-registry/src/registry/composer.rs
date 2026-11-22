@@ -669,6 +669,14 @@ fn not_modified_since(headers: &HeaderMap, last_modified: &str, now: i64) -> boo
 /// (`+0000`) some upstreams use. The served date and the comparison read it the same way, so
 /// a new body dated in another form moves the date forward instead of back to `since`.
 fn last_modified_to_unix(value: &str) -> Option<i64> {
+    // A leap second has no Unix time of its own; RFC 2822 parsing folds it into the second
+    // before, which would make a later date compare equal to an earlier one. Leave it unread.
+    if value
+        .split_whitespace()
+        .any(|t| t.len() == 8 && t.ends_with(":60"))
+    {
+        return None;
+    }
     http_date_to_unix(value).or_else(|| crate::datetime::parse_rfc2822_to_unix(value))
 }
 
