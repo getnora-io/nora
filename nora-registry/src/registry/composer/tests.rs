@@ -596,6 +596,165 @@ async fn a_client_revalidating_its_own_copy_gets_a_304() {
     assert!(body_bytes(resp).await.is_empty());
 }
 
+// ── If-Modified-Since is a date, not a string (#1315) ─────────────────────────────────
+
+/// `Sun, 22 Nov 2026 08:00:00 GMT` in RFC 850 form: `Sunday, 22-Nov-26 08:00:00 GMT`.
+fn rfc850(imf: &str) -> String {
+    let days = [
+        ("Mon", "Monday"),
+        ("Tue", "Tuesday"),
+        ("Wed", "Wednesday"),
+        ("Thu", "Thursday"),
+        ("Fri", "Friday"),
+        ("Sat", "Saturday"),
+        ("Sun", "Sunday"),
+    ];
+    let f: Vec<&str> = imf.split(' ').collect();
+    let day = days
+        .iter()
+        .find(|(short, _)| f[0] == format!("{short},"))
+        .unwrap()
+        .1;
+    format!("{day}, {}-{}-{} {} GMT", f[1], f[2], &f[3][2..], f[4])
+}
+
+/// The same date in asctime form: `Sun Nov 22 08:00:00 2026` (day padded with a space).
+fn asctime(imf: &str) -> String {
+    let f: Vec<&str> = imf.split(' ').collect();
+    let day: u32 = f[1].parse().unwrap();
+    format!("{} {} {day:>2} {} {}", &f[0][..3], f[2], f[4], f[3])
+}
+
+fn imf(t: std::time::SystemTime) -> String {
+    let secs = t.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    crate::datetime::UtcTime::from_unix(secs, 0)
+        .unwrap()
+        .http_date()
+}
+
+async fn proxied_last_modified(ctx: &TestContext) -> String {
+    let resp = send(&ctx.app, Method::GET, "/composer/p2/acme/lib.json", "").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.headers()[header::LAST_MODIFIED]
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+async fn revalidate(ctx: &TestContext, since: &str) -> StatusCode {
+    send_with_headers(
+        &ctx.app,
+        Method::GET,
+        "/composer/p2/acme/lib.json",
+        vec![("if-modified-since", since)],
+        "",
+    )
+    .await
+    .status()
+}
+
+#[test]
+fn if_modified_since_is_one_date_at_or_after_last_modified_and_not_ahead_of_the_clock() {
+    let lm = "Sun, 22 Nov 2026 08:00:00 GMT";
+    let now = crate::datetime::parse_rfc2822_to_unix(lm).unwrap() + 3600;
+    let h = |values: &[&str]| {
+        let mut m = HeaderMap::new();
+        for v in values {
+            m.append(header::IF_MODIFIED_SINCE, v.parse().unwrap());
+        }
+        m
+    };
+    let yes = |values: &[&str], lm: &str| not_modified_since(&h(values), lm, now);
+    assert!(yes(&[lm], lm));
+    assert!(yes(&["Sunday, 22-Nov-26 08:00:00 GMT"], lm));
+    assert!(yes(&["Sun Nov 22 08:00:00 2026"], lm));
+    assert!(yes(&["Sun, 22 Nov 2026 08:30:00 GMT"], lm));
+    assert!(yes(&["Sun, 22 Nov 2026 09:00:00 GMT"], lm), "now itself");
+    assert!(
+        !yes(&["Sun, 22 Nov 2026 07:59:59 GMT"], lm),
+        "before Last-Modified"
+    );
+    assert!(
+        !yes(&["Sun, 22 Nov 2026 09:00:01 GMT"], lm),
+        "ahead of the clock"
+    );
+    assert!(!yes(&[lm, lm], lm), "more than one value");
+    assert!(!yes(&["garbage"], lm));
+    assert!(!yes(&[], lm));
+    // An upstream Last-Modified NORA passes through in RFC 2822 form with an offset.
+    assert!(yes(&[lm], "Sun, 22 Nov 2026 08:00:00 +0000"));
+}
+
+#[test]
+fn the_date_forms_in_these_tests_are_the_ones_rfc_9110_names() {
+    let imf = "Sun, 06 Nov 1994 08:49:37 GMT";
+    assert_eq!(rfc850(imf), "Sunday, 06-Nov-94 08:49:37 GMT");
+    assert_eq!(asctime(imf), "Sun Nov  6 08:49:37 1994");
+}
+
+/// RFC 9110 5.6.7: a recipient accepts all three forms of an HTTP-date.
+#[tokio::test]
+async fn the_same_date_in_rfc_850_or_asctime_form_gets_a_304() {
+    let up = upstream().await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let lm = proxied_last_modified(&ctx).await;
+    assert_eq!(
+        revalidate(&ctx, &rfc850(&lm)).await,
+        StatusCode::NOT_MODIFIED
+    );
+    assert_eq!(
+        revalidate(&ctx, &asctime(&lm)).await,
+        StatusCode::NOT_MODIFIED
+    );
+}
+
+/// RFC 9110 13.1.3: not modified since a date at or after its Last-Modified. A cache that
+/// stores the time it fetched sends such a date.
+#[tokio::test]
+async fn a_date_after_last_modified_and_not_in_the_future_gets_a_304() {
+    let up = upstream().await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let lm = proxied_last_modified(&ctx).await;
+    // Leave the second Last-Modified names, so the clock is past it.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let now = imf(std::time::SystemTime::now());
+    assert_ne!(now, lm);
+    assert_eq!(revalidate(&ctx, &now).await, StatusCode::NOT_MODIFIED);
+}
+
+/// A date before Last-Modified, a date later than the server's clock, a value that is no
+/// date: the document is sent in full.
+#[tokio::test]
+async fn an_earlier_future_or_invalid_date_gets_the_document() {
+    let up = upstream().await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let _ = proxied_last_modified(&ctx).await;
+    let day = std::time::Duration::from_secs(86_400);
+    let earlier = imf(std::time::SystemTime::now() - 3650 * day);
+    let future = imf(std::time::SystemTime::now() + day);
+    for since in [earlier.as_str(), future.as_str(), "yesterday", ""] {
+        assert_eq!(revalidate(&ctx, since).await, StatusCode::OK, "{since:?}");
+    }
+}
+
+/// `If-None-Match`, when sent, decides alone: a stale tag gets the document even with a
+/// date that would otherwise give a 304.
+#[tokio::test]
+async fn if_none_match_still_decides_over_a_matching_date() {
+    let up = upstream().await;
+    let ctx = proxy_ctx(&up.uri(), |_| {});
+    let lm = proxied_last_modified(&ctx).await;
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        "/composer/p2/acme/lib.json",
+        vec![("if-modified-since", &lm), ("if-none-match", "\"stale\"")],
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
 #[tokio::test]
 async fn metadata_is_served_stale_when_the_upstream_is_down() {
     let up = upstream().await;
@@ -2854,6 +3013,16 @@ async fn a_hosted_listing_changed_within_its_second_is_never_a_304() {
         Method::GET,
         p2,
         vec![("if-modified-since", &given)],
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    // The same date in RFC 850 form revalidates a hosted listing too (#1315).
+    let resp = send_with_headers(
+        &ctx.app,
+        Method::GET,
+        p2,
+        vec![("if-modified-since", &rfc850(&given))],
         "",
     )
     .await;

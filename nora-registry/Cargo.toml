@@ -53,6 +53,8 @@ clap = { version = "4", features = ["derive"] }
 tar = "0.4"
 flate2 = "1.1"
 indicatif = "0.18"
+# HTTP-date in its three forms (RFC 9110 5.6.7) for If-Modified-Since (#1315); already in the graph through hyper.
+httpdate = "1"
 # Calendar math for NORA's dates (src/datetime.rs); years up to ±262143, as before #1282.
 time = { version = "0.3", default-features = false, features = ["std", "large-dates"] }
 thiserror = "2"

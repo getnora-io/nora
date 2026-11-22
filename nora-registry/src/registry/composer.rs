@@ -650,6 +650,29 @@ fn http_date(unix: u64) -> String {
         .http_date()
 }
 
+/// `If-Modified-Since` as RFC 9110 reads it (13.1.3): an HTTP-date in any of its three forms,
+/// and the document is not modified when its `Last-Modified` is at or before that date. A
+/// value that is not one date, or a date later than `now`, is ignored. A string comparison
+/// gave a 304 only to a client that sent back the exact bytes (#1315).
+fn not_modified_since(headers: &HeaderMap, last_modified: &str, now: i64) -> bool {
+    let mut values = headers.get_all(header::IF_MODIFIED_SINCE).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return false;
+    };
+    let Some(since) = value.to_str().ok().and_then(http_date_to_unix) else {
+        return false;
+    };
+    let modified = http_date_to_unix(last_modified)
+        .or_else(|| crate::datetime::parse_rfc2822_to_unix(last_modified));
+    since <= now && modified.is_some_and(|modified| modified <= since)
+}
+
+fn http_date_to_unix(value: &str) -> Option<i64> {
+    let t = httpdate::parse_http_date(value.trim()).ok()?;
+    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
+    i64::try_from(secs).ok()
+}
+
 /// A metadata document, or 304 when the client's copy is the one NORA serves now. The
 /// validators describe the served document, not the upstream's: NORA rewrites it (archive
 /// URLs, and sources under curation), so a configuration that took effect after the upstream's
@@ -676,12 +699,9 @@ fn metadata_response(
             .split(',')
             .map(str::trim)
             .any(|tag| tag == "*" || tag.strip_prefix("W/").unwrap_or(tag) == etag),
-        None => last_modified.as_deref().is_some_and(|lm| {
-            headers
-                .get(header::IF_MODIFIED_SINCE)
-                .and_then(|v| v.to_str().ok())
-                == Some(lm)
-        }),
+        None => last_modified
+            .as_deref()
+            .is_some_and(|lm| not_modified_since(headers, lm, crate::datetime::now_unix())),
     };
     let mut builder = axum::http::Response::builder()
         .header(header::CACHE_CONTROL, "no-cache")
