@@ -1762,9 +1762,11 @@ pub(crate) fn upstream_packument_key(name: &str) -> String {
 /// validators are never written in between another writer's. A key outside `npm/<name>/upstream/`
 /// is its own lock.
 fn document_lock(state: &AppState, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    // The name is what precedes the last `/upstream/`: a package may itself be called `upstream`
+    // (`npm/@scope/upstream/upstream/packument.json`), and a manifest's spec has no `/`.
     match key
         .strip_prefix("npm/")
-        .and_then(|rest| rest.split_once("/upstream/"))
+        .and_then(|rest| rest.rsplit_once("/upstream/"))
     {
         Some((name, _)) => state.publish_lock(&published_packument_key(name)),
         None => state.publish_lock(key),
@@ -17295,6 +17297,37 @@ mod meta_writes_tests {
                 provenance_record(&origin_of(&upstream.uri()), &body.unwrap()).as_bytes(),
                 "{}: the body and its record are not one write",
                 store.name()
+            );
+        }
+    }
+    /// The lock is the package's for every name, `upstream` and scoped ones included: the key
+    /// `npm/@scope/upstream/upstream/packument.json` belongs to `@scope/upstream`.
+    #[tokio::test]
+    async fn the_lock_is_the_packages_whatever_its_name() {
+        let upstream = MockServer::start().await;
+        let ctx = context(&upstream, Store::Object.backend());
+        for (name, key) in [
+            ("racepkg", "npm/racepkg/upstream/packument.json"),
+            ("upstream", "npm/upstream/upstream/packument.json"),
+            (
+                "@scope/upstream",
+                "npm/@scope/upstream/upstream/packument.json",
+            ),
+            (
+                "@scope/upstream",
+                "npm/@scope/upstream/upstream/manifests/1.0.0.json",
+            ),
+            (
+                "@upstream/upstream",
+                "npm/@upstream/upstream/upstream/manifests/latest.json",
+            ),
+        ] {
+            let want = ctx
+                .state
+                .publish_lock(&super::published_packument_key(name));
+            assert!(
+                Arc::ptr_eq(&super::document_lock(&ctx.state, key), &want),
+                "{key} is not under {name}'s lock"
             );
         }
     }
