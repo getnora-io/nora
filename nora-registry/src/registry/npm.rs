@@ -1474,7 +1474,7 @@ async fn refetch_metadata(
                 let storage = state.storage.clone();
                 let key_clone = key.to_string();
                 let asked_with = validators.clone();
-                let lock = state.publish_lock(key);
+                let lock = document_lock(state, key);
                 state.cache_writes.spawn("npm", async move {
                     // LOCK-SAFE: tokio mutex, the one every write of this document holds (#1295):
                     // the check and the write are one step. Nothing else is locked under it.
@@ -1526,7 +1526,7 @@ async fn refetch_metadata(
                         let storage = state.storage.clone();
                         let key_clone = key.to_string();
                         let asked_with = validators.clone();
-                        let lock = state.publish_lock(key);
+                        let lock = document_lock(state, key);
                         state.cache_writes.spawn("npm", async move {
                             // LOCK-SAFE: tokio mutex, the one every write of this document holds.
                             // Nothing else is locked under it.
@@ -1559,8 +1559,16 @@ async fn refetch_metadata(
                     // Body gone (GC, retention, corruption). Delete the stale
                     // validator sidecar so the next revalidation cycle does a
                     // full unconditional fetch instead of looping on 304 (#867).
-                    let vkey = validators_key(key);
-                    let _ = state.storage.delete(&vkey).await;
+                    // Under the document's lock and only while the body is still gone: a writer
+                    // that stored a body and its validators meanwhile keeps them (#1295).
+                    // LOCK-SAFE: tokio mutex, the one every write of this document holds. Nothing
+                    // else is locked under it. CANCEL-SAFETY: dropped while waiting, it deletes
+                    // nothing; the next 304 for a gone body clears the sidecar.
+                    let lock = document_lock(state, key);
+                    let _guard = lock.lock().await;
+                    if state.storage.stat(key).await.is_none() {
+                        let _ = state.storage.delete(&validators_key(key)).await;
+                    }
                     tracing::warn!(
                         key = %key,
                         "304 but cached body missing; cleared validators for full refetch"
@@ -1589,7 +1597,7 @@ async fn refetch_metadata(
             let key_clone = key.to_string();
             let cache_data = rewritten.clone();
             let origin = origin_of(proxy_url);
-            let lock = state.publish_lock(key);
+            let lock = document_lock(state, key);
             state.cache_writes.spawn("npm", async move {
                 // LOCK-SAFE: tokio mutex, the one every write of this document holds (#1295): the
                 // body, its record and its validators land as one, never interleaved with another
@@ -1747,6 +1755,36 @@ pub(crate) fn published_packument_key(name: &str) -> String {
 /// Where the packument an upstream serves for a package NORA has not published is cached.
 pub(crate) fn upstream_packument_key(name: &str) -> String {
     format!("npm/{name}/upstream/packument.json")
+}
+
+/// The lock every writer of a package's cached documents holds (#1295): the package's own,
+/// the one publish, the rebuild and retention take, so that a cached body, its record and its
+/// validators are never written in between another writer's. A key outside `npm/<name>/upstream/`
+/// is its own lock.
+fn document_lock(state: &AppState, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    match key
+        .strip_prefix("npm/")
+        .and_then(|rest| rest.split_once("/upstream/"))
+    {
+        Some((name, _)) => state.publish_lock(&published_packument_key(name)),
+        None => state.publish_lock(key),
+    }
+}
+
+/// Store a body that came without validators, and its record. A sidecar left is another body's,
+/// and a 304 for it would confirm this one, so it goes first: a reader in between finds the old
+/// body without validators and asks the upstream unconditionally. Under [`document_lock`].
+async fn put_without_validators(
+    storage: &crate::storage::Storage,
+    key: &str,
+    body: &[u8],
+    origin: &str,
+) -> crate::storage::Result<()> {
+    match storage.delete(&validators_key(key)).await {
+        Ok(()) | Err(crate::storage::StorageError::NotFound) => {}
+        Err(e) => return Err(e),
+    }
+    put_with_origin(storage, key, body, origin).await
 }
 
 /// Where one version's manifest that an upstream serves is cached.
@@ -2612,12 +2650,12 @@ async fn upstream_metadata(
             let key = cache_key.to_string();
             let body = rewritten.clone();
             let origin = origin_of(upstream.url);
-            let lock = state.publish_lock(cache_key);
+            let lock = document_lock(state, cache_key);
             let task = async move {
                 // LOCK-SAFE: tokio mutex, the one every write of this document holds (#1295).
                 // Nothing else is locked under it.
                 let _guard = lock.lock().await;
-                if let Err(e) = put_with_origin(&storage, &key, &body, &origin).await {
+                if let Err(e) = put_without_validators(&storage, &key, &body, &origin).await {
                     tracing::warn!(key = %key, error = ?e, "npm proxy: failed to cache metadata");
                 }
             };
@@ -3465,11 +3503,21 @@ async fn ensure_npm_metadata_cached(state: &AppState, package_name: &str) {
         if let Some(rewritten) =
             rewrite_for_nora(state, &data, proxy_url, package_name, Links::Stored)
         {
-            // LOCK-SAFE: tokio mutex, the one every write of this document holds (#1295).
-            // Nothing else is locked under it.
-            let lock = state.publish_lock(&key);
-            let _guard = lock.lock().await;
-            let _ = put_with_origin(&state.storage, &key, &rewritten, &origin_of(proxy_url)).await;
+            // The write is a task of its own, awaited: the date is readable on this request, and a
+            // request dropped meanwhile leaves the write to finish whole (#1295).
+            let lock = document_lock(state, &key);
+            let storage = state.storage.clone();
+            let origin = origin_of(proxy_url);
+            let (done, written) = tokio::sync::oneshot::channel();
+            state.cache_writes.spawn("npm", async move {
+                // LOCK-SAFE: tokio mutex, the one every write of this document holds (#1295).
+                // Nothing else is locked under it.
+                let _guard = lock.lock().await;
+                let _ = put_without_validators(&storage, &key, &rewritten, &origin).await;
+                let _ = done.send(());
+            });
+            // CANCEL-SAFETY: only waits for the task; dropped, the write runs on.
+            let _ = written.await;
         }
     }
 }
@@ -10775,8 +10823,8 @@ mod published_and_upstream_keys {
     }
 
     /// The published packument key is named in one function, and only publish, the rebuild,
-    /// the published-packument answer, the readers that pick a key, and retention's lock call
-    /// it; the legacy key is named in one function, called only where a cache is read and
+    /// the published-packument answer, the readers that pick a key, and the package's lock
+    /// (retention's, and every proxy cache write's since #1295, as a lock name only) call it; the legacy key is named in one function, called only where a cache is read and
     /// where a non-package path is proxied. A new path that writes a published packument has
     /// to name one of them, here.
     #[test]
@@ -10822,6 +10870,7 @@ mod published_and_upstream_keys {
         assert_eq!(
             published_callers.into_iter().collect::<Vec<_>>(),
             [
+                "document_lock",
                 "handle_publish",
                 "packument_key_for_reading",
                 "published_packument_response",
@@ -16752,6 +16801,23 @@ mod meta_writes_tests {
         .unwrap()
     }
 
+    /// The lock retention, publish and the rebuild hold for `racepkg`: every writer of its cached
+    /// documents holds it too (#1295).
+    fn package_lock(ctx: &TestContext) -> Arc<tokio::sync::Mutex<()>> {
+        ctx.state
+            .publish_lock(&super::published_packument_key("racepkg"))
+    }
+
+    /// Wait until the upstream has been asked `n` times, or [`WAIT`].
+    async fn asked(upstream: &MockServer, n: usize) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while upstream.received_requests().await.map_or(0, |r| r.len()) < n
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// The marker of the document stored at `key`, and the ETag its sidecar holds.
     async fn stored(storage: &Storage, key: &str) -> (String, Option<String>) {
         let body = storage.get(key).await.unwrap();
@@ -16911,7 +16977,7 @@ mod meta_writes_tests {
             }
 
             // The writes of `racepkg` are held: those of `otherpkg` land.
-            let held = ctx.state.publish_lock(KEY);
+            let held = package_lock(&ctx);
             let guard = held.lock().await;
             let v1 = document(&upstream, "otherpkg", "V1");
             revalidate(&ctx, "otherpkg", OTHER, &v1, &etag("v1")).await;
@@ -16973,7 +17039,7 @@ mod meta_writes_tests {
                 .mount(&upstream)
                 .await;
             let ctx = context(&upstream, store.backend());
-            let held = ctx.state.publish_lock(KEY);
+            let held = package_lock(&ctx);
 
             // A first fetch is served while its write waits.
             let guard = held.lock().await;
@@ -17078,6 +17144,156 @@ mod meta_writes_tests {
                 stored(&ctx.state.storage, KEY).await,
                 ("V2".to_string(), Some("\"v2\"".to_string())),
                 "{}: the 200's validators were emptied by a 304 about another copy",
+                store.name()
+            );
+        }
+    }
+
+    /// A writer that brings a body and no validators — a first fetch, the prefetch of a tarball
+    /// request — and lands after another writer stored its body and validators leaves no
+    /// validators: those it found are the other body's, and a 304 for them would confirm its own.
+    #[tokio::test]
+    async fn a_body_without_validators_drops_the_validators_another_body_left() {
+        for store in Store::both() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/racepkg"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(document(&upstream, "racepkg", "V3")),
+                )
+                .mount(&upstream)
+                .await;
+            let ctx = context(&upstream, store.backend());
+            let held = package_lock(&ctx);
+            let v2 = document(&upstream, "racepkg", "V2");
+
+            // First fetch: its write waits; a full 200 lands meanwhile.
+            let guard = held.lock().await;
+            let resp = send(&ctx.app, Method::GET, "/npm/racepkg", "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{}", store.name());
+            seed(&ctx, &upstream, KEY, &v2, &etag("v2")).await;
+            drop(guard);
+            ctx.state.cache_writes.settled().await;
+            assert_eq!(
+                stored(&ctx.state.storage, KEY).await,
+                ("V3".to_string(), None),
+                "{}: the first fetch kept another body's validators",
+                store.name()
+            );
+
+            // Prefetch: the same, the full 200 landing after the prefetch asked the upstream.
+            ctx.state.storage.delete(KEY).await.unwrap();
+            let _ = ctx.state.storage.delete(&validators_key(KEY)).await;
+            let before = upstream.received_requests().await.map_or(0, |r| r.len());
+            let guard = held.lock().await;
+            let interleave = async {
+                asked(&upstream, before + 1).await;
+                seed(&ctx, &upstream, KEY, &v2, &etag("v2")).await;
+                drop(guard);
+            };
+            tokio::join!(
+                ensure_npm_metadata_cached(&ctx.state, "racepkg"),
+                interleave
+            );
+            ctx.state.cache_writes.settled().await;
+            assert_eq!(
+                stored(&ctx.state.storage, KEY).await,
+                ("V3".to_string(), None),
+                "{}: the prefetch kept another body's validators",
+                store.name()
+            );
+        }
+    }
+
+    /// A 304 whose body is gone clears the sidecar (#867) under the document's lock, and only while
+    /// the body is still gone: a 200 that stored a body and validators meanwhile keeps them.
+    #[tokio::test]
+    async fn a_304_for_a_body_gone_clears_the_sidecar_only_while_it_is_gone() {
+        for store in Store::both() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/racepkg"))
+                .and(header("if-none-match", "\"v1\""))
+                .respond_with(ResponseTemplate::new(304))
+                .mount(&upstream)
+                .await;
+            let ctx = context(&upstream, store.backend());
+            let v1 = document(&upstream, "racepkg", "V1");
+            let v2 = document(&upstream, "racepkg", "V2");
+            write_validators(&ctx.state.storage, KEY, &etag("v1")).await;
+            let held = package_lock(&ctx);
+            let guard = held.lock().await;
+            let body = Bytes::from(v1.clone());
+            let revalidation = refetch_metadata(
+                &ctx.state,
+                "racepkg",
+                KEY,
+                (KEY, Some(body.clone())),
+                false,
+                true,
+                Some((body, etag("v1"))),
+            );
+            let interleave = async {
+                asked(&upstream, 1).await;
+                tokio::time::sleep(WAIT / 2).await;
+                let kept = ctx.state.storage.get(&validators_key(KEY)).await.is_ok();
+                seed(&ctx, &upstream, KEY, &v2, &etag("v2")).await;
+                drop(guard);
+                kept
+            };
+            let (_, kept) = tokio::join!(revalidation, interleave);
+            ctx.state.cache_writes.settled().await;
+            assert!(
+                kept,
+                "{}: the sidecar was cleared while the document's writes were held",
+                store.name()
+            );
+            assert_eq!(
+                stored(&ctx.state.storage, KEY).await,
+                ("V2".to_string(), Some("\"v2\"".to_string())),
+                "{}: the 304 for a gone body cleared a later 200's validators",
+                store.name()
+            );
+        }
+    }
+
+    /// A prefetch whose request is dropped while its write waits still writes the whole document,
+    /// body and record: the write is not the request's to cancel.
+    #[tokio::test]
+    async fn a_dropped_prefetch_still_writes_the_whole_document() {
+        for store in Store::both() {
+            let upstream = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/racepkg"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(document(&upstream, "racepkg", "V3")),
+                )
+                .mount(&upstream)
+                .await;
+            let ctx = context(&upstream, store.backend());
+            let held = package_lock(&ctx);
+            let guard = held.lock().await;
+            // CANCEL-SAFETY: the point of the test: the prefetch is dropped at the deadline.
+            let dropped =
+                tokio::time::timeout(WAIT, ensure_npm_metadata_cached(&ctx.state, "racepkg")).await;
+            assert!(
+                dropped.is_err(),
+                "{}: the prefetch did not wait",
+                store.name()
+            );
+            drop(guard);
+            ctx.state.cache_writes.settled().await;
+            let body = ctx.state.storage.get(KEY).await;
+            assert!(
+                body.is_ok(),
+                "{}: the dropped prefetch wrote nothing",
+                store.name()
+            );
+            let record = ctx.state.storage.get(&origin_key(KEY)).await.unwrap();
+            assert_eq!(
+                record.as_ref(),
+                provenance_record(&origin_of(&upstream.uri()), &body.unwrap()).as_bytes(),
+                "{}: the body and its record are not one write",
                 store.name()
             );
         }
