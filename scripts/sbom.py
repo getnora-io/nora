@@ -290,6 +290,29 @@ def write(path, doc):
         f.write("\n")
 
 
+class DuplicateKey(ValueError):
+    pass
+
+
+def _no_duplicates(pairs):
+    seen = {}
+    for k, v in pairs:
+        if k in seen:
+            raise DuplicateKey(f"key {k!r} appears twice in one object")
+        seen[k] = v
+    return seen
+
+
+def load(path):
+    """A JSON file read for checking. json.load keeps the last of two equal keys, and a
+    scanner may keep the first, so a repeated key is refused instead of resolved."""
+    with open(path, encoding="utf-8") as f:
+        return json.load(f, object_pairs_hook=_no_duplicates)
+
+
+TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
+
+
 def one_per_kind(entries, kind_field, value_field, label, errs):
     """{algorithm: value}; a second entry for one algorithm is an error, not an override."""
     out = {}
@@ -302,8 +325,7 @@ def one_per_kind(entries, kind_field, value_field, label, errs):
 
 
 def read_cdx(path):
-    with open(path, encoding="utf-8") as f:
-        d = json.load(f)
+    d = load(path)
     errs = []
     if d.get("bomFormat") != "CycloneDX":
         errs.append("not a CycloneDX document")
@@ -338,8 +360,7 @@ def read_cdx(path):
 
 
 def read_spdx(path):
-    with open(path, encoding="utf-8") as f:
-        d = json.load(f)
+    d = load(path)
     errs = []
     if d.get("spdxVersion") != "SPDX-2.3":
         errs.append("not an SPDX 2.3 document")
@@ -457,8 +478,7 @@ def exact(label, path, generated):
     """The allowlist: the file must be, up to list order, the document the generator writes for
     this crate graph and the file's own timestamp. Field-by-field checks above say what is wrong
     in words; this one refuses anything they do not know about."""
-    with open(path, encoding="utf-8") as f:
-        d = first_difference(canonical(json.load(f)), canonical(generated))
+    d = first_difference(canonical(load(path)), canonical(generated))
     return [f"{label}: {d}"] if d else []
 
 
@@ -481,13 +501,18 @@ def main(argv):
         print(f"SBOM {a.target}: {runtime} runtime crates, {len(want) - runtime} build-time crates")
         return 0
 
-    errs = compare(a.cdx, version, a.target, want, read_cdx(a.cdx))
-    errs += compare(a.spdx, version, a.target, want, read_spdx(a.spdx))
+    try:
+        errs = compare(a.cdx, version, a.target, want, read_cdx(a.cdx))
+        errs += compare(a.spdx, version, a.target, want, read_spdx(a.spdx))
+    except (DuplicateKey, json.JSONDecodeError) as e:
+        errs = [f"unreadable SBOM: {e}"]
     if not errs:
-        with open(a.cdx, encoding="utf-8") as f:
-            cdx_ts = json.load(f).get("metadata", {}).get("timestamp")
-        with open(a.spdx, encoding="utf-8") as f:
-            spdx_ts = json.load(f).get("creationInfo", {}).get("created")
+        cdx_ts = load(a.cdx).get("metadata", {}).get("timestamp")
+        spdx_ts = load(a.spdx).get("creationInfo", {}).get("created")
+        for label, ts in ((a.cdx, cdx_ts), (a.spdx, spdx_ts)):
+            if not (isinstance(ts, str) and TIMESTAMP.match(ts)):
+                errs.append(f"{label}: timestamp {ts!r} is not a UTC date like 2026-11-22T08:00:00Z")
+    if not errs:
         errs += exact(a.cdx, a.cdx, cyclonedx(version, a.target, want, cdx_ts))
         errs += exact(a.spdx, a.spdx, spdx(version, a.target, want, spdx_ts))
     if errs:
