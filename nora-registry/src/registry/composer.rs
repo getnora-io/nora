@@ -662,15 +662,56 @@ fn not_modified_since(headers: &HeaderMap, last_modified: &str, now: i64) -> boo
     let Some(since) = value.to_str().ok().and_then(http_date_to_unix) else {
         return false;
     };
-    let modified = http_date_to_unix(last_modified)
-        .or_else(|| crate::datetime::parse_rfc2822_to_unix(last_modified));
-    since <= now && modified.is_some_and(|modified| modified <= since)
+    since <= now && last_modified_to_unix(last_modified).is_some_and(|modified| modified <= since)
 }
 
+/// A `Last-Modified` NORA serves or an upstream sent: an HTTP-date, or the RFC 2822 forms
+/// (`+0000`) some upstreams use. The served date and the comparison read it the same way, so
+/// a new body dated in another form moves the date forward instead of back to `since`.
+fn last_modified_to_unix(value: &str) -> Option<i64> {
+    http_date_to_unix(value).or_else(|| crate::datetime::parse_rfc2822_to_unix(value))
+}
+
+/// An HTTP-date in one of its three forms (RFC 9110 5.6.7), exactly: httpdate also reads some
+/// malformed values (`22-Nov-26X08:30:00`), so the value must be what that date spells in the
+/// form it was written in.
 fn http_date_to_unix(value: &str) -> Option<i64> {
-    let t = httpdate::parse_http_date(value.trim()).ok()?;
-    let secs = t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs();
-    i64::try_from(secs).ok()
+    let value = value.trim();
+    let t = httpdate::parse_http_date(value).ok()?;
+    let secs = i64::try_from(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_secs()).ok()?;
+    let imf = http_date(secs as u64);
+    (value == imf || value == rfc850_form(&imf)? || value == asctime_form(&imf)?).then_some(secs)
+}
+
+/// `Sun, 22 Nov 2026 08:00:00 GMT` → `Sunday, 22-Nov-26 08:00:00 GMT`.
+fn rfc850_form(imf: &str) -> Option<String> {
+    let [weekday, day, month, year, time, _] = imf.split(' ').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let weekday = match weekday.strip_suffix(',')? {
+        "Mon" => "Monday",
+        "Tue" => "Tuesday",
+        "Wed" => "Wednesday",
+        "Thu" => "Thursday",
+        "Fri" => "Friday",
+        "Sat" => "Saturday",
+        "Sun" => "Sunday",
+        _ => return None,
+    };
+    let year = year.get(year.len().checked_sub(2)?..)?;
+    Some(format!("{weekday}, {day}-{month}-{year} {time} GMT"))
+}
+
+/// `Sun, 22 Nov 2026 08:00:00 GMT` → `Sun Nov 22 08:00:00 2026`, the day padded with a space.
+fn asctime_form(imf: &str) -> Option<String> {
+    let [weekday, day, month, year, time, _] = imf.split(' ').collect::<Vec<_>>()[..] else {
+        return None;
+    };
+    let day: u8 = day.parse().ok()?;
+    Some(format!(
+        "{} {month} {day:>2} {time} {year}",
+        weekday.strip_suffix(',')?
+    ))
 }
 
 /// A metadata document, or 304 when the client's copy is the one NORA serves now. The
@@ -686,7 +727,7 @@ fn metadata_response(
     stale: bool,
     since: i64,
 ) -> Response {
-    let last_modified = last_modified.map(|lm| match crate::datetime::parse_rfc2822_to_unix(&lm) {
+    let last_modified = last_modified.map(|lm| match last_modified_to_unix(&lm) {
         Some(date) if date >= since => lm,
         _ => http_date(since.max(0) as u64),
     });

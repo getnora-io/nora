@@ -685,6 +685,51 @@ fn if_modified_since_is_one_date_at_or_after_last_modified_and_not_ahead_of_the_
     assert!(yes(&[lm], "Sun, 22 Nov 2026 08:00:00 +0000"));
 }
 
+/// An upstream that dates a new body in asctime form: the served date moves forward with
+/// it, so a client holding the older body gets the new one, not a 304. Read as RFC 2822 only,
+/// the date fell back to when the configuration was loaded, which is before the client's.
+#[test]
+fn an_upstream_date_in_another_form_moves_last_modified_forward() {
+    let since = crate::datetime::parse_rfc2822_to_unix("Sat, 22 Nov 2025 07:00:00 GMT").unwrap();
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::IF_MODIFIED_SINCE,
+        "Sat, 22 Nov 2025 08:00:00 GMT".parse().unwrap(),
+    );
+    for upstream in [
+        "Sat Nov 22 08:30:00 2025",
+        "Saturday, 22-Nov-25 08:30:00 GMT",
+    ] {
+        let resp = metadata_response(
+            &headers,
+            b"{}".to_vec(),
+            Some(upstream.to_string()),
+            false,
+            since,
+        );
+        assert_eq!(resp.status(), StatusCode::OK, "{upstream}");
+        assert_eq!(resp.headers()[header::LAST_MODIFIED], upstream);
+    }
+}
+
+/// A value that only looks like an HTTP-date is not one, and is ignored.
+#[test]
+fn a_malformed_date_is_ignored() {
+    let lm = "Sun, 22 Nov 2026 08:00:00 GMT";
+    let now = crate::datetime::parse_rfc2822_to_unix(lm).unwrap() + 3600;
+    for bad in [
+        "Sunday, 22-Nov-26X08:30:00 GMT",
+        "Sunday, 22-Nov-26 08:30:00 GMTX",
+        "Sun Nov 22 08:30:00 2026X",
+        "Sun, 22 Nov 2026 08:30:00 UTC",
+        "Mon, 22 Nov 2026 08:30:00 GMT",
+    ] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::IF_MODIFIED_SINCE, bad.parse().unwrap());
+        assert!(!not_modified_since(&headers, lm, now), "{bad:?}");
+    }
+}
+
 #[test]
 fn the_date_forms_in_these_tests_are_the_ones_rfc_9110_names() {
     let imf = "Sun, 06 Nov 1994 08:49:37 GMT";
@@ -3521,7 +3566,8 @@ async fn metadata_naming_no_package_is_not_a_failure() {
 }
 
 /// The `Last-Modified` NORA gives a Composer document, as 1.4.5 wrote it (#1282); the epoch for
-/// a date past the calendar. An upstream's own date is kept only when it reads as RFC 2822.
+/// a date past the calendar. An upstream's own date is kept, as sent, when it reads as an
+/// HTTP-date or as RFC 2822 (#1315 added the RFC 850 and asctime forms).
 #[test]
 fn composer_dates_are_the_http_dates_they_were() {
     assert_eq!(http_date(0), "Thu, 01 Jan 1970 00:00:00 GMT");
@@ -3552,6 +3598,10 @@ fn composer_dates_are_the_http_dates_they_were() {
     assert_eq!(
         served("tue, 14 nov 23 23:13:20 +0100", 1_700_000_000).as_deref(),
         Some("tue, 14 nov 23 23:13:20 +0100")
+    );
+    assert_eq!(
+        served("Tue Nov 14 22:13:20 2023", 1_700_000_000).as_deref(),
+        Some("Tue Nov 14 22:13:20 2023")
     );
     assert_eq!(
         served("2023-11-14T22:13:20Z", 0).as_deref(),
