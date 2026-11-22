@@ -90,6 +90,19 @@ expect fail duplicate
 mutate other-version cdx 'd["metadata"]["component"]["version"] = "0.0.0"'
 expect fail other-version
 
+# ── must fail: ways around a check that reads only what it expects (review of #1314) ──
+mutate nested-component cdx 'first("required")["components"] = [{"type": "library", "name": "criterion", "version": "0.8.2"}]'
+expect fail nested-component
+mutate spdx-id-reused spdx '
+p = dict(pkgs[1]); p.update(name="criterion", versionInfo="0.8.2"); pkgs.insert(1, p)'
+expect fail spdx-id-reused
+mutate second-hash cdx 'first("required")["hashes"].insert(0, {"alg": "SHA-256", "content": "0" * 64})'
+expect fail second-hash
+mutate second-checksum spdx 'pkgs[1]["checksums"].insert(0, {"algorithm": "SHA256", "checksumValue": "0" * 64})'
+expect fail second-checksum
+mutate spdx-file spdx 'd["files"] = [{"SPDXID": "SPDXRef-File-ci", "fileName": ".github/workflows/ci.yml", "checksums": [{"algorithm": "SHA1", "checksumValue": "0" * 40}]}]'
+expect fail spdx-file
+
 # ── must fail: an amd64 SBOM is not an arm64 SBOM ─────────────────────────
 cp "$TMP/base.cdx.json" "$TMP/other-target.cdx.json"; cp "$TMP/base.spdx.json" "$TMP/other-target.spdx.json"
 expect fail other-target "$OTHER"

@@ -285,6 +285,17 @@ def write(path, doc):
         f.write("\n")
 
 
+def one_per_kind(entries, kind_field, value_field, label, errs):
+    """{algorithm: value}; a second entry for one algorithm is an error, not an override."""
+    out = {}
+    for e in entries:
+        kind = e.get(kind_field)
+        if kind in out:
+            errs.append(f"{label} has more than one {kind} checksum")
+        out[kind] = e.get(value_field)
+    return out
+
+
 def read_cdx(path):
     with open(path, encoding="utf-8") as f:
         d = json.load(f)
@@ -302,7 +313,10 @@ def read_cdx(path):
             continue
         if key in got:
             errs.append(f"component {key[0]} {key[1]} is listed twice")
-        hashes = {h.get("alg"): h.get("content") for h in c.get("hashes", [])}
+        if c.get("components"):
+            errs.append(f"component {key[0]} {key[1]} nests other components")
+        hashes = one_per_kind(c.get("hashes", []), "alg", "content",
+                              f"component {key[0]} {key[1]}", errs)
         lic = [l.get("expression") or (l.get("license") or {}).get("id")
                for l in c.get("licenses", [])]
         got[key] = {"scope": c.get("scope"), "sha256": hashes.get("SHA-256"),
@@ -316,7 +330,14 @@ def read_spdx(path):
     errs = []
     if d.get("spdxVersion") != "SPDX-2.3":
         errs.append("not an SPDX 2.3 document")
-    by_id = {p.get("SPDXID"): p for p in d.get("packages", [])}
+    for kind in ("files", "snippets"):
+        if d.get(kind):
+            errs.append(f"the document lists {kind}; only packages are expected")
+    by_id = {}
+    for p in d.get("packages", []):
+        if p.get("SPDXID") in by_id:
+            errs.append(f"SPDXID {p.get('SPDXID')} is used by more than one package")
+        by_id[p.get("SPDXID")] = p
     described = [r["relatedSpdxElement"] for r in d.get("relationships", [])
                  if r.get("spdxElementId") == "SPDXRef-DOCUMENT"
                  and r.get("relationshipType") == "DESCRIBES"]
@@ -337,7 +358,8 @@ def read_spdx(path):
         key = (p.get("name"), p.get("versionInfo"))
         if key in got:
             errs.append(f"package {key[0]} {key[1]} is listed twice")
-        sums = {c.get("algorithm"): c.get("checksumValue") for c in p.get("checksums", [])}
+        sums = one_per_kind(p.get("checksums", []), "algorithm", "checksumValue",
+                            f"package {key[0]} {key[1]}", errs)
         if pid in runtime_ids and pid in build_ids:
             scope = "both"
         elif pid in runtime_ids:
