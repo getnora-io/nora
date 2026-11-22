@@ -80,6 +80,9 @@ pub struct DeletionPlan {
     pub keys: Vec<String>,
     pub size: u64,
     pub reason: String,
+    /// The version's `modified` the plan was made from: a version whose writers hold a lock
+    /// other than its keys' is deleted only if it still reads the same under that lock.
+    pub modified: u64,
 }
 
 /// Plan which versions to delete based on retention rules.
@@ -157,6 +160,7 @@ pub fn plan_deletions(
                 keys: version.keys.clone(),
                 size: version.size,
                 reason: reason_parts.join(", "),
+                modified: version.modified,
             });
         }
         non_excluded_pos += 1;
@@ -306,19 +310,20 @@ async fn collect_maven_versions(storage: &Storage) -> Vec<(String, Vec<VersionEn
 /// version therefore requires the post-delete index regeneration in
 /// `run_retention`.
 async fn collect_rpm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    collect_sidecar_versions(storage, "rpm", |v| {
-        let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
-        SidecarVersion {
-            package: s("name"),
-            version: format!("{}-{}.{}", s("version"), s("release"), s("arch")),
-            arch: s("arch"),
-            href: s("href"),
-            size: v.get("size_package").and_then(|x| x.as_u64()).unwrap_or(0),
-            modified: v.get("file_time").and_then(|x| x.as_u64()),
-            placement: None,
-        }
-    })
-    .await
+    collect_sidecar_versions(storage, "rpm", rpm_sidecar_version).await
+}
+
+fn rpm_sidecar_version(v: &serde_json::Value) -> SidecarVersion {
+    let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    SidecarVersion {
+        package: s("name"),
+        version: format!("{}-{}.{}", s("version"), s("release"), s("arch")),
+        arch: s("arch"),
+        href: s("href"),
+        size: v.get("size_package").and_then(|x| x.as_u64()).unwrap_or(0),
+        modified: v.get("file_time").and_then(|x| x.as_u64()),
+        placement: None,
+    }
 }
 
 /// Collect deb package versions per repository — deb counterpart of
@@ -328,23 +333,24 @@ async fn collect_rpm_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntr
 /// `regenerate_indexes` rebuilds one index per distribution × architecture;
 /// flat-root packages group as `deb:{repo}/{arch}/{package}`.
 async fn collect_deb_versions(storage: &Storage) -> Vec<(String, Vec<VersionEntry>)> {
-    collect_sidecar_versions(storage, "deb", |v| {
-        let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
-        SidecarVersion {
-            package: s("package"),
-            version: format!("{}_{}", s("version"), s("arch")),
-            arch: s("arch"),
-            href: s("filename"),
-            size: v.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
-            modified: None, // deb sidecars carry no upload time; use sidecar mtime
-            placement: v.get("placement").and_then(|p| {
-                let d = p.get("distribution")?.as_str()?;
-                let c = p.get("component")?.as_str()?;
-                Some(format!("{d}/{c}"))
-            }),
-        }
-    })
-    .await
+    collect_sidecar_versions(storage, "deb", deb_sidecar_version).await
+}
+
+fn deb_sidecar_version(v: &serde_json::Value) -> SidecarVersion {
+    let s = |f: &str| v.get(f).and_then(|x| x.as_str()).unwrap_or("").to_string();
+    SidecarVersion {
+        package: s("package"),
+        version: format!("{}_{}", s("version"), s("arch")),
+        arch: s("arch"),
+        href: s("filename"),
+        size: v.get("size").and_then(|x| x.as_u64()).unwrap_or(0),
+        modified: None, // deb sidecars carry no upload time; use sidecar mtime
+        placement: v.get("placement").and_then(|p| {
+            let d = p.get("distribution")?.as_str()?;
+            let c = p.get("component")?.as_str()?;
+            Some(format!("{d}/{c}"))
+        }),
+    }
 }
 
 struct SidecarVersion {
@@ -369,7 +375,7 @@ struct SidecarVersion {
 async fn collect_sidecar_versions(
     storage: &Storage,
     registry: &str,
-    parse: impl Fn(&serde_json::Value) -> SidecarVersion,
+    parse: fn(&serde_json::Value) -> SidecarVersion,
 ) -> Vec<(String, Vec<VersionEntry>)> {
     let all_keys = storage
         .list(&format!("{registry}/"))
@@ -382,50 +388,60 @@ async fn collect_sidecar_versions(
     let mut groups: std::collections::HashMap<String, Vec<VersionEntry>> =
         std::collections::HashMap::new();
     for key in &all_keys {
-        // {registry}/{repo}/.nora-meta/{path}.json
-        let Some(rest) = key.strip_prefix(&format!("{registry}/")) else {
-            continue;
-        };
-        let Some((repo, meta_rest)) = rest.split_once("/.nora-meta/") else {
-            continue;
-        };
-        let Some(pkg_path) = meta_rest.strip_suffix(".json") else {
-            continue;
-        };
-        let Ok(data) = storage.get(key).await else {
-            tracing::warn!(key = %key, "retention: sidecar unreadable — version skipped (kept)");
-            continue;
-        };
-        let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) else {
-            tracing::warn!(key = %key, "retention: sidecar unparsable — version skipped (kept)");
-            continue;
-        };
-        let sv = parse(&json);
-        if sv.package.is_empty() || sv.href != pkg_path {
-            // href/path divergence means the sidecar does not describe this
-            // package file — leave it for `-/reindex` to reconcile.
-            tracing::warn!(key = %key, "retention: sidecar/package mismatch — version skipped (kept)");
-            continue;
+        if let Some((group, entry)) = sidecar_version(storage, registry, key, parse).await {
+            groups.entry(group).or_default().push(entry);
         }
-        let package_key = format!("{registry}/{repo}/{pkg_path}");
-        let modified = match sv.modified {
-            Some(m) => m,
-            None => storage.stat(key).await.map(|m| m.modified).unwrap_or(0),
-        };
-        let group = match &sv.placement {
-            Some(placement) => {
-                format!("{registry}:{repo}/{placement}/{}/{}", sv.arch, sv.package)
-            }
-            None => format!("{registry}:{repo}/{}/{}", sv.arch, sv.package),
-        };
-        groups.entry(group).or_default().push(VersionEntry {
-            name: sv.version,
-            keys: vec![package_key, key.clone()],
-            modified,
-            size: sv.size,
-        });
     }
     groups.into_iter().collect()
+}
+
+/// The group and version a sidecar key (`{registry}/{repo}/.nora-meta/{path}.json`) stands for,
+/// read the way retention plans from it; `None` for any other key, and for a sidecar that is
+/// unreadable, unparsable or describes another file (the version is kept).
+async fn sidecar_version(
+    storage: &Storage,
+    registry: &str,
+    key: &str,
+    parse: fn(&serde_json::Value) -> SidecarVersion,
+) -> Option<(String, VersionEntry)> {
+    let rest = key.strip_prefix(registry)?.strip_prefix('/')?;
+    let (repo, meta_rest) = rest.split_once("/.nora-meta/")?;
+    let pkg_path = meta_rest.strip_suffix(".json")?;
+    let Ok(data) = storage.get(key).await else {
+        tracing::warn!(key = %key, "retention: sidecar unreadable — version skipped (kept)");
+        return None;
+    };
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&data) else {
+        tracing::warn!(key = %key, "retention: sidecar unparsable — version skipped (kept)");
+        return None;
+    };
+    let sv = parse(&json);
+    if sv.package.is_empty() || sv.href != pkg_path {
+        // href/path divergence means the sidecar does not describe this
+        // package file — leave it for `-/reindex` to reconcile.
+        tracing::warn!(key = %key, "retention: sidecar/package mismatch — version skipped (kept)");
+        return None;
+    }
+    let package_key = format!("{registry}/{repo}/{pkg_path}");
+    let modified = match sv.modified {
+        Some(m) => m,
+        None => storage.stat(key).await.map(|m| m.modified).unwrap_or(0),
+    };
+    let group = match &sv.placement {
+        Some(placement) => {
+            format!("{registry}:{repo}/{placement}/{}/{}", sv.arch, sv.package)
+        }
+        None => format!("{registry}:{repo}/{}/{}", sv.arch, sv.package),
+    };
+    Some((
+        group,
+        VersionEntry {
+            name: sv.version,
+            keys: vec![package_key, key.to_string()],
+            modified,
+            size: sv.size,
+        },
+    ))
 }
 
 /// Collect raw "versions" as depth-2 path prefixes: `raw/{top}/{version}/…`
@@ -903,14 +919,34 @@ pub async fn run_retention(
             None => continue,
         };
 
-        let plans = plan_deletions(versions, rule, now);
+        let mut plans = plan_deletions(versions, rule, now);
         if plans.is_empty() {
             continue;
         }
 
-        total_planned += plans.len();
-
         if !dry_run {
+            // Only the plans carried out are deleted versions: one whose version changed
+            // since it was planned is kept, and reported nowhere as deleted.
+            let mut deleted = Vec::with_capacity(plans.len());
+            for plan in plans {
+                let Some(keys) = delete_plan_keys(storage, publish_locks, &group_name, &plan).await
+                else {
+                    continue;
+                };
+                total_deleted_keys += keys;
+                total_bytes += plan.size;
+                info!(
+                    group = %group_name,
+                    version = %plan.version_name,
+                    reason = %plan.reason,
+                    "Retention: deleted"
+                );
+                deleted.push(plan);
+            }
+            plans = deleted;
+            if plans.is_empty() {
+                continue;
+            }
             if let Some(artifact) = group_name.strip_prefix("maven:") {
                 maven_regen
                     .entry(artifact.to_string())
@@ -940,16 +976,6 @@ pub async fn run_retention(
                     repo.1,
                 ));
             }
-            for plan in &plans {
-                total_deleted_keys += delete_plan_keys(storage, publish_locks, plan).await;
-                total_bytes += plan.size;
-                info!(
-                    group = %group_name,
-                    version = %plan.version_name,
-                    reason = %plan.reason,
-                    "Retention: deleted"
-                );
-            }
         } else {
             for plan in &plans {
                 total_bytes += plan.size;
@@ -963,6 +989,7 @@ pub async fn run_retention(
             }
         }
 
+        total_planned += plans.len();
         all_plans.push((group_name, plans));
     }
 
@@ -1022,9 +1049,9 @@ pub async fn run_retention(
             Some(crate::registry_type::RegistryType::Rpm)
         );
         let lock_key = if is_rpm {
-            format!("rpm/{repo}/repodata/repomd.xml")
+            crate::registry::rpm::repo_publish_lock_key(repo)
         } else {
-            format!("deb/{repo}/Release")
+            crate::registry::deb::repo_publish_lock_key(repo)
         };
         let lock = crate::acquire_publish_lock(publish_locks, &lock_key);
         let _guard = lock.lock().await;
@@ -1071,24 +1098,227 @@ pub async fn run_retention(
     }
 }
 
-/// Delete the keys of one plan, each under the publish lock of its key, so a concurrent publish
-/// of the same key is never interleaved. Returns the number of keys deleted.
+/// How the writers of a group's versions are serialized, when it is not by the lock of each key:
+/// the lock they hold while they write a version, and with it how the version is read again
+/// under that lock. An rpm or deb upload stores the package and its sidecar under the
+/// repository's lock (#1298), a Maven deploy stores a file and its checksums under the artifact's
+/// metadata lock, a PyPI upload stores a file, its `.sha256`, its hash marker and the record that
+/// it is the project's own under the lock of the file's key (the plan's first).
+enum Writers {
+    /// An rpm or deb repository, and how its sidecars read.
+    Repository {
+        lock: String,
+        registry: crate::registry_type::RegistryType,
+        parse: fn(&serde_json::Value) -> SidecarVersion,
+    },
+    /// A Maven artifact.
+    MavenArtifact { lock: String },
+    /// A PyPI file of `project`.
+    PypiFile { lock: String, project: String },
+}
+
+impl Writers {
+    /// The writers of the versions of `group_name` (`{registry}:{name}`), `plan` being one of
+    /// them; `None` for a format whose versions are deleted under each key's lock alone.
+    fn of(group_name: &str, plan: &DeletionPlan) -> Option<Self> {
+        use crate::registry_type::RegistryType;
+        let (registry, name) = group_name.split_once(':')?;
+        let registry = RegistryType::from_str_opt(registry)?;
+        match registry {
+            RegistryType::Rpm => Some(Self::Repository {
+                lock: crate::registry::rpm::repo_publish_lock_key(name.split('/').next()?),
+                registry,
+                parse: rpm_sidecar_version,
+            }),
+            RegistryType::Deb => Some(Self::Repository {
+                lock: crate::registry::deb::repo_publish_lock_key(name.split('/').next()?),
+                registry,
+                parse: deb_sidecar_version,
+            }),
+            RegistryType::Maven => {
+                let (group_path, artifact_id) = name.rsplit_once('/')?;
+                Some(Self::MavenArtifact {
+                    lock: crate::registry::maven_artifact_metadata_lock_key(
+                        group_path,
+                        artifact_id,
+                    ),
+                })
+            }
+            RegistryType::PyPI => Some(Self::PypiFile {
+                lock: plan.keys.first()?.clone(),
+                project: name.to_string(),
+            }),
+            RegistryType::Docker
+            | RegistryType::Npm
+            | RegistryType::Cargo
+            | RegistryType::Go
+            | RegistryType::Raw
+            | RegistryType::Gems
+            | RegistryType::Terraform
+            | RegistryType::Ansible
+            | RegistryType::Nuget
+            | RegistryType::PubDart
+            | RegistryType::Conan
+            | RegistryType::Cpan
+            | RegistryType::Composer
+            | RegistryType::HuggingFace => None,
+        }
+    }
+
+    /// The key of the lock the writers hold.
+    fn lock_key(&self) -> &str {
+        match self {
+            Self::Repository { lock, .. }
+            | Self::MavenArtifact { lock }
+            | Self::PypiFile { lock, .. } => lock,
+        }
+    }
+}
+
+/// Whether a Maven version is still the files `plan` takes, as old as when it was planned. A
+/// deploy that rewrote one of them changed the version's `modified`; one that added a file to
+/// the version (a classifier's jar, the pom) changed its files, and deleting the planned ones
+/// would leave the added file alone. A version whose files cannot be listed is not known to be
+/// unchanged, and is kept.
+async fn maven_version_unchanged(storage: &Storage, plan: &DeletionPlan) -> bool {
+    let Some((dir, _)) = plan.keys.first().and_then(|key| key.rsplit_once('/')) else {
+        return false;
+    };
+    let Ok(listed) = storage.list(&format!("{dir}/")).await else {
+        return false;
+    };
+    // The version's own files: a deeper key is a file of another artifact's version.
+    let mut stored: Vec<&str> = listed
+        .iter()
+        .map(String::as_str)
+        .filter(|key| {
+            key.rsplit_once('/').map(|(parent, _)| parent) == Some(dir)
+                && crate::registry::MavenVersionFile::parse(key).is_some()
+        })
+        .collect();
+    stored.sort_unstable();
+    let mut planned: Vec<&str> = plan.keys.iter().map(String::as_str).collect();
+    planned.sort_unstable();
+    stored == planned && aggregate_meta(storage, &plan.keys).await.0 == plan.modified
+}
+
+/// Whether a PyPI file is still the keys `plan` takes, as old as when it was planned. An upload
+/// that replaced the file changed its `modified` (a file is as old as the file itself, the plan's
+/// first key); one that was still running when the plan was made has since stored the `.sha256`,
+/// the hash marker and the record beside the file, and deleting the planned keys would leave
+/// those alone. A file whose markers cannot be listed is not known to be unchanged, and is kept.
+async fn pypi_file_unchanged(storage: &Storage, project: &str, plan: &DeletionPlan) -> bool {
+    let Some(file_key) = plan.keys.first() else {
+        return false;
+    };
+    let filename = file_key.rsplit('/').next().unwrap_or("");
+    // The keys of the file, found the way `collect_pypi_versions` finds them.
+    let mut stored = vec![file_key.clone()];
+    let hash_key = format!("{file_key}.sha256");
+    if storage.stat(&hash_key).await.is_some() {
+        stored.push(hash_key);
+    }
+    let marker_root = crate::registry::PYPI_HASH_MARKER_PREFIX;
+    let Ok(markers) = storage
+        .list(&format!("{marker_root}{project}/{filename}/"))
+        .await
+    else {
+        return false;
+    };
+    stored.extend(markers);
+    let own = crate::registry::pypi_own_file_key(project, filename);
+    if storage.stat(&own).await.is_some() {
+        stored.push(own);
+    }
+    stored.sort_unstable();
+    let mut planned = plan.keys.clone();
+    planned.sort_unstable();
+    stored == planned
+        && aggregate_meta(storage, std::slice::from_ref(file_key))
+            .await
+            .0
+            == plan.modified
+}
+
+/// Whether the version `plan` takes still reads as it did when it was planned, read under the
+/// lock of its `writers` the way its collector read it: same group, name, keys and `modified`. A
+/// writer that rewrote the version since (a re-upload of the same path) changed its `modified`;
+/// a rewrite that leaves even that equal leaves every input of the plan equal, so the plan
+/// stands.
+async fn plan_still_current(
+    storage: &Storage,
+    writers: &Writers,
+    group_name: &str,
+    plan: &DeletionPlan,
+) -> bool {
+    match writers {
+        Writers::Repository {
+            registry, parse, ..
+        } => {
+            let Some(sidecar) = plan.keys.iter().find(|key| key.contains("/.nora-meta/")) else {
+                return false;
+            };
+            sidecar_version(storage, registry.as_str(), sidecar, *parse)
+                .await
+                .is_some_and(|(group, entry)| {
+                    group == group_name
+                        && entry.name == plan.version_name
+                        && entry.keys == plan.keys
+                        && entry.modified == plan.modified
+                })
+        }
+        Writers::MavenArtifact { .. } => maven_version_unchanged(storage, plan).await,
+        Writers::PypiFile { project, .. } => pypi_file_unchanged(storage, project, plan).await,
+    }
+}
+
+/// Delete the keys of one plan, so that no publish of them is interleaved: under the lock its
+/// writers hold ([`Writers`]) when that is not each key's own — and then only if the version is
+/// still the one planned — and each key under its own lock, as before. Returns the number of
+/// keys deleted, or `None` when the version changed since it was planned and is kept.
 async fn delete_plan_keys(
     storage: &Storage,
     publish_locks: &PublishLocks,
+    group_name: &str,
     plan: &DeletionPlan,
-) -> usize {
+) -> Option<usize> {
+    // LOCK-SAFE: tokio mutexes. The writers' lock is taken before any key's, as the handlers
+    // take a shorter path's lock first; no holder of a key's lock waits for the writers' lock.
+    let writers = Writers::of(group_name, plan);
+    let writer_lock = writers
+        .as_ref()
+        .map(|writers| crate::acquire_publish_lock(publish_locks, writers.lock_key()));
+    let _writer_guard = match &writer_lock {
+        Some(lock) => Some(lock.lock().await),
+        None => None,
+    };
+    if let Some(writers) = &writers {
+        if !plan_still_current(storage, writers, group_name, plan).await {
+            info!(
+                group = %group_name,
+                version = %plan.version_name,
+                "Retention: version changed since it was planned — kept"
+            );
+            return None;
+        }
+    }
+    let writer_lock_key = writers.as_ref().map(Writers::lock_key);
     let mut deleted = 0;
     for key in &plan.keys {
         // Serialize with concurrent publish to prevent deleting
-        // an artifact that is being referenced by a new publish.
-        let lock = crate::acquire_publish_lock(publish_locks, key);
-        let _guard = lock.lock().await;
+        // an artifact that is being referenced by a new publish. The writers' lock, when it is
+        // a key's own (a PyPI file's), is held already.
+        let lock = (writer_lock_key != Some(key.as_str()))
+            .then(|| crate::acquire_publish_lock(publish_locks, key));
+        let _guard = match &lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         if storage.delete(key).await.is_ok() {
             deleted += 1;
         }
     }
-    deleted
+    Some(deleted)
 }
 
 /// Reconcile the Maven documents of the artifacts retention touched (#1281), `regen` mapping each
@@ -1650,6 +1880,7 @@ mod tests {
                     keys: version.keys.clone(),
                     size: version.size,
                     reason: reason_parts.join(", "),
+                    modified: version.modified,
                 });
             }
         }
@@ -4549,5 +4780,1011 @@ mod maven_proxy_document_and_retention {
     #[tokio::test]
     async fn test_maven_proxy_document_write_and_retention_object_store() {
         no_checksum_outlives_its_document(Arc::new(ObjectStorage::in_memory())).await;
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod upload_racing_retention {
+    //! An upload of a package path that retention is deleting (#1298). The upload holds the
+    //! repository's lock while it stores the package, then its metadata sidecar; retention, which
+    //! planned from what was stored before, must not delete the package in between. Either the
+    //! upload's package survives (and the index lists it), or the deletion ran first and the
+    //! upload stored the package again after it.
+    use super::*;
+    use crate::test_helpers::{
+        body_bytes, create_test_context_with_storage_and_config, local_outage_storage,
+        outage_storage, send, StorageOutage, TestContext,
+    };
+    use axum::http::{Method, StatusCode};
+    use sha2::Digest as _;
+    use std::time::Duration;
+
+    fn rule(registry: &str, keep: Option<u32>, days: Option<u32>) -> RetentionRule {
+        RetentionRule {
+            registry: registry.into(),
+            name_glob: None,
+            keep_last: keep,
+            older_than_days: days,
+            include_tags: Vec::new(),
+            exclude_tags: Vec::new(),
+        }
+    }
+
+    fn build_rpm(name: &str, version: &str) -> Vec<u8> {
+        let pkg = rpm::PackageBuilder::new(name, version, "MIT", "x86_64", "t")
+            .release("1")
+            .build()
+            .unwrap();
+        let mut buf = Vec::new();
+        pkg.write(&mut buf).unwrap();
+        buf
+    }
+
+    /// A context over the in-memory object store, and its switch.
+    fn in_memory() -> (TestContext, StorageOutage, Option<tempfile::TempDir>) {
+        let (storage, outage) = outage_storage();
+        (
+            create_test_context_with_storage_and_config(storage, |_| {}),
+            outage,
+            None,
+        )
+    }
+
+    /// A context over a local directory, and its switch.
+    fn local() -> (TestContext, StorageOutage, Option<tempfile::TempDir>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_str().unwrap().to_string();
+        let (storage, outage) = local_outage_storage(&path);
+        let ctx = create_test_context_with_storage_and_config(storage, |c| {
+            c.storage.path = path.clone();
+        });
+        (ctx, outage, Some(dir))
+    }
+
+    async fn text(ctx: &TestContext, uri: &str) -> String {
+        let response = send(&ctx.app, Method::GET, uri, "").await;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        String::from_utf8(body_bytes(response).await.to_vec()).unwrap()
+    }
+
+    /// The rpm repository's primary.xml, read the way a client reads it: repomd.xml first.
+    async fn rpm_primary(ctx: &TestContext, repo: &str) -> String {
+        let repomd = text(ctx, &format!("/rpm/{repo}/repodata/repomd.xml")).await;
+        let start = repomd.find("primary").unwrap();
+        let href_at = repomd[start..].find("href=\"").unwrap() + start + 6;
+        let end = repomd[href_at..].find('"').unwrap() + href_at;
+        let gz = body_bytes(
+            send(
+                &ctx.app,
+                Method::GET,
+                &format!("/rpm/{repo}/{}", &repomd[href_at..end]),
+                "",
+            )
+            .await,
+        )
+        .await;
+        let mut primary = String::new();
+        std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(&gz[..]), &mut primary)
+            .unwrap();
+        primary
+    }
+
+    /// Re-upload `uri` while retention runs `rules`: the upload's write of its new `sidecar` is
+    /// held at the store — the package is already stored and the repository's lock held — until
+    /// retention has read what it plans from of the sidecar stored before (`planning_reads`
+    /// reads, `get` and `stat` counted); then the write goes on. Without serialization the
+    /// upload may also fail its index rebuild, the sidecars deleted under it — the same defect.
+    /// Both must finish within the deadline.
+    async fn reupload_racing_retention(
+        ctx: &TestContext,
+        outage: &StorageOutage,
+        uri: &str,
+        body: Vec<u8>,
+        sidecar: &str,
+        planning_reads: usize,
+        rules: Vec<RetentionRule>,
+    ) -> RetentionResult {
+        // Every rpm and deb sidecar names the package's architecture.
+        let held = outage.hold_write_of(sidecar, b"\"arch\"");
+        let planned_from = outage.watch_reads_of(sidecar, planning_reads);
+        // CANCEL-SAFETY: a watchdog over the scenario: a deadlock fails the test instead of
+        // stalling the run; nothing is ordered by it.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            // The package's key is the upload's path: `/rpm/{repo}/{path}` → `rpm/{repo}/{path}`.
+            let package = uri.trim_start_matches('/').to_string();
+            let app = ctx.app.clone();
+            let uri = uri.to_string();
+            let put = async move { send(&app, Method::PUT, &uri, body).await.status() };
+            let upload = tokio::spawn(put);
+            held.reached().await;
+            let (storage, locks, signer) = (
+                ctx.state.storage.clone(),
+                ctx.state.publish_locks.clone(),
+                ctx.state.signer.clone(),
+            );
+            let retention = tokio::spawn(async move {
+                run_retention(&storage, &locks, signer.as_deref(), &rules, false).await
+            });
+            // Retention read the old sidecar: its plan takes the package, whatever runs next.
+            planned_from.answered().await;
+            // Unserialized, retention deletes the package within milliseconds; serialized, it
+            // waits for the repository's lock, and this wait is spent.
+            let started = std::time::Instant::now();
+            while ctx.state.storage.stat(&package).await.is_some()
+                && started.elapsed() < Duration::from_millis(200)
+            {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            held.release();
+            assert_eq!(upload.await.unwrap(), StatusCode::CREATED, "upload");
+            retention.await.unwrap()
+        })
+        .await
+        .expect("the upload and retention both finished")
+    }
+
+    /// A version retention planned from its old state and kept is not reported as deleted: not
+    /// in the count the audit trail records, not in the keys or bytes.
+    fn assert_nothing_reported_deleted(result: &RetentionResult) {
+        assert_eq!(
+            (result.planned, result.deleted_keys, result.bytes_freed),
+            (0, 0, 0),
+            "a kept version reported as deleted: {:?}",
+            result.plans
+        );
+    }
+
+    async fn rpm_reupload_keeps_its_package(ctx: TestContext, outage: StorageOutage) {
+        let path = "pkg-1.0-1.x86_64.rpm";
+        let uri = format!("/rpm/prod/{path}");
+        let package = format!("rpm/prod/{path}");
+        let sidecar = format!("rpm/prod/.nora-meta/{path}.json");
+        let body = build_rpm("pkg", "1.0");
+        let first = send(&ctx.app, Method::PUT, &uri, body.clone()).await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        // The stored version is 40 days old (the collector reads its sidecar's file_time), so a
+        // 30-day rule plans its deletion; the re-upload is new and outside the rule.
+        let mut sc: serde_json::Value =
+            serde_json::from_slice(&ctx.state.storage.get(&sidecar).await.unwrap()).unwrap();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        sc["file_time"] = serde_json::json!(now - 40 * 86400);
+        ctx.state
+            .storage
+            .put(&sidecar, &serde_json::to_vec(&sc).unwrap())
+            .await
+            .unwrap();
+
+        let result = reupload_racing_retention(
+            &ctx,
+            &outage,
+            &uri,
+            body.clone(),
+            &sidecar,
+            // The sidecar's content: file_time is the version's age.
+            1,
+            vec![rule("rpm", None, Some(30))],
+        )
+        .await;
+        assert_nothing_reported_deleted(&result);
+
+        let stored = ctx.state.storage.get(&package).await.ok();
+        assert!(
+            stored.as_deref() == Some(&body[..]),
+            "the upload answered 201 and its package is gone (stored: {:?} bytes)",
+            stored.map(|b| b.len())
+        );
+        assert!(
+            ctx.state.storage.stat(&sidecar).await.is_some(),
+            "the package's sidecar is gone"
+        );
+        let primary = rpm_primary(&ctx, "prod").await;
+        assert!(
+            primary.contains("packages=\"1\"") && primary.contains(path),
+            "the repodata does not list the uploaded package: {primary}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpm_reupload_during_retention_keeps_its_package_local() {
+        let (ctx, outage, _dir) = local();
+        rpm_reupload_keeps_its_package(ctx, outage).await;
+    }
+
+    #[tokio::test]
+    async fn rpm_reupload_during_retention_keeps_its_package_object_store() {
+        let (ctx, outage, _dir) = in_memory();
+        rpm_reupload_keeps_its_package(ctx, outage).await;
+    }
+
+    async fn deb_reupload_keeps_its_package(ctx: TestContext, outage: StorageOutage) {
+        let uri = "/deb/prod/pool/pkg_1.0.deb";
+        let package = "deb/prod/pool/pkg_1.0.deb";
+        let sidecar = "deb/prod/.nora-meta/pool/pkg_1.0.deb.json";
+        let body = crate::registry::deb::test_fixtures::build_deb("pkg", "1.0");
+        // A deb version is as old as its sidecar's write time, in whole seconds: 1.0 is written
+        // a second before 2.0, so keep_last=1 plans 1.0's deletion, and the re-upload a second
+        // after 2.0 makes 1.0 the newest.
+        let first = send(&ctx.app, Method::PUT, uri, body.clone()).await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let newer = send(
+            &ctx.app,
+            Method::PUT,
+            "/deb/prod/pool/pkg_2.0.deb",
+            crate::registry::deb::test_fixtures::build_deb("pkg", "2.0"),
+        )
+        .await;
+        assert_eq!(newer.status(), StatusCode::CREATED);
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+
+        let result = reupload_racing_retention(
+            &ctx,
+            &outage,
+            uri,
+            body.clone(),
+            sidecar,
+            // The sidecar's content, then its write time: the version's age.
+            2,
+            vec![rule("deb", Some(1), None)],
+        )
+        .await;
+        assert_nothing_reported_deleted(&result);
+
+        let stored = ctx.state.storage.get(package).await.ok();
+        assert!(
+            stored.as_deref() == Some(&body[..]),
+            "the upload answered 201 and its package is gone (stored: {:?} bytes)",
+            stored.map(|b| b.len())
+        );
+        assert!(
+            ctx.state.storage.stat(sidecar).await.is_some(),
+            "the package's sidecar is gone"
+        );
+        let packages = text(&ctx, "/deb/prod/Packages").await;
+        assert!(
+            packages.contains("Version: 1.0"),
+            "the Packages index does not list the uploaded package: {packages}"
+        );
+    }
+
+    /// Maven: a deploy of a version's file holds its artifact's metadata lock while it stores the
+    /// file, then the file's checksums. A SNAPSHOT deployed under its plain name rewrites the same
+    /// path. Retention deleting the old version is paused after the jar, before its checksums
+    /// (the test holds the lock of the `.md5` key, the one retention takes before deleting it),
+    /// while the redeploy runs: the redeploy must not end up as a jar without its checksums.
+    async fn maven_redeploy_keeps_its_file(ctx: TestContext) {
+        let base = "com/example/race";
+        let jar = format!("{base}/1.0-SNAPSHOT/race-1.0-SNAPSHOT.jar");
+        let uri = format!("/maven2/{jar}");
+        let package = format!("maven/{jar}");
+        let body = b"snapshot-jar".to_vec();
+        let first = send(&ctx.app, Method::PUT, &uri, body.clone()).await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let newer = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/maven2/{base}/1.1-SNAPSHOT/race-1.1-SNAPSHOT.jar"),
+            b"newer".to_vec(),
+        )
+        .await;
+        assert_eq!(newer.status(), StatusCode::CREATED);
+        let mut snapshots = rule("maven", None, None);
+        snapshots.include_tags = vec!["1.0-SNAPSHOT".to_string()];
+        snapshots.keep_last = Some(0);
+
+        let md5_lock =
+            crate::acquire_publish_lock(&ctx.state.publish_locks, &format!("{package}.md5"));
+        let md5_guard = md5_lock.lock().await;
+        // CANCEL-SAFETY: a watchdog over the scenario: a deadlock fails the test instead of
+        // stalling the run; nothing is ordered by it.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (storage, locks, signer) = (
+                ctx.state.storage.clone(),
+                ctx.state.publish_locks.clone(),
+                ctx.state.signer.clone(),
+            );
+            let rules = vec![snapshots];
+            let retention = tokio::spawn(async move {
+                run_retention(&storage, &locks, signer.as_deref(), &rules, false).await
+            });
+            // Retention deletes the jar first, then waits for the `.md5` lock.
+            while ctx.state.storage.stat(&package).await.is_some() && !retention.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let app = ctx.app.clone();
+            let (uri, redeployed) = (uri.clone(), body.clone());
+            let put = async move { send(&app, Method::PUT, &uri, redeployed).await.status() };
+            let deploy = tokio::spawn(put);
+            // Unserialized, the deploy stores the jar and its checksums now; serialized with the
+            // deletion, it waits for it. (A deploy's HTTP path takes milliseconds.)
+            let started = std::time::Instant::now();
+            while !deploy.is_finished() && started.elapsed() < Duration::from_secs(2) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(md5_guard);
+            assert_eq!(deploy.await.unwrap(), StatusCode::CREATED, "deploy");
+            let result = retention.await.unwrap();
+            // Planned from the version as stored, and carried out before the deploy.
+            assert_eq!(result.planned, 1, "{:?}", result.plans);
+        })
+        .await
+        .expect("the deploy and retention both finished");
+
+        let stored = ctx.state.storage.get(&package).await.ok();
+        assert!(
+            stored.as_deref() == Some(&body[..]),
+            "the deploy answered 201 and its file is gone (stored: {:?} bytes)",
+            stored.map(|b| b.len())
+        );
+        for suffix in ["md5", "sha1", "sha256", "sha512"] {
+            assert!(
+                ctx.state
+                    .storage
+                    .stat(&format!("{package}.{suffix}"))
+                    .await
+                    .is_some(),
+                "the deployed file's .{suffix} is gone"
+            );
+        }
+    }
+
+    /// Maven: retention planned 1.0-SNAPSHOT's deletion from its old files, then waits for the
+    /// artifact's lock, which a deploy holds while it rewrites the version's jar and checksums
+    /// (the test holds the lock and writes them as the deploy does). Under the lock the version
+    /// no longer reads as planned, so it is kept, and reported nowhere as deleted.
+    async fn maven_version_rewritten_after_planning_is_kept(
+        ctx: TestContext,
+        outage: StorageOutage,
+    ) {
+        let base = "com/example/race";
+        let jar = format!("maven/{base}/1.0-SNAPSHOT/race-1.0-SNAPSHOT.jar");
+        let first = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/maven2/{base}/1.0-SNAPSHOT/race-1.0-SNAPSHOT.jar"),
+            b"old".to_vec(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        // Ages in whole seconds: 1.0-SNAPSHOT older than 1.1-SNAPSHOT, then rewritten newest.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let newer = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/maven2/{base}/1.1-SNAPSHOT/race-1.1-SNAPSHOT.jar"),
+            b"newer".to_vec(),
+        )
+        .await;
+        assert_eq!(newer.status(), StatusCode::CREATED);
+        let mut snapshots = rule("maven", Some(1), None);
+        snapshots.include_tags = vec!["*-SNAPSHOT".to_string()];
+
+        let artifact_lock = crate::acquire_publish_lock(
+            &ctx.state.publish_locks,
+            &crate::registry::maven_artifact_metadata_lock_key("com/example", "race"),
+        );
+        let deploy_guard = artifact_lock.lock().await;
+        // The jar and its four checksums: the version's age is the newest of them.
+        let planned_from = outage.watch_reads_of(".jar.sha512", 2);
+        // CANCEL-SAFETY: a watchdog over the scenario: a deadlock fails the test instead of
+        // stalling the run; nothing is ordered by it.
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let (storage, locks, signer) = (
+                ctx.state.storage.clone(),
+                ctx.state.publish_locks.clone(),
+                ctx.state.signer.clone(),
+            );
+            let rules = vec![snapshots];
+            let retention = tokio::spawn(async move {
+                run_retention(&storage, &locks, signer.as_deref(), &rules, false).await
+            });
+            // Both versions' files were read (stat of each `.sha512`): the plan is made.
+            planned_from.answered().await;
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let body = b"redeployed".to_vec();
+            ctx.state.storage.put(&jar, &body).await.unwrap();
+            for suffix in ["md5", "sha1", "sha256", "sha512"] {
+                let sum = match suffix {
+                    "md5" => hex::encode(md5::Md5::digest(&body)),
+                    "sha1" => hex::encode(sha1::Sha1::digest(&body)),
+                    "sha256" => hex::encode(sha2::Sha256::digest(&body)),
+                    _ => hex::encode(sha2::Sha512::digest(&body)),
+                };
+                ctx.state
+                    .storage
+                    .put(&format!("{jar}.{suffix}"), sum.as_bytes())
+                    .await
+                    .unwrap();
+            }
+            drop(deploy_guard);
+            retention.await.unwrap()
+        })
+        .await
+        .expect("retention finished");
+
+        assert_eq!(
+            ctx.state.storage.get(&jar).await.ok().as_deref(),
+            Some(&b"redeployed"[..]),
+            "the rewritten version was deleted by a plan made before it"
+        );
+        for suffix in ["md5", "sha1", "sha256", "sha512"] {
+            assert!(
+                ctx.state
+                    .storage
+                    .stat(&format!("{jar}.{suffix}"))
+                    .await
+                    .is_some(),
+                ".{suffix} gone"
+            );
+        }
+        assert_eq!(
+            result.planned, 0,
+            "a kept version reported as deleted: {:?}",
+            result.plans
+        );
+    }
+
+    #[tokio::test]
+    async fn maven_version_rewritten_after_planning_is_kept_local() {
+        let (ctx, outage, _dir) = local();
+        maven_version_rewritten_after_planning_is_kept(ctx, outage).await;
+    }
+
+    #[tokio::test]
+    async fn maven_version_rewritten_after_planning_is_kept_object_store() {
+        let (ctx, outage, _dir) = in_memory();
+        maven_version_rewritten_after_planning_is_kept(ctx, outage).await;
+    }
+
+    /// Maven: retention planned 1.0-SNAPSHOT's deletion from the files it had, then waits for the
+    /// artifact's lock, which a deploy holds while it adds a file to the version (a `-sources.jar`
+    /// beside the jar; the test holds the lock and writes as the deploy does). The files planned
+    /// are untouched, but the version is no longer the one planned: it is kept whole, not left as
+    /// the added file alone.
+    async fn maven_version_given_a_file_after_planning_is_kept(
+        ctx: TestContext,
+        outage: StorageOutage,
+    ) {
+        let base = "com/example/race";
+        let dir = format!("maven/{base}/1.0-SNAPSHOT");
+        let jar = format!("{dir}/race-1.0-SNAPSHOT.jar");
+        let first = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/maven2/{base}/1.0-SNAPSHOT/race-1.0-SNAPSHOT.jar"),
+            b"old".to_vec(),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        // Ages in whole seconds: 1.0-SNAPSHOT older than 1.1-SNAPSHOT.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let newer = send(
+            &ctx.app,
+            Method::PUT,
+            &format!("/maven2/{base}/1.1-SNAPSHOT/race-1.1-SNAPSHOT.jar"),
+            b"newer".to_vec(),
+        )
+        .await;
+        assert_eq!(newer.status(), StatusCode::CREATED);
+        let mut snapshots = rule("maven", Some(1), None);
+        snapshots.include_tags = vec!["*-SNAPSHOT".to_string()];
+
+        let artifact_lock = crate::acquire_publish_lock(
+            &ctx.state.publish_locks,
+            &crate::registry::maven_artifact_metadata_lock_key("com/example", "race"),
+        );
+        let deploy_guard = artifact_lock.lock().await;
+        // The jar and its four checksums: the version's age is the newest of them.
+        let planned_from = outage.watch_reads_of(".jar.sha512", 2);
+        // CANCEL-SAFETY: a watchdog over the scenario: a deadlock fails the test instead of
+        // stalling the run; nothing is ordered by it.
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let (storage, locks, signer) = (
+                ctx.state.storage.clone(),
+                ctx.state.publish_locks.clone(),
+                ctx.state.signer.clone(),
+            );
+            let rules = vec![snapshots];
+            let retention = tokio::spawn(async move {
+                run_retention(&storage, &locks, signer.as_deref(), &rules, false).await
+            });
+            // Both versions' files were read (stat of each `.sha512`): the plan is made.
+            planned_from.answered().await;
+            // The added file makes 1.0-SNAPSHOT the newest version, a second after 1.1-SNAPSHOT.
+            tokio::time::sleep(Duration::from_millis(1100)).await;
+            let sources = format!("{dir}/race-1.0-SNAPSHOT-sources.jar");
+            let body = b"sources".to_vec();
+            ctx.state.storage.put(&sources, &body).await.unwrap();
+            let sum = hex::encode(sha2::Sha256::digest(&body));
+            ctx.state
+                .storage
+                .put(&format!("{sources}.sha256"), sum.as_bytes())
+                .await
+                .unwrap();
+            drop(deploy_guard);
+            retention.await.unwrap()
+        })
+        .await
+        .expect("retention finished");
+
+        assert_eq!(
+            ctx.state.storage.get(&jar).await.ok().as_deref(),
+            Some(&b"old"[..]),
+            "a version that was given a file was deleted around it by a plan made before"
+        );
+        for suffix in ["md5", "sha1", "sha256", "sha512"] {
+            assert!(
+                ctx.state
+                    .storage
+                    .stat(&format!("{jar}.{suffix}"))
+                    .await
+                    .is_some(),
+                ".{suffix} gone"
+            );
+        }
+        assert_eq!(
+            result.planned, 0,
+            "a kept version reported as deleted: {:?}",
+            result.plans
+        );
+    }
+
+    #[tokio::test]
+    async fn maven_version_given_a_file_after_planning_is_kept_local() {
+        let (ctx, outage, _dir) = local();
+        maven_version_given_a_file_after_planning_is_kept(ctx, outage).await;
+    }
+
+    #[tokio::test]
+    async fn maven_version_given_a_file_after_planning_is_kept_object_store() {
+        let (ctx, outage, _dir) = in_memory();
+        maven_version_given_a_file_after_planning_is_kept(ctx, outage).await;
+    }
+
+    /// Maven: a client uploads a file's checksum while retention deletes the file's version.
+    /// Retention is paused after the jar, before its checksums (the test holds the lock of the
+    /// `.md5` key, the one retention takes before deleting it), while the `.sha256` is uploaded:
+    /// the upload must not answer 201 for a checksum the deletion then takes.
+    async fn maven_checksum_upload_keeps_its_checksum(ctx: TestContext) {
+        let base = "com/example/race";
+        let jar = format!("{base}/1.0-SNAPSHOT/race-1.0-SNAPSHOT.jar");
+        let uri = format!("/maven2/{jar}");
+        let package = format!("maven/{jar}");
+        let body = b"snapshot-jar".to_vec();
+        let first = send(&ctx.app, Method::PUT, &uri, body.clone()).await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let mut snapshots = rule("maven", None, None);
+        snapshots.include_tags = vec!["1.0-SNAPSHOT".to_string()];
+        snapshots.keep_last = Some(0);
+
+        let md5_lock =
+            crate::acquire_publish_lock(&ctx.state.publish_locks, &format!("{package}.md5"));
+        let md5_guard = md5_lock.lock().await;
+        // CANCEL-SAFETY: a watchdog over the scenario: a deadlock fails the test instead of
+        // stalling the run; nothing is ordered by it.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (storage, locks, signer) = (
+                ctx.state.storage.clone(),
+                ctx.state.publish_locks.clone(),
+                ctx.state.signer.clone(),
+            );
+            let rules = vec![snapshots];
+            let retention = tokio::spawn(async move {
+                run_retention(&storage, &locks, signer.as_deref(), &rules, false).await
+            });
+            // Retention deletes the jar first, then waits for the `.md5` lock.
+            while ctx.state.storage.stat(&package).await.is_some() && !retention.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let app = ctx.app.clone();
+            let sum_uri = format!("{uri}.sha256");
+            let sum = hex::encode(sha2::Sha256::digest(&body));
+            let put = async move { send(&app, Method::PUT, &sum_uri, sum).await.status() };
+            let upload = tokio::spawn(put);
+            // Unserialized, the upload stores the checksum now; serialized with the deletion,
+            // it waits for it. (An upload's HTTP path takes milliseconds.)
+            let started = std::time::Instant::now();
+            while !upload.is_finished() && started.elapsed() < Duration::from_secs(2) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(md5_guard);
+            assert_eq!(
+                upload.await.unwrap(),
+                StatusCode::CREATED,
+                "checksum upload"
+            );
+            let result = retention.await.unwrap();
+            // Planned from the version as stored, and carried out before the upload.
+            assert_eq!(result.planned, 1, "{:?}", result.plans);
+        })
+        .await
+        .expect("the upload and retention both finished");
+
+        assert!(
+            ctx.state
+                .storage
+                .stat(&format!("{package}.sha256"))
+                .await
+                .is_some(),
+            "the upload answered 201 and its checksum is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn maven_checksum_upload_during_retention_keeps_its_checksum_local() {
+        let (ctx, _outage, _dir) = local();
+        maven_checksum_upload_keeps_its_checksum(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn maven_checksum_upload_during_retention_keeps_its_checksum_object_store() {
+        let (ctx, _outage, _dir) = in_memory();
+        maven_checksum_upload_keeps_its_checksum(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn maven_redeploy_during_retention_keeps_its_file_local() {
+        let (ctx, _outage, _dir) = local();
+        maven_redeploy_keeps_its_file(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn maven_redeploy_during_retention_keeps_its_file_object_store() {
+        let (ctx, _outage, _dir) = in_memory();
+        maven_redeploy_keeps_its_file(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn deb_reupload_during_retention_keeps_its_package_local() {
+        let (ctx, outage, _dir) = local();
+        deb_reupload_keeps_its_package(ctx, outage).await;
+    }
+
+    #[tokio::test]
+    async fn deb_reupload_during_retention_keeps_its_package_object_store() {
+        let (ctx, outage, _dir) = in_memory();
+        deb_reupload_keeps_its_package(ctx, outage).await;
+    }
+
+    /// Retention still deletes what its rule selects, on both stores, and the index stops listing
+    /// it: the repository's lock it now takes does not keep it from its work.
+    async fn rpm_and_deb_retention_still_delete(ctx: TestContext) {
+        for v in ["1.0", "2.0"] {
+            let rpm = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/rpm/prod/pkg-{v}-1.x86_64.rpm"),
+                build_rpm("pkg", v),
+            )
+            .await;
+            assert_eq!(rpm.status(), StatusCode::CREATED);
+            let deb = send(
+                &ctx.app,
+                Method::PUT,
+                &format!("/deb/prod/pool/pkg_{v}.deb"),
+                crate::registry::deb::test_fixtures::build_deb("pkg", v),
+            )
+            .await;
+            assert_eq!(deb.status(), StatusCode::CREATED);
+        }
+        // CANCEL-SAFETY: a watchdog: a retention pass that waits forever on a lock fails the
+        // test instead of stalling the run.
+        let result = tokio::time::timeout(
+            Duration::from_secs(30),
+            run_retention(
+                &ctx.state.storage,
+                &ctx.state.publish_locks,
+                ctx.state.signer.as_deref(),
+                &[rule("rpm", Some(1), None), rule("deb", Some(1), None)],
+                false,
+            ),
+        )
+        .await
+        .expect("retention finished");
+        assert_eq!(result.planned, 2, "{:?}", result.plans);
+        assert_eq!(result.deleted_keys, 4, "package and sidecar of each");
+        for gone in [
+            "rpm/prod/pkg-1.0-1.x86_64.rpm",
+            "rpm/prod/.nora-meta/pkg-1.0-1.x86_64.rpm.json",
+            "deb/prod/pool/pkg_1.0.deb",
+            "deb/prod/.nora-meta/pool/pkg_1.0.deb.json",
+        ] {
+            assert!(ctx.state.storage.stat(gone).await.is_none(), "{gone} kept");
+        }
+        let primary = rpm_primary(&ctx, "prod").await;
+        assert!(
+            primary.contains("packages=\"1\"") && primary.contains("pkg-2.0-1.x86_64.rpm"),
+            "{primary}"
+        );
+        let packages = text(&ctx, "/deb/prod/Packages").await;
+        assert!(
+            packages.contains("Version: 2.0") && !packages.contains("Version: 1.0"),
+            "{packages}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rpm_and_deb_retention_still_delete_local() {
+        let (ctx, _outage, _dir) = local();
+        rpm_and_deb_retention_still_delete(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn rpm_and_deb_retention_still_delete_object_store() {
+        let (ctx, _outage, _dir) = in_memory();
+        rpm_and_deb_retention_still_delete(ctx).await;
+    }
+
+    /// The multipart form `twine` posts to upload `filename` of `name` 1.0.0 with `content`.
+    fn pypi_upload_form(name: &str, filename: &str, content: &str) -> (String, Vec<u8>) {
+        let b = "NORA-RETENTION-RACE-BOUNDARY";
+        let form = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\":action\"\r\n\r\nfile_upload\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"name\"\r\n\r\n{name}\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"version\"\r\n\r\n1.0.0\r\n\
+--{b}\r\nContent-Disposition: form-data; name=\"content\"; filename=\"{filename}\"\r\n\
+Content-Type: application/octet-stream\r\n\r\n{content}\r\n--{b}--\r\n"
+        );
+        (
+            format!("multipart/form-data; boundary={b}"),
+            form.into_bytes(),
+        )
+    }
+
+    async fn pypi_upload(ctx: &TestContext, filename: &str, content: &str) -> StatusCode {
+        let (ctype, body) = pypi_upload_form("racepkg", filename, content);
+        crate::test_helpers::send_with_headers(
+            &ctx.app,
+            Method::POST,
+            "/simple/",
+            vec![("content-type", ctype.as_str())],
+            body,
+        )
+        .await
+        .status()
+    }
+
+    /// PyPI: an upload stores the file, its `.sha256`, its hash marker and, last, the record that
+    /// the file is the project's own, all under the lock of the file's key; a hosted project lists
+    /// a file only once it is recorded. Retention deleting the file is paused before the record
+    /// (the test holds the record key's lock, the one retention takes before deleting it) while an
+    /// upload of the same name runs: the upload must not end up unrecorded and unlisted.
+    async fn pypi_reupload_keeps_its_record(ctx: TestContext) {
+        let filename = "racepkg-1.0.0.tar.gz";
+        let file_key = format!("pypi/racepkg/{filename}");
+        let record_key = crate::registry::pypi_own_file_key("racepkg", filename);
+        assert_eq!(pypi_upload(&ctx, filename, "first").await, StatusCode::OK);
+        let rules = vec![rule("pypi", Some(0), None)];
+
+        let record_lock = crate::acquire_publish_lock(&ctx.state.publish_locks, &record_key);
+        let record_guard = record_lock.lock().await;
+        // CANCEL-SAFETY: a watchdog over the scenario: a deadlock fails the test instead of
+        // stalling the run; nothing is ordered by it.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            let (storage, locks, signer) = (
+                ctx.state.storage.clone(),
+                ctx.state.publish_locks.clone(),
+                ctx.state.signer.clone(),
+            );
+            let retention = tokio::spawn(async move {
+                run_retention(&storage, &locks, signer.as_deref(), &rules, false).await
+            });
+            // Retention deletes the file first, then waits for the record's lock.
+            while ctx.state.storage.stat(&file_key).await.is_some() && !retention.is_finished() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let upload = tokio::spawn({
+                let app = ctx.app.clone();
+                async move {
+                    let (ctype, body) = pypi_upload_form("racepkg", filename, "second");
+                    let headers = vec![("content-type", ctype.as_str())];
+                    crate::test_helpers::send_with_headers(
+                        &app,
+                        Method::POST,
+                        "/simple/",
+                        headers,
+                        body,
+                    )
+                    .await
+                    .status()
+                }
+            });
+            // Unserialized, the upload stores everything now; serialized with the deletion, it
+            // waits for it. (An upload's HTTP path takes milliseconds.)
+            let started = std::time::Instant::now();
+            while !upload.is_finished() && started.elapsed() < Duration::from_secs(2) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            drop(record_guard);
+            assert_eq!(upload.await.unwrap(), StatusCode::OK, "upload");
+            let result = retention.await.unwrap();
+            assert_eq!(result.planned, 1, "{:?}", result.plans);
+        })
+        .await
+        .expect("the upload and retention both finished");
+
+        assert!(
+            ctx.state.storage.stat(&file_key).await.is_some(),
+            "the upload answered 200 and its file is gone"
+        );
+        assert!(
+            ctx.state
+                .storage
+                .stat(&format!("{file_key}.sha256"))
+                .await
+                .is_some(),
+            "the uploaded file's .sha256 is gone"
+        );
+        assert!(
+            ctx.state.storage.stat(&record_key).await.is_some(),
+            "the uploaded file's own-file record is gone"
+        );
+        let index = text(&ctx, "/simple/racepkg/").await;
+        assert!(
+            index.contains(filename),
+            "the index does not list the upload: {index}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pypi_reupload_during_retention_keeps_its_record_local() {
+        let (ctx, _outage, _dir) = local();
+        pypi_reupload_keeps_its_record(ctx).await;
+    }
+
+    #[tokio::test]
+    async fn pypi_reupload_during_retention_keeps_its_record_object_store() {
+        let (ctx, _outage, _dir) = in_memory();
+        pypi_reupload_keeps_its_record(ctx).await;
+    }
+
+    /// PyPI: retention planned a file's deletion from its stored state, then waits for the file's
+    /// lock, which an upload replacing the file holds while it rewrites it (the test holds the lock
+    /// and writes as the upload does). Under the lock the file no longer reads as planned, so it is
+    /// kept, and reported nowhere as deleted.
+    async fn pypi_file_rewritten_after_planning_is_kept(ctx: TestContext, outage: StorageOutage) {
+        let filename = "racepkg-1.0.0.tar.gz";
+        let file_key = format!("pypi/racepkg/{filename}");
+        assert_eq!(pypi_upload(&ctx, filename, "first").await, StatusCode::OK);
+        // Ages in whole seconds: the rewrite is a second younger than the planned file.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let file_lock = crate::acquire_publish_lock(&ctx.state.publish_locks, &file_key);
+        let upload_guard = file_lock.lock().await;
+        let planned_from = outage.watch_reads_of(&file_key, 1);
+        // CANCEL-SAFETY: a watchdog over the scenario: a deadlock fails the test instead of
+        // stalling the run; nothing is ordered by it.
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let (storage, locks, signer) = (
+                ctx.state.storage.clone(),
+                ctx.state.publish_locks.clone(),
+                ctx.state.signer.clone(),
+            );
+            let rules = vec![rule("pypi", Some(0), None)];
+            let retention = tokio::spawn(async move {
+                run_retention(&storage, &locks, signer.as_deref(), &rules, false).await
+            });
+            // The file's age was read (its stat): the plan is made.
+            planned_from.answered().await;
+            ctx.state.storage.put(&file_key, b"second").await.unwrap();
+            let sha = hex::encode(sha2::Sha256::digest(b"second"));
+            ctx.state
+                .storage
+                .put(&format!("{file_key}.sha256"), sha.as_bytes())
+                .await
+                .unwrap();
+            drop(upload_guard);
+            retention.await.unwrap()
+        })
+        .await
+        .expect("retention finished");
+
+        assert_eq!(
+            ctx.state.storage.get(&file_key).await.ok().as_deref(),
+            Some(&b"second"[..]),
+            "the rewritten file was deleted by a plan made before it"
+        );
+        assert_eq!(
+            result.planned, 0,
+            "a kept file reported as deleted: {:?}",
+            result.plans
+        );
+    }
+
+    #[tokio::test]
+    async fn pypi_file_rewritten_after_planning_is_kept_local() {
+        let (ctx, outage, _dir) = local();
+        pypi_file_rewritten_after_planning_is_kept(ctx, outage).await;
+    }
+
+    #[tokio::test]
+    async fn pypi_file_rewritten_after_planning_is_kept_object_store() {
+        let (ctx, outage, _dir) = in_memory();
+        pypi_file_rewritten_after_planning_is_kept(ctx, outage).await;
+    }
+
+    /// PyPI: retention plans from a file whose first upload is still running — the file is
+    /// stored, its `.sha256`, hash marker and record are not yet — and waits for the file's lock,
+    /// which the upload holds. The plan takes the file alone; what the upload leaves is the file
+    /// and what it wrote beside it, so the file is kept, not deleted from under them.
+    async fn pypi_file_planned_during_its_upload_is_kept(ctx: TestContext, outage: StorageOutage) {
+        let filename = "racepkg-1.0.0.tar.gz";
+        let file_key = format!("pypi/racepkg/{filename}");
+        let hash_key = format!("{file_key}.sha256");
+        let digest = hex::encode(sha2::Sha256::digest(b"first"));
+        let held = outage.hold_write_of(&hash_key, digest.as_bytes());
+        // CANCEL-SAFETY: a watchdog over the scenario: a deadlock fails the test instead of
+        // stalling the run; nothing is ordered by it.
+        let result = tokio::time::timeout(Duration::from_secs(30), async {
+            let upload = tokio::spawn({
+                let app = ctx.app.clone();
+                async move {
+                    let (ctype, body) = pypi_upload_form("racepkg", filename, "first");
+                    let headers = vec![("content-type", ctype.as_str())];
+                    crate::test_helpers::send_with_headers(
+                        &app,
+                        Method::POST,
+                        "/simple/",
+                        headers,
+                        body,
+                    )
+                    .await
+                    .status()
+                }
+            });
+            held.reached().await;
+            // Retention looks for the file's `.sha256` after it read the file's age: once that
+            // is answered, the plan is made from the file alone.
+            let planned_from = outage.watch_reads_of(&hash_key, 1);
+            let (storage, locks, signer) = (
+                ctx.state.storage.clone(),
+                ctx.state.publish_locks.clone(),
+                ctx.state.signer.clone(),
+            );
+            let rules = vec![rule("pypi", Some(0), None)];
+            let retention = tokio::spawn(async move {
+                run_retention(&storage, &locks, signer.as_deref(), &rules, false).await
+            });
+            planned_from.answered().await;
+            held.release();
+            assert_eq!(upload.await.unwrap(), StatusCode::OK, "upload");
+            retention.await.unwrap()
+        })
+        .await
+        .expect("the upload and retention both finished");
+
+        assert!(
+            ctx.state.storage.stat(&file_key).await.is_some(),
+            "the upload answered 200 and its file is gone"
+        );
+        assert!(
+            ctx.state.storage.stat(&hash_key).await.is_some(),
+            "the uploaded file's .sha256 is gone"
+        );
+        let index = text(&ctx, "/simple/racepkg/").await;
+        assert!(
+            index.contains(filename),
+            "the index does not list the upload: {index}"
+        );
+        assert_eq!(
+            result.planned, 0,
+            "a kept file reported as deleted: {:?}",
+            result.plans
+        );
+    }
+
+    #[tokio::test]
+    async fn pypi_file_planned_during_its_upload_is_kept_local() {
+        let (ctx, outage, _dir) = local();
+        pypi_file_planned_during_its_upload_is_kept(ctx, outage).await;
+    }
+
+    #[tokio::test]
+    async fn pypi_file_planned_during_its_upload_is_kept_object_store() {
+        let (ctx, outage, _dir) = in_memory();
+        pypi_file_planned_during_its_upload_is_kept(ctx, outage).await;
     }
 }
