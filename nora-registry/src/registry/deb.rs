@@ -88,6 +88,12 @@ fn release_key(repo: &str) -> String {
     format!("deb/{repo}/Release")
 }
 
+/// The publish lock of a repository: every upload, delete, reindex and index rebuild of it holds
+/// it, and so does retention while it deletes a version of it.
+pub(crate) fn repo_publish_lock_key(repo: &str) -> String {
+    release_key(repo)
+}
+
 /// apt resolves a flat-repo sources line (`deb <url>/deb/{repo} ./`) to
 /// literal `/deb/{repo}/./InRelease` etc. — strip that leading `./` on the
 /// read paths. Only the prefix apt produces; traversal stays rejected.
@@ -695,7 +701,7 @@ async fn upload(
     // Serialize publishes/deletes per repo: the index rebuild is a
     // list-read-generate-write cycle over the whole repo (same TOCTOU
     // rationale as the maven-metadata.xml lock).
-    let lock = state.publish_lock(&release_key(&repo));
+    let lock = state.publish_lock(&repo_publish_lock_key(&repo));
     let _guard = lock.lock().await;
 
     if let Err(e) = state.storage.put(&key, &body).await {
@@ -913,7 +919,7 @@ async fn delete_package(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let lock = state.publish_lock(&release_key(&repo));
+    let lock = state.publish_lock(&repo_publish_lock_key(&repo));
     let _guard = lock.lock().await;
 
     match state.storage.delete(&key).await {
@@ -976,7 +982,7 @@ async fn reindex(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let lock = state.publish_lock(&release_key(&repo));
+    let lock = state.publish_lock(&repo_publish_lock_key(&repo));
     let _guard = lock.lock().await;
 
     let prefix = format!("deb/{repo}/");

@@ -70,6 +70,12 @@ fn repomd_key(repo: &str) -> String {
     format!("rpm/{repo}/{REPODATA}/repomd.xml")
 }
 
+/// The publish lock of a repository: every upload, delete, reindex and index rebuild of it holds
+/// it, and so does retention while it deletes a version of it.
+pub(crate) fn repo_publish_lock_key(repo: &str) -> String {
+    repomd_key(repo)
+}
+
 /// Validate the `{repo}` segment and the tail path of a package operation.
 /// The storage-key wrapper re-validates centrally; this is edge defence with
 /// format-specific rules (single-segment repo, `.rpm` suffix, reserved dirs).
@@ -758,7 +764,7 @@ async fn upload(
     // Serialize publishes/deletes per repo: the repodata rebuild is a
     // list-read-generate-write cycle over the whole repo (same TOCTOU
     // rationale as the maven-metadata.xml lock).
-    let lock = state.publish_lock(&repomd_key(&repo));
+    let lock = state.publish_lock(&repo_publish_lock_key(&repo));
     let _guard = lock.lock().await;
 
     if let Err(e) = state.storage.put(&key, &body).await {
@@ -977,7 +983,7 @@ async fn delete_package(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    let lock = state.publish_lock(&repomd_key(&repo));
+    let lock = state.publish_lock(&repo_publish_lock_key(&repo));
     let _guard = lock.lock().await;
 
     match state.storage.delete(&key).await {
@@ -1038,7 +1044,7 @@ async fn reindex(
         return StatusCode::FORBIDDEN.into_response();
     }
 
-    let lock = state.publish_lock(&repomd_key(&repo));
+    let lock = state.publish_lock(&repo_publish_lock_key(&repo));
     let _guard = lock.lock().await;
 
     let prefix = format!("rpm/{repo}/");

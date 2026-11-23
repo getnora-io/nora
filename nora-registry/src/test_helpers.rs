@@ -807,6 +807,25 @@ struct Faults {
     landed_writes: Vec<String>,
     /// Writes held at the store until released, each once.
     held: Vec<WriteHold>,
+    /// Reads watched until they have been answered, each once.
+    watched_reads: Vec<ReadWatch>,
+}
+
+/// Reads of a key [`StorageOutage::watch_reads_of`] reports once the store has answered so many
+/// of them (`get` and `stat` both count): for a test that has to know a concurrent task has read
+/// what it needs of a key before the key changes.
+#[derive(Clone)]
+pub struct ReadWatch {
+    suffix: String,
+    left: Arc<std::sync::atomic::AtomicUsize>,
+    answered: Arc<tokio::sync::Notify>,
+}
+
+impl ReadWatch {
+    /// Wait until the watched reads have been answered.
+    pub async fn answered(&self) {
+        self.answered.notified().await;
+    }
 }
 
 /// A write [`StorageOutage::hold_write_of`] stops at the store, before anything is stored,
@@ -937,6 +956,34 @@ impl StorageOutage {
         };
         self.faults().held.push(hold.clone());
         hold
+    }
+
+    /// Report once the store has answered the next `reads` reads (`get` or `stat`) of a key
+    /// ending with `suffix` ([`ReadWatch::answered`]); the reads themselves go on as usual.
+    pub fn watch_reads_of(&self, suffix: &str, reads: usize) -> ReadWatch {
+        let watch = ReadWatch {
+            suffix: suffix.to_string(),
+            left: Arc::new(reads.into()),
+            answered: Arc::default(),
+        };
+        self.faults().watched_reads.push(watch.clone());
+        watch
+    }
+
+    /// Count an answered read of `key` against the watch it meets; the last one it waits for
+    /// reports, and the watch is dropped.
+    fn read_answered(&self, key: &str) {
+        let mut faults = self.faults();
+        let Some(at) = faults
+            .watched_reads
+            .iter()
+            .position(|w| key.ends_with(w.suffix.as_str()))
+        else {
+            return;
+        };
+        if faults.watched_reads[at].left.fetch_sub(1, Ordering::SeqCst) == 1 {
+            faults.watched_reads.remove(at).answered.notify_one();
+        }
     }
 
     /// The hold the write of `key` with `data` meets, taken so it holds once.
@@ -1089,6 +1136,7 @@ impl crate::storage::StorageBackend for OutageBackend {
         self.outage.wait_answer().await;
         self.check_read(key)?;
         let (data, pin) = self.inner.get(key).await?;
+        self.outage.read_answered(key);
         if self.outage.read_fault(key) != Some(ReadFault::Tampered) {
             return Ok((data, pin));
         }
@@ -1126,7 +1174,9 @@ impl crate::storage::StorageBackend for OutageBackend {
         if self.outage.stat_fails(key) {
             return None;
         }
-        self.inner.stat(key).await
+        let meta = self.inner.stat(key).await;
+        self.outage.read_answered(key);
+        meta
     }
 
     async fn list_with_meta(

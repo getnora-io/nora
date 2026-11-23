@@ -895,6 +895,15 @@ async fn upload(
 
     match classify_path(&path) {
         MavenPathKind::VersionFile(coords) if is_checksum_file(&coords.filename) => {
+            // A checksum is a file of its version: it is stored under the artifact's lock, as
+            // the file it names is, so it never lands between the deletions of a version
+            // retention is removing (#1298).
+            let lock = state.publish_lock(&artifact_metadata_lock_key(
+                &coords.group_path,
+                &coords.artifact_id,
+            ));
+            let _guard = lock.lock().await;
+
             // Client uploading a checksum — verify against our computed value
             if state.config.maven.checksum_verify {
                 if let Ok(computed) = state.storage.get(&key).await {
