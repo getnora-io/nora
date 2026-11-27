@@ -19,8 +19,8 @@ use std::env;
 /// auth_burst = 5
 /// upload_rps = 200
 /// upload_burst = 500
-/// general_rps = 1000
-/// general_burst = 2000
+/// general_rps = 5000
+/// general_burst = 50000
 /// ```
 ///
 /// # Environment Variables
@@ -64,12 +64,15 @@ fn default_upload_rps() -> u64 {
 fn default_upload_burst() -> u32 {
     500
 }
-// Reads: not below the write defaults, so that a default start reads at general_* (#1205).
+// Reads: not below the write defaults, so that a default start reads at general_* (#1205), and
+// sized for a build host rather than one interactive client: tens of concurrent builds behind one
+// address (a Spring Boot build resolves about 1200 files at once) pass, while the rate one address
+// can send at stays bounded (#1326).
 fn default_general_rps() -> u64 {
-    1000
+    5000
 }
 fn default_general_burst() -> u32 {
-    2000
+    50000
 }
 
 impl Default for RateLimitConfig {

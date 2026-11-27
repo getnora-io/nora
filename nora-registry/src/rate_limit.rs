@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(config.auth_rps, 1);
         assert_eq!(config.auth_burst, 5);
         assert_eq!(config.upload_rps, 200);
-        assert_eq!(config.general_rps, 1000);
+        assert_eq!(config.general_rps, 5000);
     }
 
     #[test]
@@ -798,14 +798,14 @@ mod tests {
                 "general enforced"
             );
         }
-        // The default intervals: 1 s, 5 ms, 1 ms; bursts 5, 500, 2000.
+        // The default intervals: 1 s, 5 ms, 200 us; bursts 5, 500, 50 000 (#1326).
         let quotas = limiter_quotas(&RateLimitConfig::default());
         let ms = std::time::Duration::from_millis;
         assert_eq!((quotas.auth.interval, quotas.auth.burst), (ms(1000), 5));
         assert_eq!((quotas.upload.interval, quotas.upload.burst), (ms(5), 500));
         assert_eq!(
             (quotas.general.interval, quotas.general.burst),
-            (ms(1), 2000)
+            (std::time::Duration::from_micros(200), 50_000)
         );
     }
 
