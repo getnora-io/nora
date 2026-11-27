@@ -54,6 +54,90 @@ struct SearchParams {
     sem_ver_level: Option<String>,
     /// Autocomplete's package-versions form: `?id=<package>` lists that package's versions.
     id: Option<String>,
+    #[serde(rename = "packageType")]
+    package_type: Option<String>,
+    /// A target framework filter some hosts take (BaGet): `net8.0`.
+    framework: Option<String>,
+}
+
+/// The query string NORA sends a search or autocomplete host: only the parameters the NuGet search
+/// and autocomplete protocols define, rebuilt from what NORA parsed, with values of the shape the
+/// protocol gives them. Whatever else a client put in its query stays in NORA (#1329): a host is
+/// never sent a term that was not checked against the internal namespaces. `id` is autocomplete's.
+fn host_query(params: &HostQuery<'_>) -> String {
+    let encode = |value: &str| {
+        percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+    };
+    let mut pairs = Vec::new();
+    if !params.q.is_empty() {
+        pairs.push(format!("q={}", encode(params.q)));
+    }
+    if let Some(id) = params.id {
+        pairs.push(format!("id={}", encode(id)));
+    }
+    pairs.push(format!("skip={}", params.skip));
+    pairs.push(format!("take={}", params.take));
+    if params.prerelease {
+        pairs.push("prerelease=true".to_string());
+    }
+    if let Some(level) = params.sem_ver_level.filter(|v| is_sem_ver_level(v)) {
+        pairs.push(format!("semVerLevel={level}"));
+    }
+    if let Some(kind) = params.package_type.filter(|t| is_package_type(t)) {
+        pairs.push(format!("packageType={kind}"));
+    }
+    if let Some(framework) = params.framework.filter(|f| is_package_type(f)) {
+        pairs.push(format!("framework={}", encode(framework)));
+    }
+    pairs.join("&")
+}
+
+/// What [`host_query`] is built from.
+struct HostQuery<'a> {
+    q: &'a str,
+    id: Option<&'a str>,
+    skip: usize,
+    take: usize,
+    prerelease: bool,
+    sem_ver_level: Option<&'a str>,
+    package_type: Option<&'a str>,
+    framework: Option<&'a str>,
+}
+
+/// A `semVerLevel` as the protocol writes it: `2.0.0`, `2`, `1.0`.
+fn is_sem_ver_level(value: &str) -> bool {
+    let parts: Vec<&str> = value.split('.').collect();
+    parts.len() <= 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 9 && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A `packageType` name (`Dependency`, `DotnetTool`, `Contoso-Extension`) or a framework
+/// (`net8.0`): NuGet allows letters, digits, `.`, `_` and `-`, up to the id length.
+fn is_package_type(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
+/// Whether any of `terms` that is not empty names an internal namespace: such a request is
+/// answered from NORA's own records and never sent to a host (#68, #1329).
+fn names_internal_namespace(state: &AppState, terms: &[Option<&str>]) -> bool {
+    let curation = state.curation();
+    terms
+        .iter()
+        .flatten()
+        .filter(|t| !t.is_empty())
+        .any(|term| {
+            crate::curation::is_internal_namespace(
+                &curation.curation_engine,
+                crate::curation::RegistryType::Nuget,
+                term,
+            )
+        })
 }
 
 /// Storage prefix and file suffix for repo index scanning.
@@ -229,7 +313,6 @@ async fn search_query(
     State(state): State<AppState>,
     _headers: HeaderMap,
     Query(params): Query<SearchParams>,
-    raw_query: axum::extract::RawQuery,
 ) -> Response {
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
@@ -253,10 +336,13 @@ async fn search_query(
 
     // #68 namespace isolation: never forward a search term that matches an internal
     // namespace upstream (dependency confusion) — serve local results only.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Nuget,
-        &query,
+    if names_internal_namespace(
+        &state,
+        &[
+            Some(&query),
+            params.package_type.as_deref(),
+            params.framework.as_deref(),
+        ],
     ) {
         let data = local_search_results(
             &state,
@@ -283,7 +369,16 @@ async fn search_query(
     let window = PageWindow::new(skip, take, own.len());
 
     // Try upstream with short timeout (UX-critical path)
-    let qs = raw_query.0.unwrap_or_default();
+    let qs = host_query(&HostQuery {
+        q: &query,
+        id: None,
+        skip,
+        take,
+        prerelease,
+        sem_ver_level: sem_ver_level.as_deref(),
+        package_type: params.package_type.as_deref(),
+        framework: params.framework.as_deref(),
+    });
 
     let need = window.upstream_need();
     match read_search_host(
@@ -353,7 +448,6 @@ async fn search_query(
 async fn autocomplete_query(
     State(state): State<AppState>,
     Query(params): Query<SearchParams>,
-    raw_query: axum::extract::RawQuery,
 ) -> Response {
     let query = params.q.unwrap_or_default();
     let skip = params.skip.unwrap_or(0);
@@ -397,12 +491,18 @@ async fn autocomplete_query(
         return data.map_or_else(records_unavailable, with_json);
     }
 
-    // #68 namespace isolation: don't forward an internal-namespace autocomplete term — for the
-    // versions form the term is the package id.
-    if crate::curation::is_internal_namespace(
-        &state.curation().curation_engine,
-        crate::curation::RegistryType::Nuget,
-        id.unwrap_or(&query),
+    // #68 namespace isolation: don't forward an internal-namespace autocomplete term. Both terms are
+    // checked: the versions form names the package in `id`, the package-ID form in `q`, and the
+    // whole query string goes upstream, so a request carrying both stays local when either names
+    // an internal namespace (#1329).
+    if names_internal_namespace(
+        &state,
+        &[
+            id,
+            Some(&query),
+            params.package_type.as_deref(),
+            params.framework.as_deref(),
+        ],
     ) {
         let data = local_autocomplete_results(
             &state,
@@ -417,7 +517,16 @@ async fn autocomplete_query(
         return data.map_or_else(records_unavailable, with_json);
     }
 
-    let qs = raw_query.0.unwrap_or_default();
+    let qs = host_query(&HostQuery {
+        q: &query,
+        id,
+        skip,
+        take,
+        prerelease,
+        sem_ver_level: sem_ver_level.as_deref(),
+        package_type: params.package_type.as_deref(),
+        framework: params.framework.as_deref(),
+    });
     let host = if id.is_some() {
         // The versions form of an id NORA does not host: the host's answer as it is.
         let url = format!("{}?{}", state.config.nuget.autocomplete, qs);
@@ -4497,6 +4606,149 @@ mod integration_tests {
             2,
             "with semVerLevel=2.0.0, SemVer2 must be visible"
         );
+    }
+
+    /// #1329: an internal name in either autocomplete term stays local, in either order of the
+    /// parameters, with the other term naming a public package; public terms are forwarded.
+    #[tokio::test]
+    async fn an_internal_name_in_either_autocomplete_term_is_not_forwarded() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::builder().start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "totalHits": 0, "data": [] })),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.autocomplete = format!("{uri}/autocomplete");
+            cfg.nuget.search_service = format!("{uri}/query");
+            cfg.curation.internal_namespaces = vec!["corp*".to_string()];
+        });
+        for path in [
+            "/nuget/v3/autocomplete?id=public.pkg&q=corp.lib",
+            "/nuget/v3/autocomplete?q=corp.lib&id=public.pkg",
+            "/nuget/v3/autocomplete?id=corp.lib&q=public",
+            "/nuget/v3/autocomplete?q=corp.lib",
+            "/nuget/v3/autocomplete?q=public&packageType=corp.lib",
+            "/nuget/v3/query?q=public&packageType=corp.lib",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+            let asked = upstream.received_requests().await.unwrap_or_default();
+            assert!(asked.is_empty(), "{path} asked the upstream: {asked:?}");
+        }
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?id=public.pkg&q=other",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let asked = upstream.received_requests().await.unwrap_or_default();
+        assert_eq!(asked.len(), 1, "public terms are forwarded");
+        // Only the parameters of the protocol go to the host, never a term NORA did not check.
+        for path in [
+            "/nuget/v3/autocomplete?id=public.pkg&semVerLevel=corp.lib&prefix=corp.lib",
+            "/nuget/v3/autocomplete?q=public&extra=corp.lib",
+            "/nuget/v3/query?q=public&id=corp.lib&semVerLevel=2.0.0",
+        ] {
+            let resp = send(&ctx.app, Method::GET, path, "").await;
+            assert_eq!(resp.status(), StatusCode::OK, "{path}");
+        }
+        let asked = upstream.received_requests().await.unwrap_or_default();
+        assert!(asked.len() >= 4, "each forwarded: {}", asked.len());
+        for request in &asked {
+            let query = request.url.query().unwrap_or_default();
+            assert!(!query.contains("corp"), "{query}");
+        }
+        assert!(asked
+            .last()
+            .unwrap()
+            .url
+            .query()
+            .unwrap()
+            .contains("semVerLevel=2.0.0"));
+    }
+
+    /// An empty pattern among the internal namespaces matches no absent term: the versions of a
+    /// public package are still asked of the host (#1329).
+    #[tokio::test]
+    async fn an_empty_internal_pattern_does_not_keep_a_public_versions_request_local() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let upstream = MockServer::builder().start().await;
+        Mock::given(any())
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": ["1.0.0"] })),
+            )
+            .mount(&upstream)
+            .await;
+        let uri = upstream.uri();
+        let ctx = create_test_context_with_config(move |cfg| {
+            cfg.nuget.enabled = true;
+            cfg.nuget.proxy = Some(uri.clone());
+            cfg.nuget.autocomplete = format!("{uri}/autocomplete");
+            cfg.curation.internal_namespaces = vec!["corp*".to_string(), String::new()];
+        });
+        let resp = send(
+            &ctx.app,
+            Method::GET,
+            "/nuget/v3/autocomplete?id=public.pkg",
+            "",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            upstream.received_requests().await.unwrap_or_default().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_host_query_carries_only_protocol_parameters_of_their_shape() {
+        use super::{host_query, is_sem_ver_level, HostQuery};
+        let q = |sem: Option<&'static str>, kind: Option<&'static str>| {
+            host_query(&HostQuery {
+                q: "json",
+                id: None,
+                skip: 0,
+                take: 20,
+                prerelease: true,
+                sem_ver_level: sem,
+                package_type: kind,
+                framework: None,
+            })
+        };
+        assert_eq!(
+            q(Some("2.0.0"), Some("DotnetTool")),
+            "q=json&skip=0&take=20&prerelease=true&semVerLevel=2.0.0&packageType=DotnetTool"
+        );
+        assert_eq!(
+            q(Some("2.0.0&x=y"), Some("a b")),
+            "q=json&skip=0&take=20&prerelease=true"
+        );
+        assert!(
+            is_sem_ver_level("2")
+                && is_sem_ver_level("1.0")
+                && !is_sem_ver_level("1.0.0.0")
+                && !is_sem_ver_level("")
+        );
+    }
+
+    #[test]
+    fn long_sem_ver_levels_and_package_type_names_of_every_allowed_character_are_kept() {
+        use super::{is_package_type, is_sem_ver_level};
+        assert!(is_sem_ver_level("2.0.10000"));
+        assert!(is_package_type("Contoso-Extension_2.v1"));
+        assert!(is_package_type(&"a".repeat(100)) && !is_package_type(&"a".repeat(101)));
+        assert!(!is_package_type("a b") && !is_package_type("a&b=c"));
     }
 
     #[tokio::test]
