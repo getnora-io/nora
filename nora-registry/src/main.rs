@@ -60,6 +60,7 @@ mod metrics;
 mod migrate;
 mod mirror;
 mod openapi;
+mod process_limits;
 mod proxy_coalesce;
 mod rate_limit;
 mod registry;
@@ -2158,8 +2159,20 @@ mod bind_tests {
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // Before the runtime opens its first descriptor: the runtime itself needs some (#1321).
+    let open_files = process_limits::raise_open_files();
+    if let Some(line) = process_limits::early_notice(&open_files) {
+        eprintln!("{line}");
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("Cannot start the async runtime")
+        .block_on(async_main(open_files));
+}
+
+async fn async_main(open_files: process_limits::Outcome) {
     let cli = Cli::parse();
 
     // Initialize logging (JSON for server, plain for CLI commands)
@@ -2171,7 +2184,7 @@ async fn main() {
 
     // The audit writer, a task the process cannot run without, ends the process from its own
     // thread with this hook, the log file drained first, whatever the main task is doing.
-    match run(cli, is_server, log_known, log_file.exit_hook()).await {
+    match run(cli, is_server, log_known, log_file.exit_hook(), open_files).await {
         Ok(()) => drop(drained),
         Err(Exit(code)) => log_file.exit_after_logs(code),
     }
@@ -2190,6 +2203,7 @@ async fn run(
     is_server: bool,
     log_known: log_redact::KnownTexts,
     exit_hook: supervise::ExitHook,
+    open_files: process_limits::Outcome,
 ) -> Result<(), Exit> {
     // Healthcheck is a client-side probe (Docker HEALTHCHECK) — handle it before
     // loading the full server config, which it does not need and which can abort
@@ -2265,7 +2279,7 @@ async fn run(
     // Dispatch to command
     match cli.command {
         None | Some(Commands::Serve) => {
-            run_server(config, storage, exit_hook).await?;
+            run_server(config, storage, exit_hook, open_files).await?;
         }
         Some(Commands::Backup { output }) => {
             if let Err(e) = backup::create_backup(&storage, &output).await {
@@ -3381,6 +3395,7 @@ async fn run_server(
     mut config: Config,
     storage: Storage,
     exit_hook: supervise::ExitHook,
+    open_files: process_limits::Outcome,
 ) -> Result<(), Exit> {
     let start_time = Instant::now();
 
@@ -3979,6 +3994,7 @@ async fn run_server(
         max_connections = state.config.server.max_connections,
         "Connection limits"
     );
+    process_limits::log_outcome(&open_files, state.config.server.max_connections);
     match serve_with_drain(listener, app, shutdown_signal(), drain, limits)
         .await
         .expect("Server error")
