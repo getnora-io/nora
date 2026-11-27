@@ -56,7 +56,7 @@ struct SearchParams {
     id: Option<String>,
     #[serde(rename = "packageType")]
     package_type: Option<String>,
-    /// A target framework filter some hosts take (BaGet): `net8.0`.
+    /// A target framework filter some self-hosted NuGet servers take: `net8.0`.
     framework: Option<String>,
 }
 
