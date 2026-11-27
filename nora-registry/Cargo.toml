@@ -90,9 +90,9 @@ rand = "0.8"
 mimalloc = { version = "0.1", features = ["no_thp"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
-# flock(2) on the local backend's staging lock, without unsafe; already in the tree
-# through tempfile.
-rustix = { version = "1", default-features = false, features = ["std", "fs"] }
+# flock(2) on the local backend's staging lock and setrlimit(2) for the open-file limit at
+# startup (#1321), without unsafe; already in the tree through tempfile.
+rustix = { version = "1", default-features = false, features = ["std", "fs", "process"] }
 
 [dev-dependencies]
 # Paused clock for the tests of timers measured in seconds and minutes.
