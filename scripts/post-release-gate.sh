@@ -115,9 +115,13 @@ EXPECTED_ASSETS=(
     "nora-linux-amd64.sha256"
     "nora-linux-amd64.bundle"
     "nora-${TAG}.sbom.amd64.spdx.json"
+    "nora-${TAG}.sbom.amd64.spdx.json.bundle"
     "nora-${TAG}.sbom.amd64.cdx.json"
+    "nora-${TAG}.sbom.amd64.cdx.json.bundle"
     "nora-${TAG}.sbom.arm64.spdx.json"
+    "nora-${TAG}.sbom.arm64.spdx.json.bundle"
     "nora-${TAG}.sbom.arm64.cdx.json"
+    "nora-${TAG}.sbom.arm64.cdx.json.bundle"
 )
 
 ACTUAL_ASSETS=$(echo "$RELEASE_JSON" | jq -r '.assets[].name')
@@ -292,10 +296,12 @@ gh release download "$TAG" --repo "$REPO" \
     --pattern "nora-linux-amd64.bundle" \
     --dir "$WORK_DIR" --clobber 2>/dev/null || true
 
+# Signed by the release workflow on this very tag, not by any workflow of the repository (#1344).
+RELEASE_IDENTITY="https://github.com/${REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
 if [ -f "$WORK_DIR/nora-linux-amd64.bundle" ]; then
     if cosign_run verify-blob \
         --bundle "$WORK_DIR/nora-linux-amd64.bundle" \
-        --certificate-identity-regexp "github.com/getnora-io/nora" \
+        --certificate-identity "$RELEASE_IDENTITY" \
         --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
         "$WORK_DIR/nora-linux-amd64" >/dev/null 2>&1; then
         pass "cosign verify-blob binary signature"
@@ -305,6 +311,38 @@ if [ -f "$WORK_DIR/nora-linux-amd64.bundle" ]; then
 else
     fail "Signature bundle not available"
 fi
+
+# Each SBOM is signed by the release workflow like the binaries (#1344), and describes the
+# binary its name says: a signed SBOM of the other platform under this name is refused.
+for sbom in "nora-${TAG}".sbom.{amd64,arm64}.{spdx,cdx}.json; do
+    case "$sbom" in
+        *.amd64.*) target="x86_64-unknown-linux-musl" ;;
+        *) target="aarch64-unknown-linux-musl" ;;
+    esac
+    gh release download "$TAG" --repo "$REPO" \
+        --pattern "$sbom" --pattern "$sbom.bundle" \
+        --dir "$WORK_DIR" --clobber 2>/dev/null || true
+    if [ -f "$WORK_DIR/$sbom" ] && [ -f "$WORK_DIR/$sbom.bundle" ] && cosign_run verify-blob \
+        --bundle "$WORK_DIR/$sbom.bundle" \
+        --certificate-identity "$RELEASE_IDENTITY" \
+        --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+        "$WORK_DIR/$sbom" >/dev/null 2>&1; then
+        pass "cosign verify-blob SBOM signature: $sbom"
+    else
+        fail "cosign verify-blob SBOM signature: $sbom"
+    fi
+    case "$sbom" in
+        *.cdx.json) described=$(jq -r --arg v "$VERSION" \
+            '[(.metadata.properties[]? | select(.name == "nora:target") | .value), (.metadata.component.version == $v)] | @tsv' \
+            "$WORK_DIR/$sbom" 2>/dev/null) ; want="${target}	true" ;;
+        *) described=$(jq -r .name "$WORK_DIR/$sbom" 2>/dev/null) ; want="nora-${VERSION}-${target}" ;;
+    esac
+    if [ "$described" = "$want" ]; then
+        pass "SBOM describes nora ${VERSION} for ${target}: $sbom"
+    else
+        fail "SBOM does not describe nora ${VERSION} for ${target}: $sbom (${described:-unreadable})"
+    fi
+done
 
 # Verify GHCR image signatures (alpine, RED OS, Astra)
 for variant in "${VARIANTS[@]}"; do

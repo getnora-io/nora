@@ -780,6 +780,30 @@ jobs:
             --bundle nora-linux-arm64.bundle \
             ./nora-linux-arm64
 
+      # An SBOM is signed like the binary it describes (#1344): without it a file replaced next to
+      # an authentic binary could not be told from the release's own.
+      - name: Sign SBOMs with cosign (keyless Sigstore)
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          for f in "nora-$TAG".sbom.{amd64,arm64}.{spdx,cdx}.json; do
+            cosign sign-blob --yes --bundle "$f.bundle" "$f"
+          done
+
+      # Every signature is checked against this workflow's identity before anything is published:
+      # a signing step that produced no valid bundle stops the release here, not after it.
+      - name: Verify the signatures before publishing
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          identity="https://github.com/${GITHUB_REPOSITORY}/.github/workflows/release.yml@${GITHUB_REF}"
+          for f in nora-linux-amd64 nora-linux-arm64 "nora-$TAG".sbom.{amd64,arm64}.{spdx,cdx}.json; do
+            cosign verify-blob --bundle "$f.bundle" \
+              --certificate-identity "$identity" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              "$f"
+          done
+
       - name: Extract release notes from CHANGELOG.md
         id: notes
         run: |
@@ -815,9 +839,13 @@ jobs:
             nora-linux-arm64.cert
             nora-linux-arm64.bundle
             nora-${{ github.ref_name }}.sbom.amd64.spdx.json
+            nora-${{ github.ref_name }}.sbom.amd64.spdx.json.bundle
             nora-${{ github.ref_name }}.sbom.amd64.cdx.json
+            nora-${{ github.ref_name }}.sbom.amd64.cdx.json.bundle
             nora-${{ github.ref_name }}.sbom.arm64.spdx.json
+            nora-${{ github.ref_name }}.sbom.arm64.spdx.json.bundle
             nora-${{ github.ref_name }}.sbom.arm64.cdx.json
+            nora-${{ github.ref_name }}.sbom.arm64.cdx.json.bundle
             packages/nora-amd64.deb
             packages/nora-amd64.rpm
             packages/nora-arm64.deb
