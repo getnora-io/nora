@@ -13,7 +13,7 @@ use crate::audit::AuditEntry;
 use crate::auth::{enforce_namespace_scope, NamespaceAuthority};
 use crate::circuit_breaker::BreakerScope;
 use crate::config::UpstreamAuth;
-use crate::registry::{method_not_allowed, proxy_fetch, UpstreamMiss};
+use crate::registry::{method_not_allowed, proxy_fetch_on_429, On429, UpstreamMiss};
 use crate::registry_type::RegistryType;
 use crate::storage::StorageError;
 use crate::validation::ends_with_ci;
@@ -685,13 +685,18 @@ async fn download(
             .unwrap_or(&path);
         let url = format!("{}/{}", proxy.url().trim_end_matches('/'), upstream_path);
 
-        match proxy_fetch(
+        match proxy_fetch_on_429(
             &state.http_client,
             &url,
             Duration::from_secs(state.config.maven.proxy_timeout),
             proxy.auth().map(UpstreamAuth::Basic),
             &state.circuit_breaker,
             BreakerScope::upstream(RegistryType::Maven, proxy.url()),
+            if state.config.maven.upstream_429_retryable {
+                On429::RateLimited
+            } else {
+                On429::NotFound
+            },
         )
         .await
         {
@@ -3279,6 +3284,174 @@ mod upstream_failure_cases {
             let resp = send(&ctx.app, Method::GET, path, "").await;
             assert_eq!(resp.status(), StatusCode::BAD_GATEWAY, "{path}");
         }
+    }
+
+    /// #1325: an upstream `429` on a cold miss is a rate limit, not a missing artifact. The client
+    /// gets `429` with `Retry-After` (Maven retries it; a `404` it records in `*.lastUpdated`), the
+    /// body names no upstream, and the upstream is not asked again inside its window, by a repeat
+    /// or by the second attempt of a request already waiting on a 5xx. Another upstream's `404`
+    /// does not hide it; a held copy is still served; the window holds with the breaker off; the
+    /// switch off answers `404` as before.
+    #[tokio::test]
+    async fn an_upstream_429_on_a_cold_miss_is_not_a_missing_artifact() {
+        use wiremock::matchers::path as at;
+        let jar = "/maven2/com/example/lib/1.0.0/lib-1.0.0.jar";
+        let upstream_jar = "/com/example/lib/1.0.0/lib-1.0.0.jar";
+        let limited = || {
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "30")
+                .set_body_string("You have been rate limited by mirror.internal.example")
+        };
+        let mut wrong = Vec::new();
+
+        // (row, a second upstream answering 404, breaker on, switch on, expected status)
+        for (row, second_404, breaker, on, want) in [
+            ("alone", false, true, true, StatusCode::TOO_MANY_REQUESTS),
+            (
+                "then a 404",
+                true,
+                true,
+                true,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                "breaker off",
+                false,
+                false,
+                true,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            ("switch off", false, true, false, StatusCode::NOT_FOUND),
+        ] {
+            let first = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(limited())
+                .mount(&first)
+                .await;
+            let second = MockServer::start().await;
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(404))
+                .mount(&second)
+                .await;
+            let mut proxies = vec![MavenProxyEntry::Simple(first.uri())];
+            if second_404 {
+                proxies.push(MavenProxyEntry::Simple(second.uri()));
+            }
+            let ctx = create_test_context_with_config(move |c| {
+                c.circuit_breaker.enabled = breaker;
+                c.maven.upstream_429_retryable = on;
+                c.maven.proxies = proxies;
+            });
+            for attempt in ["first", "repeat"] {
+                let resp = send(&ctx.app, Method::GET, jar, "").await;
+                let got = resp.status();
+                let retry_after = resp
+                    .headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok());
+                let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
+                if got != want {
+                    wrong.push(format!("{row} ({attempt}): {got}, want {want}"));
+                }
+                if want == StatusCode::TOO_MANY_REQUESTS {
+                    match retry_after {
+                        Some(secs) if (1..=30).contains(&secs) => {
+                            if body != crate::registry::rate_limited_body(secs) {
+                                wrong.push(format!("{row} ({attempt}): body {body:?}"));
+                            }
+                        }
+                        other => wrong.push(format!("{row} ({attempt}): Retry-After {other:?}")),
+                    }
+                }
+            }
+            let sent = first.received_requests().await.map_or(0, |r| r.len());
+            if on && sent != 1 {
+                wrong.push(format!(
+                    "{row}: the limited upstream was asked {sent} times, want 1"
+                ));
+            }
+        }
+
+        // A request waiting to retry a 5xx does not send its second attempt into a window that
+        // another request opened meanwhile.
+        let up = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(at(upstream_jar))
+            .respond_with(ResponseTemplate::new(503))
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(limited())
+            .mount(&up)
+            .await;
+        let url = up.uri();
+        let ctx = create_test_context_with_config(move |c| {
+            c.maven.proxies = vec![MavenProxyEntry::Simple(url)];
+        });
+        let app = ctx.app.clone();
+        let waiting = tokio::spawn(async move { send(&app, Method::GET, jar, "").await.status() });
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let other = "/maven2/com/example/other/1.0.0/other-1.0.0.pom";
+        let resp = send(&ctx.app, Method::GET, other, "").await;
+        if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+            wrong.push(format!("the other request: {}", resp.status()));
+        }
+        let got = waiting.await.unwrap();
+        if got != StatusCode::TOO_MANY_REQUESTS {
+            wrong.push(format!("the waiting request: {got}, want 429"));
+        }
+        let jar_sent = up
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.url.path() == upstream_jar)
+            .count();
+        if jar_sent != 1 {
+            wrong.push(format!(
+                "the waiting request sent {jar_sent} attempts, want 1"
+            ));
+        }
+
+        // A held copy (metadata past its TTL) is served stale over a 429.
+        let up = MockServer::start().await;
+        let meta = "/maven2/com/example/lib/maven-metadata.xml";
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                "<metadata><groupId>com.example</groupId><artifactId>lib</artifactId><versioning><versions><version>1.0.0</version></versions></versioning></metadata>",
+            ))
+            .up_to_n_times(1)
+            .mount(&up)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(limited())
+            .mount(&up)
+            .await;
+        let url = up.uri();
+        let ctx = create_test_context_with_config(move |c| {
+            c.maven.metadata_ttl = 0;
+            c.maven.proxies = vec![MavenProxyEntry::Simple(url)];
+        });
+        let warm = send(&ctx.app, Method::GET, meta, "").await;
+        if warm.status() != StatusCode::OK {
+            wrong.push(format!("warm metadata: {}", warm.status()));
+        }
+        let mut resp = StatusCode::NOT_FOUND;
+        let mut stale = false;
+        for _ in 0..50 {
+            let r = send(&ctx.app, Method::GET, meta, "").await;
+            resp = r.status();
+            stale = r.headers().get("x-nora-stale").is_some();
+            if resp == StatusCode::OK && stale {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if resp != StatusCode::OK || !stale {
+            wrong.push(format!("held copy: {resp}, stale={stale}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     /// Every spelling of an upstream with userinfo that the client sends: once its breaker

@@ -598,7 +598,7 @@ pub(crate) async fn proxy_fetch_hop(
     proxy_fetch_core_with(
         client,
         url,
-        (timeout, Retry::Once),
+        (timeout, Retry::Once, On429::NotFound),
         auth,
         None,
         (
@@ -628,13 +628,24 @@ where
     proxy_fetch_core_with(
         client,
         url,
-        (timeout, Retry::Once),
+        (timeout, Retry::Once, On429::NotFound),
         auth,
         extra_headers,
         (extract, |_: &reqwest::Response| None),
         (cb, scope.into()),
     )
     .await
+}
+
+/// What an upstream `429` is to the caller of the plain fetch (#1325).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum On429 {
+    /// A "not found", like any other 4xx: the caller answers it as missing (the 1.4.8 behaviour,
+    /// kept for every format not yet moved).
+    NotFound,
+    /// A rate limit: the upstream's window is recorded, every attempt checks it first, and the
+    /// caller's miss answers `429` with `Retry-After`.
+    RateLimited,
 }
 
 /// Whether an upstream request that failed — a 5xx, a network error, a timeout — is sent once
@@ -674,7 +685,7 @@ impl Retry {
 async fn proxy_fetch_core_with<T, F, Fut, R>(
     client: &reqwest::Client,
     url: &str,
-    (timeout, retry): (Duration, Retry),
+    (timeout, retry, on_429): (Duration, Retry, On429),
     auth: Option<UpstreamAuth<'_>>,
     extra_headers: Option<(&str, &str)>,
     (extract, redirected): (F, R),
@@ -688,11 +699,23 @@ where
     let auth_header = upstream_auth_header(auth)?;
     let registry_str = scope.registry().as_str();
     let cb_key = scope.key();
+    let limited = on_429 == On429::RateLimited;
+    if limited {
+        cb.rate_limits().check(&cb_key)?;
+    }
     let probe = cb.check(&cb_key)?;
     let attempts = retry.attempts();
 
     for attempt in 0..attempts {
         let last = attempt + 1 == attempts;
+        // A second attempt follows a 5xx or a network error a second later; a 429 another request
+        // got from this upstream meanwhile opened its window, which this attempt respects too.
+        if limited && attempt > 0 {
+            if let Err(e) = cb.rate_limits().check(&cb_key) {
+                cb.record_failure(&cb_key, probe);
+                return Err(e);
+            }
+        }
         let mut request = client.get(url).timeout(timeout);
         if let Some(value) = &auth_header {
             request = request.header(header::AUTHORIZATION, value.clone());
@@ -758,6 +781,15 @@ where
                     // from HalfOpen (so it recovers instead of slow-probing) but
                     // is a no-op in Closed, so a 4xx never clears a real failure
                     // tally (#606).
+                    if limited && status == 429 {
+                        // The window goes up before the breaker lets the next probe through.
+                        let retry_after = response.headers().get(header::RETRY_AFTER);
+                        let e = cb
+                            .rate_limits()
+                            .limited(&cb_key, retry_after.map(|v| v.as_bytes()));
+                        cb.record_alive(&cb_key, probe);
+                        return Err(e);
+                    }
                     cb.record_alive(&cb_key, probe);
                     return Err(ProxyError::NotFound);
                 }
@@ -817,6 +849,31 @@ pub(crate) async fn proxy_fetch(
     .await
 }
 
+/// [`proxy_fetch`] with what an upstream `429` is chosen by the caller (#1325).
+pub(crate) async fn proxy_fetch_on_429(
+    client: &reqwest::Client,
+    url: &str,
+    timeout: Duration,
+    auth: Option<UpstreamAuth<'_>>,
+    cb: &CircuitBreakerRegistry,
+    scope: impl Into<BreakerScope<'_>>,
+    on_429: On429,
+) -> Result<Vec<u8>, ProxyError> {
+    proxy_fetch_core_with(
+        client,
+        url,
+        (timeout, Retry::Once, on_429),
+        auth,
+        None,
+        (
+            |r: reqwest::Response| async { r.bytes().await.map(|b| b.to_vec()) },
+            |_: &reqwest::Response| None,
+        ),
+        (cb, scope.into()),
+    )
+    .await
+}
+
 /// [`proxy_fetch_text`] with the retry the caller chooses, and no extra header: a caller that
 /// answers from a stored copy when the upstream fails asks it once ([`Retry::Never`]), so the copy
 /// comes within one timeout (#1230).
@@ -832,7 +889,7 @@ pub(crate) async fn proxy_fetch_text_with_retry(
     proxy_fetch_core_with(
         client,
         url,
-        (timeout, retry),
+        (timeout, retry, On429::NotFound),
         auth,
         None,
         (

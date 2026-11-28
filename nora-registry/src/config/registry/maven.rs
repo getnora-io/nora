@@ -23,6 +23,11 @@ pub struct MavenConfig {
     /// non-positive value revalidates every pull. Release artifacts are always immutable.
     #[serde(default = "super::super::default_metadata_ttl")]
     pub metadata_ttl: i64,
+    /// An upstream `429` on a miss NORA holds no copy for is answered `429` with `Retry-After`,
+    /// and the upstream is not asked again until then (#1325); Maven does not retry a `404` and
+    /// records it in `*.lastUpdated`. `false` answers `404`, as 1.4.8 did.
+    #[serde(default = "super::super::default_true")]
+    pub upstream_429_retryable: bool,
 }
 
 /// Maven upstream proxy configuration
@@ -82,6 +87,7 @@ impl Default for MavenConfig {
             checksum_verify: true,
             immutable_releases: true,
             metadata_ttl: 300,
+            upstream_429_retryable: true,
         }
     }
 }
@@ -119,6 +125,9 @@ impl MavenConfig {
         }
         if let Ok(val) = env::var("NORA_MAVEN_METADATA_TTL") {
             super::super::parse_env_warn("NORA_MAVEN_METADATA_TTL", &val, &mut self.metadata_ttl);
+        }
+        if let Ok(val) = env::var("NORA_MAVEN_UPSTREAM_429_RETRYABLE") {
+            self.upstream_429_retryable = !matches!(val.as_str(), "false" | "0");
         }
     }
 }
