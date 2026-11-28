@@ -3286,7 +3286,7 @@ mod upstream_failure_cases {
     /// and both name the upstream the client was sending to.
     #[tokio::test]
     async fn an_open_upstream_never_shows_its_userinfo() {
-        use crate::url_userinfo::check::{holds_no_secret, same_target};
+        use crate::url_userinfo::check::holds_no_secret;
         for (form, secrets) in crate::url_userinfo::FORMS {
             // Refused at once: nothing listens on port 9 of the loopback.
             let url = form
@@ -3307,11 +3307,8 @@ mod upstream_failure_cases {
             assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "{form}");
             let body = String::from_utf8(body_bytes(resp).await.to_vec()).unwrap();
             holds_no_secret(&body, form, secrets);
-            let named = body
-                .strip_prefix("upstream maven:")
-                .and_then(|rest| rest.strip_suffix(" temporarily unavailable"))
-                .unwrap_or_else(|| panic!("{form}: {body}"));
-            same_target(named, &url);
+            // The body names no upstream at all (#1335): neither its credentials nor its host.
+            assert_eq!(body, crate::registry::CIRCUIT_OPEN_BODY, "{form}");
 
             let metrics = send(&ctx.app, Method::GET, "/metrics", "").await;
             let metrics = String::from_utf8(body_bytes(metrics).await.to_vec()).unwrap();

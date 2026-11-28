@@ -403,7 +403,7 @@ impl UpstreamMiss {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
                 [(header::RETRY_AFTER, secs.to_string())],
-                format!("upstream {key} is rate-limiting NORA, retry after {secs} seconds"),
+                rate_limited_body(secs),
             )
                 .into_response();
         }
@@ -520,14 +520,26 @@ pub(crate) fn local_copy_unreadable(
     storage_unavailable(registry, key)
 }
 
-/// 503 response for circuit breaker open state with Retry-After header.
-pub(crate) fn circuit_open_response(registry: &str) -> Response {
+/// 503 response for circuit breaker open state with Retry-After header. The body does not name
+/// the upstream: its address (a private mirror's host) is the operator's, and goes to the log
+/// only (#1335).
+pub(crate) fn circuit_open_response(key: &str) -> Response {
+    tracing::debug!(upstream = key, "circuit breaker open, returning 503");
     (
         StatusCode::SERVICE_UNAVAILABLE,
         [("retry-after", "30")],
-        format!("upstream {} temporarily unavailable", registry),
+        CIRCUIT_OPEN_BODY,
     )
         .into_response()
+}
+
+/// The body of a 503 for an open breaker.
+pub(crate) const CIRCUIT_OPEN_BODY: &str = "upstream temporarily unavailable";
+
+/// The body of a 429 for a rate-limited upstream: what to do and when, without the upstream's
+/// address (#1335).
+pub(crate) fn rate_limited_body(secs: u64) -> String {
+    format!("upstream is rate-limiting NORA, retry after {secs} seconds")
 }
 
 /// Detect a policy/geo block signature on an upstream 4xx response, returning a
@@ -1484,6 +1496,40 @@ mod tests {
 
     /// 404 only when an upstream said "not found"; 502 when upstreams were asked and every
     /// one failed; 404 with no upstream at all.
+    /// #1335: a 429 or 503 a client gets never names the upstream; its address is the operator's.
+    #[tokio::test]
+    async fn the_answer_to_a_client_names_no_upstream() {
+        let key = "maven:https://mirror.internal.example/maven2";
+        let body = |r: Response| async move {
+            String::from_utf8(
+                axum::body::to_bytes(r.into_body(), 1 << 16)
+                    .await
+                    .unwrap()
+                    .to_vec(),
+            )
+            .unwrap()
+        };
+        let mut limited = UpstreamMiss::default();
+        limited.record(&ProxyError::RateLimited {
+            key: key.into(),
+            retry_after: 7,
+        });
+        let r = limited.response("maven", "com/example/x.jar");
+        assert_eq!(r.status(), StatusCode::TOO_MANY_REQUESTS);
+        let text = body(r).await;
+        assert_eq!(
+            text,
+            "upstream is rate-limiting NORA, retry after 7 seconds"
+        );
+        let mut open = UpstreamMiss::default();
+        open.record(&ProxyError::CircuitOpen(key.into()));
+        let r = open.response("maven", "com/example/x.jar");
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let text = body(r).await;
+        assert!(!text.contains("mirror.internal"), "{text}");
+        assert_eq!(body(circuit_open_response(key)).await, CIRCUIT_OPEN_BODY);
+    }
+
     #[test]
     fn a_miss_is_not_found_only_when_an_upstream_said_so() {
         use axum::http::StatusCode;
@@ -1777,10 +1823,11 @@ mod tests {
                 let body = axum::body::to_bytes(response.into_body(), 1 << 16)
                     .await
                     .unwrap();
+                // The body names no upstream (#1335); the key is only in the log.
                 assert_eq!(
                     body.as_ref(),
-                    format!("upstream {key} temporarily unavailable").as_bytes(),
-                    "{upstreams:?}"
+                    CIRCUIT_OPEN_BODY.as_bytes(),
+                    "{upstreams:?} {key}"
                 );
             }
         }
