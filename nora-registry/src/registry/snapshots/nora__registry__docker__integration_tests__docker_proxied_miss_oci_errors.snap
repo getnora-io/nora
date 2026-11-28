@@ -46,7 +46,7 @@ expression: pinned
           "detail": {
             "retry_after": 7
           },
-          "message": "upstream docker:<upstream> is rate-limiting NORA, retry after 7 seconds"
+          "message": "upstream is rate-limiting NORA, retry after 7 seconds"
         }
       ]
     },
@@ -63,7 +63,7 @@ expression: pinned
           "detail": {
             "retry_after": 7
           },
-          "message": "upstream docker:<upstream> is rate-limiting NORA, retry after 7 seconds"
+          "message": "upstream is rate-limiting NORA, retry after 7 seconds"
         }
       ]
     },
@@ -123,7 +123,7 @@ expression: pinned
         {
           "code": "UNAVAILABLE",
           "detail": "its circuit breaker is open; retry after the Retry-After interval",
-          "message": "upstream docker:<upstream> temporarily unavailable"
+          "message": "upstream temporarily unavailable"
         }
       ]
     },

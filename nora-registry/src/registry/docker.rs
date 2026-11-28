@@ -856,10 +856,10 @@ fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
     };
     let response = miss.response("docker", &path);
     let status = response.status();
-    let (code, message, detail) = if let Some((key, secs)) = miss.rate_limited() {
+    let (code, message, detail) = if let Some((_key, secs)) = miss.rate_limited() {
         (
             "TOOMANYREQUESTS",
-            format!("upstream {key} is rate-limiting NORA, retry after {secs} seconds"),
+            crate::registry::rate_limited_body(secs),
             json!({ "retry_after": secs }),
         )
     } else if miss.credentials_refused() {
@@ -874,10 +874,10 @@ fn docker_miss_response(miss: &UpstreamMiss, missed: Missed<'_>) -> Response {
             Missed::Blob { digest, .. } => blob_unknown_response(digest),
             Missed::Tags { name } => name_unknown_response(name),
         };
-    } else if let Some(key) = miss.open_key() {
+    } else if miss.open_key().is_some() {
         (
             "UNAVAILABLE",
-            format!("upstream {key} temporarily unavailable"),
+            crate::registry::CIRCUIT_OPEN_BODY.to_string(),
             json!("its circuit breaker is open; retry after the Retry-After interval"),
         )
     } else {
