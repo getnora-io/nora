@@ -1,6 +1,13 @@
 # Changelog
 ## [Unreleased]
 
+## [1.4.9] - 2026-11-28
+
+### Fixed
+- A Maven request NORA holds no copy for, when the upstream answers `429 Too Many Requests`, is now answered `429` with `Retry-After` instead of `404`. Maven does not retry a `404` and records it in `*.lastUpdated`, so a build failed with `Could not find artifact` until the update interval passed, although the artifact existed. The upstream is not asked again until its `Retry-After`, including the second attempt of a request already waiting on a `5xx`. Another upstream's `404` does not hide the limit, and a held copy is still served. `maven.upstream_429_retryable = false` (`NORA_MAVEN_UPSTREAM_429_RETRYABLE`) restores the `404`. Measured with Maven 3.9.9, which retries the `429` within the same build. Other formats follow. (#1325)
+- A BuildKit or kaniko push of a new tag no longer fails while a Docker upstream is rate-limiting NORA. Both check a tag with a manifest `HEAD` before they write it, and NORA answered that check with the upstream's `429` — and, for the whole `Retry-After` window, with `429` for every new tag in every repository. A manifest `HEAD` by tag that NORA holds no copy of, while every upstream asked only rate-limits NORA, now answers `404 MANIFEST_UNKNOWN` (`Cache-Control: no-store`, `X-Nora-Rate-Limited: true`). A `GET`, a `HEAD` by digest and a tag NORA holds keep their answers. `docker.head_tag_rate_limited_as_404 = false` (`NORA_DOCKER_HEAD_TAG_RATE_LIMITED_AS_404`) restores the `429`. (#1332)
+- **A 429 or 503 a client gets no longer names the upstream (#1335)** — when an upstream rate-limited NORA or its circuit breaker was open, the response body said `upstream maven:https://mirror.internal.example/maven2 is rate-limiting NORA, retry after 7 seconds` (Docker: the same in the OCI error message). Credentials were masked, the host was not, so any client, anonymous ones included, learned the address of a private mirror. The bodies now say what happened and when to retry (`upstream is rate-limiting NORA, retry after 7 seconds`, `upstream temporarily unavailable`); the upstream stays in the log. Status codes and `Retry-After` are unchanged; metric labels keep the upstream for now so dashboards keep working.
+
 ## [1.4.8] - 2026-11-28
 
 ### Changed
