@@ -315,7 +315,10 @@ mod tests {
 
     #[tokio::test]
     async fn record_triggers_periodic_fsync() {
-        // Recording past SYNC_EVERY (64) triggers the in-loop sync(); all survive.
+        // Recording past SYNC_EVERY (64) triggers the in-loop sync(): the first 64 are on disk.
+        // The 6 after it are written but not yet synced — a tokio File write may still be in
+        // flight — so a reopen sees at least the synced ones; an explicit sync() makes all 70
+        // durable (the un-synced tail is what a crash may lose, and re-imports idempotently).
         let tmp = tempfile::tempdir().unwrap();
         let store = ResumeStore::open(tmp.path(), "h").await.unwrap();
         let mut j = store.open_journal("r").await.unwrap();
@@ -323,7 +326,14 @@ mod tests {
             j.record(&format!("k{i}"), "sha").await.unwrap();
         }
         assert_eq!(j.snapshot().len(), 70);
-        // Rebuilt from disk confirms the periodic fsync persisted them.
+        let reopened = store.open_journal("r").await.unwrap().snapshot();
+        assert!(
+            (SYNC_EVERY..=70).contains(&reopened.len()),
+            "{}",
+            reopened.len()
+        );
+        assert!((0..SYNC_EVERY).all(|i| reopened.contains(&format!("k{i}"))));
+        j.sync().await.unwrap();
         assert_eq!(store.open_journal("r").await.unwrap().snapshot().len(), 70);
     }
 }
