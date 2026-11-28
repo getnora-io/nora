@@ -358,6 +358,13 @@ impl UpstreamMiss {
             && self.limited.is_none()
     }
 
+    /// Whether an upstream rate-limited NORA and every other one asked said "not found": none
+    /// failed, was skipped for its open breaker or refused NORA's credentials (#1332). Such a
+    /// miss is a rate limit alone, which no other kind of failure hides.
+    pub(crate) fn only_rate_limited(&self) -> bool {
+        self.limited.is_some() && !self.failed && !self.refused && self.open.is_none()
+    }
+
     /// Whether every upstream asked said "not found", and none failed, was skipped for its open
     /// breaker, refused NORA's credentials or rate-limited it: a miss that is safe to remember,
     /// since no upstream that may hold the artifact went unasked or unanswered (#1192).
