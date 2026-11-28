@@ -213,6 +213,7 @@ fn build_context_full(
             checksum_verify: true,
             immutable_releases: true,
             metadata_ttl: 300,
+            upstream_429_retryable: true,
         },
         npm: NpmConfig {
             enabled: true,
