@@ -1166,6 +1166,7 @@ async fn docker_v2_dispatch(
                     state,
                     headers,
                     Path((name.to_string(), reference.to_string())),
+                    method == Method::HEAD,
                 )
                 .await;
                 if method == Method::HEAD {
@@ -2622,6 +2623,7 @@ async fn get_manifest(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Path((name, reference)): Path<(String, String)>,
+    head: bool,
 ) -> Response {
     let c = canonicalize(&name, &state.config.docker);
     if let Some(r) = c.denied_response() {
@@ -2911,6 +2913,34 @@ async fn get_manifest(
         let mut response = manifest_unknown_response(&name, &reference);
         response.headers_mut().insert(
             axum::http::header::HeaderName::from_static("x-nora-stale"),
+            axum::http::header::HeaderValue::from_static("true"),
+        );
+        response.headers_mut().insert(
+            axum::http::header::CACHE_CONTROL,
+            axum::http::header::HeaderValue::from_static("no-store"),
+        );
+        return response;
+    }
+    // #1332: BuildKit and kaniko check a tag with `HEAD` before they push it, and fail on a
+    // 429. A tag NORA holds no copy of, asked while the upstreams only rate-limit NORA, answers
+    // that check as absent so the push goes on; nothing is remembered (no miss is recorded), and
+    // a `GET` or a `HEAD` by digest keeps the retryable 429.
+    if head
+        && cached.is_none()
+        && !is_digest_reference(&reference)
+        && miss.only_rate_limited()
+        && state.config.docker.head_tag_rate_limited_as_404
+    {
+        tracing::warn!(
+            registry = "docker",
+            name = %name,
+            reference = %reference,
+            upstream = miss.rate_limited().map_or("", |(key, _)| key),
+            "Upstream is rate-limiting NORA and no copy of this tag is held; answering the HEAD 404 so a push can go on"
+        );
+        let mut response = manifest_unknown_response(&name, &reference);
+        response.headers_mut().insert(
+            axum::http::header::HeaderName::from_static("x-nora-rate-limited"),
             axum::http::header::HeaderValue::from_static("true"),
         );
         response.headers_mut().insert(
@@ -9079,7 +9109,9 @@ mod integration_tests {
     /// `MANIFEST_UNKNOWN` / `BLOB_UNKNOWN`; the upstream's own `404 MANIFEST_UNKNOWN` stays 404.
     /// The status itself (429 relayed, 503, 502) and the Retry-After cap are not chosen yet:
     /// the rows pin only what every candidate shares. A blob HEAD is answered from storage
-    /// alone (`check_blob`) and never asks the upstream, so it has no row.
+    /// alone (`check_blob`) and never asks the upstream, so it has no row. A manifest HEAD by
+    /// tag is answered 404 instead (#1332, `a_tag_head_while_rate_limited_lets_a_push_go_on`), so
+    /// the HEAD row asks by digest.
     #[tokio::test]
     async fn an_upstream_rate_limit_is_not_a_missing_artifact() {
         use wiremock::matchers::any;
@@ -9087,6 +9119,7 @@ mod integration_tests {
 
         let blob = format!("sha256:{}", hex::encode(sha2::Sha256::digest(b"layer")));
         let manifest = "/v2/myorg/app/manifests/9.9".to_string();
+        let by_digest = format!("/v2/myorg/app/manifests/{blob}");
         let layer = format!("/v2/myorg/app/blobs/{blob}");
         let retryable = [
             StatusCode::TOO_MANY_REQUESTS,
@@ -9103,10 +9136,10 @@ mod integration_tests {
                 "MANIFEST_UNKNOWN",
             ),
             (
-                "manifest-head",
+                "manifest-head-by-digest",
                 429,
                 Method::HEAD,
-                &manifest,
+                &by_digest,
                 "MANIFEST_UNKNOWN",
             ),
             ("blob-get", 429, Method::GET, &layer, "BLOB_UNKNOWN"),
@@ -9178,6 +9211,160 @@ mod integration_tests {
             {
                 wrong.push(format!("{row}: {content_type} {body}"));
             }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// #1332: BuildKit and kaniko `HEAD` a tag before they push it and fail on a 429, so a tag
+    /// NORA holds no copy of, while every upstream asked only rate-limits NORA, answers that
+    /// `HEAD` 404 `MANIFEST_UNKNOWN`, `no-store`, marked `X-Nora-Rate-Limited` — also inside the
+    /// window, when the upstream is not asked again. A `GET`, a `HEAD` by digest, a held copy,
+    /// another failure in the chain and the switch turned off keep their answers.
+    #[tokio::test]
+    async fn a_tag_head_while_rate_limited_lets_a_push_go_on() {
+        use crate::test_helpers::create_test_context_with_storage_and_config;
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tag = "/v2/myorg/app/manifests/new".to_string();
+        let digest = format!(
+            "/v2/myorg/app/manifests/sha256:{}",
+            hex::encode(sha2::Sha256::digest(b"m"))
+        );
+        // (row, upstream answers, switch on, method, path, expected status)
+        let rows = [
+            (
+                "head-tag",
+                vec![429],
+                true,
+                Method::HEAD,
+                &tag,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "get-tag",
+                vec![429],
+                true,
+                Method::GET,
+                &tag,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                "head-digest",
+                vec![429],
+                true,
+                Method::HEAD,
+                &digest,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                "switch-off",
+                vec![429],
+                false,
+                Method::HEAD,
+                &tag,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                "upstream-502",
+                vec![502],
+                true,
+                Method::HEAD,
+                &tag,
+                StatusCode::BAD_GATEWAY,
+            ),
+            (
+                "429-and-502",
+                vec![429, 502],
+                true,
+                Method::HEAD,
+                &tag,
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                "429-and-404",
+                vec![429, 404],
+                true,
+                Method::HEAD,
+                &tag,
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        let mut wrong = Vec::new();
+        for (row, answers, on, verb, uri, want) in rows {
+            let mut servers = Vec::new();
+            for answer in &answers {
+                let server = MockServer::start().await;
+                let template = match answer {
+                    429 => rate_limit_answer("60"),
+                    status => ResponseTemplate::new(*status),
+                };
+                Mock::given(any())
+                    .respond_with(template)
+                    .mount(&server)
+                    .await;
+                servers.push(server);
+            }
+            let entries: Vec<_> = servers.iter().map(|s| (s.uri(), Vec::new())).collect();
+            let ctx = create_test_context_with_config(move |cfg| {
+                cfg.docker.proxy_timeout = 1;
+                cfg.docker.head_tag_rate_limited_as_404 = on;
+                cfg.docker.upstreams = upstreams_of(entries);
+            });
+            // twice: the second is inside the window and asks no upstream again
+            for attempt in ["first", "in the window"] {
+                let asked = servers[0].received_requests().await.map_or(0, |r| r.len());
+                let resp = send(&ctx.app, verb.clone(), uri, Body::empty()).await;
+                let got = resp.status();
+                let resp_marked_any = resp.headers().get("x-nora-rate-limited").is_some();
+                let marked = resp
+                    .headers()
+                    .get("x-nora-rate-limited")
+                    .is_some_and(|v| v == "true");
+                let no_store = resp
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .is_some_and(|v| v == "no-store");
+                if got != want {
+                    wrong.push(format!("{row} ({attempt}): {got}, want {want}"));
+                }
+                let synthetic = row == "head-tag" || row == "429-and-404";
+                if synthetic && !(marked && no_store) {
+                    wrong.push(format!(
+                        "{row} ({attempt}): marked={marked} no_store={no_store}"
+                    ));
+                }
+                if !synthetic && resp_marked_any {
+                    wrong.push(format!("{row} ({attempt}): marked as rate-limited"));
+                }
+                let now = servers[0].received_requests().await.map_or(0, |r| r.len());
+                if answers[0] == 429 && attempt == "in the window" && now != asked {
+                    wrong.push(format!("{row}: the window asked the upstream again"));
+                }
+            }
+        }
+
+        // a held (stale) copy of the tag is never answered as absent
+        let name = "myorg/app";
+        let img = AttestedImage::new();
+        let upstream = MockServer::start().await;
+        let (warm, _) =
+            warm_then(Outage::RateLimited, &upstream, name, &img, &[], Vec::new()).await;
+        let held = format!("/v2/{name}/manifests/latest");
+        let resp = send(&warm.app, Method::HEAD, &held, Body::empty()).await;
+        if resp.status() != StatusCode::OK || resp.headers().get("x-nora-rate-limited").is_some() {
+            wrong.push(format!("held copy, serve_stale on: {}", resp.status()));
+        }
+        let url = upstream.uri();
+        let strict =
+            create_test_context_with_storage_and_config(warm.state.storage.clone(), move |cfg| {
+                cfg.docker.serve_stale = false;
+                cfg.docker.proxy_timeout = 1;
+                cfg.docker.upstreams = upstreams_of(vec![(url, Vec::new())]);
+            });
+        let resp = send(&strict.app, Method::HEAD, &held, Body::empty()).await;
+        if resp.status() != StatusCode::TOO_MANY_REQUESTS {
+            wrong.push(format!("held copy, serve_stale off: {}", resp.status()));
         }
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
@@ -16673,6 +16860,7 @@ mod hosted_pull_stats_and_re_push {
                 State(state.clone()),
                 axum::http::HeaderMap::new(),
                 Path(("race-img".to_string(), "v1".to_string())),
+                false,
             )
             .await;
             assert_eq!(pull.status(), StatusCode::OK);
@@ -16778,6 +16966,7 @@ mod hosted_pull_stats_and_re_push {
             State(state.clone()),
             axum::http::HeaderMap::new(),
             Path(("race-img".to_string(), "v1".to_string())),
+            false,
         )
         .await;
         assert_eq!(pull.status(), StatusCode::OK);
@@ -16977,6 +17166,7 @@ mod hosted_pull_stats_every_writer_takes_the_lock {
             State(state.clone()),
             axum::http::HeaderMap::new(),
             Path(("race-img".to_string(), reference.to_string())),
+            false,
         )
         .await;
         assert_eq!(r.status(), StatusCode::OK);
@@ -17461,6 +17651,7 @@ mod manifest_before_metadata_one_lock_order {
             State(state.clone()),
             axum::http::HeaderMap::new(),
             Path(("race-img".to_string(), reference.to_string())),
+            false,
         )
         .await;
         assert_eq!(r.status(), StatusCode::OK);

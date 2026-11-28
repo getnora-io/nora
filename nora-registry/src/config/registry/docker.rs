@@ -45,6 +45,13 @@ pub struct DockerConfig {
     pub miss_ttl: u64,
     #[serde(default = "super::super::default_true")]
     pub serve_stale: bool,
+    /// A manifest `HEAD` by tag that NORA holds no copy of, while every upstream asked is
+    /// rate-limiting NORA, answers `404 MANIFEST_UNKNOWN` (`Cache-Control: no-store`,
+    /// `X-Nora-Rate-Limited: true`) instead of `429` (#1332). BuildKit and kaniko check a tag
+    /// with `HEAD` before they push it and fail on a `429`; a `GET` and a `HEAD` by digest keep
+    /// the retryable `429`. `false` answers `429` as 1.4.8 did.
+    #[serde(default = "super::super::default_true")]
+    pub head_tag_rate_limited_as_404: bool,
     /// What to do with a name that no `prefix`, `namespaces` or registry host routes.
     /// `allow` (default) = the fallback chain (upstreams without `namespaces`, in order), or no
     /// upstream at all for a name behind a registry host that no upstream serves (#1195);
@@ -238,6 +245,7 @@ impl Default for DockerConfig {
             metadata_ttl: -1,
             miss_ttl: default_docker_miss_ttl(),
             serve_stale: true,
+            head_tag_rate_limited_as_404: true,
             default_action: DefaultAction::default(),
             upstreams: default_docker_upstreams(),
         }
@@ -359,6 +367,9 @@ impl DockerConfig {
         }
         if let Ok(val) = env::var("NORA_DOCKER_SERVE_STALE") {
             self.serve_stale = !matches!(val.as_str(), "false" | "0");
+        }
+        if let Ok(val) = env::var("NORA_DOCKER_HEAD_TAG_RATE_LIMITED_AS_404") {
+            self.head_tag_rate_limited_as_404 = !matches!(val.as_str(), "false" | "0");
         }
         if let Ok(val) = env::var("NORA_DOCKER_DEFAULT_ACTION") {
             match val.to_lowercase().as_str() {

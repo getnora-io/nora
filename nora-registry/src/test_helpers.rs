@@ -256,6 +256,7 @@ fn build_context_full(
             metadata_ttl: -1,
             miss_ttl: 30,
             serve_stale: true,
+            head_tag_rate_limited_as_404: true,
             default_action: crate::config::DefaultAction::Allow,
             upstreams: vec![],
         },
